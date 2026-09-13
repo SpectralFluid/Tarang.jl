@@ -76,7 +76,8 @@ RK443()
 - Order: 3
 - Stages: 5 rows, first stage explicit, so 4 implicit solves per step
 - Implicit part: L-stable ESDIRK for linear terms
-- Explicit part: four explicit evaluations for nonlinear terms
+- Explicit part: four explicit evaluations for nonlinear terms (the fifth row's
+  `F` has zero weight everywhere and is not evaluated)
 - Workspace field sets: 6 (one stage state plus one retained RHS per stage)
 
 **Recommended for**: High accuracy requirements.
@@ -405,15 +406,22 @@ allocated per state field (each set is one full field):
 | Method | Workspace Sets |
 |--------|----------------|
 | RK111 / RK222 / RK443 | stages + 1 = 3 / 4 / 6 (one stage state, one retained RHS per stage) |
+| RKGFY / RKSMR / RK443_IMEX | stages + 1 = 4 / 5 / 6 (same two paths as the RK family) |
 | CNAB1 / CNAB2 | 2 |
 | SBDF1 – SBDF4 | 2 |
 | ETD_RK222 / ETD_CNAB2 / ETD_SBDF2 | 3 |
 | Internal diagonal RK222 / RK443 | 2 × stages = 6 / 10 (one state and one RHS set per stage) |
 | Internal diagonal SBDF2 | 4 |
-| everything else (RKSMR, MCNAB2, CNLF2, RKGFY, RK443_IMEX) | 2, grown on demand by the field path |
+| everything else (MCNAB2, CNLF2) | 2 |
 
 These are the counts `_workspace_count` returns per scheme; the multistep and
 distributed paths keep their own recycled history buffers on top of them.
+
+The pool does **not** grow on demand: `get_workspace_field!` returns a freshly
+allocated `ScalarField` for any index past the end, and the distributed diagonal-IMEX
+RK stepper asks for one per (stage, field) on every step. A scheme whose count is
+below what its path indexes therefore allocates a full field per stage per step —
+which is what RKGFY, RKSMR and RK443_IMEX did before they were given rows above.
 
 The multistep schemes additionally retain previous state and RHS levels in a history ring
 (2–5 levels, depending on order), which the RK schemes do not.
