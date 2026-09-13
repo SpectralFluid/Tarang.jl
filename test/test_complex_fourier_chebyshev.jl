@@ -32,7 +32,9 @@ function _fc_diffusion(xkind; Nz=12, Nx=8, Lz=1.0, dt=1e-3, nsteps=20)
     b = ScalarField(Domain(dist, (zb, xb)), "b")
     tau1 = ScalarField(dist, "tau_b1", (), Float64)
     tau2 = ScalarField(dist, "tau_b2", (), Float64)
-    _, ez = unit_vector_fields(coords, dist)
+    # unit_vector_fields returns COORDINATE order, and z is the FIRST coordinate
+    # here -- `_, ez = ...` would bind the x unit vector and lift the tau along x.
+    ez, _ = unit_vector_fields(coords, dist)
     lift_basis = derivative_basis(zb, 1)
     τ_lift(A) = lift(A, lift_basis, -1)
     grad_b = grad(b) + ez * τ_lift(tau1)
@@ -66,6 +68,20 @@ end
     for field in (ref, got)
         xmean = vec(sum(field, dims=2)) ./ size(field, 2)
         @test isapprox(xmean, analytic; rtol=1e-5)
+    end
+
+    # The x-mean alone cannot see the tau term: it is the kx=0 mode, where the
+    # lift's x-derivative contributes nothing, so a tau lifted along the WRONG
+    # unit vector passes it. Check the full field, where each x-mode decays at
+    # its own rate.
+    Nx = size(ref, 2)
+    xf = [2π * (i - 1) / Nx for i in 1:Nx]
+    full = [sin(π * z / Lz) * (exp(-0.1 * (π / Lz)^2 * tend) +
+                               0.5cos(2x) * exp(-0.1 * ((π / Lz)^2 + 4) * tend) +
+                               0.3sin(x) * exp(-0.1 * ((π / Lz)^2 + 1) * tend))
+            for z in zf, x in xf]
+    for field in (ref, got)
+        @test isapprox(field, full; atol=1e-8)
     end
 end
 

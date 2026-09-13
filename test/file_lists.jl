@@ -131,12 +131,14 @@ const TEST_FILES = [
     "test_stress_free_bc_regressions.jl",
     "test_gpu_boundary_regressions_jlarray.jl",
     "test_periodic_bc_marker.jl",
+    "test_tau_lift_axis_and_guard.jl",       # a tangential-basis tau must count ONE DOF per subproblem in every axis ordering (it was the full coeff length unless the Chebyshev axis came last), and duplicate tau lifts must be refused however the lift basis is spelled (the guard compared bases with ===, which a fresh derivative_basis call never satisfies)
     "test_configuration_matrix.jl",           # every basis x problem x timestepper cell must solve correctly or refuse — no silent third option
     "test_bvp_fourier_forcing.jl",            # an unassemblable BVP operator must refuse, not skip a block and return a confident wrong answer
     "test_group_vara_bounds.jl",              # group_ncread/ncwrite must validate start/count before the ccall — a short vector was read past its end
     "test_slab_io.jl",                        # NetCDF slab index math + serial file round-trip
     "test_checkpoint_restart.jl",             # save_field/load_field! + solver save_state/load_state!
     "test_gpu_checkpoint_staging.jl",         # checkpoint load uploads to device storage (JLArray, no GPU needed)
+    "test_gpu_output_parity_jlarray.jl",      # CPU vs device NetCDF files must be bit-identical across grid/scales/postprocess/expression/coeff-layout tasks over 3 records — device output coverage was 1-D, grid-layout, single-record
     "test_etd_multistep.jl",
     "test_rksmr_convergence.jl",
     "test_kernel_operations.jl",

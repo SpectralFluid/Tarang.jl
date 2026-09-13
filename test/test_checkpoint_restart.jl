@@ -487,7 +487,9 @@ function _cheb_tau_solver(stepper; dt=0.02, Nz=12, Nx=8, κ=0.1)
     τ1 = ScalarField(dist, "tau_b1", (), Float64)   # zero-dim: isempty(bases) == true
     τ2 = ScalarField(dist, "tau_b2", (), Float64)   # zero-dim: isempty(bases) == true
 
-    _, ez = unit_vector_fields(coords, dist)
+    # unit_vector_fields returns COORDINATE order, and z is the FIRST coordinate
+    # here -- `_, ez = ...` would bind the x unit vector and lift the tau along x.
+    ez, _ = unit_vector_fields(coords, dist)
     lift_basis = derivative_basis(zbasis, 1)
     τ_lift(A) = lift(A, lift_basis, -1)
     grad_b = grad(b) + ez * τ_lift(τ1)

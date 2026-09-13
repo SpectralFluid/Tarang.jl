@@ -32,7 +32,9 @@ function _build(stepper; Nz=12, Nx=16, dt=1e-3)
     b = ScalarField(domain, "b")
     tau_b1 = ScalarField(dist, "tau_b1", (), Float64)
     tau_b2 = ScalarField(dist, "tau_b2", (), Float64)
-    _, ez = unit_vector_fields(coords, dist)
+    # unit_vector_fields returns COORDINATE order, and z is the FIRST coordinate
+    # here -- `_, ez = ...` would bind the x unit vector and lift the tau along x.
+    ez, _ = unit_vector_fields(coords, dist)
     lb = derivative_basis(zb, 1)
     τ_lift(A) = lift(A, lb, -1)
     grad_b = grad(b) + ez * τ_lift(tau_b1)
