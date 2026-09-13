@@ -163,9 +163,22 @@ else
         @test gpu_storage isa _GOP
         @test gpu_loaded isa _GOP
 
-        @testset "$name is identical on CPU and device" for name in (GOP_TASKS..., "sim_time")
+        # Every column but `dudx` reaches the file through the SAME FFTW calls on
+        # both runs -- the device path's transforms are the CPU twin above -- so
+        # those must agree bit for bit. `dudx` is the exception: a Fourier
+        # derivative takes `evaluate_fourier_derivative_cpu!` (explicit spectral
+        # loops) on the host and `evaluate_fourier_derivative_gpu!` (FFT, multiply
+        # by (ik)^n, inverse FFT) on a device array. Those are different algorithms
+        # and can only agree to rounding, so it is compared to a tight tolerance.
+        # Demanding `==` there passed on macOS/1.12 by luck and failed on
+        # ubuntu-x64/1.10 by last-ulp differences (~1e-16 relative).
+        @testset "$name matches on CPU and device" for name in (GOP_TASKS..., "sim_time")
             @test size(cpu[name]) == size(gpu[name])
-            @test cpu[name] == gpu[name]
+            if name == "dudx"
+                @test cpu[name] ≈ gpu[name] rtol=1e-12 atol=1e-12
+            else
+                @test cpu[name] == gpu[name]
+            end
         end
 
         # Agreeing on a wrong answer must still fail: check the analytic source.
