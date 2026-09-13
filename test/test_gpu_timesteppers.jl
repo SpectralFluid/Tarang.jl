@@ -46,7 +46,7 @@ else
     end
 
     @testset "GPU mass operators are refused before advancement" begin
-        steppers = (RK111(), RK222(), RK443(), RKSMR(), Tarang.RKGFY(), Tarang.RK443_IMEX(),
+        steppers = (RK111(), RK222(), RK443(), RKSMR(), Tarang.RKGFY(),
                     CNAB1(), CNAB2(), SBDF1(), SBDF2(), SBDF3(), SBDF4(),
                     ETD_RK222(), ETD_CNAB2(), ETD_SBDF2(), Tarang.MCNAB2(), Tarang.CNLF2(),
                     Tarang.DiagonalIMEX_RK222(), Tarang.DiagonalIMEX_RK443(), Tarang.DiagonalIMEX_SBDF2())

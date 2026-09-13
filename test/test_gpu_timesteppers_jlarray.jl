@@ -130,7 +130,7 @@ end
             return gtj_grid(u), xs
         end
 
-        all_steppers = (RK111(), RK222(), RK443(), RKSMR(), Tarang.RKGFY(), Tarang.RK443_IMEX(),
+        all_steppers = (RK111(), RK222(), RK443(), RKSMR(), Tarang.RKGFY(),
                         CNAB1(), CNAB2(), SBDF1(), SBDF2(), SBDF3(), SBDF4(),
                         ETD_RK222(), ETD_CNAB2(), ETD_SBDF2(), Tarang.MCNAB2(), Tarang.CNLF2(),
                         Tarang.DiagonalIMEX_RK222(), Tarang.DiagonalIMEX_RK443(), Tarang.DiagonalIMEX_SBDF2())
@@ -158,7 +158,7 @@ end
         # explicit problem. ETD_* legitimately substitute (with a warning) an RK/
         # multistep step when there is no linear operator, so they are checked for
         # accuracy but not bit parity.
-        parity_exact = (RK111(), RK222(), RK443(), RKSMR(), Tarang.RKGFY(), Tarang.RK443_IMEX(),
+        parity_exact = (RK111(), RK222(), RK443(), RKSMR(), Tarang.RKGFY(),
                         CNAB1(), CNAB2(), SBDF1(), SBDF2(), SBDF3(), SBDF4(),
                         Tarang.MCNAB2(), Tarang.CNLF2(), diagonal...)
 
@@ -166,7 +166,7 @@ end
             # dt(u) = -u², u0 ≡ 1 → 1/(1+t). Spatially exact, so the error is the
             # time-discretization error alone.
             expected_order = Dict(:RK111 => 1, :CNAB1 => 1, :SBDF1 => 1,
-                                  :RK443 => 3, :RKSMR => 3, :RK443_IMEX => 3,
+                                  :RK443 => 3, :RKSMR => 3,
                                   :SBDF3 => 2, :SBDF4 => 2)
             for ts in all_steppers
                 T = 0.4

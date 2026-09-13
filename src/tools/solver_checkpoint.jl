@@ -47,7 +47,7 @@ and exponential RK ones) carry no history at all. `CNAB1` and `SBDF1` are the
 first-order bootstrap formulas of their families: both depend only on the
 current state, so there is nothing to re-seed."""
 const _ONE_STEP_SCHEMES = Set([
-    "RK111", "RK222", "RK443", "RK443_IMEX", "RKSMR", "RKGFY",
+    "RK111", "RK222", "RK443", "RKSMR", "RKGFY",
     "ETD_RK222", "DiagonalIMEX_RK222", "DiagonalIMEX_RK443",
     "CNAB1", "SBDF1",
 ])
@@ -64,7 +64,7 @@ function _warn_multistep_restart(solver::InitialValueSolver)
     @warn "$scheme restart re-seeds its multistep history: the checkpoint carries the " *
           "state but not the stored time levels, so the first $steps step(s) run at the " *
           "seeding order. The run is correct but not bit-identical to an uninterrupted " *
-          "one. One-step schemes (RK111/RK222/RK443, RK443_IMEX, RKSMR, RKGFY, ETD_RK222) " *
+          "one. One-step schemes (RK111/RK222/RK443, RKSMR, RKGFY, ETD_RK222) " *
           "and the first-order bootstraps CNAB1/SBDF1 restart exactly; SBDF2 does NOT, " *
           "including its internal diagonal implementation -- it is multistep." maxlog=1 _id=Symbol(:multistep_restart_, scheme)
     return nothing

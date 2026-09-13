@@ -286,7 +286,7 @@ end
     step_rksmr!(state, solver)
 
 Spalart–Moser–Rogers semi-implicit (IMEX) RK3 step. RKSMR now carries an ARK
-Butcher tableau (see `RKSMR` in types.jl), so — like RKGFY and RK443_IMEX — it
+Butcher tableau (see `RKSMR` in types.jl), so — like RKGFY — it
 delegates to the generic IMEX driver `step_rk_imex!`, which treats the nonlinear
 term `F` explicitly and the stiff linear operator `L` implicitly (M/L matrices,
 per-mode subproblems, distributed diagonal IMEX). Failures propagate rather than
@@ -300,13 +300,9 @@ function step_rksmr!(state::TimestepperState, solver::InitialValueSolver)
     step_rk_imex!(state, solver)
 end
 
-# `step_rkgfy!` and `step_rk443_imex!` are named scheme entry points that carry
-# no bespoke logic — they delegate to the generic `step_rk_imex!` so every IMEX
-# RK variant shares one M/L-handling implementation and failure policy.
+# `step_rkgfy!` is a named scheme entry point that carries no bespoke logic — it
+# delegates to the generic `step_rk_imex!` so every IMEX RK variant shares one
+# M/L-handling implementation and failure policy.
 function step_rkgfy!(state::TimestepperState, solver::InitialValueSolver)
-    step_rk_imex!(state, solver)
-end
-
-function step_rk443_imex!(state::TimestepperState, solver::InitialValueSolver)
     step_rk_imex!(state, solver)
 end
