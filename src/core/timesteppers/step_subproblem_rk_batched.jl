@@ -795,13 +795,11 @@ function _leftover_stage_solve!(sp, sp_idx, i::Int, dt::Float64, A_exp, A_imp,
     _assign_to_buffer!(rhs, MX0[sp_idx])
 
     for j in 1:(i - 1)
-        a_ej = dt * A_exp[i, j]
-        a_ij = dt * A_imp[i, j]
-        if abs(a_ej) > 1e-14
-            _sp_axpy!(rhs, a_ej, F[j][sp_idx])
+        if !iszero(A_exp[i, j])
+            _sp_axpy!(rhs, dt * A_exp[i, j], F[j][sp_idx])
         end
-        if abs(a_ij) > 1e-14
-            _sp_axpy!(rhs, -a_ij, LX[j][sp_idx])
+        if !iszero(A_imp[i, j])
+            _sp_axpy!(rhs, -dt * A_imp[i, j], LX[j][sp_idx])
         end
     end
 
@@ -856,13 +854,11 @@ function _leftover_final!(sp, sp_idx, dt::Float64, stages::Int, b_exp, b_imp,
     rhs = _sp_stage_vector!(sp, :final_rhs, size(M_min, 1), MX0[sp_idx])
     copyto!(rhs, MX0[sp_idx])
     for s in 1:stages
-        be = dt * b_exp[s]
-        bi = dt * b_imp[s]
-        if abs(be) > 1e-14
-            _sp_axpy!(rhs, be, F[s][sp_idx])
+        if !iszero(b_exp[s])
+            _sp_axpy!(rhs, dt * b_exp[s], F[s][sp_idx])
         end
-        if abs(bi) > 1e-14
-            _sp_axpy!(rhs, -bi, LX[s][sp_idx])
+        if !iszero(b_imp[s])
+            _sp_axpy!(rhs, -dt * b_imp[s], LX[s][sp_idx])
         end
     end
 
@@ -946,6 +942,7 @@ function step_subproblem_rk_batched!(solver::InitialValueSolver,
     end
 
     # ── Stage loop ───────────────────────────────────────────────────────
+    skip_final_rhs = _rk_final_stage_rhs_unused(ts)
     for i in 1:stages
         state.current_substep = i
 
@@ -971,13 +968,11 @@ function step_subproblem_rk_batched!(solver::InitialValueSolver,
 
                 copyto!(ws.RHS, ws.MX0)
                 for j in 1:(i - 1)
-                    a_ej = dt * A_exp[i, j]
-                    a_ij = dt * A_imp[i, j]
-                    if abs(a_ej) > 1e-14
-                        _batch_axpy!(ws.RHS, a_ej, ws.F[j])
+                    if !iszero(A_exp[i, j])
+                        _batch_axpy!(ws.RHS, dt * A_exp[i, j], ws.F[j])
                     end
-                    if abs(a_ij) > 1e-14
-                        _batch_axpy!(ws.RHS, -a_ij, ws.LX[j])
+                    if !iszero(A_imp[i, j])
+                        _batch_axpy!(ws.RHS, -dt * A_imp[i, j], ws.LX[j])
                     end
                 end
 
@@ -999,6 +994,13 @@ function step_subproblem_rk_batched!(solver::InitialValueSolver,
                                        LX, ALG_F, state_fields)
             end
         end
+
+        # Last stage's F/LX are read by nothing once the tableau retires the
+        # weighted update — same reasoning (and the same balanced layout bracket)
+        # as the per-mode sibling in step_subproblem_rk.jl. Skipping this block
+        # also leaves `ws.Xg` one stage stale, which is why the stiffly-accurate
+        # exit below re-gathers it from the state before projecting.
+        skip_final_rhs && i == stages && continue
 
         from_solve_layout!(solve_stash, dist; to_grid=true)
 
@@ -1049,6 +1051,11 @@ function step_subproblem_rk_batched!(solver::InitialValueSolver,
             isempty(batch.bc_rows) && continue
             _gpu_subproblem_execution(subproblems[first(batch.sp_indices)]) && continue
             ws = workspaces[k]
+            # Re-gather from the state rather than trusting `ws.Xg`. It is written
+            # by the stage loop's F/LX block, which the last stage now skips, so
+            # it holds stage `stages-1` — scattering that back would silently undo
+            # the final stage. The per-mode sibling gathers here for the same reason.
+            _batched_gather_state!(ws.Xg, ws, batch, state_fields)
             for (m, sp_idx) in enumerate(batch.sp_indices)
                 x = view(ws.Xg, :, m)
                 _project_final_constraints!(x, x, view(ws.ALG_F, :, m),
@@ -1078,13 +1085,11 @@ function step_subproblem_rk_batched!(solver::InitialValueSolver,
 
         copyto!(ws.RHS, ws.MX0)
         for s in 1:stages
-            be = dt * b_exp[s]
-            bi = dt * b_imp[s]
-            if abs(be) > 1e-14
-                _batch_axpy!(ws.RHS, be, ws.F[s])
+            if !iszero(b_exp[s])
+                _batch_axpy!(ws.RHS, dt * b_exp[s], ws.F[s])
             end
-            if abs(bi) > 1e-14
-                _batch_axpy!(ws.RHS, -bi, ws.LX[s])
+            if !iszero(b_imp[s])
+                _batch_axpy!(ws.RHS, -dt * b_imp[s], ws.LX[s])
             end
         end
 

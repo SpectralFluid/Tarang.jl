@@ -39,6 +39,23 @@ end
     end
 end
 
+"""
+    _explicit_rk_final_stage_unused(A, b, s, stages) -> Bool
+
+Is stage `s` the last stage of an explicit tableau whose `k_s` no later
+computation reads? True when `b[end]` is zero and the last column of `A` is
+empty, which is the shape of every built-in tableau's explicit part (they are
+all stiffly accurate, so the final row carries the weights and the final stage
+feeds nothing). The raw-tableau form is needed because `_step_explicit_rk!`
+receives `(A, b, c)` rather than a timestepper — the typed sibling is
+`_rk_final_stage_rhs_unused`.
+"""
+@inline function _explicit_rk_final_stage_unused(A::AbstractMatrix, b::AbstractVector,
+                                                 s::Int, stages::Int)
+    s == stages || return false
+    return iszero(b[stages]) && all(iszero, view(A, :, stages))
+end
+
 @inline function _axpy_complex_vector!(y::AbstractVector{ComplexF64},
                                        scale,
                                        x::AbstractVector{ComplexF64})
@@ -172,11 +189,27 @@ function step_rk_imex!(state::TimestepperState, solver::InitialValueSolver; ts::
     F_imp_vecs = _timestep_stage_vectors!(state, :imex_rk_F_imp_vecs, stages, vector_size)
     rhs_vec = _timestep_vector_buffer!(state, :imex_rk_rhs_vec, vector_size)
     Xs_vec = _timestep_vector_buffer!(state, :imex_rk_Xs_vec, vector_size)
-    # Cache LHS factorizations across timesteps. Key is (dt, a_ii) so the cache
-    # automatically invalidates when dt changes (adaptive stepping).
+    # Cache LHS factorizations across timesteps, keyed by (dt, a_ii) so a stale
+    # factorization can never be served after dt changes.
+    #
+    # The key alone is not enough: under CFL-adaptive stepping every step has a
+    # new dt, so every step ADDED a factorization that no later step could ever
+    # look up again, and nothing ever removed it. Measured on 2-D 64^2 RealFourier
+    # with RK443 and a drifting dt: 72.2 KiB of retained sparse LU per step, for
+    # the life of the solver. Drop the whole table when dt changes — the entries
+    # from the previous dt are unreachable by construction — which bounds it at
+    # the number of distinct a_ii in one tableau. Constant dt keeps every hit, so
+    # the fixed-step path is unchanged. Mirrors the single-key caches used by
+    # `_global_multistep_solve!` and `step_mcnab2!`.
     lhs_cache = get!(state.timestepper_data, :imex_rk_lhs_cache) do
         Dict{Tuple{Float64, Float64}, Any}()
     end::Dict{Tuple{Float64, Float64}, Any}
+    if get(state.timestepper_data, :imex_rk_lhs_dt, NaN) != dt
+        empty!(lhs_cache)
+        state.timestepper_data[:imex_rk_lhs_dt] = dt
+    end
+
+    skip_final_rhs = _rk_final_stage_rhs_unused(ts)
 
     # Loop over stages
     # Each stage solves: (M + dt*a_ss*L) * X_s = M*X_n + dt*Σ_{j<s}(a^E*F - a^I*L*X)
@@ -186,15 +219,21 @@ function step_rk_imex!(state::TimestepperState, solver::InitialValueSolver; ts::
         copyto!(rhs_vec, MX_n_vec)
 
         # Accumulate explicit and implicit contributions from previous stages
+        # Butcher entries are exact tableau constants, so test them for exact
+        # zero rather than against a tolerance: the skip exists to avoid a
+        # pointless pass over the data (ESDIRK's empty first implicit column is
+        # 4 of RK443's 10 sub-diagonal entries, 2 of RK222's 3), not to decide
+        # that a small coefficient is negligible. The smallest nonzero entry in
+        # any built-in tableau is 1/18, twelve orders above the old 1e-14 cut, so
+        # this changes no built-in scheme — it stops a hypothetical small-but-real
+        # coefficient from being silently dropped.
         for j in 1:(s-1)
-            a_exp_sj = dt * A_exp[s, j]
-            a_imp_sj = dt * A_imp[s, j]
-            if abs(a_exp_sj) > 1e-14
-                @. rhs_vec += a_exp_sj * F_exp_vecs[j]
+            if !iszero(A_exp[s, j])
+                @. rhs_vec += (dt * A_exp[s, j]) * F_exp_vecs[j]
             end
             # Subtract implicit contributions (L on LHS)
-            if abs(a_imp_sj) > 1e-14
-                @. rhs_vec -= a_imp_sj * F_imp_vecs[j]
+            if !iszero(A_imp[s, j])
+                @. rhs_vec -= (dt * A_imp[s, j]) * F_imp_vecs[j]
             end
         end
 
@@ -245,11 +284,16 @@ function step_rk_imex!(state::TimestepperState, solver::InitialValueSolver; ts::
             end
         end
 
-        Xs_fields = _timestep_field_state!(state, :imex_rk_stage_state, current_state)
-        vector_to_fields!(Xs_fields, Xs_vec, current_state)
-        F_exp_fields = evaluate_rhs(solver, Xs_fields, t + c[s] * dt)
-        fields_to_vector!(F_exp_vecs[s], F_exp_fields)
-        mul!(F_imp_vecs[s], L_matrix, Xs_vec)
+        # The last stage's F and L*X are read by nothing when the tableau retires
+        # the weighted update — see `_rk_final_stage_rhs_unused`. `Xs_vec`, the
+        # value this path actually returns, comes from the solve above.
+        if s < stages || !skip_final_rhs
+            Xs_fields = _timestep_field_state!(state, :imex_rk_stage_state, current_state)
+            vector_to_fields!(Xs_fields, Xs_vec, current_state)
+            F_exp_fields = evaluate_rhs(solver, Xs_fields, t + c[s] * dt)
+            fields_to_vector!(F_exp_vecs[s], F_exp_fields)
+            mul!(F_imp_vecs[s], L_matrix, Xs_vec)
+        end
     end
 
     if _rk_stiffly_accurate(ts)
@@ -260,13 +304,11 @@ function step_rk_imex!(state::TimestepperState, solver::InitialValueSolver; ts::
     # Final update for alternative, non-stiffly-accurate tableaux.
     copyto!(rhs_vec, MX_n_vec)
     @inbounds for s in 1:stages
-        be = dt * b_exp[s]
-        bi = dt * b_imp[s]
-        if abs(be) > 1e-14
-            @. rhs_vec += be * F_exp_vecs[s]
+        if !iszero(b_exp[s])
+            @. rhs_vec += (dt * b_exp[s]) * F_exp_vecs[s]
         end
-        if abs(bi) > 1e-14
-            @. rhs_vec -= bi * F_imp_vecs[s]
+        if !iszero(b_imp[s])
+            @. rhs_vec -= (dt * b_imp[s]) * F_imp_vecs[s]
         end
     end
 
@@ -587,12 +629,18 @@ function _step_explicit_rk_gpu!(state::TimestepperState, solver::InitialValueSol
     @inbounds for s in 1:stages
         state.current_substep = s
 
+        # A final stage with zero weight everywhere (`b[end] == 0` and an empty
+        # last column) feeds nothing — neither its stage value nor its RHS is
+        # read — so skip it whole. `new_state` below runs its own
+        # `_refresh_algebraic_state!`, the other side effect this call had.
+        _explicit_rk_final_stage_unused(A, b, s, stages) && continue
+
         # Compute stage value: Y_s = X_n + dt * sum_{j<s} A[s,j] * k_j
         # Copy current_state into workspace (in-place, no allocation)
         _copy_field_state!(stage_state, current_state; preserve_layout=true)
         # Add contributions from previous stages
         for j in 1:(s-1)
-            if abs(A[s, j]) > 1e-14
+            if !iszero(A[s, j])
                 axpy_state!(dt * A[s, j], k_stages[j], stage_state)
             end
         end
@@ -607,7 +655,7 @@ function _step_explicit_rk_gpu!(state::TimestepperState, solver::InitialValueSol
     new_state = _acquire_recycled_history_state!(
         state, :explicit_field_rk_recycle, current_state; preserve_layout=true)
     @inbounds for s in 1:stages
-        if abs(b[s]) > 1e-14
+        if !iszero(b[s])
             axpy_state!(dt * b[s], k_stages[s], new_state)
         end
     end
@@ -647,9 +695,13 @@ function _step_explicit_rk_cpu!(state::TimestepperState, solver::InitialValueSol
     @inbounds for s in 1:stages
         state.current_substep = s
 
+        # Zero-weight final stage: nothing reads `k_vecs[end]`, so skip the stage
+        # value and its RHS evaluation alike (see `_explicit_rk_final_stage_unused`).
+        _explicit_rk_final_stage_unused(A, b, s, stages) && continue
+
         copyto!(Y_vec, X_n_vec)
         for j in 1:(s-1)
-            if abs(A[s, j]) > 1e-14
+            if !iszero(A[s, j])
                 _axpy_complex_vector!(Y_vec, dt * A[s, j], k_vecs[j])
             end
         end
@@ -667,7 +719,7 @@ function _step_explicit_rk_cpu!(state::TimestepperState, solver::InitialValueSol
     # Compute final update (reuse Y_vec buffer)
     copyto!(Y_vec, X_n_vec)
     @inbounds for s in 1:stages
-        if abs(b[s]) > 1e-14
+        if !iszero(b[s])
             _axpy_complex_vector!(Y_vec, dt * b[s], k_vecs[s])
         end
     end

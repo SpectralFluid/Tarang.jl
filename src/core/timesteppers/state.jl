@@ -572,9 +572,20 @@ Return the number of workspace field sets needed for a timestepper.
 # state per stage. The global/subproblem paths keep their own storage, and the
 # distributed diagonal path needs only one state per stage, so this is the
 # tight upper bound shared by all RK dispatches.
+#
+# RKGFY, RKSMR and RK443_IMEX reach exactly the same two paths and were missing
+# from this list, so they fell to the `::TimeStepper` default of 2. That is not a
+# smaller budget — `get_workspace_field!` does not grow the pool, it returns a
+# FRESH `ScalarField` for every index past the end, and
+# `step_distributed_diagonal_imex_rk!` asks for one per (stage, field) on EVERY
+# step. Measured at 128x128 on 2 MPI ranks: RK443 5,984 B/step against
+# RK443_IMEX (the identical tableau) at 409,712 B/step, growing with the grid.
 _workspace_count(ts::RK111) = ts.stages + 1
 _workspace_count(ts::RK222) = ts.stages + 1
 _workspace_count(ts::RK443) = ts.stages + 1
+_workspace_count(ts::RKGFY) = ts.stages + 1
+_workspace_count(ts::RKSMR) = ts.stages + 1
+_workspace_count(ts::RK443_IMEX) = ts.stages + 1
 
 function _workspace_count(::Union{CNAB1, CNAB2})
     return 2

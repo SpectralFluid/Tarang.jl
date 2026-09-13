@@ -612,19 +612,23 @@ option.
 
 ## Performance Comparison
 
-The RK counts below are the number of stages actually driven per step. Note that `RK222` is a
-**three**-stage ESDIRK tableau (explicit first stage), so it costs three RHS evaluations, not two.
+The RK counts below are RHS evaluations actually paid per step. They are one FEWER
+than the number of tableau rows: every built-in additive tableau is stiffly accurate
+with a strictly lower-triangular explicit part, so the final row's `F` carries weight
+zero everywhere and the steppers skip evaluating it (`_rk_final_stage_rhs_unused`).
+Implicit solves still run on every row after the explicit first one.
 
-| Method | RHS evaluations/step | Implicit/exponential work | Memory |
-|--------|----------------------|---------------------------|--------|
-| RK111 | 2 | 1 implicit stage solve | Medium |
-| RK222 | 3 | 2 implicit stage solves (the first stage is explicit) | Medium |
-| RK443 | 5 | 4 implicit stage solves | Higher |
-| RKSMR | 4 | 3 implicit stage solves | Higher |
-| CNAB2 | 1 | 1 implicit solve after startup | Medium |
-| SBDF2 | 1 | 1 implicit solve after startup | Medium |
-| ETD_RK222 | 2 | cached `exp(hL)`, `phi_1`, and `phi_2` actions | Dense n×n (serial) |
-| ETD_CNAB2 / ETD_SBDF2 | 1 | cached exponential/φ actions after ETD-RK2 startup | Dense n×n (serial) |
+| Method | Tableau rows | RHS evaluations/step | Implicit/exponential work | Memory |
+|--------|--------------|----------------------|---------------------------|--------|
+| RK111 | 2 | 1 | 1 implicit stage solve | Medium |
+| RK222 | 3 | 2 | 2 implicit stage solves (the first stage is explicit) | Medium |
+| RK443 | 5 | 4 | 4 implicit stage solves | Higher |
+| RKSMR | 4 | 3 | 3 implicit stage solves | Higher |
+| RKGFY | 3 | 2 | 2 implicit stage solves | Medium |
+| CNAB2 | — | 1 | 1 implicit solve after startup | Medium |
+| SBDF2 | — | 1 | 1 implicit solve after startup | Medium |
+| ETD_RK222 | — | 2 | cached `exp(hL)`, `phi_1`, and `phi_2` actions | Dense n×n (serial) |
+| ETD_CNAB2 / ETD_SBDF2 | — | 1 | cached exponential/φ actions after ETD-RK2 startup | Dense n×n (serial) |
 
 The implicit factorization is cached and reused while `dt` and the operator are unchanged, so the
 factorization is paid once, not per step. Two consequences:

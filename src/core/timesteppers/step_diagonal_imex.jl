@@ -205,6 +205,7 @@ function _step_diagonal_imex_rk_impl!(state::TimestepperState, solver::InitialVa
         ensure_layout!(field, :c)
     end
 
+    skip_final_rhs = _rk_final_stage_rhs_unused(ts)
     for s in 1:stages
         state.current_substep = s
         Y_s = Y_stages[s]
@@ -222,14 +223,14 @@ function _step_diagonal_imex_rk_impl!(state::TimestepperState, solver::InitialVa
             coeff_data = coeff_data!(ws_field)   # live coeff, = X_n[k]
             Lhat = get(Lmap, k, nothing)            # nothing ⇒ no implicit term here
             for j in 1:(s-1)
-                if abs(AE[s, j]) > 1e-14
+                if !iszero(AE[s, j])
                     # F_stages[j] came from copy_state(evaluate_rhs(...)), which can
                     # hand back a grid-layout field with a stale coeff buffer; force
                     # :c so the stage RHS actually contributes (matches the final
                     # update block below).
                     _ddirk_axpy!(coeff_data, dt * AE[s, j], coeff_data!(F_stages[j][k]))
                 end
-                if Lhat !== nothing && abs(AI[s, j]) > 1e-14
+                if Lhat !== nothing && !iszero(AI[s, j])
                     # Off-diagonal implicit contribution −dt·AI[s,j]·L̂·Y_j (the
                     # term whose omission caused the stiff-limit instability).
                     ensure_layout!(Y_stages[j][k], :c)
@@ -244,6 +245,10 @@ function _step_diagonal_imex_rk_impl!(state::TimestepperState, solver::InitialVa
                 _ddirk_implicit_divide!(coeff_data, Lhat, dt * γ_s)
             end
         end
+        # The last stage's F is read by nothing when the tableau retires the
+        # weighted update (see `_rk_final_stage_rhs_unused`) — the exit below
+        # returns `Y_stages[end]` and refreshes its algebraic state itself.
+        skip_final_rhs && s == stages && continue
         # evaluate_rhs may return reused buffer fields; copy into the POOLED
         # per-stage F set so a later stage's RHS evaluation cannot overwrite an
         # earlier stage's stored F (matches the distributed sibling) — without
@@ -273,10 +278,10 @@ function _step_diagonal_imex_rk_impl!(state::TimestepperState, solver::InitialVa
         coeff_data = coeff_data!(field)
         Lhat = get(Lmap, k, nothing)
         for s in 1:stages
-            if abs(b_exp[s]) > 1e-14
+            if !iszero(b_exp[s])
                 _ddirk_axpy!(coeff_data, dt * b_exp[s], coeff_data!(F_stages[s][k]))
             end
-            if Lhat !== nothing && abs(b_imp[s]) > 1e-14
+            if Lhat !== nothing && !iszero(b_imp[s])
                 ensure_layout!(Y_stages[s][k], :c)
                 _ddirk_axpy_lhat!(coeff_data, -dt * b_imp[s], Lhat,
                                   get_coeff_data(Y_stages[s][k]))
@@ -291,12 +296,14 @@ end
 """
     step_diagonal_imex_rk443!(state::TimestepperState, solver::InitialValueSolver)
 
-Diagonal IMEX RK step with GPU-native implicit treatment (4 stages).
+Diagonal IMEX RK step with GPU-native implicit treatment (5 tableau rows,
+four of which carry an implicit solve).
 
-Uses the Kennedy-Carpenter ARK3(2)4L[2]SA tableau (explicit ERK + full ESDIRK
-implicit, including off-diagonal terms), so it is L-stable and 3rd-order —
-identical math to `RK443`, with the implicit solve done diagonally per Fourier
-mode instead of via a global matrix.
+Uses `RK443`'s tableau — Ascher, Ruuth & Spiteri (1997) ARS(4,4,3): explicit ERK
+plus the full ESDIRK implicit part including its off-diagonal terms, so it is
+L-stable and 3rd-order. Identical math to `RK443`, with the implicit solve done
+diagonally per Fourier mode instead of via a global matrix. (It is NOT Kennedy &
+Carpenter's ARK3(2)4L[2]SA, which this docstring named before the tableau moved.)
 
 L̂ is resolved exactly as for `step_diagonal_imex_rk222!` — see
 `_serial_diagonal_imex_Lmap!`.
@@ -969,6 +976,7 @@ function step_distributed_diagonal_imex_rk!(state::TimestepperState, solver::Ini
     # (`_workspace_count` for the DiagonalIMEX RK tableaux) and pools its F
     # there, but this path keeps its dedicated cache.
     Fs_cache = _ddirk_fs_cache!(state, X_n, S, n_fields)
+    skip_final_rhs = _rk_final_stage_rhs_unused(ts)
 
     for s in 1:S
         # Stage state Yₛ reuses the timestepper's pre-allocated workspace fields
@@ -1008,6 +1016,16 @@ function step_distributed_diagonal_imex_rk!(state::TimestepperState, solver::Ini
             end
         end
         Ys[s] = Y
+        # The last stage's F is read by nothing when the tableau retires the
+        # weighted update (see `_rk_final_stage_rhs_unused`); the exit below takes
+        # `Ys[end]` and runs its own `_refresh_algebraic_state!`, so the algebraic
+        # refresh this call would have done is not lost either. `Fs[s]` is still
+        # pointed at its cache slot so the vector has no undefined element, but the
+        # values in it are last step's and only the retired branch would read them.
+        if skip_final_rhs && s == S
+            Fs[s] = Fs_cache[s]
+            continue
+        end
         # evaluate_rhs refreshes the algebraic state of Y internally, so no
         # separate _refresh_algebraic_state! is needed here (avoids a redundant
         # constraint solve + its transforms per stage). Copy the stage RHS into

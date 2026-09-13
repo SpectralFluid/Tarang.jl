@@ -552,6 +552,7 @@ function step_subproblem_rk!(state::TimestepperState, solver::InitialValueSolver
 
     # ── Stage loop ────────────────────────────────────────────────────────
     # Each stage: build RHS → solve → scatter → evaluate F and L*X at solution
+    skip_final_rhs = _rk_final_stage_rhs_unused(ts)
     for i in 1:stages
         state.current_substep = i
 
@@ -585,14 +586,16 @@ function step_subproblem_rk!(state::TimestepperState, solver::InitialValueSolver
             rhs = RHS[sp_idx]
             _assign_to_buffer!(rhs, MX0[sp_idx])
 
+            # Exact-zero test, not a tolerance: the skip is there to avoid a
+            # pointless pass over the mode's data (ESDIRK's empty first implicit
+            # column), and the tableau entries are exact constants. See the note
+            # in `step_rk_imex!`.
             for j in 1:(i - 1)
-                a_ej = dt * A_exp[i, j]
-                a_ij = dt * A_imp[i, j]
-                if abs(a_ej) > 1e-14
-                    _sp_axpy!(rhs, a_ej, F[j][sp_idx])
+                if !iszero(A_exp[i, j])
+                    _sp_axpy!(rhs, dt * A_exp[i, j], F[j][sp_idx])
                 end
-                if abs(a_ij) > 1e-14
-                    _sp_axpy!(rhs, -a_ij, LX[j][sp_idx])
+                if !iszero(A_imp[i, j])
+                    _sp_axpy!(rhs, -dt * A_imp[i, j], LX[j][sp_idx])
                 end
             end
 
@@ -636,6 +639,20 @@ function step_subproblem_rk!(state::TimestepperState, solver::InitialValueSolver
             # Scatter solution back to state fields
             scatter_inputs(sp, x_sol, state_fields)
         end
+
+        # Nothing reads `F[stages]` or `LX[stages]` once the tableau retires the
+        # weighted final update (see `_rk_final_stage_rhs_unused`): the state this
+        # step returns is the stage solution just scattered above. Skipping the
+        # block below drops one full `evaluate_rhs_buffered` — with its transforms,
+        # its per-mode `gather_eqn_F!`, and its `L*X` matvec — per step: a fifth of
+        # them for RK443, a third for RK222/RKGFY, half for RK111.
+        #
+        # The layout bracket stays balanced. `solve_stash` is still armed from the
+        # previous `to_solve_layout!`, the state is still in the solve pencil (which
+        # is what the final projection's `gather_inputs!` wants), and the exit below
+        # pops it exactly once.
+        skip_final_rhs && i == stages && continue
+
         # Pop to grid for `evaluate_rhs_buffered` (the ONLY operation in the loop
         # that needs grid space via the PencilFFT). Consumes the active solve_stash.
         # `to_grid=true`: state is next read ONLY by `evaluate_rhs_buffered` below
@@ -744,13 +761,11 @@ function step_subproblem_rk!(state::TimestepperState, solver::InitialValueSolver
         rhs = _sp_stage_vector!(sp, :final_rhs, size(sp.M_min, 1), MX0[sp_idx])
         copyto!(rhs, MX0[sp_idx])
         for s in 1:stages
-            be = dt * b_exp[s]
-            bi = dt * b_imp[s]
-            if abs(be) > 1e-14
-                _sp_axpy!(rhs, be, F[s][sp_idx])
+            if !iszero(b_exp[s])
+                _sp_axpy!(rhs, dt * b_exp[s], F[s][sp_idx])
             end
-            if abs(bi) > 1e-14
-                _sp_axpy!(rhs, -bi, LX[s][sp_idx])
+            if !iszero(b_imp[s])
+                _sp_axpy!(rhs, -dt * b_imp[s], LX[s][sp_idx])
             end
         end
 
