@@ -263,16 +263,38 @@ function _basis_coeff_size(basis::Basis)
 end
 
 """
+    _group_axis(sp::Subproblem, basis) -> Union{Int, Nothing}
+
+Index into `sp.group` for the axis `basis` spans, matched by coordinate name.
+`nothing` when the coordinate is not one of this subproblem's grouped axes, in
+which case the caller treats the dimension as coupled.
+"""
+function _group_axis(sp::Subproblem, basis)
+    label = basis.meta.element_label
+    for (axis, coord) in enumerate(coords(sp.dist.coordsys))
+        axis > length(sp.group) && break
+        coord.name == label && return axis
+    end
+    return nothing
+end
+
+"""
     subproblem_field_size(sp::Subproblem, field::ScalarField) -> Int
 
 Return the number of DOFs that `field` contributes to this subproblem's
 local matrix system.
 
 For each basis dimension of the field:
-- If the corresponding group entry is an `Int` (separable / single Fourier
-  mode), that dimension contributes **1** DOF.
-- If the corresponding group entry is `nothing` (coupled), that dimension
-  contributes the full basis coefficient size.
+- If the group entry for that basis's COORDINATE is an `Int` (separable /
+  single Fourier mode), that dimension contributes **1** DOF.
+- If it is `nothing` (coupled), that dimension contributes the full basis
+  coefficient size.
+
+The group entry is found by coordinate, not by the field's own basis position.
+A tau field carries only the TANGENTIAL bases, so its basis 1 is the domain's
+axis 1 only when the tangential axis happens to come first; matching positionally
+counted a `(xb,)` tau as the full coefficient length whenever the Chebyshev axis
+was not last, and the lift's Nz x 1 column then failed to multiply it.
 
 Fields with no bases (0-D taus) return 1.
 """
@@ -293,7 +315,8 @@ function subproblem_field_size(sp::Subproblem, field::ScalarField)
     if !isempty(bases)
         for (i, basis) in enumerate(bases)
             basis === nothing && continue                 # no basis in this dim
-            if i <= length(group) && group[i] isa Int
+            axis = _group_axis(sp, basis)
+            if axis !== nothing && group[axis] isa Int
                 dofs *= 1                                  # separable Fourier mode ⇒ 1 DOF
             else
                 dofs *= coefficient_sizes[i]               # coupled axis ⇒ full coeff size

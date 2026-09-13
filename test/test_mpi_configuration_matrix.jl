@@ -240,11 +240,17 @@ const CM_MATRIX = [
     # Fourier one, and the solve-layout transpose covers the per-mode gather.
     ("LinearBoundaryValueProblem Cheb-first  scalar tau",
         () -> cm_lbvp_cheb_fourier(cheb_first = true,  tau_per_mode = false), :solves, 1e-8),
-    # Chebyshev first, per-mode taus: rejected. A tau field carrying only the
-    # Fourier axis is a 1D field, and a 1D distributed FFT needs global data.
-    # Serially this same construction dies on a raw DimensionMismatch out of the
-    # block assembler, so it is unsupported everywhere, not merely under MPI —
-    # scalar taus solve the identical x-dependent problem, so nothing is lost.
+    # Chebyshev first, per-mode taus: rejected, and the refusal names why -- "MPI
+    # parallelization is not supported for 1D spectral domains. 1D transforms
+    # require global data access". A tau field carrying only the Fourier axis is a
+    # 1D field, and a 1D distributed FFT needs global data.
+    #
+    # This is an MPI-only restriction. The same construction used to die serially
+    # on a raw DimensionMismatch out of the block assembler, which is why this row
+    # once read as corroboration that the case was unsupported everywhere; that
+    # serial defect was a positional `sp.group` lookup and is fixed, so the serial
+    # matrix now runs this cell as `:solves`. Scalar taus solve the identical
+    # x-dependent problem distributed, so nothing is lost here.
     ("LinearBoundaryValueProblem Cheb-first  per-mode tau",
         () -> cm_lbvp_cheb_fourier(cheb_first = true,  tau_per_mode = true),  :refuses, 0.0),
     # Fourier first: rejected because the decomposed trailing axis is then the

@@ -307,24 +307,21 @@ const MATRIX = [
 
     # --- LinearBoundaryValueProblem across (coordinate order) × (tau shape). Ordering was an invisible
     #     axis here: every mixed-basis cell above happens to put Fourier first, so
-    #     nothing exercised the Chebyshev-first ordering that MPI *requires*. Three
-    #     of these four solve; the fourth is the one distributed users must write.
+    #     nothing exercised the Chebyshev-first ordering that MPI *requires*. The
+    #     fourth is the one distributed users must write.
     ("LinearBoundaryValueProblem Fourier-first scalar tau",
         () -> _lbvp_cheb_fourier_ordered(cheb_first = false, tau_per_mode = false), :solves, 1e-8),
     ("LinearBoundaryValueProblem Fourier-first per-mode tau",
         () -> _lbvp_cheb_fourier_ordered(cheb_first = false, tau_per_mode = true),  :solves, 1e-8),
     ("LinearBoundaryValueProblem Cheb-first scalar tau",
         () -> _lbvp_cheb_fourier_ordered(cheb_first = true,  tau_per_mode = false), :solves, 1e-8),
-    # KNOWN DEFECT, pinned rather than hidden. Chebyshev-first with per-mode taus
-    # is the natural way to write a distributed mixed-basis BVP, and it fails out of
-    # the block assembler with a bare `DimensionMismatch` — an internal shape error,
-    # not a refusal that names the unsupported combination. The identical
-    # construction is accepted Fourier-first (row above), so this is an ordering
-    # inconsistency rather than a real restriction. Scalar taus solve the same
-    # x-dependent problem, so there is a working alternative and no silent wrong
-    # answer; when the assembler learns this case, change this row to `:solves`.
+    # Was pinned `:refuses`: this cell failed out of the block assembler with a bare
+    # `DimensionMismatch` because `subproblem_field_size` matched `sp.group`
+    # positionally against the tau field's own bases, and a per-mode tau carries
+    # only the tangential basis. The group slot is now resolved by coordinate, so
+    # the ordering inconsistency is gone and all four cells solve.
     ("LinearBoundaryValueProblem Cheb-first per-mode tau",
-        () -> _lbvp_cheb_fourier_ordered(cheb_first = true,  tau_per_mode = true),  :refuses, 0.0),
+        () -> _lbvp_cheb_fourier_ordered(cheb_first = true,  tau_per_mode = true),  :solves, 1e-8),
 ]
 
 @testset "Configuration matrix: every cell solves correctly or refuses" begin
