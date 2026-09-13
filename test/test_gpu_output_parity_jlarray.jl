@@ -18,14 +18,6 @@ JLArray provides device-like arrays with no driver. The cuFFT stand-in is a CPU
 twin field run through Tarang's own CPU transform chain, which is what makes the
 comparison exact rather than approximate.
 
-An expression task (`add_task!(h, "\u2202x(u)")`) is deliberately NOT compared here.
-On a device field Tarang evaluates that task on the HOST: instrumenting the JLArray
-transform backend shows it is never dispatched to, and on Julia 1.10 the task throws
-`ArgumentError: FFTW plan applied to output with wrong memory alignment` from CPU
-FFTW. On 1.11/1.12 it succeeds and matches the CPU column exactly -- because it IS
-the CPU computation, so comparing it proves nothing about the device path. Add it
-back once expression tasks stay on the device.
-
 Uniquely-prefixed names (gop_*) -- the full suite shares the Main namespace.
 """
 
@@ -112,7 +104,7 @@ else
     end
 
     const GOP_NX, GOP_NZ = 8, 6
-    const GOP_TASKS = ("u_grid", "u_fine", "u_sum", "u_coeff")
+    const GOP_TASKS = ("u_grid", "u_fine", "u_sum", "dudx", "u_coeff")
 
     # Distinct data per record, so an output that silently reuses the first
     # record (or the last) cannot pass.
@@ -134,6 +126,7 @@ else
         Tarang.add_task!(handler, u; name="u_grid")
         Tarang.add_task!(handler, u; name="u_fine", scales=2)
         Tarang.add_task!(handler, u; name="u_sum", postprocess=data -> sum(data))
+        Tarang.add_task!(handler, "∂x(u)"; name="dudx")
         Tarang.add_task!(handler, u; name="u_coeff", layout="c")
 
         for rec in 1:3
@@ -196,6 +189,8 @@ else
         # complex coefficients onto a leading real/imag axis.
         @test size(cpu["u_fine"]) == (3, 2GOP_NX, 2GOP_NZ)
         @test size(cpu["u_coeff"]) == (3, 2, GOP_NX ÷ 2 + 1, GOP_NZ)
+        @test size(cpu["dudx"]) == (3, GOP_NX, GOP_NZ)
+        @test !all(iszero, cpu["dudx"])
         @test !all(iszero, cpu["u_coeff"])
     end
 end

@@ -355,12 +355,27 @@ function _get_gpu_deriv_workspace!(data_g::AbstractArray, axis::Int)
     key = (_device_cache_token(data_g), size(data_g), axis, CT)
     return lock(_DERIV_FFT_WS_GPU_LOCK) do
         get!(_DERIV_FFT_WS_GPU, key) do
-            cin  = similar(data_g, CT, size(data_g))
-            fhat = similar(data_g, CT, size(data_g))
-            # AbstractFFTs planning dispatches to CUFFT for device arrays.
-            pf  = plan_fft(cin, axis)
-            pin = plan_ifft(fhat, axis)
-            (cin, fhat, pf, pin)
+            cin = similar(data_g, CT, size(data_g))
+            # IN-PLACE plans, executed only ever against `cin` itself.
+            #
+            # An out-of-place `plan_fft(cin, axis)` records the alignment of the
+            # buffers it was planned with, and FFTW REFUSES to execute it against
+            # a different allocation: `ArgumentError: FFTW plan applied to output
+            # with wrong memory alignment`. The previous form planned against
+            # `cin` and then executed into a separately allocated `fhat`, applying
+            # a plan to a buffer it was never planned for. cuFFT performs no such
+            # check, so on CUDA that worked by luck rather than by contract, while
+            # an FFTW-backed device array (JLArray) threw on Julia 1.10 and not on
+            # 1.11/1.12 purely on how the allocator happened to line up.
+            #
+            # One buffer also drops an allocation from the cache. The cost is that
+            # an in-place transform destroys its input, so a complex-valued operand
+            # is now copied into `cin` rather than fed straight to an out-of-place
+            # plan; a real-valued operand already paid that copy to promote
+            # real -> complex.
+            pf  = plan_fft!(cin, axis)
+            pin = plan_ifft!(cin, axis)
+            (cin, pf, pin)
         end
     end
 end
@@ -420,14 +435,14 @@ function evaluate_fourier_derivative_gpu!(result::ScalarField, data_g::AbstractA
     dims in (1, 2, 3) ||
         throw(ArgumentError("Fourier derivative only implemented for 1D, 2D, and 3D"))
 
-    cin, fhat, pf, pin = _get_gpu_deriv_workspace!(data_g, axis)
+    cin, pf, pin = _get_gpu_deriv_workspace!(data_g, axis)
     mult = _get_device_deriv_mult!(basis, deriv_mult_cpu, data_g, order, axis, dims)
 
     result_grid = get_grid_data(result)
     dst = isa(result_grid, PencilArrays.PencilArray) ? parent(result_grid) : result_grid
     # Function barrier: the workspace comes from an `Any`-typed cache; the
     # broadcasts specialize on the concrete device array types inside.
-    _gpu_deriv_exec!(dst, data_g, cin, fhat, pf, pin, mult, result.dtype <: Real)
+    _gpu_deriv_exec!(dst, data_g, cin, pf, pin, mult, result.dtype <: Real)
     result.current_layout = :g
 
     # If coefficient space is requested, use full forward transform
@@ -437,19 +452,15 @@ function evaluate_fourier_derivative_gpu!(result::ScalarField, data_g::AbstractA
     end
 end
 
-function _gpu_deriv_exec!(dst::AbstractArray, data_g::AbstractArray, cin, fhat, pf, pin,
+function _gpu_deriv_exec!(dst::AbstractArray, data_g::AbstractArray, cin, pf, pin,
                           mult::AbstractArray, real_out::Bool)
-    if eltype(data_g) === eltype(cin)
-        # Already the workspace's complex eltype: the out-of-place forward FFT
-        # does not destroy its input, so feed `data_g` directly and skip a
-        # whole-field device copy per derivative call.
-        mul!(fhat, pf, data_g)
-    else
-        cin .= data_g          # promote (real → complex) in one fused pass
-        mul!(fhat, pf, cin)
-    end
-    fhat .*= mult              # (ik)^order along the derivative axis
-    mul!(cin, pin, fhat)       # normalized inverse FFT (ScaledPlan applies 1/N)
+    # `data_g` is the operand's live grid data and an in-place transform destroys
+    # its input, so it is copied in rather than transformed directly. For a
+    # real-valued operand this is the same pass that promotes real -> complex.
+    cin .= data_g
+    pf * cin                   # in-place forward FFT
+    cin .*= mult               # (ik)^order along the derivative axis
+    pin * cin                  # normalized inverse FFT (ScaledPlan applies 1/N)
     if real_out
         dst .= real.(cin)
     else
