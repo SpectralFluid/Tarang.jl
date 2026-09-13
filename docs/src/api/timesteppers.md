@@ -165,8 +165,8 @@ ETD_SBDF2()  # 2nd-order exponential semi-implicit BDF
 
 ## Specialized IMEX-RK
 
-Additive Runge-Kutta (ARK) schemes. `RKSMR` is exported; `RKGFY` and `RK443_IMEX` are
-**not**, and must be qualified.
+Additive Runge-Kutta (ARK) schemes. `RKSMR` is exported; `RKGFY` is **not**, and must be
+qualified.
 
 ### RKSMR
 
@@ -183,16 +183,23 @@ It is stored in a four-stage additive-RK (ESDIRK) tableau — a trivial explicit
 plus the three SMR substeps — so it shares the same generic IMEX runtime paths as `RK222`
 and `RK443`.
 
-### RKGFY / RK443_IMEX
+### RKGFY
 
 ```julia
 Tarang.RKGFY()       # 2nd-order predictor-corrector, three stored stages
-Tarang.RK443_IMEX()  # Same coefficients as RK443; the suffix clarifies IMEX intent
 ```
 
 For pure implicit decay `dt(u) + a*u = 0`, RKGFY has amplification
 `(1 - a*dt/2) / (1 + a*dt/2)`. It approaches `-1` for very stiff decay, so the
 method is not L-stable and does not rapidly damp unresolved stiff modes.
+
+### RK443_IMEX
+
+`Tarang.RK443_IMEX` is a `const` alias for [`RK443`](@ref) — the same type, not a
+copy of its tableau. It was a separate type until it was found to diverge: the
+per-mode diagonal implicit solve is selected by `ts isa Union{RK222, RK443,
+SBDF2}`, so the twin lost that path and a single-GPU run with an implicit `L`
+that `RK443()` completed was *refused* under the other name.
 
 ### Diagonal IMEX
 
@@ -406,7 +413,7 @@ allocated per state field (each set is one full field):
 | Method | Workspace Sets |
 |--------|----------------|
 | RK111 / RK222 / RK443 | stages + 1 = 3 / 4 / 6 (one stage state, one retained RHS per stage) |
-| RKGFY / RKSMR / RK443_IMEX | stages + 1 = 4 / 5 / 6 (same two paths as the RK family) |
+| RKGFY / RKSMR | stages + 1 = 4 / 5 (same two paths as the RK family) |
 | CNAB1 / CNAB2 | 2 |
 | SBDF1 – SBDF4 | 2 |
 | ETD_RK222 / ETD_CNAB2 / ETD_SBDF2 | 3 |
@@ -421,7 +428,7 @@ The pool does **not** grow on demand: `get_workspace_field!` returns a freshly
 allocated `ScalarField` for any index past the end, and the distributed diagonal-IMEX
 RK stepper asks for one per (stage, field) on every step. A scheme whose count is
 below what its path indexes therefore allocates a full field per stage per step —
-which is what RKGFY, RKSMR and RK443_IMEX did before they were given rows above.
+which is what RKGFY and RKSMR did before they were given a row above.
 
 The multistep schemes additionally retain previous state and RHS levels in a history ring
 (2–5 levels, depending on order), which the RK schemes do not.

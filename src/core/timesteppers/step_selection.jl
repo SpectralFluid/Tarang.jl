@@ -41,7 +41,6 @@ supports_distributed_diagonal_imex(::RK222) = true
 supports_distributed_diagonal_imex(::RK443) = true
 supports_distributed_diagonal_imex(::RKSMR) = true
 supports_distributed_diagonal_imex(::RKGFY) = true
-supports_distributed_diagonal_imex(::RK443_IMEX) = true
 
 # Each ETD entry point carries its own branch.
 supports_distributed_diagonal_imex(::ETD_RK222) = true

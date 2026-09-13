@@ -146,7 +146,7 @@ end
 #   step_multistep.jl:381 — SBDF2 ONLY
 #   step_diagonal_imex.jl — the DiagonalIMEX_* family's own path
 const EXPECTED_DISTRIBUTED_DIAGONAL = Set([
-    :RK111, :RK222, :RK443, :RKSMR, :RKGFY, :RK443_IMEX,
+    :RK111, :RK222, :RK443, :RKSMR, :RKGFY,
     :ETD_RK222, :ETD_CNAB2, :ETD_SBDF2,
     :DiagonalIMEX_RK222, :DiagonalIMEX_RK443, :DiagonalIMEX_SBDF2,
     :SBDF2,

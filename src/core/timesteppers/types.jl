@@ -375,36 +375,23 @@ struct RKGFY <: TimeStepper
     end
 end
 
-struct RK443_IMEX <: TimeStepper
-    """
-    4-stage 3rd-order IMEX Runge-Kutta method.
+"""
+    RK443_IMEX
 
-    Uses the same Ascher-Ruuth-Spiteri coefficients as RK443.
-    This type exists as an alias for use in contexts where the "_IMEX" suffix
-    makes the intent clearer.
+Alias for [`RK443`](@ref) — the same Ascher, Ruuth & Spiteri ARS(4,4,3) tableau,
+under a name whose `_IMEX` suffix makes the additive splitting explicit at the
+call site.
 
-    Properties:
-    - L-stable implicit part (stiff decay)
-    - 3rd order accuracy for both parts
-    - ESDIRK structure (explicit first stage, same diagonal thereafter)
-    - Stiffly accurate (last row of A_implicit equals b_implicit)
-    """
-    stages::Int
-    A_explicit::Matrix{Float64}
-    b_explicit::Vector{Float64}
-    c_explicit::Vector{Float64}
-    A_implicit::Matrix{Float64}
-    b_implicit::Vector{Float64}
-    c_implicit::Vector{Float64}
-
-    function RK443_IMEX()
-        # Use the same Ascher-Ruuth-Spiteri coefficients as RK443
-        # (same as RK443)
-        rk = RK443()
-        new(rk.stages, rk.A_explicit, rk.b_explicit, rk.c_explicit,
-            rk.A_implicit, rk.b_implicit, rk.c_implicit)
-    end
-end
+It used to be a separate `TimeStepper` subtype holding a field-for-field copy of
+`RK443`'s tableau. The copy was numerically identical but NOT interchangeable:
+`_serial_diagonal_imex_applicable` dispatches on `ts isa Union{RK222, RK443,
+SBDF2}`, so the twin silently lost the per-mode diagonal implicit solve. On CPU
+with an attached `SpectralLinearOperator` that meant a different execution path
+for the same scheme; on a single GPU with an implicit `L` it meant
+`_check_gpu_implicit_compatibility!` REFUSED to start a run that `RK443()` ran
+fine. A true alias cannot drift that way.
+"""
+const RK443_IMEX = RK443
 
 # =============================================================================
 # Diagonal IMEX Methods (GPU-native)
