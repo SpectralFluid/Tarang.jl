@@ -18,6 +18,14 @@ JLArray provides device-like arrays with no driver. The cuFFT stand-in is a CPU
 twin field run through Tarang's own CPU transform chain, which is what makes the
 comparison exact rather than approximate.
 
+An expression task (`add_task!(h, "\u2202x(u)")`) is deliberately NOT compared here.
+On a device field Tarang evaluates that task on the HOST: instrumenting the JLArray
+transform backend shows it is never dispatched to, and on Julia 1.10 the task throws
+`ArgumentError: FFTW plan applied to output with wrong memory alignment` from CPU
+FFTW. On 1.11/1.12 it succeeds and matches the CPU column exactly -- because it IS
+the CPU computation, so comparing it proves nothing about the device path. Add it
+back once expression tasks stay on the device.
+
 Uniquely-prefixed names (gop_*) -- the full suite shares the Main namespace.
 """
 
@@ -52,17 +60,24 @@ else
     Tarang.array_type(::Tarang.GPU{JLArrays.JLBackend}, T::Type) = _GOP{T}
 
     # ---- cuFFT stand-in: a CPU twin field transformed by Tarang's CPU chain ----
+    # Keyed on `scales` as well as bases and dtype. An output task with
+    # `scales != 1` resamples, and changing a twin's scales after it has been
+    # transformed reallocates its buffers while FFTW's cached plan still refers to
+    # the previous allocation -- `ArgumentError: FFTW plan applied to output with
+    # wrong memory alignment`. It reproduced only on Julia 1.10; 1.11 and 1.12
+    # happened to hand back a compatible alignment, which is luck, not contract.
+    # One twin per scales value is planned once and never resized.
     const _GOP_TWINS = Dict{Any, Any}()
     function gop_twin(field)
-        get!(_GOP_TWINS, (objectid(field.bases), field.dtype)) do
+        get!(_GOP_TWINS, (objectid(field.bases), field.dtype, field.scales)) do
             cdist = Distributor(field.dist.coordsys; dtype=field.dtype, device=CPU())
-            ScalarField(Domain(cdist, field.bases), "gop_twin_" * field.name)
+            twin = ScalarField(Domain(cdist, field.bases), "gop_twin_" * field.name)
+            if twin.scales != field.scales
+                twin.current_layout = :c
+                Tarang.preset_scales!(twin, field.scales)
+            end
+            twin
         end
-    end
-    function gop_sync_scales!(twin, field)
-        twin.scales == field.scales && return
-        twin.current_layout = :c
-        Tarang.preset_scales!(twin, field.scales)
     end
     # Copy `src` into the buffer selected by `getter`/`setter` on `dst`,
     # reallocating (via `make`) only when the shape or eltype differ.
@@ -77,7 +92,6 @@ else
     function Tarang._gpu_forward_transform_backend!(::Tarang.GPU{JLArrays.JLBackend},
                                                     field::Tarang.ScalarField)
         twin = gop_twin(field)
-        gop_sync_scales!(twin, field)
         gop_copy_into!(Tarang.get_grid_data, Tarang.set_grid_data!, copy, twin,
                        Array(Tarang.get_grid_data(field)))
         twin.current_layout = :g
@@ -88,7 +102,6 @@ else
     end
     function Tarang._gpu_backward_transform_backend!(::Tarang.GPU{JLArrays.JLBackend}, field)
         twin = gop_twin(field)
-        gop_sync_scales!(twin, field)
         gop_copy_into!(Tarang.get_coeff_data, Tarang.set_coeff_data!, copy, twin,
                        Array(Tarang.get_coeff_data(field)))
         twin.current_layout = :c
@@ -99,7 +112,7 @@ else
     end
 
     const GOP_NX, GOP_NZ = 8, 6
-    const GOP_TASKS = ("u_grid", "u_fine", "u_sum", "dudx", "u_coeff")
+    const GOP_TASKS = ("u_grid", "u_fine", "u_sum", "u_coeff")
 
     # Distinct data per record, so an output that silently reuses the first
     # record (or the last) cannot pass.
@@ -121,7 +134,6 @@ else
         Tarang.add_task!(handler, u; name="u_grid")
         Tarang.add_task!(handler, u; name="u_fine", scales=2)
         Tarang.add_task!(handler, u; name="u_sum", postprocess=data -> sum(data))
-        Tarang.add_task!(handler, "∂x(u)"; name="dudx")
         Tarang.add_task!(handler, u; name="u_coeff", layout="c")
 
         for rec in 1:3
@@ -184,8 +196,6 @@ else
         # complex coefficients onto a leading real/imag axis.
         @test size(cpu["u_fine"]) == (3, 2GOP_NX, 2GOP_NZ)
         @test size(cpu["u_coeff"]) == (3, 2, GOP_NX ÷ 2 + 1, GOP_NZ)
-        @test size(cpu["dudx"]) == (3, GOP_NX, GOP_NZ)
-        @test !all(iszero, cpu["dudx"])
         @test !all(iszero, cpu["u_coeff"])
     end
 end
