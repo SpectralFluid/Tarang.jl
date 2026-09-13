@@ -499,3 +499,28 @@ function _rk_stiffly_accurate(ts)
            ts.b_explicit == ts.A_explicit[end, :] &&
            ts.b_implicit == ts.A_implicit[end, :]
 end
+
+"""
+    _rk_final_stage_rhs_unused(ts) -> Bool
+
+Is `F(X_s)` at the LAST stage read by anything?
+
+Two conditions make it dead. The tableau is stiffly accurate, so the weighted
+final update never runs and cannot consume `b_explicit[end]`; and the last
+column of `A_explicit` is zero, so no stage accumulates it either (there is no
+later stage in any case). Both hold for every built-in tableau — they are all
+stiffly accurate with a strictly lower-triangular explicit part — so the final
+`evaluate_rhs`, its transforms and its `L*X` matvec were pure waste: one of two
+RHS evaluations for RK111, one of three for RK222/RKGFY, one of five for RK443.
+Measured with `Tarang.enable_transform_counts!`: transforms per step scaled
+exactly with `stages` before this, and with `stages - 1` after.
+
+The implicit side needs no separate test. `A_implicit` is lower triangular, so
+its last column is zero except for the diagonal `a_ss`, and the only consumer of
+`L*X_s` is the same weighted update that stiff accuracy retires.
+"""
+function _rk_final_stage_rhs_unused(ts)
+    _rk_stiffly_accurate(ts) || return false
+    s = ts.stages
+    return iszero(ts.b_explicit[s]) && all(iszero, view(ts.A_explicit, :, s))
+end
