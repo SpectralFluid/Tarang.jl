@@ -730,7 +730,8 @@ end
 """Acquire the state dropped from the previous one-entry history rotation."""
 function _acquire_recycled_history_state!(state::TimestepperState, key::Symbol,
                                           current::V;
-                                          preserve_layout::Bool=false) where {V<:Vector{<:ScalarField}}
+                                          preserve_layout::Bool=false,
+                                          copy_current::Bool=true) where {V<:Vector{<:ScalarField}}
     recycled = get(state.timestepper_data, key, nothing)
     if recycled isa Vector{<:ScalarField} && length(recycled) == length(current)
         # History containers may widen to `Vector{ScalarField}` even though the
@@ -746,7 +747,7 @@ function _acquire_recycled_history_state!(state::TimestepperState, key::Symbol,
         end
         if compatible
             state.timestepper_data[key] = nothing
-            return _copy_field_state!(recycled, current; preserve_layout)
+            return copy_current ? _copy_field_state!(recycled, current; preserve_layout) : recycled
         end
     end
 

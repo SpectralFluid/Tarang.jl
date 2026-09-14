@@ -56,6 +56,8 @@ mutable struct CFL
     current_dt::Float64
     iteration_count::Int
     reducer::GlobalArrayReducer
+    frequency_buffers::IdDict{VectorField,Any}
+    local_maxes::Vector{Float64}
 
     function CFL(solver::InitialValueSolver;
                 initial_dt::Float64=0.01,
@@ -69,7 +71,8 @@ mutable struct CFL
         comm = solver.base !== nothing ? solver_comm(solver.problem) : MPI.COMM_WORLD
         reducer = GlobalArrayReducer(comm)
         cfl = new(solver, initial_dt, safety, threshold, max_change, min_change, max_dt,
-                 cadence, VectorField[], CFLDiffusivity[], initial_dt, 0, reducer)
+                 cadence, VectorField[], CFLDiffusivity[], initial_dt, 0, reducer,
+                 IdDict{VectorField,Any}(), Float64[])
         return cfl
     end
 end
@@ -279,7 +282,9 @@ function compute_timestep(cfl::CFL)
     # buffer: velocities occupy 1:n_vel, diffusivities n_vel+1:n_vel+n_diff.
     n_vel = length(cfl.velocities)
     n_diff = length(cfl.diffusivities)
-    local_maxes = fill(0.0, n_vel + n_diff)
+    local_maxes = cfl.local_maxes
+    resize!(local_maxes, n_vel + n_diff)
+    fill!(local_maxes, 0.0)
 
     for (k, velocity) in enumerate(cfl.velocities)
         # Get domain and grid spacing
@@ -290,11 +295,18 @@ function compute_timestep(cfl::CFL)
 
         for (i, component) in enumerate(velocity.components)
 
-            component_frequency = abs.(grid_data!(component)) ./ spacings[i]
+            data = get_local_data(grid_data!(component))
             if cfl_frequency === nothing
-                cfl_frequency = component_frequency
+                cached = get(cfl.frequency_buffers, velocity, nothing)
+                if cached === nothing || size(cached) != size(data) ||
+                   eltype(cached) != real(eltype(data)) || architecture(cached) != architecture(data)
+                    cached = similar(data, real(eltype(data)))
+                    cfl.frequency_buffers[velocity] = cached
+                end
+                cfl_frequency = cached
+                _cfl_frequency_component!(cfl_frequency, data, spacings[i], false)
             else
-                cfl_frequency .+= component_frequency
+                _cfl_frequency_component!(cfl_frequency, data, spacings[i], true)
             end
         end
 
@@ -361,6 +373,16 @@ function compute_timestep(cfl::CFL)
 
     cfl.current_dt = proposed_dt
     return proposed_dt
+end
+
+# Function barrier specializes broadcasts on the concrete CPU/device arrays.
+function _cfl_frequency_component!(dst, src, spacing, accumulate::Bool)
+    if accumulate
+        @. dst += abs(src) / spacing
+    else
+        @. dst = abs(src) / spacing
+    end
+    return dst
 end
 
 function Base.show(io::IO, cfl::CFL)

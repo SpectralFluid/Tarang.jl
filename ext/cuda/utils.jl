@@ -795,6 +795,36 @@ Tarang._try_gpu_rand!(phases::CuArray{T}) where {T<:AbstractFloat} = false
 # GPU-Native Spectral Padding/Truncation for 3/2-Rule Dealiasing
 # ============================================================================
 
+# Ordinary CUDA C2R mul! preserves its input by copying through a plan-owned
+# half spectrum. Here the evaluator owns and consumes its spectrum. Inverting
+# its R2C plan shares that plan's buffer, which we use as the spectrum itself;
+# execute that plan directly after size/alias validation. cuFFT's executor rebinds to the current task
+# stream, including trailing non-transform axes. Keep a public-API fallback for
+# CUDA versions without the trailing-axis executor.
+function Tarang._plan_padded_inverse(forward::CUFFT.CuFFTPlan, spectrum, n, dims)
+    isdefined(CUFFT, :unsafe_execute_trailing!) || return CUFFT.plan_irfft(spectrum, n, dims)
+    return inv(forward)
+end
+
+function Tarang._padded_plan_spectrum(forward::CUFFT.CuFFTPlan, arch, ::Type{T}, shape) where T
+    buffer = forward.buffer
+    if buffer !== nothing && size(buffer) == shape && eltype(buffer) === Complex{T}
+        return buffer
+    end
+    return CUDA.zeros(Complex{T}, shape...)
+end
+
+function Tarang._padded_inverse!(dst::CuArray{T}, plan::CUFFT.ScaledPlan{Complex{T},P},
+                                  src::CuArray{Complex{T}}) where {T<:AbstractFloat,P<:CUFFT.CuFFTPlan}
+    if isdefined(CUFFT, :unsafe_execute_trailing!)
+        CUFFT.assert_applicable(plan.p, src, dst)
+        CUFFT.unsafe_execute_trailing!(plan.p, src, dst)
+        dst .*= plan.scale
+        return dst
+    end
+    return mul!(dst, plan, src)
+end
+
 """
 Override _pad_spectral! for CuArray: uses fused GPU kernel instead of
 multiple slice-based copies, reducing kernel launch overhead.
@@ -802,15 +832,13 @@ multiple slice-based copies, reducing kernel launch overhead.
 function Tarang._pad_spectral!(padded::CuArray{Complex{T}}, spec_data::CuArray{Complex{T}},
                                 original_shape::Tuple, padded_shape::Tuple,
                                 fourier_dims::Vector{Int}) where T
-    # Pin the current CUDA device to the array's device — these raw KA launches
-    # (get_backend + manual kernel call) don't go through `launch!`, which is the
-    # only place ensure_device! is otherwise called. Without this, a multi-GPU run
-    # whose current device != spec_data's device would hit an illegal access.
+    # Broadcasts, KA kernels and cuFFT remain ordered on this task's CUDA stream.
+    # No host synchronization is needed between dependent operations. Pin the
+    # device before the first broadcast as well as inside launch!.
     arch = Tarang.architecture(spec_data)
     ensure_device!(arch)
     fill!(padded, zero(Complex{T}))
     ndim = length(original_shape)
-    backend = KernelAbstractions.get_backend(spec_data)
 
     # Route through `launch!` rather than constructing the kernel with a literal
     # `256`: a scalar workgroup is padded with ones by KernelAbstractions, so a
@@ -823,14 +851,12 @@ function Tarang._pad_spectral!(padded::CuArray{Complex{T}}, spec_data::CuArray{C
         launch!(arch, pad_spectral_2d_kernel!, padded, spec_data, N1, N2, M1, M2,
                 1 in fourier_dims, 2 in fourier_dims;
                 ndrange=(N1, N2))
-        KernelAbstractions.synchronize(backend)
     elseif ndim == 3
         N1, N2, N3 = original_shape
         M1, M2, M3 = padded_shape
         launch!(arch, pad_spectral_3d_kernel!, padded, spec_data, N1, N2, N3, M1, M2, M3,
                 1 in fourier_dims, 2 in fourier_dims, 3 in fourier_dims;
                 ndrange=(N1, N2, N3))
-        KernelAbstractions.synchronize(backend)
     else
         # 1D: fall back to slice-based (fast enough for 1D)
         N = original_shape[1]
@@ -871,7 +897,6 @@ function Tarang._truncate_spectral!(result::CuArray{Complex{T}}, padded_spec::Cu
     arch = Tarang.architecture(result)
     ensure_device!(arch)
     ndim = length(original_shape)
-    backend = KernelAbstractions.get_backend(result)
 
     # Fold the dropped −N/2 image into the +N/2 plane (in place, BEFORE the copy)
     # along each even-N Fourier axis — EXACTLY as the CPU `_truncate_spectral!`
@@ -886,14 +911,12 @@ function Tarang._truncate_spectral!(result::CuArray{Complex{T}}, padded_spec::Cu
         launch!(arch, truncate_spectral_2d_kernel!, result, padded_spec, N1, N2, M1, M2,
                 1 in fourier_dims, 2 in fourier_dims;
                 ndrange=(N1, N2))
-        KernelAbstractions.synchronize(backend)
     elseif ndim == 3
         N1, N2, N3 = original_shape
         M1, M2, M3 = padded_shape
         launch!(arch, truncate_spectral_3d_kernel!, result, padded_spec, N1, N2, N3, M1, M2, M3,
                 1 in fourier_dims, 2 in fourier_dims, 3 in fourier_dims;
                 ndrange=(N1, N2, N3))
-        KernelAbstractions.synchronize(backend)
     else
         # 1D: slice-based
         N = original_shape[1]

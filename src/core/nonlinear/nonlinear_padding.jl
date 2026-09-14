@@ -25,24 +25,22 @@ mutable struct PaddedDealiasingWorkspace{T<:AbstractFloat, A<:AbstractArray{Comp
     # Pre-allocated padded arrays (on same architecture as input data)
     padded1::A
     padded2::A
-    padded_product::A
-
-    # Pre-allocated spectral buffers (original size) — avoids fft() allocation
-    spec1::A
-    spec2::A
-    spec_result::A
+    # Operands are transformed/padded sequentially, then this same original-size
+    # buffer receives the truncated product. padded1 also holds the product.
+    spectrum::A
 
     # FFT plans: FFTW.MEASURE for CPU, plain plan_fft for GPU
     plan_forward::AbstractFFTPlan
     plan_backward::AbstractFFTPlan
 
-    # In-place plans for the ORIGINAL-size spectral buffers (spec1/spec2/spec_result),
+    # In-place plans for the shared ORIGINAL-size spectral buffer,
     # so the per-call forward/inverse FFTs reuse buffers instead of allocating.
     plan_spec_forward::AbstractFFTPlan
     plan_spec_backward::AbstractFFTPlan
 
     # Architecture for dispatch
     arch::AbstractArchitecture
+    cached_operand::Any
 end
 
 """
@@ -56,9 +54,13 @@ For MPI-distributed fields, pass `local_shape` (the per-rank array shape) and
 `local_fourier_dims` (only the non-decomposed Fourier dimensions to pad).
 """
 function _get_padded_workspace!(evaluator::NonlinearEvaluator, bases::Tuple, dtype::Type{T};
+                                real_input::Bool=false,
                                 local_shape::Union{Nothing, Tuple}=nothing,
                                 local_fourier_dims::Union{Nothing, Vector{Int}}=nothing,
                                 arch::Union{Nothing, AbstractArchitecture}=nothing) where T
+    if real_input && local_shape === nothing && arch === nothing
+        return _get_real_padded_workspace!(evaluator, bases, T)
+    end
     _arch = arch !== nothing ? arch : evaluator.dist.architecture
     # Use tuple key to avoid string allocation on every call
     key = (hash(bases), dtype, hash(local_shape), is_gpu(_arch))
@@ -113,17 +115,11 @@ function _get_padded_workspace!(evaluator::NonlinearEvaluator, bases::Tuple, dty
     # Allocate padded arrays on the correct architecture
     padded1 = zeros(_arch, Complex{T}, pad_t...)
     padded2 = zeros(_arch, Complex{T}, pad_t...)
-    padded_product = zeros(_arch, Complex{T}, pad_t...)
-
-    # Allocate original-size spectral buffers
-    spec1 = zeros(_arch, Complex{T}, orig_t...)
-    spec2 = zeros(_arch, Complex{T}, orig_t...)
-    spec_result = zeros(_arch, Complex{T}, orig_t...)
+    spectrum = zeros(_arch, Complex{T}, orig_t...)
 
     # Create FFT plans — CPU gets FFTW.MEASURE, GPU gets plain plan_fft.
     # `plan_*!` are in-place (mutate their argument); the spec plans operate on the
-    # original-size buffers. The forward spec plan is built on spec1 and reused on
-    # spec2 (identical size/alignment).
+    # original-size shared buffer.
     if is_gpu(_arch)
         # For GPU: AbstractFFTs.plan_fft! dispatches to CUFFT (no flags arg).
         # In-place plans, like the CPU branch — the out-of-place forms allocated
@@ -131,26 +127,23 @@ function _get_padded_workspace!(evaluator::NonlinearEvaluator, bases::Tuple, dty
         # per product evaluation.
         plan_forward = plan_fft!(padded1, fourier_dims)
         plan_backward = plan_ifft!(padded1, fourier_dims)
-        plan_spec_forward = plan_fft!(spec1, fourier_dims)
-        plan_spec_backward = plan_ifft!(spec_result, fourier_dims)
+        plan_spec_forward = plan_fft!(spectrum, fourier_dims)
+        plan_spec_backward = plan_ifft!(spectrum, fourier_dims)
     else
-        # In-place padded plans (UNALIGNED — applied to padded1/padded2/padded_product):
+        # In-place padded plans (UNALIGNED — applied to padded1/padded2):
         # the per-call `ws.padded .= plan * ws.padded` then transforms in place instead
         # of allocating a fresh padded array each FFT/IFFT (~one padded array per call).
         plan_forward = FFTW.plan_fft!(padded1, fourier_dims; flags=FFTW.MEASURE | FFTW.UNALIGNED)
         plan_backward = FFTW.plan_ifft!(padded1, fourier_dims; flags=FFTW.MEASURE | FFTW.UNALIGNED)
-        # UNALIGNED: the forward plan is built on spec1 but also applied to spec2,
-        # so it must not bake in a single buffer's memory alignment.
-        plan_spec_forward = FFTW.plan_fft!(spec1, fourier_dims; flags=FFTW.MEASURE | FFTW.UNALIGNED)
-        plan_spec_backward = FFTW.plan_ifft!(spec_result, fourier_dims; flags=FFTW.MEASURE | FFTW.UNALIGNED)
+        plan_spec_forward = FFTW.plan_fft!(spectrum, fourier_dims; flags=FFTW.MEASURE | FFTW.UNALIGNED)
+        plan_spec_backward = FFTW.plan_ifft!(spectrum, fourier_dims; flags=FFTW.MEASURE | FFTW.UNALIGNED)
     end
 
     ws = PaddedDealiasingWorkspace{T, typeof(padded1)}(
         orig_t, pad_t, fourier_dims,
-        padded1, padded2, padded_product,
-        spec1, spec2, spec_result,
+        padded1, padded2, spectrum,
         plan_forward, plan_backward,
-        plan_spec_forward, plan_spec_backward, _arch
+        plan_spec_forward, plan_spec_backward, _arch, nothing
     )
     evaluator.pencil_transforms[key] = ws
     return ws
@@ -350,6 +343,23 @@ end
     return dst
 end
 
+_padded_coefficient_compatible(f, shape) =
+    all(b -> b isa Union{RealFourier,ComplexFourier}, f.bases) &&
+    (f.scales === nothing || all(isone, f.scales)) &&
+    size(get_local_data(get_coeff_data(f))) == shape
+
+function _complex_operand_spectrum!(ws, field)
+    if field.dtype <: Complex && field.current_layout === :c &&
+       _padded_coefficient_compatible(field, ws.original_shape)
+        copyto!(ws.spectrum, get_local_data(get_coeff_data(field)))
+    else
+        ensure_layout!(field, :g)
+        _copy_convert_into!(ws.spectrum, on_architecture(ws.arch, get_local_data(get_grid_data(field))))
+        ws.plan_spec_forward * ws.spectrum
+    end
+    return ws.spectrum
+end
+
 """
     evaluate_padded_multiply(field1, field2, evaluator, ws)
 
@@ -358,51 +368,31 @@ Works on CPU and GPU. For MPI data, operates on the local array.
 """
 function evaluate_padded_multiply(field1::ScalarField, field2::ScalarField,
                                   evaluator::NonlinearEvaluator,
-                                  ws::PaddedDealiasingWorkspace{T}) where T
-    ensure_layout!(field1, :g)
-    ensure_layout!(field2, :g)
-
-    data1 = get_grid_data(field1)
-    data2 = get_grid_data(field2)
-
-    # Handle PencilArray: extract local data for the padded operation
-    is_pencil = isa(data1, PencilArrays.PencilArray)
-    raw1 = is_pencil ? parent(data1) : data1
-    raw2 = is_pencil ? parent(data2) : data2
-
-    # Move to workspace architecture if needed. `ws.arch` is an abstract field,
-    # so `on_architecture` returns an `Any`-typed array; feed it through the
-    # `_copy_convert_into!` function barrier so the convert-copy specializes on
-    # the concrete array type instead of running a boxed, allocating broadcast.
-    raw1_ws = on_architecture(ws.arch, raw1)
-    raw2_ws = on_architecture(ws.arch, raw2)
-
+                                  ws::PaddedDealiasingWorkspace{T};
+                                  destination::Union{Nothing,ScalarField}=nothing,
+                                  result_layout::Symbol=:g, operand_key=nothing) where T
     # Step 1: FFT to spectral along Fourier dimensions, in place via pre-built
     # plans (no per-call allocation). Plans dispatch to CUFFT for GPU arrays.
-    _copy_convert_into!(ws.spec1, raw1_ws)
-    ws.plan_spec_forward * ws.spec1
-    _copy_convert_into!(ws.spec2, raw2_ws)
-    ws.plan_spec_forward * ws.spec2
-
-    # Step 2: Pad spectral coefficients
-    _pad_spectral!(ws.padded1, ws.spec1, ws.original_shape, ws.padded_shape, ws.fourier_dims)
-    _pad_spectral!(ws.padded2, ws.spec2, ws.original_shape, ws.padded_shape, ws.fourier_dims)
-
-    # Step 3: IFFT to padded grid. Both branches build in-place plans, so
-    # `plan * x` mutates and returns `x` — a `.=` on top of that is a full-array
-    # self-copy (and with an out-of-place plan it would be a full allocation).
+    _complex_operand_spectrum!(ws, field1)
+    _pad_spectral!(ws.padded1, ws.spectrum, ws.original_shape, ws.padded_shape, ws.fourier_dims)
     ws.plan_backward * ws.padded1
-    ws.plan_backward * ws.padded2
+    if operand_key === nothing || ws.cached_operand !== operand_key
+        ws.cached_operand = nothing
+        _complex_operand_spectrum!(ws, field2)
+        _pad_spectral!(ws.padded2, ws.spectrum, ws.original_shape, ws.padded_shape, ws.fourier_dims)
+        ws.plan_backward * ws.padded2
+        ws.cached_operand = operand_key
+    end
 
     # Step 4: Multiply on padded grid
-    ws.padded_product .= ws.padded1 .* ws.padded2
+    ws.padded1 .*= ws.padded2
 
     # Step 5: FFT product back (in place)
-    ws.plan_forward * ws.padded_product
+    ws.plan_forward * ws.padded1
 
     # Step 6: Truncate to original coefficients
-    fill!(ws.spec_result, zero(Complex{T}))
-    _truncate_spectral!(ws.spec_result, ws.padded_product, ws.original_shape, ws.padded_shape, ws.fourier_dims)
+    # Truncation overwrites every original-size element; no clear is needed.
+    _truncate_spectral!(ws.spectrum, ws.padded1, ws.original_shape, ws.padded_shape, ws.fourier_dims)
 
     # Step 7: IFFT to grid and normalize
     # Normalization: padded IFFT divides by M, but we want result on N-grid.
@@ -411,23 +401,29 @@ function evaluate_padded_multiply(field1::ScalarField, field2::ScalarField,
     for d in ws.fourier_dims
         scale *= T(ws.padded_shape[d]) / T(ws.original_shape[d])
     end
-    ws.plan_spec_backward * ws.spec_result
-
     # Write result to a pooled output field (rotating buffers — distinct for
     # consecutively-held products like cross product; no per-call allocation).
-    result = _checkout_nl_result!(evaluator, field1)
+    result = destination === nothing ? _checkout_nl_result!(evaluator, field1) : destination
+    if result_layout === :c && result.dtype <: Complex &&
+       _padded_coefficient_compatible(result, ws.original_shape)
+        dst = get_local_data(get_coeff_data(result))
+        @. dst = ws.spectrum * scale
+        result.current_layout = :c
+        return result
+    end
+    ws.plan_spec_backward * ws.spectrum
     result_data = grid_data!(result)
 
     # Write the scaled result directly into the (preallocated) output grid via a
     # fused broadcast — no intermediate `scaled_result` allocation. The workspace
     # and the output field share an architecture, so no device transfer is needed.
-    dst = is_pencil ? parent(result_data) : result_data
+    dst = get_local_data(result_data)
     if field1.dtype <: Real
-        @. dst = real(ws.spec_result) * scale
+        @. dst = real(ws.spectrum) * scale
     else
-        @. dst = ws.spec_result * scale
+        @. dst = ws.spectrum * scale
     end
-
+    ensure_layout!(result, result_layout)
     return result
 end
 

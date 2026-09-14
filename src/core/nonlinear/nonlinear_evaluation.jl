@@ -173,12 +173,11 @@ function evaluate_transform_multiply(field1::ScalarField, field2::ScalarField, e
             end
             return own ? _own_borrowed_field(result) : result
         else
-            # Serial path (CPU or GPU): pad all Fourier dimensions (needs grid inputs)
-            ensure_layout!(field1, :g)
-            ensure_layout!(field2, :g)
-            ws = _get_padded_workspace!(evaluator, field1.bases, T)
+            # Serial path can consume compatible Fourier coefficients directly.
+            ws = _get_padded_workspace!(evaluator, field1.bases, T;
+                                         real_input=field1.dtype <: Real && field2.dtype === field1.dtype)
             if ws !== nothing
-                result = evaluate_padded_multiply(field1, field2, evaluator, ws)
+                result = evaluate_padded_multiply(field1, field2, evaluator, ws; result_layout)
                 ensure_layout!(result, result_layout)  # serial: cheap FFT, no transpose
                 evaluator.performance_stats.total_evaluations += 1
                 if _TRACK_NL_TIMING

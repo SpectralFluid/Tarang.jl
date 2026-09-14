@@ -306,6 +306,22 @@ function _batch_stage_buffers!(ws::BatchWorkspace, batch::ModeBatch, stages::Int
     return ws
 end
 
+# Conservatively budget every retained RK array in addition to ModeBatch's
+# matrix pack. Count host staging too; pivot/status and gather-index buffers
+# are included before their lazy creation on the first stage/RHS evaluation.
+function _mode_batch_rk_workspace_bytes(sp, nmodes, fields, stages)
+    n = size(sp.LHS, 1)
+    raw_var = sum(subproblem_field_size(sp, f) for f in fields)
+    raw_eq = _subproblem_raw_eqn_size(sp)
+    bytes = ((7 + 2 * stages) * n + raw_var + raw_eq) * nmodes * sizeof(ComplexF64)
+    bytes += n * sizeof(ComplexF64)  # host algebraic column
+    # State starts, equation starts (one per raw equation row is a safe upper
+    # bound), device pivots/status, and per-mode success flags. CPU dense LU
+    # copies are outside this device-residency budget, as in mode_batch_bytes.
+    bytes += (length(fields) + raw_eq + n + 4) * nmodes * sizeof(Int)
+    return bytes
+end
+
 """
     _build_batched_rk_plan(solver, subproblems, state_fields; batches=nothing)
         -> BatchedRKPlan or nothing
@@ -337,23 +353,17 @@ function _build_batched_rk_plan(solver, subproblems, state_fields;
         nprocs = dist === nothing ? 1 : dist.size
         is_gpu = _gpu_subproblem_execution(sp1)
 
-        # Short-circuit the three gates that do not depend on a bucket, BEFORE
-        # bucketing. `should_batch_modes` remains the authority and re-checks
-        # all three per bucket; this only avoids hashing every subproblem's
-        # sparsity pattern on runs that provably cannot batch — which is every
-        # MPI run, every default CPU run, and every problem with more than one
-        # Fourier axis, the last of which in 3-D means Nx·Ny subproblems hashed
-        # for nothing.
+        # Avoid hashing sparsity patterns on MPI and default CPU runs.
         nprocs == 1 || return nothing
         setting = solver.base.batched_modes
         (setting === nothing ? is_gpu : setting) || return nothing
-        # Exactly one Fourier axis: the batched path's declared 2-D scope. See
-        # condition 4 of `should_batch_modes`.
-        _mode_batch_fourier_axes(sp1) == 1 || return nothing
+        _mode_batch_supported_layout(sp1) || return nothing
 
         like = zeros(sp1.dist.architecture, ComplexF64, 0)
         build_mode_batches!(solver.base, subproblems; is_gpu=is_gpu,
-                            nprocs=nprocs, like=like)
+                            nprocs=nprocs, like=like,
+                            workspace_bytes=(sp, nm) -> _mode_batch_rk_workspace_bytes(
+                                sp, nm, state_fields, solver.timestepper.stages))
     else
         batches
     end

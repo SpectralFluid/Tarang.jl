@@ -789,31 +789,39 @@ function CuIterativeCG(matrix::AbstractMatrix;
     return CuIterativeCG{T, typeof(M_inv)}(A_csr, M_inv, Float64(tol), maxiter, n, r, p, Ap, z)
 end
 
+# Solver instances retain mutable workspaces; as with CuSparseLU, use one
+# instance per concurrently executing solve. Returned `solve` values own data.
 function MatSolvers.solve(s::CuIterativeCG{T}, rhs::AbstractVector) where T
-    # Transfer RHS to GPU if needed using helper
-    b = _is_gpu_array(rhs) ? rhs : _gpu_array(rhs, T)
+    return MatSolvers.solve!(similar(s.r, T, s.n), s, rhs)
+end
 
-    # Initial guess: x = 0
-    x = _gpu_zeros(T, s.n)
+function MatSolvers.solve!(x::AbstractVector, s::CuIterativeCG, rhs::AbstractVector)
+    length(rhs) == s.n && length(x) == s.n || throw(DimensionMismatch("CG vector length"))
+    if (is_gpu_array(s.r) && !is_gpu_array(x)) || eltype(x) != eltype(s.r)
+        return copyto!(x, MatSolvers.solve(s, rhs))
+    end
+    copyto!(s.r, rhs)  # must precede clearing x when rhs aliases the destination
+    fill!(x, zero(eltype(x)))
+    return _cg_solve_workspace!(x, s.A_csr, s.preconditioner, s.tol, s.maxiter,
+                                s.r, s.p, s.Ap, s.z)
+end
 
-    # r = b - A*x = b (since x=0)
-    copyto!(s.r, b)
-
+function _cg_solve_workspace!(x, A, preconditioner, tol, maxiter, r, p, Ap, z)
     # Apply preconditioner: z = M^{-1} * r
-    _apply_preconditioner!(s.z, s.preconditioner, s.r)
+    _apply_preconditioner!(z, preconditioner, r)
 
     # p = z
-    copyto!(s.p, s.z)
+    copyto!(p, z)
 
     # rz_old = r' * z
-    rz_old = dot(s.r, s.z)
+    rz_old = dot(r, z)
 
-    for iter in 1:s.maxiter
+    for iter in 1:maxiter
         # Ap = A * p
-        mul!(s.Ap, s.A_csr, s.p)
+        mul!(Ap, A, p)
 
         # alpha = rz_old / (p' * Ap)
-        pAp = dot(s.p, s.Ap)
+        pAp = dot(p, Ap)
         if abs(pAp) < 1e-30
             @warn "CG breakdown at iteration $iter: p'Ap ≈ 0"
             break
@@ -821,29 +829,29 @@ function MatSolvers.solve(s::CuIterativeCG{T}, rhs::AbstractVector) where T
         alpha = rz_old / pAp
 
         # x = x + alpha * p (using helper for GPU AXPY)
-        _gpu_axpy!(alpha, s.p, x)
+        axpy!(alpha, p, x)
 
         # r = r - alpha * Ap (using helper for GPU AXPY)
-        _gpu_axpy!(-alpha, s.Ap, s.r)
+        axpy!(-alpha, Ap, r)
 
         # Check convergence
-        r_norm = norm(s.r)
-        if r_norm < s.tol
+        r_norm = norm(r)
+        if r_norm < tol
             @debug "CG converged in $iter iterations, residual = $r_norm"
             return x
         end
 
         # z = M^{-1} * r
-        _apply_preconditioner!(s.z, s.preconditioner, s.r)
+        _apply_preconditioner!(z, preconditioner, r)
 
         # rz_new = r' * z
-        rz_new = dot(s.r, s.z)
+        rz_new = dot(r, z)
 
         # beta = rz_new / rz_old
         beta = rz_new / rz_old
 
         # p = z + beta * p
-        s.p .= s.z .+ beta .* s.p
+        p .= z .+ beta .* p
 
         rz_old = rz_new
     end
@@ -855,7 +863,7 @@ function MatSolvers.solve(s::CuIterativeCG{T}, rhs::AbstractVector) where T
     # tau/BC rows break symmetry), so returning the last iterate would feed a
     # silently wrong solution back into the timestep. Use a direct GPU solver
     # (CuSparseLU / CuDenseLU) or GMRES for such systems.
-    error("CuIterativeCG did not converge in $(s.maxiter) iterations. CG requires a " *
+    error("CuIterativeCG did not converge in $(maxiter) iterations. CG requires a " *
           "Hermitian positive-definite operator; coupled Chebyshev–Fourier (tau) " *
           "systems are non-Hermitian. Use a direct solver (CuSparseLU/CuDenseLU) or GMRES.")
 end
@@ -897,6 +905,28 @@ solver = CuIterativeGMRES(A; preconditioner=:jacobi, restart=50)
 solver = CuIterativeGMRES(A; preconditioner=:ilu0, tol=1e-12)
 ```
 """
+struct _GMRESWorkspace{V,T}
+    b::V
+    r::V
+    w::V
+    tmp::V
+    basis::Vector{V}
+    H::Matrix{T}
+    e1::Vector{T}
+end
+
+function _gmres_workspace!(s, prototype)
+    ws = s.workspace
+    if ws === nothing || length(ws.b) != s.n || length(ws.basis) != s.restart + 1 ||
+       is_gpu_array(ws.b) != is_gpu_array(prototype)
+        T = eltype(s.A_csr)
+        vec() = similar(prototype, T, s.n)
+        s.workspace = _GMRESWorkspace(vec(), vec(), vec(), vec(),
+            [vec() for _ in 1:(s.restart+1)], zeros(T, s.restart+1, s.restart), zeros(T, s.restart+1))
+    end
+    return s.workspace
+end
+
 mutable struct CuIterativeGMRES{T,P<:AbstractPreconditioner} <: AbstractMatSolver
     A_csr::Any              # CuSparseMatrixCSR
     preconditioner::P
@@ -904,10 +934,12 @@ mutable struct CuIterativeGMRES{T,P<:AbstractPreconditioner} <: AbstractMatSolve
     maxiter::Int
     restart::Int            # Restart parameter
     n::Int
+    workspace::Any
+    prototype::Any
 
     function CuIterativeGMRES{T,P}(A_csr, preconditioner::P, tol::Float64, maxiter::Int,
-                                    restart::Int, n::Int) where {T, P<:AbstractPreconditioner}
-        new{T,P}(A_csr, preconditioner, tol, maxiter, restart, n)
+                                    restart::Int, n::Int, prototype=nothing) where {T, P<:AbstractPreconditioner}
+        new{T,P}(A_csr, preconditioner, tol, maxiter, restart, n, nothing, prototype)
     end
 end
 
@@ -930,57 +962,66 @@ function CuIterativeGMRES(matrix::AbstractMatrix;
 
     M_inv = _build_preconditioner(A_sparse, preconditioner, T)
 
-    return CuIterativeGMRES{T, typeof(M_inv)}(A_csr, M_inv, Float64(tol), maxiter, restart, n)
+    return CuIterativeGMRES{T, typeof(M_inv)}(A_csr, M_inv, Float64(tol), maxiter, restart, n, _gpu_zeros(T, 0))
 end
 
 function MatSolvers.solve(s::CuIterativeGMRES{T}, rhs::AbstractVector) where T
-    # Transfer RHS to GPU using helper
-    b = _is_gpu_array(rhs) ? rhs : _gpu_array(rhs, T)
+    prototype = s.workspace === nothing ? s.prototype : s.workspace.b
+    result = prototype === nothing ? _gpu_zeros(T, s.n) : similar(prototype, T, s.n)
+    return MatSolvers.solve!(result, s, rhs)
+end
 
-    n = s.n
-    m = s.restart
-    x = _gpu_zeros(T, n)
+function MatSolvers.solve!(x::AbstractVector, s::CuIterativeGMRES, rhs::AbstractVector)
+    length(rhs) == s.n && length(x) == s.n || throw(DimensionMismatch("GMRES vector length"))
+    prototype = s.prototype === nothing ? x : s.prototype
+    ws = _gmres_workspace!(s, prototype)
+    if (is_gpu_array(ws.b) && !is_gpu_array(x)) || eltype(x) != eltype(ws.b)
+        return copyto!(x, MatSolvers.solve(s, rhs))
+    end
+    copyto!(ws.b, rhs)
+    fill!(x, zero(eltype(x)))
+    return _gmres_solve_workspace!(x, s.A_csr, s.preconditioner, s.tol, s.maxiter, s.restart, ws)
+end
 
+function _gmres_solve_workspace!(x, A, preconditioner, tol, maxiter, m, ws::_GMRESWorkspace)
+    b, r, w, tmp = ws.b, ws.r, ws.w, ws.tmp
+    V, H = ws.basis, ws.H
     # Outer iteration (restart cycles). Run until maxiter is exhausted, taking a
     # final truncated cycle when maxiter is not a multiple of restart — otherwise
     # maxiter < restart (div == 0) would return the zero guess without iterating.
     total_iters = 0
-    while total_iters < s.maxiter
+    while total_iters < maxiter
         # Cycle length: full restart, or fewer on the final truncated cycle.
-        mj = min(m, s.maxiter - total_iters)
+        mj = min(m, maxiter - total_iters)
 
         # r = b - A*x
-        r = b - s.A_csr * x
+        mul!(w, A, x)
+        r .= b .- w
 
-        # Apply preconditioner
-        tmp = similar(r)
-        _apply_preconditioner!(tmp, s.preconditioner, r)
-        r = tmp
-
-        beta = norm(r)
-        if beta < s.tol
+        # Apply preconditioner without replacing the residual allocation.
+        _apply_preconditioner!(tmp, preconditioner, r)
+        beta = norm(tmp)
+        if beta < tol
             @debug "GMRES converged in $total_iters iterations"
             return x
         end
 
         # Arnoldi process
-        V = [r / beta]  # Krylov basis vectors
-        H = zeros(T, mj + 1, mj)  # Hessenberg matrix — CPU to avoid scalar indexing in Arnoldi
+        V[1] .= tmp ./ beta
+        fill!(H, zero(eltype(H)))  # host Hessenberg, reused across restart cycles
 
         last_j = mj  # tracks the actual subspace dimension on early breakdown
         for j in 1:mj
             # w = A * v_j
-            w = s.A_csr * V[j]
+            mul!(tmp, A, V[j])
 
             # Apply preconditioner (left preconditioning)
-            w_tmp = similar(w)
-            _apply_preconditioner!(w_tmp, s.preconditioner, w)
-            w = w_tmp
+            _apply_preconditioner!(w, preconditioner, tmp)
 
             # Modified Gram-Schmidt
             for i in 1:j
                 H[i, j] = dot(V[i], w)
-                w = w - H[i, j] * V[i]
+                w .-= H[i, j] .* V[i]
             end
             H[j + 1, j] = norm(w)
 
@@ -989,14 +1030,15 @@ function MatSolvers.solve(s::CuIterativeGMRES{T}, rhs::AbstractVector) where T
                 break
             end
 
-            push!(V, w / H[j + 1, j])
+            V[j + 1] .= w ./ H[j + 1, j]
         end
 
         # Solve least squares: min ||H*y - beta*e1|| over the subspace actually
         # built. On breakdown the unfilled columns of H are zero (rank-deficient),
         # so truncate to the (last_j+1) x last_j block — mirrors the CPU proxy.
-        H_sub = H[1:last_j + 1, 1:last_j]
-        e1_cpu = zeros(T, last_j + 1)
+        H_sub = @view H[1:last_j + 1, 1:last_j]
+        e1_cpu = @view ws.e1[1:last_j + 1]
+        fill!(e1_cpu, zero(eltype(e1_cpu)))
         e1_cpu[1] = beta
 
         # QR factorization (small system, already on CPU)
@@ -1004,13 +1046,13 @@ function MatSolvers.solve(s::CuIterativeGMRES{T}, rhs::AbstractVector) where T
 
         # Update solution: x = x + V * y (use CPU y values to avoid GPU scalar indexing)
         for i in 1:last_j
-            _gpu_axpy!(y_cpu[i], V[i], x)
+            axpy!(y_cpu[i], V[i], x)
         end
 
         total_iters += mj
     end
 
-    @warn "GMRES did not converge in $(s.maxiter) iterations"
+    @warn "GMRES did not converge in $(maxiter) iterations"
     return x
 end
 
