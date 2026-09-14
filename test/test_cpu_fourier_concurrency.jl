@@ -2,6 +2,25 @@ using Test
 using Tarang
 using FFTW
 
+@testset "Shared basis cache builds each entry once" begin
+    basis = RealFourier(CartesianCoordinates("x")["x"]; size=32)
+    data = zeros(ComplexF64, 32)
+    builds = Ref(0)
+    tasks = map(1:8) do _
+        @async Tarang._get_device_basis_cache!(basis, :concurrent_test, data) do
+            builds[] += 1
+            # A yielding builder exposes competing cold misses even with one
+            # worker thread (device allocation can also yield).
+            yield()
+            ones(ComplexF64, 32)
+        end
+    end
+    entries = fetch.(tasks)
+    @test builds[] == 1
+    @test all(entry -> entry === first(entries), entries)
+    @test first(entries) == ones(ComplexF64, 32)
+end
+
 function _fourier_concurrency_cases(n, count; shared_basis=nothing)
     [let
         coords = CartesianCoordinates("x")
@@ -98,10 +117,12 @@ end
             for c in shared
                 @test evaluate(c.op, :g)["g"] ≈ c.expected atol=1e-8
             end
-            delete!(shared[1].input.bases[1].transforms, (:deriv_mult, 16384, 1))
-            empty!(Tarang._DERIV_FFT_WS)
-            errors = _fourier_concurrent_errors(shared)
-            @test all(e -> isfinite(e) && e < 1e-8, errors)
+            for _ in 1:12
+                delete!(shared[1].input.bases[1].transforms, (:deriv_mult, 16384, 1))
+                empty!(Tarang._DERIV_FFT_WS)
+                errors = _fourier_concurrent_errors(shared; repeats=4)
+                @test all(e -> isfinite(e) && e < 1e-8, errors)
+            end
             @test all(c -> c.input["g"] == c.values, shared)
         end
     finally

@@ -5,12 +5,9 @@
 # ============================================================================
 
 # Local and distributed derivative multipliers share a basis's `transforms`
-# dictionary, which follows the single-threaded convention stated on
-# `_get_device_basis_cache!`: basis caches are touched from the solve loop only,
-# and every writer (here, `_get_cached_lazy_deriv_mult`, `_diff_matmul_buffer`,
-# `_get_device_basis_cache!`) leaves them unlocked. A lock over only some of
-# those writers cannot stop a rehash under a concurrent reader, so it would buy
-# nothing but the appearance of safety.
+# dictionary with lazy and device caches. Every accessor uses
+# `_get_basis_cache!` so independent fields can safely share a basis, including
+# concurrent cold misses. The read-only multipliers are used outside the lock.
 
 """
     evaluate_fourier_derivative!(result, operand, axis, order, layout)
@@ -194,56 +191,53 @@ size/bounds validation runs on the cache-miss path (config is fixed per run).
 """
 function _get_cached_dist_deriv_mult!(coeff_data::PencilArrays.PencilArray,
                                       basis::Union{RealFourier, ComplexFourier},
-                                      axis::Int, order::Int, uses_rfft::Bool, local_range)
+                                      axis::Int, order::Int, uses_rfft::Bool, local_range)::Vector{ComplexF64}
     lr_lo = local_range === nothing ? 0 : Int(first(local_range))
     lr_hi = local_range === nothing ? 0 : Int(last(local_range))
     cache_key = (:dist_deriv_mult, order, uses_rfft, axis, lr_lo, lr_hi)
-    cached = get(basis.transforms, cache_key, nothing)
-    cached !== nothing && return cached::Vector{ComplexF64}
+    return _get_basis_cache!(basis, cache_key) do
+        L = basis.meta.bounds[2] - basis.meta.bounds[1]
+        N_global = basis.meta.size
 
-    L = basis.meta.bounds[2] - basis.meta.bounds[1]
-    N_global = basis.meta.size
-
-    # CRITICAL: In PencilFFTs, RFFT is only used on the FIRST RealFourier axis.
-    # Subsequent RealFourier axes use FFT with full size N (not N/2+1).
-    if isa(basis, RealFourier) && uses_rfft
-        N_coeff = div(N_global, 2) + 1
-        k0 = 2π / L
-        k_global = collect(0:(N_coeff-1)) .* k0  # rfft: [0, 1, …, N/2]
-    elseif isa(basis, RealFourier)
-        N_coeff = N_global
-        k0 = 2π / L
-        k_global = _fftfreq(N_global) .* N_global .* k0
-    else
-        N_coeff = N_global
-        k0 = 2π / L
-        k_global = _fftfreq(N_global) .* N_global .* k0
-    end
-
-    # CRITICAL: Validate coefficient global size matches expected N_coeff (catches
-    # uses_rfft / data-size mismatch).
-    global_size_axis = PencilArrays.size_global(coeff_data)[axis]
-    if global_size_axis != N_coeff
-        error("Spectral derivative coefficient size mismatch on axis $axis: " *
-              "global coefficient size is $global_size_axis but expected $N_coeff " *
-              "(basis=$(typeof(basis)), uses_rfft=$uses_rfft, N_global=$N_global). " *
-              "Check that uses_rfft correctly identifies the first RealFourier axis.")
-    end
-
-    if local_range !== nothing
-        if last(local_range) > length(k_global)
-            error("Spectral derivative index out of bounds: local_range=$local_range but k_global has $(length(k_global)) elements. " *
-                  "This may indicate a mismatch between coefficient sizing and wavenumber computation. " *
-                  "axis=$axis, uses_rfft=$uses_rfft, basis=$(typeof(basis)), N_global=$N_global")
+        # CRITICAL: In PencilFFTs, RFFT is only used on the FIRST RealFourier axis.
+        # Subsequent RealFourier axes use FFT with full size N (not N/2+1).
+        if isa(basis, RealFourier) && uses_rfft
+            N_coeff = div(N_global, 2) + 1
+            k0 = 2π / L
+            k_global = collect(0:(N_coeff-1)) .* k0  # rfft: [0, 1, …, N/2]
+        elseif isa(basis, RealFourier)
+            N_coeff = N_global
+            k0 = 2π / L
+            k_global = _fftfreq(N_global) .* N_global .* k0
+        else
+            N_coeff = N_global
+            k0 = 2π / L
+            k_global = _fftfreq(N_global) .* N_global .* k0
         end
-        k_local = k_global[local_range]
-    else
-        k_local = k_global  # Axis not distributed: use full wavenumber array
-    end
 
-    deriv_mult = ComplexF64.((im .* k_local) .^ order)
-    basis.transforms[cache_key] = deriv_mult
-    return deriv_mult
+        # CRITICAL: Validate coefficient global size matches expected N_coeff (catches
+        # uses_rfft / data-size mismatch).
+        global_size_axis = PencilArrays.size_global(coeff_data)[axis]
+        if global_size_axis != N_coeff
+            error("Spectral derivative coefficient size mismatch on axis $axis: " *
+                  "global coefficient size is $global_size_axis but expected $N_coeff " *
+                  "(basis=$(typeof(basis)), uses_rfft=$uses_rfft, N_global=$N_global). " *
+                  "Check that uses_rfft correctly identifies the first RealFourier axis.")
+        end
+
+        if local_range !== nothing
+            if last(local_range) > length(k_global)
+                error("Spectral derivative index out of bounds: local_range=$local_range but k_global has $(length(k_global)) elements. " *
+                      "This may indicate a mismatch between coefficient sizing and wavenumber computation. " *
+                      "axis=$axis, uses_rfft=$uses_rfft, basis=$(typeof(basis)), N_global=$N_global")
+            end
+            k_local = k_global[local_range]
+        else
+            k_local = k_global  # Axis not distributed: use full wavenumber array
+        end
+
+        ComplexF64.((im .* k_local) .^ order)
+    end
 end
 
 function _apply_spectral_derivative_distributed!(coeff_data::AbstractArray,
@@ -273,17 +267,13 @@ Get or compute cached derivative multiplier `(ik)^order` for Fourier derivatives
 The multiplier depends only on the basis parameters and derivative order, so it
 is computed once and cached in the basis's transforms dict.
 """
-function _get_cached_deriv_mult(basis::Union{RealFourier, ComplexFourier}, N::Int, L::Float64, order::Int)
+function _get_cached_deriv_mult(basis::Union{RealFourier, ComplexFourier}, N::Int, L::Float64, order::Int)::Vector{ComplexF64}
     # Tuple key avoids string allocation on every call
     cache_key = (:deriv_mult, N, order)
-    cached = get(basis.transforms, cache_key, nothing)
-    if cached !== nothing
-        return cached::Vector{ComplexF64}
+    return _get_basis_cache!(basis, cache_key) do
+        k_axis = _fftfreq(N, L/N) .* 2π
+        ComplexF64.((im .* k_axis) .^ order)
     end
-    k_axis = _fftfreq(N, L/N) .* 2π
-    deriv_mult = ComplexF64.((im .* k_axis) .^ order)
-    basis.transforms[cache_key] = deriv_mult
-    return deriv_mult
 end
 
 """
