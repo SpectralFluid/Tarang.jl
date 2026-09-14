@@ -16,6 +16,7 @@ Key features:
 include("nonlinear/nonlinear_core.jl")
 
 include("nonlinear/nonlinear_padding.jl")
+include("nonlinear/nonlinear_real_padding.jl")
 include("nonlinear/nonlinear_transforms.jl")
 
 include("nonlinear/nonlinear_dealiasing.jl")

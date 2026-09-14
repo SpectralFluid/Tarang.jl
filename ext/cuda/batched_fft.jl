@@ -1,3 +1,5 @@
+import LinearAlgebra: mul!
+
 # ============================================================================
 # Batched FFT Support
 # ============================================================================
@@ -8,12 +10,17 @@
 FFT plan for batched transforms on multiple arrays simultaneously.
 More efficient than individual FFTs for multi-field operations.
 """
-struct BatchedGPUFFTPlan{P, IP}
+struct BatchedGPUFFTPlan{P, IP, I, O}
     plan::P
     iplan::IP
     field_size::Tuple{Vararg{Int}}
     batch_size::Int
     is_real::Bool
+    packed_input::I
+    packed_output::O
+    owner::WeakRef
+    stream::CuStream
+    device_id::Int
 end
 
 """
@@ -66,7 +73,8 @@ function _create_batched_fft_plan(field_size::Tuple, T::Type, batch_size::Int, r
         dummy_out = CUDA.zeros(complex_T, out_size...)
         iplan = CUFFT.plan_irfft(dummy_out, field_size[1], fft_dims)
 
-        return BatchedGPUFFTPlan(plan, iplan, field_size, batch_size, true)
+        return BatchedGPUFFTPlan(plan, iplan, field_size, batch_size, true,
+            dummy_in, dummy_out, WeakRef(current_task()), CUDA.stream(), _current_device_id())
     else
         # Complex-to-complex batched FFT
         dummy = CUDA.zeros(complex_T, batched_size...)
@@ -74,7 +82,8 @@ function _create_batched_fft_plan(field_size::Tuple, T::Type, batch_size::Int, r
         plan = CUFFT.plan_fft(dummy, fft_dims)
         iplan = CUFFT.plan_ifft(dummy, fft_dims)
 
-        return BatchedGPUFFTPlan(plan, iplan, field_size, batch_size, false)
+        return BatchedGPUFFTPlan(plan, iplan, field_size, batch_size, false,
+            dummy, similar(dummy), WeakRef(current_task()), CUDA.stream(), _current_device_id())
     end
 end
 
@@ -84,11 +93,11 @@ Thread-safe cache for batched GPU FFT plans.
 Uses a ReentrantLock to protect concurrent access from multiple Julia threads.
 """
 struct BatchedFFTCache
-    plans::Dict{Tuple, BatchedGPUFFTPlan}
+    plans::WeakKeyDict{Task, Dict{Tuple, BatchedGPUFFTPlan}}
     lock::ReentrantLock
 end
 
-const BATCHED_FFT_CACHE = BatchedFFTCache(Dict{Tuple, BatchedGPUFFTPlan}(), ReentrantLock())
+const BATCHED_FFT_CACHE = BatchedFFTCache(WeakKeyDict{Task, Dict{Tuple, BatchedGPUFFTPlan}}(), ReentrantLock())
 
 """
     _batched_plan_key(arch, field_size, T, batch_size, real_input)
@@ -108,16 +117,51 @@ _batched_plan_key(arch::GPU, field_size::Tuple, T::Type, batch_size::Int, real_i
 Get or create a cached batched FFT plan (thread-safe).
 
 **Important:** `field_size` should be the LOCAL field shape (what this process owns),
-not the global domain size. Plans are cached per (device, size, type, batch_size, real_input).
+not the global domain size. Plans and packed buffers are cached per task and
+(device, stream, size, type, batch_size, real_input). Tasks are weakly referenced
+so short-lived task caches can be collected.
 """
 function get_batched_fft_plan(arch::GPU, field_size::Tuple, T::Type, batch_size::Int; real_input::Bool=false)
-    key = _batched_plan_key(arch, field_size, T, batch_size, real_input)
+    ensure_device!(arch)
+    key = (_batched_plan_key(arch, field_size, T, batch_size, real_input)..., CUDA.stream())
     lock(BATCHED_FFT_CACHE.lock) do
-        if !haskey(BATCHED_FFT_CACHE.plans, key)
-            BATCHED_FFT_CACHE.plans[key] = plan_batched_gpu_fft(arch, field_size, T, batch_size; real_input=real_input)
+        plans = get!(BATCHED_FFT_CACHE.plans, current_task()) do
+            Dict{Tuple, BatchedGPUFFTPlan}()
         end
-        return BATCHED_FFT_CACHE.plans[key]
+        return get!(plans, key) do
+            plan_batched_gpu_fft(arch, field_size, T, batch_size; real_input)
+        end
     end
+end
+
+function _check_batched_fft_context(plan::BatchedGPUFFTPlan)
+    plan.owner.value === current_task() || throw(ArgumentError(
+        "Batched FFT plans own task-local buffers; obtain a plan in the executing task"))
+    plan.device_id == _current_device_id() && plan.stream == CUDA.stream() || throw(ArgumentError(
+        "Batched FFT plans own stream-local buffers; obtain a plan on the executing device and stream"))
+    return nothing
+end
+
+# Backend-generic executor permits FFTW-backed parity/ownership tests without a
+# CUDA device. Public CUDA entry points additionally enforce task/stream affinity.
+function _execute_batched_fft!(outputs, inputs, fft_plan, packed_in, packed_out)
+    batch_dim = ndims(packed_in)
+    n = size(packed_in, batch_dim)
+    length(inputs) == n && length(outputs) == n || throw(DimensionMismatch("FFT batch count"))
+    input_shape = size(packed_in)[1:end-1]
+    output_shape = size(packed_out)[1:end-1]
+    for i in 1:n
+        size(inputs[i]) == input_shape && size(outputs[i]) == output_shape ||
+            throw(DimensionMismatch("FFT field shape does not match its plan"))
+    end
+    for i in 1:n
+        selectdim(packed_in, batch_dim, i) .= inputs[i]
+    end
+    mul!(packed_out, fft_plan, packed_in)
+    for i in 1:n
+        outputs[i] .= selectdim(packed_out, ndims(packed_out), i)
+    end
+    return outputs
 end
 
 """
@@ -126,54 +170,20 @@ end
 Execute batched FFT on multiple fields simultaneously.
 """
 function batched_fft!(outputs::Vector{<:CuArray}, inputs::Vector{<:CuArray}, plan::BatchedGPUFFTPlan)
-    @assert length(inputs) == plan.batch_size "Input count must match batch size"
-    @assert length(outputs) == plan.batch_size "Output count must match batch size"
-
-    # Stack inputs into batched array using explicit copy (avoids scalar indexing from cat)
-    batch_dim = ndims(inputs[1]) + 1
-    batched_in = CUDA.zeros(eltype(inputs[1]), size(inputs[1])..., plan.batch_size)
-    for i in 1:plan.batch_size
-        selectdim(batched_in, batch_dim, i) .= inputs[i]
-    end
-
-    # Execute FFT
-    batched_out = plan.plan * batched_in
-
-    # Split results back to individual arrays along the batch dimension
-    out_batch_dim = ndims(batched_out)
-    for i in 1:plan.batch_size
-        outputs[i] .= selectdim(batched_out, out_batch_dim, i)
-    end
-
-    return outputs
+    _check_batched_fft_context(plan)
+    return _execute_batched_fft!(outputs, inputs, plan.plan, plan.packed_input, plan.packed_output)
 end
 
 """
-    batched_ifft!(outputs::Vector{<:CuArray}, inputs::Vector{<:CuArray}, plan::BatchedGPUFFTPlan)
+    batched_ifft!(outputs, inputs, plan::BatchedGPUFFTPlan)
 
-Execute batched inverse FFT on multiple fields simultaneously.
+Execute a batched inverse transform with retained packed buffers. Caller inputs
+are copied before the potentially destructive C2R transform. A plan is local to
+its creating Julia task and CUDA stream; request a plan in each execution context.
 """
 function batched_ifft!(outputs::Vector{<:CuArray}, inputs::Vector{<:CuArray}, plan::BatchedGPUFFTPlan)
-    @assert length(inputs) == plan.batch_size "Input count must match batch size"
-    @assert length(outputs) == plan.batch_size "Output count must match batch size"
-
-    # Stack inputs into batched array using explicit copy (avoids scalar indexing from cat)
-    batch_dim = ndims(inputs[1]) + 1
-    batched_in = CUDA.zeros(eltype(inputs[1]), size(inputs[1])..., plan.batch_size)
-    for i in 1:plan.batch_size
-        selectdim(batched_in, batch_dim, i) .= inputs[i]
-    end
-
-    # Execute inverse FFT
-    batched_out = plan.iplan * batched_in
-
-    # Split results back to individual arrays along the batch dimension
-    out_batch_dim = ndims(batched_out)
-    for i in 1:plan.batch_size
-        outputs[i] .= selectdim(batched_out, out_batch_dim, i)
-    end
-
-    return outputs
+    _check_batched_fft_context(plan)
+    return _execute_batched_fft!(outputs, inputs, plan.iplan, plan.packed_output, plan.packed_input)
 end
 
 """

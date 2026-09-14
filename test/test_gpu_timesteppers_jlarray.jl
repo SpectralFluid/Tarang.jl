@@ -27,6 +27,7 @@ using Test
 using Tarang
 using Printf
 using Random
+using LinearAlgebra
 
 const _GTJ_OK = try
     @eval using JLArrays
@@ -52,6 +53,25 @@ if _GTJ_OK
     Tarang.copy_to_device(a::_GTJ, ::_GTJ) = copy(a)
     Tarang.array_type(::Tarang.GPU{JLArrays.JLBackend}) = _GTJ
     Tarang.array_type(::Tarang.GPU{JLArrays.JLBackend}, T::Type) = _GTJ{T}
+
+    # Padded products execute FFT plans directly, bypassing the field transform
+    # hooks below. Give them the same explicit host stand-in: generic FFTW
+    # dispatch on JLArray can impose host alignment requirements on separately
+    # allocated device-proxy buffers (and some JLArrays versions reject it).
+    struct GTJHostFFTPlan{P}
+        host_plan::P
+    end
+    function LinearAlgebra.mul!(dst::_GTJ, plan::GTJHostFFTPlan, src::_GTJ)
+        copyto!(dst, plan.host_plan * Array(src))
+        return dst
+    end
+    function Tarang._real_padded_fft_plans(::Tarang.GPU{JLArrays.JLBackend},
+                                           a, original, padhalf, half, dims)
+        pf, pb, sf, sb, ps, s = Tarang._real_padded_fft_plans(
+            CPU(), Array(a), Array(original), padhalf, half, dims)
+        return GTJHostFFTPlan(pf), GTJHostFFTPlan(pb), GTJHostFFTPlan(sf),
+               GTJHostFFTPlan(sb), _GTJ(ps), _GTJ(s)
+    end
 
     # ---- cuFFT stand-in: a CPU twin field transformed by Tarang's CPU chain ----
     const _GTJ_TWINS = Dict{Any, Any}()

@@ -592,6 +592,62 @@ function _step_explicit_rk!(state::TimestepperState, solver::InitialValueSolver,
     end
 end
 
+# One fused broadcast per field, retaining the tableau's sequential addition
+# order. A zero weight must not propagate NaNs from an unused stage, and each
+# addition converts back to the field type just as the former AXPY passes did.
+@inline _rk_weighted_value(x, ::Tuple{}, ::Tuple{}) = x
+@inline function _rk_weighted_value(x, weights::Tuple, values::Tuple)
+    w = first(weights)
+    y = iszero(w) ? x : oftype(x, x + w * first(values))
+    return _rk_weighted_value(y, Base.tail(weights), Base.tail(values))
+end
+
+function _rk_combine_arrays!(dest, base, terms::Tuple, weights::Tuple)
+    length(terms) == length(weights) || throw(DimensionMismatch("RK weights and stages"))
+    dest .= ((x, values...) -> _rk_weighted_value(x, weights, values)).(base, terms...)
+    return dest
+end
+
+function _rk_combine_arrays_divide!(dest, base, terms::Tuple, weights::Tuple, denominator)
+    length(terms) == length(weights) || throw(DimensionMismatch("RK weights and stages"))
+    dest .= ((x, d, values...) -> _rk_weighted_value(x, weights, values) / d).(base, denominator, terms...)
+    return dest
+end
+
+function _rk_combine_fields!(dest, base, stages::Tuple, weights::Tuple)
+    for i in eachindex(dest, base)
+        isempty(base[i].bases) && continue
+        fields = map(stage -> stage[i], stages)
+        # Unused stages can still hold an old layout. Do not transform them.
+        active = filter(k -> !iszero(weights[k]), ntuple(identity, length(weights)))
+        used = map(k -> fields[k], active)
+        coeffs = map(k -> weights[k], active)
+        layout = _arith_layout((base[i], used...))
+        for field in (base[i], used...)
+            ensure_layout!(field, layout)
+        end
+        # The destination is fully overwritten: reuse compatible coefficient
+        # storage without transforming its stale previous stage value.
+        if layout === :c && get_coeff_data(dest[i]) !== nothing &&
+           size(get_coeff_data(dest[i])) == size(get_coeff_data(base[i]))
+            dest[i].current_layout = :c
+        elseif layout === :g && get_grid_data(dest[i]) !== nothing &&
+               size(get_grid_data(dest[i])) == size(get_grid_data(base[i]))
+            dest[i].current_layout = :g
+        else
+            ensure_layout!(dest[i], layout)
+        end
+        if layout === :c
+            _rk_combine_arrays!(get_coeff_data(dest[i]), get_coeff_data(base[i]),
+                                map(get_coeff_data, used), coeffs)
+        else
+            _rk_combine_arrays!(get_grid_data(dest[i]), get_grid_data(base[i]),
+                                map(get_grid_data, used), coeffs)
+        end
+    end
+    return dest
+end
+
 """
     _step_explicit_rk_gpu!(state, solver, A, b, c)
 
@@ -613,19 +669,9 @@ function _step_explicit_rk_gpu!(state::TimestepperState, solver::InitialValueSol
     k_stages = _workspace_stage_states!(
         state, :explicit_field_rk_k_stages, current_state, stages, 2)
 
-    # `preserve_layout=true` on every copy below, and the layout-following
-    # `axpy_state!`, keep the whole stage loop in whatever space the state is
-    # already in rather than forcing it to grid space. `copy_field_data!` falls
-    # back to the grid path by itself whenever the coefficient buffers do not
-    # line up, so this is safe for mixed-layout and nothing-buffer states, and
-    # `_arith_layout` (state_utils.jl) makes the same fallback for the stage
-    # arithmetic.
-    #
-    # Measured: on the paths exercised today (linear pure-Fourier RK443 on the
-    # distributed field path) the per-step transform count is unchanged, because
-    # the lazy RHS hands the state back in `:g` and the transforms those steps
-    # pay are the RHS's own coefficient round trip. The value here is that the
-    # stage loop no longer FORCES a layout of its own on top of that.
+    # The fused combination follows the operands' common coefficient layout,
+    # or uses grid layout when they disagree. Retained RHS copies preserve
+    # their layout and remain independent of the evaluator's reusable output.
     @inbounds for s in 1:stages
         state.current_substep = s
 
@@ -635,15 +681,10 @@ function _step_explicit_rk_gpu!(state::TimestepperState, solver::InitialValueSol
         # `_refresh_algebraic_state!`, the other side effect this call had.
         _explicit_rk_final_stage_unused(A, b, s, stages) && continue
 
-        # Compute stage value: Y_s = X_n + dt * sum_{j<s} A[s,j] * k_j
-        # Copy current_state into workspace (in-place, no allocation)
-        _copy_field_state!(stage_state, current_state; preserve_layout=true)
-        # Add contributions from previous stages
-        for j in 1:(s-1)
-            if !iszero(A[s, j])
-                axpy_state!(dt * A[s, j], k_stages[j], stage_state)
-            end
-        end
+        # Assemble every active contribution in one pass over each field.
+        _rk_combine_fields!(stage_state, current_state,
+                            Tuple(k_stages[j] for j in 1:(s-1)),
+                            Tuple(dt * A[s, j] for j in 1:(s-1)))
 
         # Evaluate RHS: k_s = F(t + c[s]*dt, Y_s)
         F_stage = evaluate_rhs(solver, stage_state, t + c[s] * dt)
@@ -653,12 +694,10 @@ function _step_explicit_rk_gpu!(state::TimestepperState, solver::InitialValueSol
 
     # Compute final update: X_{n+1} = X_n + dt * sum_s b[s] * k_s
     new_state = _acquire_recycled_history_state!(
-        state, :explicit_field_rk_recycle, current_state; preserve_layout=true)
-    @inbounds for s in 1:stages
-        if !iszero(b[s])
-            axpy_state!(dt * b[s], k_stages[s], new_state)
-        end
-    end
+        state, :explicit_field_rk_recycle, current_state; preserve_layout=true,
+        copy_current=false)
+    _rk_combine_fields!(new_state, current_state, Tuple(k_stages),
+                        Tuple(dt * b[s] for s in 1:stages))
 
     _refresh_algebraic_state!(solver.problem, new_state)
     _push_recycled_history_state!(state, :explicit_field_rk_recycle, new_state)

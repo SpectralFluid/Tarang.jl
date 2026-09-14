@@ -136,56 +136,23 @@ end
                                          is_gpu=true, nprocs=2)
     end
 
-    @testset "a 3-D problem declines, silently" begin
-        # Nothing else stops it. Measured on this exact problem before the gate
-        # existed: one bucket of 12 modes, `should_batch_modes` true,
-        # `build_mode_batches!` returning a batch. At nx=ny=nz=64 that is 4096
-        # modes at a few hundred MB — under the 1 GiB default — so a 3-D GPU run
-        # would have engaged BY DEFAULT a gather over a `(kx, ky, :)` selection
-        # that has never executed and that no test on this branch covers. The
-        # declared scope is 2-D; decline like the one-mode bucket does, without
-        # the byte cap's `@info` (an unsupported dimensionality is not a
-        # surprise the way a silent performance cliff is).
+    @testset "a 3-D Fourier-Fourier-Chebyshev problem engages" begin
         solver, _ = _parity_channel_solver_3d(; batched_modes=true)
         step!(solver)
         sps = collect(solver.problem.compiled.subproblems)
-        live = [sp for sp in sps if sp.M_min !== nothing]
-        @test length(live) >= 2
-
-        # The gate's input, with the 2-D discriminator alongside it: the mode
-        # group pins two Fourier axes here and exactly one in the channel.
-        @test Tarang._mode_batch_fourier_axes(live[1]) == 2
-        solver_2d, _ = _parity_channel_solver(; batched_modes=true)
-        step!(solver_2d)
-        sps_2d = collect(solver_2d.problem.compiled.subproblems)
-        @test Tarang._mode_batch_fourier_axes(sps_2d[1]) == 1
-
-        # Every OTHER condition passes, so the decline can only be the gate.
-        buckets = Tarang.bucket_subproblems(sps)
-        @test length(buckets) == 1
-        indices = first(values(buckets))
-        @test length(indices) >= 2
-        @test Tarang.mode_batch_bytes(sps[indices[1]], length(indices)) <=
-              solver.base.batched_modes_max_bytes
-
-        result = @test_logs Tarang.should_batch_modes(solver.base, sps, indices;
-                                                        is_gpu=true, nprocs=1)
-        @test !result
-        @test isempty(Tarang.build_mode_batches!(solver.base, sps; is_gpu=true,
-                                                 nprocs=1, like=ComplexF64[]))
-
-        # And through the production entry point, which short-circuits before
-        # bucketing. Layout is set first so that a REMOVED gate would reach the
-        # workspace build and fail this assertion, rather than erroring earlier
-        # for an unrelated reason.
+        indices = first(values(Tarang.bucket_subproblems(sps)))
+        @test Tarang._mode_batch_fourier_axes(sps[first(indices)]) == 2
+        @test Tarang.should_batch_modes(solver.base, sps, indices;
+                                       is_gpu=true, nprocs=1)
         state = solver.timestepper_state
         state_fields = state.timestepper_data[:_sp_state_fields][2]
-        for f in state_fields
-            ensure_layout!(f, :c)
+        foreach(f -> ensure_layout!(f, :c), state_fields)
+        plan = Tarang._build_batched_rk_plan(solver,
+            solver.problem.compiled.subproblems, state_fields)
+        @test plan !== nothing
+        if plan !== nothing
+            @test isempty(plan.leftovers)
         end
-        @test Tarang._build_batched_rk_plan(solver,
-                                            solver.problem.compiled.subproblems,
-                                            state_fields) === nothing
     end
 
     @testset "a one-mode bucket declines silently" begin

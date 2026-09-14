@@ -180,6 +180,41 @@ end
 # — their explicit tableau terms still apply. The array element types in `Lmap`
 # are abstract at this call site, so every L̂ broadcast goes through the
 # `_ddirk_*` function barriers below, which recover full type stability.
+# Assemble alternating explicit/implicit contributions in tableau order and
+# divide by the diagonal in the same broadcast, with no full-grid temporaries.
+function _serial_rk_imex_combine!(dest, base, Fs::Tuple, Ys::Tuple,
+                                  explicit::Tuple, implicit::Tuple, Lhat, gamma)
+    terms = ()
+    weights = ()
+    for j in eachindex(explicit)
+        if !iszero(explicit[j])
+            terms = (terms..., coeff_data!(Fs[j]))
+            weights = (weights..., explicit[j])
+        end
+        if Lhat !== nothing && !iszero(implicit[j])
+            # Preserve ((-dt*a)*Lhat)*Y from the former AXPY kernel. Computing
+            # Lhat*Y first can overflow even when the weighted result is finite.
+            scaled_L = Base.Broadcast.broadcasted(*, implicit[j], Lhat)
+            terms = (terms..., Base.Broadcast.broadcasted(*, scaled_L, coeff_data!(Ys[j])))
+            weights = (weights..., 1.0)
+        end
+    end
+    src = coeff_data!(base)
+    # Every coefficient is overwritten; avoid transforming stale stage data.
+    if get_coeff_data(dest) === nothing || size(get_coeff_data(dest)) != size(src)
+        coeff_data!(dest)
+    end
+    dest.current_layout = :c
+    target = get_coeff_data(dest)
+    if Lhat !== nothing && !iszero(gamma)
+        denominator = Base.Broadcast.broadcasted(+, 1, Base.Broadcast.broadcasted(*, gamma, Lhat))
+        _rk_combine_arrays_divide!(target, src, terms, weights, denominator)
+    else
+        _rk_combine_arrays!(target, src, terms, weights)
+    end
+    return dest
+end
+
 function _step_diagonal_imex_rk_impl!(state::TimestepperState, solver::InitialValueSolver,
                                        ts::TimeStepper, Lmap::DiagonalLMap)
     current_state = state.history[end]
@@ -211,39 +246,13 @@ function _step_diagonal_imex_rk_impl!(state::TimestepperState, solver::InitialVa
         Y_s = Y_stages[s]
         for (k, src_field) in enumerate(current_state)
             ws_field = Y_s[k]
-            # Layout-preserving copy: the state was just put in :c, so this is a
-            # straight coefficient copyto! — the old grid-normalizing copy
-            # backward-transformed the state and the ensure_layout! below then
-            # forward-transformed it again, one full FFT round-trip per field
-            # per stage.
-            copy_field_data!(ws_field, src_field; preserve_layout=true)
-            # Safety net for the fallback path (mismatched buffers → grid copy):
-            # a no-op when the coefficient copy above already left :c.
-
-            coeff_data = coeff_data!(ws_field)   # live coeff, = X_n[k]
-            Lhat = get(Lmap, k, nothing)            # nothing ⇒ no implicit term here
-            for j in 1:(s-1)
-                if !iszero(AE[s, j])
-                    # F_stages[j] came from copy_state(evaluate_rhs(...)), which can
-                    # hand back a grid-layout field with a stale coeff buffer; force
-                    # :c so the stage RHS actually contributes (matches the final
-                    # update block below).
-                    _ddirk_axpy!(coeff_data, dt * AE[s, j], coeff_data!(F_stages[j][k]))
-                end
-                if Lhat !== nothing && !iszero(AI[s, j])
-                    # Off-diagonal implicit contribution −dt·AI[s,j]·L̂·Y_j (the
-                    # term whose omission caused the stiff-limit instability).
-                    ensure_layout!(Y_stages[j][k], :c)
-                    _ddirk_axpy_lhat!(coeff_data, -dt * AI[s, j], Lhat,
-                                      get_coeff_data(Y_stages[j][k]))
-                end
-            end
-            # Diagonal implicit solve (1 + dt·AI[s,s]·L̂)·Y_s = RHS. For the ESDIRK
-            # explicit first stage AI[1,1]=0, so this is a no-op there.
-            γ_s = AI[s, s]
-            if Lhat !== nothing && abs(γ_s) > 1e-14
-                _ddirk_implicit_divide!(coeff_data, Lhat, dt * γ_s)
-            end
+            Lhat = get(Lmap, k, nothing)
+            _serial_rk_imex_combine!(ws_field, src_field,
+                Tuple(F_stages[j][k] for j in 1:(s-1)),
+                Tuple(Y_stages[j][k] for j in 1:(s-1)),
+                Tuple(dt * AE[s, j] for j in 1:(s-1)),
+                Tuple(-dt * AI[s, j] for j in 1:(s-1)), Lhat,
+                abs(AI[s, s]) > 1e-14 ? dt * AI[s, s] : 0.0)
         end
         # The last stage's F is read by nothing when the tableau retires the
         # weighted update (see `_rk_final_stage_rhs_unused`) — the exit below
@@ -269,24 +278,13 @@ function _step_diagonal_imex_rk_impl!(state::TimestepperState, solver::InitialVa
     # instead of allocating a fresh deep copy; the coefficient-preserving copy
     # keeps the :c layout the update block below works in.
     new_state = _acquire_recycled_history_state!(state, :diagonal_imex_recycled,
-                                                 current_state; preserve_layout=true)
+        current_state; preserve_layout=true, copy_current=false)
     for (k, field) in enumerate(new_state)
-        # copy_state may return the field in grid layout with a stale coefficient
-        # buffer; normalize to :c so the implicit update below writes the
-        # authoritative data (otherwise the edits are discarded when the field is
-        # next read in :c from its grid, and the state never evolves).
-        coeff_data = coeff_data!(field)
-        Lhat = get(Lmap, k, nothing)
-        for s in 1:stages
-            if !iszero(b_exp[s])
-                _ddirk_axpy!(coeff_data, dt * b_exp[s], coeff_data!(F_stages[s][k]))
-            end
-            if Lhat !== nothing && !iszero(b_imp[s])
-                ensure_layout!(Y_stages[s][k], :c)
-                _ddirk_axpy_lhat!(coeff_data, -dt * b_imp[s], Lhat,
-                                  get_coeff_data(Y_stages[s][k]))
-            end
-        end
+        _serial_rk_imex_combine!(field, current_state[k],
+            Tuple(F_stages[s][k] for s in 1:stages),
+            Tuple(Y_stages[s][k] for s in 1:stages),
+            Tuple(dt * b_exp[s] for s in 1:stages),
+            Tuple(-dt * b_imp[s] for s in 1:stages), get(Lmap, k, nothing), 0.0)
     end
 
     _refresh_algebraic_state!(solver.problem, new_state)

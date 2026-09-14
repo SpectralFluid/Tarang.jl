@@ -308,6 +308,14 @@ function _mode_batch_fourier_axes(sp::Subproblem)
     return n
 end
 
+# A 3-D batch has exactly one coupled axis; multiple coupled axes require
+# multidimensional gathers and remain on the per-mode path.
+function _mode_batch_supported_layout(sp::Subproblem)
+    nf = _mode_batch_fourier_axes(sp)
+    return nf == 1 || (nf == 2 && length(sp.group) == 3 &&
+                      count(isnothing, sp.group) == 1)
+end
+
 # `like` selects the array backend: pass an existing device vector to get device
 # storage, or a plain `ComplexF64[]` for host storage. Mirrors the `like=`
 # convention already used by `_subproblem_cached_vector!`.
@@ -500,14 +508,9 @@ All of the following must hold:
 2. `base.batched_modes` resolves true for this device — `nothing` means GPU yes,
    CPU no, so no existing CPU run changes behavior.
 3. the bucket holds at least two modes — one mode has nothing to batch.
-4. the problem has EXACTLY ONE Fourier axis, i.e. it is 2-D mixed
-   Fourier-coupled. That is the declared scope of the batched path and the only
-   shape any test on it exercises. A 3-D `(x, y)` Fourier + `z` Chebyshev run
-   otherwise qualifies on every other condition — at `nx=ny=nz=64` its 4096
-   modes sit well under the default cap — and would engage by default a gather
-   path (`_batch_field_plan` over a `(kx, ky, :)` selection) that has never
-   executed. `_subproblem_strided_index` may well express that selection
-   correctly; "may well" is not a basis for a default-on numerical path.
+4. the group pins one Fourier axis (2-D) or two Fourier axes and one
+   coupled axis (3-D Fourier-Fourier-Chebyshev). Gather plans additionally
+   verify each field's complete strided selection before the RK loop engages.
 5. the batch's workspace fits under `base.batched_modes_max_bytes` —
    `mode_batch_bytes`, which counts every array the batch allocates, not just
    the dense LHS.
@@ -516,8 +519,6 @@ Condition 5 emits `@info maxlog=1` when it declines, because a silent
 performance cliff at large `nz` is exactly what goes unnoticed for months.
 Conditions 3 and 4 decline SILENTLY: both are structural non-qualifications, and
 an unsupported dimensionality is not a surprise the way a performance cliff is.
-Condition 4 is checked BEFORE the cap so a 3-D run never emits the cap's `@info`
-either.
 """
 function should_batch_modes(base, sps, indices::Vector{Int};
                             is_gpu::Bool, nprocs::Int)
@@ -539,7 +540,7 @@ function should_batch_modes(base, sps, indices::Vector{Int};
     (sp1.M_exp === nothing || sp1.M_min === nothing ||
      sp1.L_exp === nothing) && return false
 
-    _mode_batch_fourier_axes(sp1) == 1 || return false
+    _mode_batch_supported_layout(sp1) || return false
 
     n = size(LHS, 1)
     bytes = mode_batch_bytes(sp1, length(indices))
@@ -559,16 +560,28 @@ end
 
 Bucket `sps` and build a `ModeBatch` for every bucket that passes
 `should_batch_modes`. Buckets that decline are simply absent from the result,
-and their subproblems stay on the per-mode path.
+and their subproblems stay on the per-mode path. The RK caller supplies
+`workspace_bytes(sp, nmodes)` so the byte cap covers all retained matrix and
+stage workspaces across buckets, before any batch allocation.
 """
 function build_mode_batches!(base, sps; is_gpu::Bool, nprocs::Int,
-                             like::AbstractVector)
+                             like::AbstractVector, workspace_bytes=nothing)
     batches = ModeBatch[]
-    for indices in values(bucket_subproblems(sps))
+    used_bytes = 0
+    buckets = sort!(collect(values(bucket_subproblems(sps))); by=first)
+    for indices in buckets
         should_batch_modes(base, sps, indices; is_gpu, nprocs) || continue
+        if workspace_bytes !== nothing
+            sp = sps[first(indices)]
+            bytes = mode_batch_bytes(sp, length(indices)) + workspace_bytes(sp, length(indices))
+            if bytes > base.batched_modes_max_bytes - used_bytes
+                @info "Batched RK solve declined: matrix and RK workspace exceed the remaining aggregate byte cap" required_bytes=bytes remaining_bytes=base.batched_modes_max_bytes-used_bytes maxlog=1
+                continue
+            end
+            used_bytes += bytes
+        end
         push!(batches, build_mode_batch(sps, indices; like))
     end
-    sort!(batches; by=b -> b.sp_indices[1])
     return batches
 end
 

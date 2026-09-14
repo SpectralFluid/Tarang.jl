@@ -137,10 +137,12 @@ mutable struct LazyWorkspace{F<:ScalarField}
     # which are populated for the CURRENT evaluation and is cleared between them.
     diff_cache::Dict{Int, F}
     diff_cache_valid::Set{Int}
+    operand_epoch::UInt
+    operand_cache_active::Bool
 end
 
 LazyWorkspace{F}() where {F<:ScalarField} =
-    LazyWorkspace{F}(F[], 1, nothing, Dict{Int, F}(), Set{Int}())
+    LazyWorkspace{F}(F[], 1, nothing, Dict{Int, F}(), Set{Int}(), UInt(0), false)
 LazyWorkspace() = LazyWorkspace{ScalarField}()
 
 """Drop the shared-operand coefficient cache. The state changes between RHS evaluations, so
@@ -801,7 +803,18 @@ end
         # 3/2-padded (serial) / 2/3-truncation (MPI) machinery used elsewhere, unless
         # every Fourier axis has dealias ≤ 1 (dealiasing disabled).
         if _any_axis_dealias(out.bases, 1.5)
-            _dealiased_lazy_product!(out, a, b)
+            # Retain just the second padded operand already present in the
+            # nonlinear workspace. Tokens are valid only during one equation's
+            # frozen-state evaluation; scratch fields themselves are not keys.
+            if ws.operand_cache_active && expr.left isa LazyStateField
+                _dealiased_lazy_product!(out, b, a;
+                    operand_key=(ws, ws.operand_epoch, expr.left.idx))
+            elseif ws.operand_cache_active && expr.right isa LazyStateField
+                _dealiased_lazy_product!(out, a, b;
+                    operand_key=(ws, ws.operand_epoch, expr.right.idx))
+            else
+                _dealiased_lazy_product!(out, a, b)
+            end
         else
             _fused_binary!(out, a, b, *)
         end
@@ -810,8 +823,21 @@ end
 end
 
 """Dealiased field·field product for the lazy RHS, written into `out` (grid layout)."""
-function _dealiased_lazy_product!(out::ScalarField, a::ScalarField, b::ScalarField)
+function _dealiased_lazy_product!(out::ScalarField, a::ScalarField, b::ScalarField;
+                                   operand_key=nothing)
     evaluator = _get_evaluator(out.dist)
+    # The compiled RHS owns its destination. On the serial padded path write
+    # there directly instead of filling an eight-field pool and copying again.
+    if !(a.dist.use_pencil_arrays && a.dist.size > 1) &&
+       a.bases == b.bases == out.bases && a.dtype == b.dtype == out.dtype
+        ws = _get_padded_workspace!(evaluator, a.bases, real(a.dtype); real_input=a.dtype <: Real)
+        if ws !== nothing
+            evaluate_padded_multiply(a, b, evaluator, ws; destination=out, operand_key)
+            evaluator.performance_stats.total_evaluations += 1
+            out.current_layout = :g
+            return out
+        end
+    end
     # `own=false`: the product is copied into `out` below and never escapes this
     # function, so borrowing the pooled buffer is safe here — and this is the hot
     # RHS path the pool exists for.
@@ -1552,7 +1578,13 @@ function execute_lazy_rhs_buffered!(plan::LazyRHSPlan, state, solver)
         # the shared-operand cache safe: within one evaluate_lazy! call the state is frozen, and
         # across calls nothing is reused.
         _reset_diff_cache!(ws)
-        evaluate_lazy!(result_field, expr, state, ws)
+        ws.operand_epoch += UInt(1)
+        ws.operand_cache_active = true
+        try
+            evaluate_lazy!(result_field, expr, state, ws)
+        finally
+            ws.operand_cache_active = false
+        end
     end
     _add_registered_forcings_to_lazy_rhs!(plan.output_fields, solver.problem)
     return plan.output_fields

@@ -22,6 +22,13 @@ const TEST_FILES = [
     "test_config.jl",
     "test_cpu_parallel_benchmark_config.jl",
     "test_spectral_padding_allocations.jl",
+    "test_single_gpu_nonlinear.jl",
+    "test_real_padding_kernels.jl",
+    "test_cfl_workspace.jl",
+    "test_gpu_rk_fused_combinations.jl",
+    "test_mode_batch_3d.jl",
+    "test_gpu_iterative_workspace.jl",
+    "test_batched_fft_workspace.jl",
     "test_fields.jl",
     "test_problems.jl",
     "test_operators_basic.jl",
@@ -222,6 +229,9 @@ const OPTIONAL_TEST_FILES = [
 # Single-process CUDA tests. Run with TARANG_RUN_GPU_TESTS=true on a CUDA host
 # (the JuliaGPU Buildkite pipeline sets this).
 const GPU_TEST_FILES = [
+    "test_gpu_nonlinear_optimizations.jl",
+    "test_gpu_rk_optimizations_cuda.jl",
+    "test_gpu_optional_workspaces_cuda.jl",
     "test_gpu_transform_correctness.jl",
     "test_gpu_fc_2d_complete.jl",
     "test_ilu0_preconditioner.jl",
