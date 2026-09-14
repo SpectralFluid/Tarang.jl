@@ -90,7 +90,7 @@ function set_dt!(forcing::StochasticForcing{T, N, A, CA}, dt::Real) where {T, N,
     new_dt = T(dt)
     if forcing.dt != new_dt
         forcing.dt = new_dt
-        forcing.last_update_time = T(-Inf)
+        forcing.last_update_time = -Inf
         fill!(forcing.cached_forcing, zero(Complex{T}))
     end
     return forcing
@@ -100,7 +100,7 @@ function set_dt!(forcing::SeparableStochasticForcing{T}, dt::Real) where T
     new_dt = T(dt)
     if forcing.dt != new_dt
         forcing.dt = new_dt
-        forcing.last_update_time = T(-Inf)
+        forcing.last_update_time = -Inf
         fill!(forcing.cached_forcing, zero(eltype(forcing.cached_forcing)))
         fill!(forcing.fourier_realization, zero(eltype(forcing.fourier_realization)))
     end
@@ -114,7 +114,7 @@ Reset the forcing cache, causing regeneration on next call.
 Works on both CPU and GPU.
 """
 function reset_forcing!(forcing::StochasticForcing{T, N, A, CA}) where {T, N, A, CA}
-    forcing.last_update_time = T(-Inf)
+    forcing.last_update_time = -Inf
     # Use fill! which works on both CPU and GPU arrays
     fill!(forcing.cached_forcing, zero(Complex{T}))
     if forcing.prevsol !== nothing
@@ -123,7 +123,7 @@ function reset_forcing!(forcing::StochasticForcing{T, N, A, CA}) where {T, N, A,
 end
 
 function reset_forcing!(forcing::SeparableStochasticForcing{T}) where T
-    forcing.last_update_time = T(-Inf)
+    forcing.last_update_time = -Inf
     fill!(forcing.cached_forcing, zero(eltype(forcing.cached_forcing)))
     fill!(forcing.fourier_realization, zero(eltype(forcing.fourier_realization)))
     if forcing.prevsol !== nothing

@@ -383,6 +383,8 @@ end
     end
 
     @testset "Time-based Caching" begin
+        isdefined(@__MODULE__, :test_stochastic_cache_precision) || include("stochastic_cache_support.jl")
+        test_stochastic_cache_precision(CPU())
         forcing = StochasticForcing(
             field_size=(16, 16),
             forcing_rate=0.1,
@@ -1201,6 +1203,13 @@ end
                 instantaneous_power(forcing, sol_prev)
                 @test forcing.diagnostic_weights === cached_weights
             end
+        end
+
+        @testset "GPU forcing cache precision" begin
+            CUDA.allowscalar(false)
+            isdefined(@__MODULE__, :test_stochastic_cache_precision) || include("stochastic_cache_support.jl")
+            test_stochastic_cache_precision(GPU())
+            test_stochastic_cache_precision(GPU(); separable=true)
         end
 
         @testset "GPU forced 2D InitialValueProblem advances without scalar indexing" begin
