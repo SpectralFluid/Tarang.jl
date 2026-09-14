@@ -45,6 +45,26 @@ else
         return coords, dist, xb, u
     end
 
+    @testset "GPU RK retains small-dt stage contributions" begin
+        for ts in (RK222(), RK443()), dt in (0.1, 1e-15),
+            path in (:diagonal, :subproblem, :batched)
+            coords = CartesianCoordinates("x", "z")
+            dist = Distributor(coords; dtype=Float64, device=GPU())
+            xb = RealFourier(coords["x"]; size=8, bounds=(0.0, 2pi))
+            zb = ChebyshevT(coords["z"]; size=6, bounds=(0.0, 1.0))
+            u = ScalarField(Domain(dist, path === :diagonal ? (xb,) : (xb, zb)), "u")
+            fill!(grid_data!(u), 1.0)
+            problem = InitialValueProblem([u])
+            add_parameters!(problem; rate=0.1/dt)
+            add_equation!(problem, "dt(u) + rate*u = rate*u")
+            solver = InitialValueSolver(problem, ts; dt, batched_modes=path === :batched)
+            for _ in 1:3; step!(solver); end
+            @test (Tarang._timestepper_subproblems(solver) !== nothing) == (path !== :diagonal)
+            @test !isempty(Tarang.active_mode_batches(solver)) == (path === :batched)
+            @test maximum(abs, Array(grid_data!(u)) .- 1.0) < 2e-12
+        end
+    end
+
     @testset "GPU mass operators are refused before advancement" begin
         steppers = (RK111(), RK222(), RK443(), RKSMR(), Tarang.RKGFY(), Tarang.RK443_IMEX(),
                     CNAB1(), CNAB2(), SBDF1(), SBDF2(), SBDF3(), SBDF4(),

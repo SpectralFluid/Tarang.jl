@@ -69,6 +69,25 @@ else
     end
 
     @testset "GPU boundary buffer regressions on JLArray" begin
+        @testset "subproblem RK retains small-dt stage contributions" begin
+            for ts in (RK222(), RK443()), dt in (0.1, 1e-15)
+                coords = CartesianCoordinates("x", "z")
+                dist = Distributor(coords; dtype=Float64, device=_BCJL_ARCH)
+                xb = RealFourier(coords["x"]; size=8, bounds=(0.0, 2pi))
+                zb = ChebyshevT(coords["z"]; size=6, bounds=(0.0, 1.0))
+                u = ScalarField(Domain(dist, (xb, zb)), "u")
+                copyto!(grid_data!(u), ones(8, 6))
+                problem = InitialValueProblem([u])
+                add_parameters!(problem; rate=0.1/dt)
+                add_equation!(problem, "dt(u) + rate*u = rate*u")
+                solver = InitialValueSolver(problem, ts; dt,
+                           matsolver=BoundaryJLHostLU, batched_modes=false)
+                for _ in 1:3; step!(solver); end
+                @test Tarang._timestepper_subproblems(solver) !== nothing
+                @test Array(grid_data!(u)) ≈ ones(8, 6) atol=2e-12
+            end
+        end
+
         @testset "empty-basis scalar storage and unit vectors" begin
             for T in (Float64, ComplexF64)
                 coords = CartesianCoordinates("x", "z")

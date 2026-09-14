@@ -223,10 +223,10 @@ function step_rk_imex!(state::TimestepperState, solver::InitialValueSolver; ts::
         # zero rather than against a tolerance: the skip exists to avoid a
         # pointless pass over the data (ESDIRK's empty first implicit column is
         # 4 of RK443's 10 sub-diagonal entries, 2 of RK222's 3), not to decide
-        # that a small coefficient is negligible. The smallest nonzero entry in
-        # any built-in tableau is 1/18, twelve orders above the old 1e-14 cut, so
-        # this changes no built-in scheme — it stops a hypothetical small-but-real
-        # coefficient from being silently dropped.
+        # that a small coefficient is negligible. The old cutoff tested dt*A,
+        # which can be tiny while its product with a large RHS/operator remains
+        # significant. Testing the unscaled entries also makes built-in schemes
+        # invariant under a change of time units; see test_rk_time_scaling.jl.
         for j in 1:(s-1)
             if !iszero(A_exp[s, j])
                 @. rhs_vec += (dt * A_exp[s, j]) * F_exp_vecs[j]

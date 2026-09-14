@@ -149,6 +149,7 @@ const TEST_FILES = [
     "test_field_typestability.jl",
     "test_filter_forcing_typestability.jl",
     "test_reference_timesteppers.jl",
+    "test_rk_time_scaling.jl",
     "test_fourier_algebraic_constraints.jl",
     "test_gpu_field_rk_allocations.jl",
     "test_lazy_rhs_fourier.jl",
