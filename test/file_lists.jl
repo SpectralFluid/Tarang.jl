@@ -20,6 +20,8 @@ const TEST_FILES = [
     "test_basis_wavenumbers.jl",
     "test_architectures.jl",
     "test_config.jl",
+    "test_cpu_parallel_benchmark_config.jl",
+    "test_spectral_padding_allocations.jl",
     "test_fields.jl",
     "test_problems.jl",
     "test_operators_basic.jl",
@@ -304,6 +306,7 @@ const MPI_TEST_FILES = [
     "test_mpi_forcing_work.jl",              # work_stratonovich/ito/instantaneous_power distributed == serial (np>=2)
     "test_mpi_padded_dealiasing.jl",         # distributed 3/2 padded dealiasing == serial (transpose-pad) (np>=2)
     "test_mpi_padded_dealiasing_3d.jl",      # distributed 3D padded dealiasing == serial (N-D, 2D-mesh at np=4) (np>=2)
+    "test_mpi_padded_workspace_budget.jl",  # retained scratch and transpose budgets with changing 3D operands
     "test_mpi_padded_dealiasing_3d_slab.jl", # 3D padded dealiasing must also run on a 1-D slab mesh — the D-1 decomposition gate silently routed it to 2/3-rule truncation (np>=2)
     "test_mpi_padded_dealiasing_chebfourier.jl", # distributed mixed Cheb-Fourier dealiasing == serial (Fourier-only pad) (np>=2)
     "test_mpi_dealiasing_ivp_3d.jl",         # 3D Burgers InitialValueProblem solve distributed == serial (e2e dealias-in-timestepper) (np>=2)

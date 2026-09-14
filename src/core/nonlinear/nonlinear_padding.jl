@@ -279,7 +279,7 @@ function _pad_spectral_sliced_3d!(padded, spec_data, original_shape, padded_shap
             length(s2) == 0 && continue
             for (s3, d3) in ((r3[1], r3[2]), (r3[3], r3[4]))
                 length(s3) == 0 && continue
-                padded[d1, d2, d3] .= spec_data[s1, s2, s3]
+                @views padded[d1, d2, d3] .= spec_data[s1, s2, s3]
             end
         end
     end
@@ -331,7 +331,7 @@ function _truncate_spectral!(result::AbstractArray{Complex{T}}, padded_spec::Abs
                 length(d2) == 0 && continue
                 for (d3, s3) in ((r3[1], r3[2]), (r3[3], r3[4]))
                     length(d3) == 0 && continue
-                    result[d1, d2, d3] .= padded_spec[s1, s2, s3]
+                    @views result[d1, d2, d3] .= padded_spec[s1, s2, s3]
                 end
             end
         end
