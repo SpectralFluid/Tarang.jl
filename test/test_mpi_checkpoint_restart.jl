@@ -180,6 +180,51 @@ MPI.Barrier(COMM)
 # place, a real failure fails the SAME testset on every rank at once, so they
 # either all reach this `finally` together or none of them do.
 try
+    @testset "checkpoint metadata failures stop every rank before restoring fields (rank=$RANK)" begin
+        path = joinpath(CHK_ROOT, "metadata")
+        donor, _ = _build(RK222(), 0.02)
+        step!(donor, 0.02)
+        written = save_state(donor, path)
+        MPI.Barrier(COMM)
+
+        # A complete stale slab is geometrically valid but belongs to another time.
+        if RANK == 1
+            Tarang.ncputatt(written, "global", Dict("sim_time" => 9.0))
+        end
+        MPI.Barrier(COMM)
+        restored, _ = _build(RK222(), 0.02)
+        original = copy(parent(get_coeff_data(restored.state[1])))
+        rejected = try
+            load_state!(restored, path)
+            false
+        catch err
+            err isa ErrorException
+        end
+        @test _agree(rejected)
+        @test _agree(restored.sim_time == 0.0 && restored.iteration == 0)
+        @test _agree(restored.state[1].current_layout == :c &&
+                     parent(get_coeff_data(restored.state[1])) == original)
+
+        # Model a filesystem/read failure visible to only one rank. The others
+        # must finish the metadata collective before entering load_field!'s
+        # transposes; an outer guard around both phases would hang here.
+        save_state(donor, path)
+        MPI.Barrier(COMM)
+        local_path = RANK == 1 ? joinpath(CHK_ROOT, "absent_metadata") : path
+        rejected = try
+            load_state!(restored, local_path)
+            false
+        catch err
+            err isa ErrorException
+        end
+        @test _agree(rejected)
+        @test _agree(restored.state[1].current_layout == :c &&
+                     parent(get_coeff_data(restored.state[1])) == original)
+
+        load_state!(restored, path)
+        @test _agree(restored.sim_time == donor.sim_time && restored.iteration == donor.iteration)
+    end
+
     @testset "Distributed checkpoint round-trips at the same rank count (rank=$RANK)" begin
         path = joinpath(CHK_ROOT, "same")
         solver, _ = _build(RK222(), 0.02)

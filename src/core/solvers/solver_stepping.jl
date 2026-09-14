@@ -623,8 +623,9 @@ Solves PER-FOURIER-MODE on the square per-subproblem tau matrices (`sp.L_min`,
 rank-deficient for multi-variable tau systems, so the dense per-subproblem solve
 is both correct and robust (Arpack on the global matrices throws
 `SingularException`). Spurious eigenvalues from the singular mass matrix (the
-algebraic BC/tau rows have zero `M`) come back as non-finite or astronomically
-large and are filtered out. Falls back to global Arpack only when no per-mode
+algebraic BC/tau rows have zero `M`) come back as non-finite and are filtered
+out. Finite eigenvalues are retained regardless of their dimensional magnitude.
+Falls back to global Arpack only when no per-mode
 subproblems are available.
 """
 function solve!(solver::EigenvalueSolver; nev::Int=solver.nev,
@@ -654,8 +655,9 @@ function solve!(solver::EigenvalueSolver; nev::Int=solver.nev,
             # diffusive (always-decaying, σ<0) problem was reported with σ>0, inverting
             # every stability conclusion. Eigenvectors are unchanged by the negation.
             F = eigen(-Lm, Mm)
-            # drop spurious eigenvalues from the singular (zero-row) mass matrix
-            keep = findall(x -> isfinite(x) && abs(x) < 1e10, F.values)
+            # Infinite modes from algebraic constraints are non-finite. A fixed
+            # magnitude cutoff also drops physical modes when rates or units change.
+            keep = findall(isfinite, F.values)
             append!(all_λ, F.values[keep])
             if n_active == 1
                 single_vecs = F.vectors[:, keep]

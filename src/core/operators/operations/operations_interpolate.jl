@@ -71,6 +71,8 @@ function interpolate_fourier(field::ScalarField, basis::FourierBasis, axis::Int,
     coeffs = get_coeff_data(field)
     is_gpu_array(coeffs) && error(
         "Fourier interpolation is not yet device-native; CPU fallback is disabled.")
+    bundle = _field_transform_bundle(field)
+    uses_rfft = _axis_uses_rfft(bundle, axis)
 
     # MPI: reducing the interpolation axis multiplies the coefficients by global-length
     # spectral weights and sums over that axis. If the axis is MPI-DECOMPOSED, each rank
@@ -91,18 +93,15 @@ function interpolate_fourier(field::ScalarField, basis::FourierBasis, axis::Int,
 
     # For 1D fields, evaluate directly
     if ndims(coeffs) == 1
-        return _interpolate_fourier_1d(coeffs, basis, N, L, x)
+        return _interpolate_fourier_1d(coeffs, basis, N, L, x, uses_rfft)
     end
 
-    # For multi-D fields, interpolate along the specified axis using spectral weights.
-    # The weight LAYOUT must match how this axis is stored: the operand's first
-    # RealFourier axis is an rfft half-spectrum (length N÷2+1), but a RealFourier axis
-    # that is NOT first is stored as a FULL FFT (length N, Hermitian) — that needs the
-    # full FFT-ordered weights, not the half-spectrum ones.
-    interp_weights = if isa(basis, RealFourier) && size(coeffs, axis) == N
-        _fourier_full_weights(N, L, x)        # full-FFT-stored RealFourier (non-first axis)
-    else
+    # Follow the transform plan: complex-valued RealFourier fields use full FFTs,
+    # and at N=1 or N=2 the half/full spectra cannot be distinguished by length.
+    interp_weights = if uses_rfft
         _fourier_interp_weights(basis, N, L, x)
+    else
+        _fourier_full_weights(N, L, x)
     end
 
     # Weighted sum along axis: result[...] = Σ_i weights[i] * coeffs[..., i, ...]
@@ -144,16 +143,13 @@ function interpolate_fourier(field::ScalarField, basis::FourierBasis, axis::Int,
     # A remaining rfft half-spectrum axis exists only when the interpolated axis was
     # NOT the operand's first RealFourier axis. ifft the full-spectrum axes, then irfft
     # the half axis (which yields a real array); otherwise a plain inverse FFT.
-    half_axis = findfirst(d -> isa(new_bases[d], RealFourier) &&
-                               size(result_data, d) < new_bases[d].meta.size,
-                          1:length(new_bases))
+    remaining_axes = Tuple(d for d in 1:nb if d != axis)
+    half_axis = findfirst(d -> _axis_uses_rfft(bundle, d), remaining_axes)
     if half_axis === nothing
-        # No remaining rfft half-spectrum axis. If every surviving axis is
-        # ComplexFourier the field is genuinely complex-valued, so keep the
-        # imaginary part; if any surviving axis is RealFourier (Hermitian) the
-        # physical field is real, so take the real part.
+        # RealFourier also supports complex grid data; its basis type alone
+        # does not imply that the reduced grid is real.
         full = ifft(result_data)
-        return all(b -> isa(b, ComplexFourier), new_bases) ? full : real.(full)
+        return field.dtype <: Complex ? full : real.(full)
     end
     full_axes = Tuple(d for d in 1:ndims(result_data) if d != half_axis)
     tmp = isempty(full_axes) ? result_data : ifft(result_data, full_axes)
@@ -165,9 +161,10 @@ end
 
 Evaluate 1D Fourier spectral reconstruction at position x.
 """
-function _interpolate_fourier_1d(coeffs::AbstractVector, basis::FourierBasis, N::Int, L::Real, x::Real)
+function _interpolate_fourier_1d(coeffs::AbstractVector, basis::FourierBasis, N::Int,
+                                 L::Real, x::Real, uses_rfft::Bool=isa(basis, RealFourier))
     k0 = 2π / L
-    if isa(basis, RealFourier)
+    if uses_rfft
         # RealFourier coefficients are stored as an UNNORMALIZED complex
         # half-spectrum (rfft): coeffs[i] holds mode k = i-1 for i = 1..N÷2+1.
         # Reconstruction: s(x) = (1/N) [ Re(c_0)
@@ -183,9 +180,7 @@ function _interpolate_fourier_1d(coeffs::AbstractVector, basis::FourierBasis, N:
             result += factor * real(coeffs[i] * cis(k0 * k * x))
         end
         return result / N
-    else  # ComplexFourier: full unnormalized spectrum, FFT-ordered wavenumbers.
-        # A ComplexFourier field is the representation for genuinely complex-valued
-        # data, so the interpolant is complex in general — keep the imaginary part.
+    else  # Full unnormalized spectrum, including complex-valued RealFourier fields.
         result = complex(0.0, 0.0)
         for i in 1:N
             k = i <= N ÷ 2 + 1 ? i - 1 : i - N - 1
