@@ -42,15 +42,15 @@ function is_time_dependent(value)
     return false
 end
 
-"""Check if value depends on spatial coordinates"""
-function is_space_dependent(value)
+"""Check if value depends on spatial coordinates (conventional names by default)."""
+function is_space_dependent(value, coordinate_names=_BC_SPACE_SYMBOLS)
     if isa(value, String)
-        return !isempty(intersect(_bc_free_symbols(value), _BC_SPACE_SYMBOLS))
+        symbols = _bc_free_symbols(value)
+        return any(name -> Symbol(name) in symbols, coordinate_names)
     elseif isa(value, SpaceDependentValue) || isa(value, TimeSpaceDependentValue)
         return true
     elseif isa(value, FieldReference)
-        spatial_coords = ["x", "y", "z", "r", "theta", "phi", "θ", "φ"]
-        return any(coord in value.dependencies for coord in spatial_coords)
+        return any(name -> string(name) in value.dependencies, coordinate_names)
     end
     return false
 end

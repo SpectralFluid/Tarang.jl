@@ -2,12 +2,14 @@ using Test
 using Tarang
 using MPI
 
-function _bc_context_problem(kind, bottom, top; bounds=(0.0, 1.0), parameters=NamedTuple(), three_d=false)
-    coords = three_d ? CartesianCoordinates("x", "y", "z") : CartesianCoordinates("x", "z")
+function _bc_context_problem(kind, bottom, top; bounds=(0.0, 1.0), parameters=NamedTuple(), three_d=false,
+                             coordinate_names=("x", "y", "z"))
+    xn, yn, zn = coordinate_names
+    coords = three_d ? CartesianCoordinates(xn, yn, zn) : CartesianCoordinates(xn, zn)
     dist = Distributor(coords; comm=MPI.COMM_SELF, dtype=Float64, architecture=CPU())
-    xb = RealFourier(coords["x"]; size=8, bounds=(0.0, 2π))
-    zb = ChebyshevT(coords["z"]; size=16, bounds=bounds)
-    tangential = three_d ? (xb, RealFourier(coords["y"]; size=6, bounds=(0.0, 2π))) : (xb,)
+    xb = RealFourier(coords[xn]; size=8, bounds=(0.0, 2π))
+    zb = ChebyshevT(coords[zn]; size=16, bounds=bounds)
+    tangential = three_d ? (xb, RealFourier(coords[yn]; size=6, bounds=(0.0, 2π))) : (xb,)
     u = ScalarField(dist, "u", (tangential..., zb), Float64)
     tau1 = ScalarField(dist, "tau1", tangential, Float64)
     tau2 = ScalarField(dist, "tau2", tangential, Float64)
@@ -19,6 +21,42 @@ function _bc_context_problem(kind, bottom, top; bounds=(0.0, 1.0), parameters=Na
     add_bc!(problem, bottom)
     add_bc!(problem, top)
     return problem, u, coords
+end
+
+@testset "boundary values use custom coordinate names" begin
+    disabled = dirichlet_bc("u", "z", 0.0, "sin(x)"; space_dependent=false)
+    problem, _, _ = _bc_context_problem(InitialValueProblem, disabled, "u(z=1)=0")
+    @test !first(problem.bc_manager.conditions).is_space_dependent
+    xs = (0:7) .* (2π/8)
+    zs = (1 .- cos.(π .* (0:15) ./ 15)) ./ 2
+    cases = (
+        ("u(wall=0)=amp*sin(s)", (x,z) -> sin(x)*sinh(1-z)/sinh(1)),
+        (dirichlet_bc("u", "wall", 0.0, "amp*sin(s)"), (x,z) -> sin(x)*sinh(1-z)/sinh(1)),
+        ("d(u,wall)(wall=0)=amp*cos(s)", (x,z) -> -cos(x)*sinh(1-z)/cosh(1)),
+        (neumann_bc("u", "wall", 0.0, "amp*cos(s)"), (x,z) -> -cos(x)*sinh(1-z)/cosh(1)),
+        ("1*u(wall=0)+0.5*d(u,wall)(wall=0)=amp*sin(s)",
+         (x,z) -> sin(x)*sinh(1-z)/(sinh(1)-0.5cosh(1))),
+        (robin_bc("u", "wall", 0.0, 1.0, 0.5, "amp*sin(s)"),
+         (x,z) -> sin(x)*sinh(1-z)/(sinh(1)-0.5cosh(1))),
+    )
+    for (bottom, exact) in cases
+        problem, u, _ = _bc_context_problem(LinearBoundaryValueProblem, bottom, "u(wall=1)=0";
+            coordinate_names=("s", "q", "wall"), parameters=(amp=1.25,))
+        solve!(BoundaryValueSolver(problem))
+        @test Array(grid_data!(u)) ≈ [1.25exact(x,z) for x in xs, z in zs] atol=1e-9
+    end
+    for moving in (false, true)
+        bottom = moving ? "u(wall=0)=sin(s)*(1+t)" : "u(wall=0)=sin(s)"
+        problem, u, _ = _bc_context_problem(InitialValueProblem, bottom, "u(wall=1)=0";
+            coordinate_names=("s", "q", "wall"))
+        solver = InitialValueSolver(problem, RK222(); dt=0.01)
+        for _ in 1:3; step!(solver); end
+        @test Array(grid_data!(u))[:,1] ≈ sin.(xs) .* (moving ? 1+solver.sim_time : 1) atol=1e-10
+    end
+    problem, u, _ = _bc_context_problem(LinearBoundaryValueProblem, "u(wall=0)=wall", "u(wall=1)=wall";
+        coordinate_names=("s", "q", "wall"))
+    solve!(BoundaryValueSolver(problem))
+    @test Array(grid_data!(u)) ≈ [z for x in xs, z in zs] atol=1e-10
 end
 
 @testset "steady solvers evaluate spatial boundary values" begin
