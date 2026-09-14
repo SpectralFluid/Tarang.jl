@@ -137,7 +137,7 @@ silently drops an implicit operator or substitutes a lower-order scheme.
 |---|---|---|
 | Serial CPU, pure Fourier | every scheme (global-matrix path; attached diagonal operators select per-mode division) | — |
 | Serial CPU, any Chebyshev/Jacobi axis | every IMEX RK and multistep scheme through per-mode tau subproblems | ETD (singular mass matrix of a tau/DAE system) |
-| MPI, pure Fourier, implicit operator on the LHS | RK111/222/443, RKSMR, RKGFY, RK443_IMEX, SBDF2, ETD_* — all as per-mode *distributed diagonal IMEX/ETD* | CNAB1/2, SBDF1/3/4, MCNAB2, CNLF2 (`ArgumentError`: no distributed diagonal implementation) |
+| MPI, pure Fourier, implicit operator on the LHS | RK111/222/443, RKSMR, RKGFY, SBDF2, ETD_* — all as per-mode *distributed diagonal IMEX/ETD* | CNAB1/2, SBDF1/3/4, MCNAB2, CNLF2 (`ArgumentError`: no distributed diagonal implementation) |
 | MPI, pure Fourier, no implicit operator | every RK and multistep scheme on the matrix-free field path at nominal order | — |
 | MPI, Chebyshev axis | the per-mode subproblem path (Chebyshev axis first) | — |
 | Single GPU, pure Fourier, implicit operator | `RK222`, `RK443`, `SBDF2` only, per-mode on device (from the equation's `L`, or an attached `SpectralLinearOperator`) | the remaining schemes (`ErrorException` naming supported schemes or "move the term to the RHS") |

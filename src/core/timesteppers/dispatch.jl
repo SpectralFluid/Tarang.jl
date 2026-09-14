@@ -238,7 +238,6 @@ function _dispatch_step!(::CNLF2, state, solver)
 end
 _dispatch_step!(::RKSMR, state, solver) = step_rksmr!(state, solver)   # IMEX ARK → step_rk_imex!
 _dispatch_step!(::RKGFY, state, solver) = step_rkgfy!(state, solver)
-_dispatch_step!(::RK443_IMEX, state, solver) = step_rk443_imex!(state, solver)
 
 # --- Diagonal IMEX methods (GPU-native) ---
 _dispatch_step!(::DiagonalIMEX_RK222, state, solver) = step_diagonal_imex_rk222!(state, solver)

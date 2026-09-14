@@ -394,7 +394,7 @@ end
 @testset "every timestepper is classified as multistep-reseeding or one-step" begin
     all_schemes = sort(String[string(nameof(T)) for T in subtypes(Tarang.TimeStepper)
                              if isconcretetype(T)])
-    @test length(all_schemes) >= 20   # the scanner must actually be finding types
+    @test length(all_schemes) >= 19   # the scanner must actually be finding types
 
     classified = union(Set(keys(Tarang._MULTISTEP_RESEED_STEPS)), Tarang._ONE_STEP_SCHEMES)
     unclassified = sort([s for s in all_schemes if !(s in classified)])
