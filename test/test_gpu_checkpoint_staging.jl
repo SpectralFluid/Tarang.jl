@@ -91,6 +91,8 @@ end
         CUDA.allowscalar(false)
         coords = CartesianCoordinates("x")
         dist = Distributor(coords; dtype=Float64, device=GPU())
+        isdefined(@__MODULE__, :test_output_postprocess_isolation) || include("netcdf_postprocess_support.jl")
+        test_output_postprocess_isolation(dist)
         xb = RealFourier(coords["x"]; size=8, bounds=(0.0, 2pi))
         u = ScalarField(Domain(dist, (xb,)), "u")
         original = cos.(collect(0:7) .* (2pi / 8))
