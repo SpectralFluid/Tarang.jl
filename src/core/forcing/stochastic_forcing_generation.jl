@@ -57,7 +57,7 @@ function generate_forcing!(forcing::StochasticForcing{T, N, A, CA}, t::Real, sub
     # Generate forcing using GPU-compatible method
     _generate_forcing_gpu_compatible!(forcing)
 
-    forcing.last_update_time = T(t)
+    forcing.last_update_time = Float64(t)
     return forcing.cached_forcing
 end
 
@@ -116,7 +116,7 @@ function generate_forcing!(forcing::SeparableStochasticForcing{T}, t::Real,
     _set_zero_mode!(forcing.fourier_realization, forcing.architecture)
 
     forcing.cached_forcing .= forcing.fourier_outer_view .* forcing.profile_outer_view
-    forcing.last_update_time = T(t)
+    forcing.last_update_time = Float64(t)
     return forcing.cached_forcing
 end
 

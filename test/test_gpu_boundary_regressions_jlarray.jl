@@ -50,11 +50,13 @@ else
         return solver, u, initial
     end
 
-    function bcjl_context_problem(kind, bottom, top; bounds=(0.0,1.0), parameters=NamedTuple())
-        coords = CartesianCoordinates("x", "z")
+    function bcjl_context_problem(kind, bottom, top; bounds=(0.0,1.0), parameters=NamedTuple(),
+                                  coordinate_names=("x", "z"))
+        xn, zn = coordinate_names
+        coords = CartesianCoordinates(xn, zn)
         dist = Distributor(coords; dtype=Float64, device=_BCJL_ARCH)
-        xb = RealFourier(coords["x"]; size=8, bounds=(0.0,2pi))
-        zb = ChebyshevT(coords["z"]; size=16, bounds=bounds)
+        xb = RealFourier(coords[xn]; size=8, bounds=(0.0,2pi))
+        zb = ChebyshevT(coords[zn]; size=16, bounds=bounds)
         u = ScalarField(dist, "u", (xb,zb), Float64)
         tau1 = ScalarField(dist, "tau1", (xb,), Float64)
         tau2 = ScalarField(dist, "tau2", (xb,), Float64)
@@ -69,6 +71,52 @@ else
     end
 
     @testset "GPU boundary buffer regressions on JLArray" begin
+        @testset "custom coordinate names on device boundary values" begin
+            xs = (0:7) .* (2pi/8)
+            zs = (1 .- cos.(pi .* (0:15) ./ 15)) ./ 2
+            cases = (
+                ("u(wall=0)=sin(s)", (x,z) -> sin(x)*sinh(1-z)/sinh(1)),
+                (neumann_bc("u", "wall", 0.0, "cos(s)"), (x,z) -> -cos(x)*sinh(1-z)/cosh(1)),
+                ("1*u(wall=0)+0.5*d(u,wall)(wall=0)=sin(s)",
+                 (x,z) -> sin(x)*sinh(1-z)/(sinh(1)-0.5cosh(1))),
+                (robin_bc("u", "wall", 0.0, 1.0, 0.5, "sin(s)"),
+                 (x,z) -> sin(x)*sinh(1-z)/(sinh(1)-0.5cosh(1))),
+            )
+            for (bottom, exact) in cases
+                problem, u, _ = bcjl_context_problem(LinearBoundaryValueProblem, bottom, "u(wall=1)=0";
+                    coordinate_names=("s", "wall"))
+                solve!(BoundaryValueSolver(problem; matsolver=BoundaryJLHostLU, batched_modes=false))
+                @test Array(grid_data!(u)) ≈ [exact(x,z) for x in xs, z in zs] atol=1e-9
+            end
+            for moving in (false, true)
+                bottom = moving ? "u(wall=0)=sin(s)*(1+t)" : "u(wall=0)=sin(s)"
+                problem, u, _ = bcjl_context_problem(InitialValueProblem, bottom, "u(wall=1)=0";
+                    coordinate_names=("s", "wall"))
+                solver = InitialValueSolver(problem, RK222(); dt=0.01,
+                    matsolver=BoundaryJLHostLU, batched_modes=false)
+                for _ in 1:3; step!(solver); end
+                @test Array(grid_data!(u))[:,1] ≈ sin.(xs) .* (moving ? 1+solver.sim_time : 1) atol=1e-10
+            end
+        end
+        @testset "subproblem RK retains small-dt stage contributions" begin
+            for ts in (RK222(), RK443()), dt in (0.1, 1e-15)
+                coords = CartesianCoordinates("x", "z")
+                dist = Distributor(coords; dtype=Float64, device=_BCJL_ARCH)
+                xb = RealFourier(coords["x"]; size=8, bounds=(0.0, 2pi))
+                zb = ChebyshevT(coords["z"]; size=6, bounds=(0.0, 1.0))
+                u = ScalarField(Domain(dist, (xb, zb)), "u")
+                copyto!(grid_data!(u), ones(8, 6))
+                problem = InitialValueProblem([u])
+                add_parameters!(problem; rate=0.1/dt)
+                add_equation!(problem, "dt(u) + rate*u = rate*u")
+                solver = InitialValueSolver(problem, ts; dt,
+                           matsolver=BoundaryJLHostLU, batched_modes=false)
+                for _ in 1:3; step!(solver); end
+                @test Tarang._timestepper_subproblems(solver) !== nothing
+                @test Array(grid_data!(u)) ≈ ones(8, 6) atol=2e-12
+            end
+        end
+
         @testset "empty-basis scalar storage and unit vectors" begin
             for T in (Float64, ComplexF64)
                 coords = CartesianCoordinates("x", "z")

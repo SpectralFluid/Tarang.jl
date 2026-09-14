@@ -52,6 +52,9 @@ end
         @test_skip "JLArrays not available"
     else
         GPUArrays.allowscalar(false)
+        isdefined(@__MODULE__, :test_stochastic_cache_precision) || include("stochastic_cache_support.jl")
+        test_stochastic_cache_precision(_JLS_ARCH)
+        test_stochastic_cache_precision(_JLS_ARCH; separable=true)
 
         @testset "Hermitian symmetry: device kernel == CPU loop" begin
             # The forcing spectrum is a FULL complex spectrum (field_size, not an

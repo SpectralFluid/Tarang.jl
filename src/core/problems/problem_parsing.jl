@@ -8,6 +8,7 @@ See also: [`no_slip!`](@ref), [`fixed_value!`](@ref), [`free_slip!`](@ref),
 [`insulating!`](@ref), [`dirichlet_bc`](@ref), [`neumann_bc`](@ref)
 """
 function add_bc!(problem::Problem, bc::AbstractBoundaryCondition)
+    bc = _bc_with_problem_coordinates(problem, bc)
     add_bc!(problem.bc_manager, bc)
 
     # Fourier bases enforce periodicity; the marker adds no constraint equation.
@@ -22,6 +23,32 @@ function add_bc!(problem::Problem, bc::AbstractBoundaryCondition)
     end
 
     return bc
+end
+
+# Standalone BC constructors have no domain context. Resolve additional spatial
+# dependencies when attaching the BC, using basis labels rather than assuming
+# that every Cartesian problem uses x/y/z. Preserve the other BC settings.
+function _bc_with_problem_coordinates(problem::Problem, bc::AbstractBoundaryCondition)
+    bc isa Union{DirichletBC,NeumannBC,RobinBC} || return bc
+    bc.is_space_dependent && return bc
+    # If the standalone detector already recognized the value, a false flag
+    # was an explicit override. Only infer dependencies it could not recognize.
+    is_space_dependent(bc.value) && return bc
+    names = Set{Symbol}()
+    for variable in problem.variables, component in scalar_components(variable), basis in component.bases
+        basis === nothing || push!(names, Symbol(basis.meta.element_label))
+    end
+    is_space_dependent(bc.value, names) || return bc
+    if bc isa DirichletBC
+        return DirichletBC(bc.field, bc.coordinate, bc.position, bc.value,
+                           bc.tau_field, bc.is_time_dependent, true)
+    elseif bc isa NeumannBC
+        return NeumannBC(bc.field, bc.coordinate, bc.position, bc.derivative_order,
+                         bc.value, bc.tau_field, bc.is_time_dependent, true)
+    else
+        return RobinBC(bc.field, bc.coordinate, bc.position, bc.alpha, bc.beta,
+                       bc.value, bc.tau_field, bc.is_time_dependent, true)
+    end
 end
 
 # Boundary conditions can also be passed to add_equation!() following convention:

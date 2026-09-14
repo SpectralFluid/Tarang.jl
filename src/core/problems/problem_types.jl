@@ -842,7 +842,7 @@ function _register_string_bc!(problem::Problem, bc_string::String)
         nothing
     end
     if robin_object !== nothing
-        add_bc!(problem.bc_manager, robin_object)
+        add_bc!(problem.bc_manager, _bc_with_problem_coordinates(problem, robin_object))
         return
     end
 
@@ -865,7 +865,7 @@ function _register_string_bc!(problem::Problem, bc_string::String)
         end
         field_name, coord, position, value = parts
         bc_obj = neumann_bc(field_name, coord, position, value)
-        add_bc!(problem.bc_manager, bc_obj)
+        add_bc!(problem.bc_manager, _bc_with_problem_coordinates(problem, bc_obj))
         return
     end
 
@@ -890,6 +890,6 @@ function _register_string_bc!(problem::Problem, bc_string::String)
     end
 
     bc_obj = dirichlet_bc(field_name, coord, position, value)
-    add_bc!(problem.bc_manager, bc_obj)
+    add_bc!(problem.bc_manager, _bc_with_problem_coordinates(problem, bc_obj))
     return
 end

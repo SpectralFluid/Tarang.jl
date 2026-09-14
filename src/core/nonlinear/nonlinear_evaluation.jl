@@ -248,19 +248,20 @@ end
 # _get_batched_backward_plan!/_BATCHED_PENCIL_PLAN_CACHE and the in-place-plan +
 # CPU/GPU split of _get_padded_workspace!/PaddedDealiasingWorkspace (serial sibling).
 #
-# Buffers are handed out by a per-call BUMP index (`idx`, reset to 0 at the start
-# of each call). Because the control flow is data-independent, the i-th _buf!
-# request asks for the same shape on every call, so each logical "role" (e.g. up1
-# vs up2, which are alive simultaneously when their product is formed) maps to a
-# DISTINCT, stable slot and never aliases. Every buffer is FULLY overwritten
+# Scratch is leased until its last read, then reused by a later operation with
+# the same pencil geometry. Both padded operands remain leased until multiplied;
+# spent transpose and FFT inputs can be reused immediately after completion.
+# Every buffer is FULLY overwritten
 # (transpose! destination, a `.=` copy, or a full-coverage pad/truncate) before it
 # is read, so stale data from a previous call is never observed — exactly the
 # property the original relied on when it allocated `undef` buffers each call.
 mutable struct PaddedDistDealiasWorkspace{CT}
     topo::Any
     pencils::Dict{Tuple{Tuple, Tuple}, Any}     # (global size, decomp dims) → memoized NoPermutation Pencil
-    buffers::Vector{Any}                         # per-call bump pool of complex scratch PencilArrays
-    idx::Base.RefValue{Int}
+    buffers::Vector{Any}
+    in_use::BitVector
+    transpose_count::Int                         # decomposition changes in the last product
+    transpose_elements::Int                      # global elements carried by those transposes
     fwd_plans::Dict{Tuple{Tuple, Int}, Any}      # (local array size, axis) → in-place forward FFT plan
     inv_plans::Dict{Tuple{Tuple, Int}, Any}      # (local array size, axis) → in-place inverse FFT plan
 end
@@ -279,7 +280,7 @@ function _get_padded_dist_workspace!(dist, topo, bases, ::Type{CT}, N, Mp, decom
     cached = get(_PADDED_DIST_WS_CACHE, key, nothing)
     cached === nothing || return cached::PaddedDistDealiasWorkspace{CT}
     ws = PaddedDistDealiasWorkspace{CT}(topo,
-        Dict{Tuple{Tuple, Tuple}, Any}(), Any[], Ref(0),
+        Dict{Tuple{Tuple, Tuple}, Any}(), Any[], BitVector(), 0, 0,
         Dict{Tuple{Tuple, Int}, Any}(), Dict{Tuple{Tuple, Int}, Any}())
     _PADDED_DIST_WS_CACHE[key] = ws
     return ws
@@ -309,20 +310,43 @@ end
            typeof(PencilArrays.permutation(a)) === typeof(PencilArrays.permutation(b))
 end
 
-# Next per-call scratch buffer for pencil `pen`. Bump index ⇒ each role gets a
-# distinct, stable slot (no aliasing of simultaneously-live buffers).
+# Reuse only an unleased buffer with the exact geometry; active operands never alias.
 function _padded_dist_buf!(ws::PaddedDistDealiasWorkspace{CT}, pen) where {CT}
-    i = (ws.idx[] += 1)
-    if i <= length(ws.buffers)
+    for i in eachindex(ws.buffers)
+        ws.in_use[i] && continue
         b = ws.buffers[i]::PencilArrays.PencilArray
-        _pen_compatible(PencilArrays.pencil(b), pen) && return b
-        nb = PencilArrays.PencilArray{CT}(undef, pen)       # shape changed: replace slot
-        ws.buffers[i] = nb
-        return nb
+        if _pen_compatible(PencilArrays.pencil(b), pen)
+            ws.in_use[i] = true
+            return b
+        end
     end
     nb = PencilArrays.PencilArray{CT}(undef, pen)
     push!(ws.buffers, nb)
+    push!(ws.in_use, true)
     return nb
+end
+
+function _release_padded_dist_buf!(ws::PaddedDistDealiasWorkspace, buffer)
+    for i in eachindex(ws.buffers)
+        if ws.buffers[i] === buffer
+            ws.in_use[i] = false
+            return nothing
+        end
+    end
+    throw(ArgumentError("Cannot release a buffer outside the padded workspace"))
+end
+
+# PencilArrays.transpose! completes the destination before returning. Only count
+# decomposition changes: a local permutation/copy does not communicate with ranks.
+function _padded_dist_transpose!(ws::PaddedDistDealiasWorkspace, dest, src)
+    dp, sp = PencilArrays.pencil(dest), PencilArrays.pencil(src)
+    if PencilArrays.decomposition(dp) != PencilArrays.decomposition(sp)
+        ws.transpose_count += 1
+        ws.transpose_elements += prod(PencilArrays.size_global(sp))
+    end
+    PencilArrays.transpose!(dest, src)
+    _release_padded_dist_buf!(ws, src)
+    return dest
 end
 
 # In-place single-local-axis FFT plans, cached by (local size, axis). CPU: FFTW
@@ -401,12 +425,17 @@ function evaluate_padded_multiply_distributed(field1::ScalarField, field2::Scala
     length(decomp0) <= D - 1 || return nothing
     all(d -> isfourier(bases[d]), decomp0) || return nothing   # only pad/transpose decomposed FOURIER axes
     ws = _get_padded_dist_workspace!(dist, topo, bases, CT, N, Mp, decomp0, fourier_axes)
-    ws.idx[] = 0
+    fill!(ws.in_use, false)
+    ws.transpose_count = 0
+    ws.transpose_elements = 0
     mkpen(sz, dd) = _padded_dist_pencil!(ws, sz, dd)
 
     tolog(gd) = begin
         gc = _padded_dist_buf!(ws, PencilArrays.pencil(gd)); parent(gc) .= CT.(parent(gd))
-        a = _padded_dist_buf!(ws, mkpen(N, decomp0)); PencilArrays.transpose!(a, gc); a
+        logical_pen = mkpen(N, decomp0)
+        _pen_compatible(PencilArrays.pencil(gc), logical_pen) && return gc
+        a = _padded_dist_buf!(ws, logical_pen)
+        _padded_dist_transpose!(ws, a, gc)
     end
     # Bring axis `a` into a LOCAL slot. "Local" is a SET, not a single axis: a
     # D-1 decomposition leaves one local axis, a coarser mesh leaves several, and
@@ -419,10 +448,12 @@ function evaluate_padded_multiply_distributed(field1::ScalarField, field2::Scala
         locs = setdiff(1:D, dec)
         l = (prefer != 0 && prefer in locs) ? prefer : first(locs)
         ndec = [d == a ? l : d for d in dec]
-        nxt = _padded_dist_buf!(ws, mkpen(csz, ndec)); PencilArrays.transpose!(nxt, cur); (nxt, ndec)
+        nxt = _padded_dist_buf!(ws, mkpen(csz, ndec))
+        _padded_dist_transpose!(ws, nxt, cur)
+        (nxt, ndec)
     end
     # Local-axis pad/truncate: forward FFT in place on the SPENT input buffer `pin`
-    # (never read again — see the workspace bump-pool note), pad/truncate into the
+    # (never read again), pad/truncate into the
     # fresh `pout` (a distinct slot/size), then inverse FFT in place. Plan-backed
     # (no per-call fft()/ifft() allocation); identical FFTW/CUFFT routines + 1/N
     # normalization as the original out-of-place fft/ifft, so the values match to
@@ -440,21 +471,27 @@ function evaluate_padded_multiply_distributed(field1::ScalarField, field2::Scala
         _truncate_spectral!(parent(pout), pp, Tuple(trl), Tuple(orig), [a])
         po = parent(pout); _padded_dist_inv_plan!(ws, po, a) * po
     end
-    sweep(start, sdec, ssz, tgt, op) = begin
+    sweep(start, sdec, ssz, tgt, op, axes_order) = begin
         cur = start; dec = collect(sdec); csz = collect(ssz)
-        for a in fourier_axes   # pad/truncate only Fourier axes; non-Fourier stay nodal/local
+        for a in axes_order   # pad/truncate only Fourier axes; non-Fourier stay nodal/local
             cur, dec = makelocal(cur, csz, dec, a, 0)
             csz[a] = tgt[a]
-            nxt = _padded_dist_buf!(ws, mkpen(csz, dec)); op(nxt, cur, a); cur = nxt
+            nxt = _padded_dist_buf!(ws, mkpen(csz, dec))
+            op(nxt, cur, a)
+            _release_padded_dist_buf!(ws, cur)
+            cur = nxt
         end
         cur
     end
 
-    up1 = sweep(tolog(gd1), decomp0, N, Mp, pad_local!)
-    up2 = sweep(tolog(gd2), decomp0, N, Mp, pad_local!)
+    up1 = sweep(tolog(gd1), decomp0, N, Mp, pad_local!, fourier_axes)
+    up2 = sweep(tolog(gd2), decomp0, N, Mp, pad_local!, fourier_axes)
     pdec = Tuple(PencilArrays.decomposition(PencilArrays.pencil(up1)))
-    P = _padded_dist_buf!(ws, mkpen(Mp, pdec)); parent(P) .= parent(up1) .* parent(up2)
-    res = sweep(P, pdec, Mp, N, trunc_local!)
+    parent(up1) .*= parent(up2)
+    _release_padded_dist_buf!(ws, up2)
+    # Separable truncations commute. Undo the padding order so the first axis is
+    # already local, and shrink each axis BEFORE communicating the next pencil.
+    res = sweep(up1, pdec, Mp, N, trunc_local!, reverse(fourier_axes))
     parent(res) .*= (T(prod(Mp)) / T(prod(N)))
 
     result = _checkout_nl_result!(evaluator, field1)
@@ -472,13 +509,17 @@ function evaluate_padded_multiply_distributed(field1::ScalarField, field2::Scala
         res, rdec = makelocal(res, collect(N), rdec, rgdec[i], 0)         # free the target axis
         res, rdec = makelocal(res, collect(N), rdec, rdec[i], rgdec[i])   # swap it into slot i
     end
-    rc = _padded_dist_buf!(ws, PencilArrays.pencil(rg))
-    PencilArrays.transpose!(rc, res)
+    rc = if _pen_compatible(PencilArrays.pencil(res), PencilArrays.pencil(rg))
+        res
+    else
+        _padded_dist_transpose!(ws, _padded_dist_buf!(ws, PencilArrays.pencil(rg)), res)
+    end
     if field1.dtype <: Complex
         parent(rg) .= parent(rc)
     else
         parent(rg) .= real.(parent(rc))
     end
+    _release_padded_dist_buf!(ws, rc)
     ensure_layout!(result, result_layout)
     return result
 end

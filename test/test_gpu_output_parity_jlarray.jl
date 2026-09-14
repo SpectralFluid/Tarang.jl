@@ -155,6 +155,11 @@ else
 
     @testset "NetCDF output parity: CPU vs JLArray device" begin
         GPUArrays.allowscalar(false)
+        @testset "mutating callbacks cannot change device fields or other tasks" begin
+            isdefined(@__MODULE__, :test_output_postprocess_isolation) || include("netcdf_postprocess_support.jl")
+            dist = Distributor(CartesianCoordinates("x"); dtype=Float64, device=_GOP_ARCH)
+            test_output_postprocess_isolation(dist)
+        end
         dir = mktempdir()
         cpu, cpu_storage, cpu_loaded = gop_run(CPU(), dir, "cpu")
         gpu, gpu_storage, gpu_loaded = gop_run(_GOP_ARCH, dir, "gpu")

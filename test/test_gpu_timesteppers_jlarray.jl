@@ -138,6 +138,15 @@ end
         implicit_supported = (RK222(), RK443(), SBDF2(), diagonal...)
         gtj_name(ts) = nameof(typeof(ts))
 
+        @testset "RK equilibrium is independent of time units" begin
+            for arch in (CPU(), _GTJ_ARCH), ts in (RK222(), RK443()), dt in (0.1, 1e-15)
+                rate = 0.1 / dt
+                values, _ = gtj_run(arch, "dt(u) + $rate*u = $rate*u", ts,
+                                    fill(dt, 3), x -> 1.0)
+                @test values ≈ ones(16) atol=2e-12
+            end
+        end
+
         @testset "Reference steps on CPU and device" begin
             for arch in (CPU(), _GTJ_ARCH)
                 for ts in (RK222(), Tarang.DiagonalIMEX_RK222())

@@ -140,7 +140,7 @@ where ξ(k) is complex white noise with |ξ| = 1 and random phase.
 - `rng::AbstractRNG`: Random number generator (default: fresh MersenneTwister per instance for thread/parallel safety)
 - `random_phases::AbstractArray{T,N}`: Pre-allocated random phase buffer (on target architecture)
 - `diagnostic_weights`: Cached backend weights for the active GPU diagnostic layout
-- `last_update_time::T`: Time of last forcing update
+- `last_update_time::Float64`: Time of last forcing update, matching solver time precision
 - `spectrum_type::Symbol`: Type of forcing spectrum
 - `enforce_hermitian::Bool`: Enforce Hermitian symmetry for real-valued fields
 - `architecture::AbstractArchitecture`: CPU() or GPU() architecture
@@ -163,7 +163,8 @@ mutable struct StochasticForcing{T<:AbstractFloat, N, A<:AbstractArray{T,N}, CA<
     diagnostic_global_shape::NTuple{N, Int}
     diagnostic_local_ranges::NTuple{N, UnitRange{Int}}
     diagnostic_metric::Symbol
-    last_update_time::T
+    # Cache identity follows solver time, not the precision of forcing arrays.
+    last_update_time::Float64
     spectrum_type::Symbol
     enforce_hermitian::Bool                 # Enforce Hermitian symmetry for real fields
     architecture::AbstractArchitecture
@@ -206,7 +207,7 @@ mutable struct SeparableStochasticForcing{
     fourier_realization::FCA
     fourier_outer_view::FRV
     profile_outer_view::PV
-    last_update_time::T
+    last_update_time::Float64
     spectrum_type::Symbol
     enforce_hermitian::Bool
     architecture::AbstractArchitecture
@@ -401,7 +402,7 @@ function StochasticForcing(;
         ntuple(_ -> 0, N),
         ntuple(_ -> 1:0, N),
         injection_metric,
-        T(-Inf),  # Initialize to -Inf so first call always updates
+        -Inf,  # Initialize to -Inf so first call always updates
         spectrum_type,
         enforce_hermitian,
         architecture
@@ -538,7 +539,7 @@ function SeparableStochasticForcing(;
         fourier_realization,
         fourier_outer_view,
         profile_outer_view,
-        T(-Inf),
+        -Inf,
         base.spectrum_type,
         enforce_hermitian,
         architecture,

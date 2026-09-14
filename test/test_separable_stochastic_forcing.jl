@@ -3,6 +3,8 @@ using Random
 using Tarang
 
 @testset "Separable stochastic forcing" begin
+    isdefined(@__MODULE__, :test_stochastic_cache_precision) || include("stochastic_cache_support.jl")
+    test_stochastic_cache_precision(CPU(); separable=true)
     coords = CartesianCoordinates("z")
     zbasis = ChebyshevT(coords["z"]; size=10, bounds=(0.0, 1.0))
 

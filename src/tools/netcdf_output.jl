@@ -2099,9 +2099,11 @@ function _stage_task_data!(handler::NetCDFFileHandler, task::Dict,
 end
 
 function _postprocess_task_data(task::Dict, data, precision::Type=Float64)
-    # Apply optional postprocess (slices/reductions)
+    # A staged array may alias a live CPU field and is reused by other tasks.
+    # Give callbacks private storage so in-place operations (even before an
+    # exception) cannot change the simulation or contaminate later output.
     if task["postprocess"] !== nothing
-        data = task["postprocess"](data)
+        data = task["postprocess"](copy(data))
     end
     # Ensure plain CPU array for NetCDF - handle scalars by wrapping in 1-element array
     # Use get_cpu_data() to handle any remaining GPU arrays

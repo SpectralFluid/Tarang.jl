@@ -63,6 +63,11 @@ end
 
 if get(ENV, "TARANG_TEST_NETCDF_OUTPUT", "1") != "0"
 @testset "NetCDF output integration regressions" begin
+    @testset "mutating callbacks cannot change fields or other tasks" begin
+        isdefined(@__MODULE__, :test_output_postprocess_isolation) || include("netcdf_postprocess_support.jl")
+        dist, _ = _serial_output_field()
+        test_output_postprocess_isolation(dist)
+    end
     @testset "output scales resample without changing the field" begin
         dist, u = _serial_output_field()
         original = cos.(collect(0:3) .* (2pi / 4))
