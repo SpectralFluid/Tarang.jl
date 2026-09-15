@@ -48,6 +48,52 @@ eigenvalues, eigenvectors = solve!(solver)
 @assert isapprox(sort(real.(eigenvalues); rev=true), -(π .* (1:4)).^2; rtol=1e-6)
 ```
 
+## Computed spectrum and eigenmodes
+
+The figures below run the example above with 32 Chebyshev coefficients on the
+CPU in `Float64`. Diffusion with homogeneous Dirichlet boundaries is a standard
+EVP benchmark: both the decay rates and eigenfunctions are known analytically.
+In this run, the largest relative eigenvalue error was ``2.22\times10^{-13}``
+and the largest grid-point eigenfunction error was ``3.18\times10^{-14}``.
+Roundoff-level results can vary with Julia and the linear algebra backend.
+
+![The first four diffusion decay rates agree with the analytic spectrum; the second panel shows their relative errors.](../assets/figures/eigenvalue/diffusion_spectrum.svg)
+
+The decay rates are ``-\operatorname{Re}\sigma_n=(n\pi)^2``. The error panel
+compares the computed eigenvalues with these exact values; errors smaller than
+machine epsilon are displayed at epsilon.
+
+[Spectrum PNG](../assets/figures/eigenvalue/diffusion_spectrum.png) ·
+[Spectrum SVG](../assets/figures/eigenvalue/diffusion_spectrum.svg) ·
+[Eigenvalues and error measurements (CSV)](../assets/figures/eigenvalue/diffusion_modes.csv)
+
+![Four computed diffusion eigenfunctions at Chebyshev nodes overlaid on the exact sine functions.](../assets/figures/eigenvalue/diffusion_eigenmodes.svg)
+
+Dots show eigenvectors reconstructed on the Chebyshev grid; dashed curves show
+``\sin(n\pi z)``. Each eigenvector has an arbitrary sign and amplitude, aligned
+here by a least-squares fit to the analytic function. No spatial rescaling is
+applied.
+
+[Eigenmodes PNG](../assets/figures/eigenvalue/diffusion_eigenmodes.png) ·
+[Eigenmodes SVG](../assets/figures/eigenvalue/diffusion_eigenmodes.svg) ·
+[Computed profiles (CSV)](../assets/figures/eigenvalue/diffusion_profiles.csv)
+
+### Reproduce the figures
+
+From the repository root, install the optional CairoMakie environment and run
+the generator:
+
+```bash
+julia --project=docs/figures -e 'using Pkg; Pkg.develop(path="."); Pkg.instantiate()'
+julia --project=docs/figures docs/figures/eigenvalue.jl
+```
+
+The script executes this page's Julia example, checks the eigenvalues,
+reconstructed eigenfunctions, wall values, and generalized matrix residuals,
+then writes SVG, PNG, and CSV files to `docs/src/assets/figures/eigenvalue/`.
+The normal documentation build uses these saved assets and does not require
+CairoMakie.
+
 ## Selecting and interpreting modes
 
 `nev` selects the number of modes. `which=:SM` selects smallest magnitude;
