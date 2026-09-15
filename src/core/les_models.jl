@@ -39,8 +39,6 @@ on the GPU and computations use GPU-optimized broadcasting.
 3. Abkar, M., Bae, H.J., Moin, P. (2016). "Minimum-dissipation scalar transport model"
 """
 
-# LinearAlgebra already in Tarang.jl
-
 # ============================================================================
 # Abstract Types
 # ============================================================================
@@ -66,18 +64,9 @@ abstract type EddyViscosityModel <: SGSModel end
 """
     _validate_gradient_arrays(reference, arrays...)
 
-Validate every input gradient array against `reference` — the model's own output
-array, which is what the kernels actually iterate.
-
-This check is deliberately NOT wrapped in `@boundscheck`. It used to be, and that
-made it vanish under `--check-bounds=no` (a plausible flag for a production LES
-run) while the kernels still ran `@inbounds`: an undersized gradient array was
-then read past its end, which segfaults for a large mismatch and silently returns
-values read from unowned memory for a small one. One predictable branch per call
-is nothing against the O(N) work that follows.
-
-`reference` is the model's array rather than `model.field_size`, so a mutated
-`field_size` cannot desync the validated shape from the iterated one.
+Validate gradients against the output buffer's shape, not mutable `field_size`.
+Keep validation outside `@boundscheck`: the kernels use `@inbounds`, so shape
+checks must remain active under `--check-bounds=no`.
 """
 function _validate_gradient_arrays(reference::AbstractArray, arrays...)
     expected_size = size(reference)
@@ -95,13 +84,9 @@ end
 """
     _reject_nonlocal_array(i, arr)
 
-Reject array types whose element order does not match the model's own array.
-
-The kernels pair cells positionally against a rank-local dense array. A
-`PencilArray` reports the same `size` but stores its data in (possibly permuted)
-parent order, so mixing one in passes a size check and then silently pairs the
-wrong cells — measured at 75% of cells mispaired for a `Permutation(3,2,1)`
-pencil. Fail loudly with the fix instead.
+Require the same storage order as the model's rank-local dense arrays.
+A `PencilArray` may have permuted storage despite a matching size; callers must
+pass `get_local_data(field)` or `parent(array)`.
 """
 @inline function _reject_nonlocal_array(i::Int, arr::AbstractArray)
     if arr isa PencilArrays.PencilArray
@@ -117,15 +102,9 @@ end
 """
     _safe_quotient(C, numer, denom)
 
-Return `C * numer / denom`, guarding only the genuine `0/0`.
-
-AMD kernels pass contractions of normalized gradients here. Forming powers of
-the physical gradients first can underflow or overflow even when their quotient
-is representable. An absolute epsilon guard on a dimensional gradient norm is
-also incorrect: it would make the result depend on the caller's choice of units.
-
-NaN propagates deliberately. Returning zero for a blown-up velocity field would
-hide the blow-up at the one place a solver would naturally notice it.
+Return `C * (numer / denom)` for normalized AMD contractions; return zero for a
+zero denominator and propagate NaN. Avoid an absolute epsilon cutoff, which
+would make the result depend on the gradient's units.
 """
 @inline function _safe_quotient(C::T, numer::T, denom::T) where {T}
     isnan(denom) && return T(NaN)
@@ -146,9 +125,7 @@ Clip a negative eddy-viscosity/diffusivity predictor to zero when requested.
 Geometric-mean filter width `(Δ₁ Δ₂ … Δ_N)^(1/N)`, derived on demand so a mutated
 `filter_width` can never disagree with it.
 """
-# Signature requires at least one element: `NTuple{N,T}` also matches the empty
-# tuple, which leaves `T` unbound (Aqua flags it, and `prod(())^(1/0)` is
-# meaningless anyway). `N` comes from the tuple length, which is static.
+# Require a nonempty tuple so the mean is defined and `T` remains bound.
 @inline function _effective_delta(filter_width::Tuple{T, Vararg{T}}) where {T}
     return T(prod(filter_width)^(1 / length(filter_width)))
 end
@@ -156,10 +133,8 @@ end
 """
     _validate_model_params(constant_name, constant, filter_width, field_size)
 
-Shared constructor validation for the SGS models. Previously absent, which let
-`filter_width = (-1,-1,-1)` construct an AMD model silently (the sign vanished in
-the squaring) while raising `DomainError` from the geometric mean in Smagorinsky,
-and let `C = -5` (anti-dissipative), zero widths, and empty grids through.
+Require a finite nonnegative model constant, finite positive filter widths,
+and positive grid extents.
 """
 function _validate_model_params(constant_name::Symbol, constant::Real,
                                 filter_width::NTuple{N, Real},
@@ -193,9 +168,7 @@ function _coerce_arrays_to_architecture(arch::AbstractArchitecture, arrays::Abst
     return tuple((_ensure_array_on_architecture(arch, arr) for arr in arrays)...)
 end
 
-# One method per architecture rather than an `is_gpu` branch: a GPU model that
-# reaches a build without the CUDA extension now fails on the missing
-# `on_architecture(::GPU, _)` method instead of silently taking the host path.
+# Architecture dispatch requires a device transfer implementation for GPU models.
 @inline function _ensure_array_on_architecture(::CPU, arr::AbstractArray)
     is_gpu_array(arr) && error(
         "A CPU LES model cannot consume GPU gradient arrays; CPU fallback is disabled. " *
@@ -342,7 +315,7 @@ end
 
 Compute eddy viscosity from velocity gradient components.
 
-GPU-aware: Uses broadcasting for GPU arrays, optimized SIMD loops for CPU.
+Uses shared scalar kernels broadcast over CPU or GPU arrays.
 
 ## 2D Case
 ```julia
@@ -357,12 +330,8 @@ compute_eddy_viscosity!(model, ∂u∂x, ∂u∂y, ∂u∂z, ∂v∂x, ∂v∂y,
 # ----------------------------------------------------------------------------
 # Pointwise kernels
 # ----------------------------------------------------------------------------
-# One scalar function per formula, broadcast over whatever array type the model
-# holds. CPU and GPU previously ran separately hand-written implementations of
-# the same algebra: they happened to agree bitwise, but every future edit had to
-# be mirrored by hand, and the GPU branch materialised up to eight field-sized
-# temporaries per call (≈1 GB at 256³ Float64 for AMD 3-D). Broadcasting one
-# scalar kernel needs none and cannot drift.
+# CPU and GPU broadcast the same scalar kernels, fusing intermediate arithmetic
+# without allocating field-sized temporaries.
 
 """
     _smag_strain(gradients...)
@@ -675,7 +644,7 @@ end
 
 Compute AMD eddy viscosity from velocity gradient components.
 
-GPU-aware: Uses broadcasting for GPU arrays, optimized SIMD loops for CPU.
+Uses shared scalar kernels broadcast over CPU or GPU arrays.
 
 ## 2D Case
 ```julia
@@ -752,21 +721,16 @@ end
 
 Compute eddy diffusivity for scalar transport using AMD model.
 
-GPU-aware: Uses broadcasting for GPU arrays, optimized SIMD loops for CPU.
+Uses shared scalar kernels broadcast over CPU or GPU arrays.
 
 For a scalar field b with gradient ∇b, the AMD eddy diffusivity
-(Abkar, Bae & Moin 2016, eq. 2.7) is the FULL double contraction over the
-scaled-gradient direction k AND all velocity components i:
+(Abkar, Bae & Moin 2016, eq. 2.7) contracts over the scaled-gradient direction k
+and all velocity components i:
 
     κₑ = max(0, κₑ†),   κₑ† = -C · [ Σₖ δₖ² (∂ₖ uᵢ)(∂ₖ b)(∂ᵢ b) ] / [ (∂ₗ b)(∂ₗ b) ]
 
-i.e. for each direction k form the inner sum Σᵢ (∂ₖ uᵢ)(∂ᵢ b) over ALL velocity
-components uᵢ, weight by δₖ²(∂ₖ b), and sum over k. The method therefore needs
-every velocity-gradient component ∂uᵢ/∂xₖ (2D: 4 of them; 3D: 9), passed in
-component-major order, followed by the scalar gradients ∂b/∂xₖ.
-(An earlier version summed only a single velocity component, contracting the
-scaled velocity gradient with the SAME scalar-gradient direction twice — that is
-NOT the AMD diffusivity and is fixed here.)
+Pass every velocity-gradient component ∂uᵢ/∂xₖ (2D: 4; 3D: 9) in component-major
+order, followed by the scalar gradients ∂b/∂xₖ.
 """
 function compute_eddy_diffusivity!(
     model::AMDModel{T, 2, A, Arch},

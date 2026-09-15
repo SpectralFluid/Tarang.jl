@@ -1,8 +1,6 @@
 # Architecture and Codebase Structure
 
-This page is a contributor map of Tarang.jl. It describes ownership and the
-runtime path without duplicating type definitions that are easier to read in
-the source.
+This page maps source ownership, dependencies, and solver execution in Tarang.jl.
 
 Use the website's **dev** version for the structure on `main`; **stable**
 describes the latest tagged release. The published manual is built from
@@ -167,8 +165,7 @@ For an InitialValueProblem, trace these files:
    structure, and whether global matrices and subproblems were assembled.
 6. `core/solvers/solver_stepping.jl` refreshes dynamic boundary conditions and
    calls the timestepper dispatcher (`core/timesteppers/dispatch.jl`), which
-   first runs the loud guards (stochastic-forcing compatibility, the single-GPU
-   implicit-operator refusal).
+   checks stochastic-forcing and single-GPU implicit-operator compatibility.
 7. `core/timesteppers/step_selection.jl` chooses the runtime path; the
    per-scheme `step_*!` functions then run one of the paths below.
 
@@ -188,9 +185,8 @@ refresh BCs → evaluate RHS → per-mode solve → update fields
 
 ### Timestepper runtime paths
 
-Every scheme picks one of these paths from the same facts. There is never a
-silent fourth option: a configuration with no correct path raises and names
-the working alternative.
+Runtime selection uses the execution plan and timestepper capabilities.
+Unsupported configurations raise an error.
 
 | Path | File | When |
 |---|---|---|
@@ -240,18 +236,9 @@ the same scalar kernels over architecture-specific arrays. There is no separate
 CUDA AMD implementation under `ext/cuda/`; the extension supplies device arrays
 and transfers through the architecture interface.
 
-AMD normalizes velocity gradients before forming their contractions, then
-restores the velocity scale. Its scalar diffusivity additionally normalizes
-scalar gradients, whose scale cancels. This avoids the intermediate powers of
-very small or large gradients that previously produced zero or NaN despite a
-representable result.
-
-These closures consume grid-space gradient arrays and return eddy viscosity,
-diffusivity, or stress arrays. They are not automatically attached to the solver RHS. Callers
-must apply the divergence of the full symmetric SGS stress, including the
-contribution from spatially varying viscosity; see [LES Models](les_models.md).
-The CPU, reference-device, and CUDA test ownership is described in
-[Testing](testing.md).
+Callers supply grid-space gradients and apply the resulting stress to the RHS.
+See [LES Models](les_models.md) for AMD gradient normalization and the full
+variable-viscosity stress, and [Testing](testing.md) for CPU/JLArrays/CUDA coverage.
 
 ## RHS execution policy
 
@@ -316,15 +303,9 @@ The two conventions it encodes differ: with PencilArrays the **last**
 **first** ones are. Both live in `src/core/distributor/distributor_core.jl` and
 nowhere else.
 
-Do not re-derive the rule at a call site. It was previously written out by hand
-in seventeen places, and two of those copies drifted apart — the array allocator
-and the index math disagreed about which axes were split, so a field's shape and
-the meaning of its indices no longer matched, with no error raised.
-`test_decomposition_convention.jl` scans `src/` for hand-rolled copies, checking
-the arithmetic as well as the comments, and fails if one reappears.
-
-`ndim` is the *field's* dimensionality, which is not always `dist.dim`; pass the
-one you mean.
+Use these helpers at call sites; `test_decomposition_convention.jl` detects
+independent copies of the axis arithmetic. Pass the field's dimensionality as
+`ndim`, which can differ from `dist.dim`.
 
 ## Extension checklist
 
