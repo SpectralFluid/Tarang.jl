@@ -17,6 +17,7 @@ jobs:
     permissions:
       contents: write
       pages: write
+      pull-requests: read
     steps:
       - uses: actions/checkout@v7
 
@@ -63,6 +64,15 @@ jobs:
 
       - name: Build and deploy
         env:
+          # Publish to this repository with the workflow token. The legacy
+          # DOCUMENTER_KEY cannot push after the repository transfer.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          DOCUMENTER_KEY: ${{ secrets.DOCUMENTER_KEY }}
         run: julia --project=docs docs/make.jl
+
+      # GITHUB_TOKEN pushes do not automatically trigger a branch-based Pages
+      # build, so request publication explicitly after Documenter succeeds.
+      - name: Publish GitHub Pages
+        if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh api --method POST "repos/$GITHUB_REPOSITORY/pages/builds"
