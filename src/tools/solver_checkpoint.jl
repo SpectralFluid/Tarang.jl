@@ -76,6 +76,11 @@ end
 Write `solver.state` and the simulation clock to NetCDF. Serial runs produce
 `<path>.nc`; under MPI each rank writes `<path>/<name>_p<rank>.nc` with no gather.
 
+Registered stochastic forcings also store their RNG, cached realization, and
+cache clock. These host-only payloads support CPU/GPU and rank-count changes,
+but require the same Julia major/minor version for RNG deserialization.
+Previous-solution work-diagnostic scratch is not checkpointed.
+
 Zero-dimensional tau variables are skipped: they carry no spatial data and are
 re-solved from the state on the next step.
 
@@ -88,6 +93,9 @@ walked into the solver's next collective.
 function save_state(solver::InitialValueSolver, path::AbstractString)
     isempty(solver.state) && error("save_state: solver.state is empty; nothing to write.")
     dist = solver.state[1].dist
+    forcing_payload = _collectively(dist, "save_state stochastic forcing") do
+        _stochastic_checkpoint_payload(solver)
+    end
     target = _slab_output_path!(dist, path, "save_state")
 
     # Transpose EVERY field to grid space before the write loop, not inside it.
@@ -113,6 +121,7 @@ function save_state(solver::InitialValueSolver, path::AbstractString)
             write_local_slab(target, field.name, host, local_start, global_shape)
         end
 
+        _write_stochastic_checkpoint!(target, forcing_payload)
         ncputatt(target, "global", Dict("sim_time" => Float64(solver.sim_time),
                                         "iteration" => Int(solver.iteration),
                                         "dt" => Float64(solver.dt)))
@@ -154,6 +163,10 @@ Restore `solver.state` and the simulation clock from a checkpoint written at any
 rank count. Discards the timestepper's cached state so the scheme restarts from
 the loaded fields.
 
+Registered stochastic forcing must match the saved configuration. A legacy
+checkpoint without forcing state cannot reproduce a stochastic trajectory and
+is rejected for a stochastically forced solver before any fields are restored.
+
 Every slab must carry all three clock attributes with identical values. Validate
 them before restoring any fields: a save interrupted on one rank can leave its
 slab without completion attributes, or leave a complete slab from an older save.
@@ -164,9 +177,9 @@ function load_state!(solver::InitialValueSolver, path::AbstractString)
     isempty(solver.state) && error("load_state!: solver.state is empty; nothing to restore.")
     dist = solver.state[1].dist
 
-    src, clock = _collectively(dist, "load_state! checkpoint metadata") do
+    src, clock, forcing_state = _collectively(dist, "load_state! checkpoint metadata") do
         src = open_slab_source(path)
-        (src, _checkpoint_clock(src, path))
+        (src, _checkpoint_clock(src, path), _prepare_stochastic_restart(solver, src))
     end
 
     _collectively(dist, "load_state!") do
@@ -178,6 +191,7 @@ function load_state!(solver::InitialValueSolver, path::AbstractString)
         solver.sim_time = clock.sim_time
         solver.iteration = clock.iteration
         solver.dt = clock.dt
+        _restore_stochastic_restart!(forcing_state)
 
         # A checkpoint variable with no matching solver.state field is not an
         # error -- a file may legitimately hold more than this solver needs --

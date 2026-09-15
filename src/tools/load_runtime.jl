@@ -14,5 +14,6 @@ include("netcdf_slab_io.jl")
 # and the merge readers included just above, which is why they cannot live under
 # `core/` — see field_netcdf_io.jl's header and test/test_layering.jl.
 include("field_netcdf_io.jl")
+include("stochastic_checkpoint.jl")
 include("solver_checkpoint.jl")
 include("temporal_filters.jl")

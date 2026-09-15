@@ -82,6 +82,7 @@ const TEST_FILES = [
     "test_cartesian_operators.jl",
     "test_stochastic_forcing.jl",
     "test_separable_stochastic_forcing.jl",
+    "test_stochastic_checkpoint_restart.jl",
     "test_temporal_filters.jl",
     "test_temporal_filters_extended.jl",
     "test_arithmetic.jl",
@@ -230,6 +231,8 @@ const OPTIONAL_TEST_FILES = [
 # Single-process CUDA tests. Run with TARANG_RUN_GPU_TESTS=true on a CUDA host
 # (the JuliaGPU Buildkite pipeline sets this).
 const GPU_TEST_FILES = [
+    "test_stochastic_forcing.jl",
+    "test_stochastic_checkpoint_restart.jl",
     "test_gpu_nonlinear_optimizations.jl",
     "test_gpu_rk_optimizations_cuda.jl",
     "test_gpu_optional_workspaces_cuda.jl",
