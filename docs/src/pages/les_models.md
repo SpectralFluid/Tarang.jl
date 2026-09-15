@@ -106,10 +106,19 @@ where:
 This transforms the filtered momentum equation into:
 
 ```math
-\frac{\partial \bar{u}_i}{\partial t} + \bar{u}_j \frac{\partial \bar{u}_i}{\partial x_j} = -\frac{1}{\rho}\frac{\partial \bar{p}^*}{\partial x_i} + (\nu + \nu_e) \nabla^2 \bar{u}_i
+\frac{\partial \bar{u}_i}{\partial t} + \bar{u}_j \frac{\partial \bar{u}_i}{\partial x_j} = -\frac{1}{\rho}\frac{\partial \bar{p}^*}{\partial x_i} + \frac{\partial}{\partial x_j}\left[2(\nu + \nu_e)\bar{S}_{ij}\right]
 ```
 
 where we've absorbed the isotropic part into a modified pressure $\bar{p}^*$.
+
+For constant molecular viscosity and incompressible velocity, the viscous term
+expands to $(\nu + \nu_e)\nabla^2\bar{u}_i +
+2(\partial_j\nu_e)\bar{S}_{ij}$. Keep the full symmetric stress inside the
+divergence when $\nu_e$ varies in space; multiplying the Laplacian by the local
+viscosity, or taking the divergence of an unsymmetrized velocity gradient,
+omits part of the SGS force. `compute_sgs_stress` returns
+$\tau_{ij}=-2\nu_e\bar{S}_{ij}$; its contribution to momentum is
+$-\partial_j\tau_{ij}$.
 
 **Key insight**: The SGS model effectively adds a spatially-varying viscosity $\nu_e(x,t)$ to the molecular viscosity $\nu$.
 
@@ -486,7 +495,8 @@ for step in 1:nsteps
 
     # --- Step 4: Advance the momentum equation (your code) ---
     # The filtered Navier-Stokes with SGS model:
-    #   ∂ū/∂t + (ū·∇)ū = -∇p̄/ρ + ∇·((ν + νₑ)∇ū)
+    #   ∂ū/∂t + (ū·∇)ū = -∇p*/ρ + ∇·[2(ν + νₑ)S̄]
+    #   S̄ = (∇ū + transpose(∇ū))/2
     #
     # ν_eff is a plain array and no timestepper keyword accepts it, so the
     # variable-viscosity term must be assembled and applied explicitly.

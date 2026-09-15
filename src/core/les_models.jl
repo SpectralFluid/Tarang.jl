@@ -119,21 +119,17 @@ end
 
 Return `C * numer / denom`, guarding only the genuine `0/0`.
 
-`denom` is `|∇u|²` (or `|∇b|²`) — a DIMENSIONAL quantity. The previous guard
-compared it against an absolute `100*eps(T)`, which made the result depend on the
-caller's choice of units and dtype and broke the model's exact invariances: κₑ is
-mathematically unchanged by `b → αb`, yet a Float64 scalar scaled by 1e-8 (a trace
-species in mixing-ratio units) returned identically zero, and in Float32 an
-ordinary weakly-turbulent field had 89% of its cells silently zeroed. No guard
-that large is needed: `numer` is `O(denom^1.5)`, so the quotient stays finite for
-every `denom > 0` down to the smallest subnormal.
+AMD kernels pass contractions of normalized gradients here. Forming powers of
+the physical gradients first can underflow or overflow even when their quotient
+is representable. An absolute epsilon guard on a dimensional gradient norm is
+also incorrect: it would make the result depend on the caller's choice of units.
 
 NaN propagates deliberately. Returning zero for a blown-up velocity field would
 hide the blow-up at the one place a solver would naturally notice it.
 """
 @inline function _safe_quotient(C::T, numer::T, denom::T) where {T}
     isnan(denom) && return T(NaN)
-    return denom > zero(T) ? C * numer / denom : zero(T)
+    return denom > zero(T) ? C * (numer / denom) : zero(T)
 end
 
 """
@@ -585,6 +581,12 @@ most easily got wrong.
 """
 @inline function _amd_nu(C::T, Δx²::T, Δy²::T, clip::Bool,
                          u_x::T, u_y::T, v_x::T, v_y::T) where {T}
+    # nu(a*G) = a*nu(G) for a > 0. Normalize BEFORE squaring/cubing;
+    # all intermediates in the gradient contraction then remain O(1).
+    scale = max(abs(u_x), abs(u_y), abs(v_x), abs(v_y))
+    isfinite(scale) || return T(NaN)
+    iszero(scale) && return zero(T)
+    u_x, u_y, v_x, v_y = map(g -> g / scale, (u_x, u_y, v_x, v_y))
     S11 = u_x
     S22 = v_y
     S12 = T(0.5) * (u_y + v_x)
@@ -592,13 +594,19 @@ most easily got wrong.
     numer_x = Δx² * (u_x^2 * S11 + T(2) * u_x * v_x * S12 + v_x^2 * S22)
     numer_y = Δy² * (u_y^2 * S11 + T(2) * u_y * v_y * S12 + v_y^2 * S22)
     numer = -(numer_x + numer_y)
-    return _apply_clip(clip, _safe_quotient(C, numer, denom))
+    return _apply_clip(clip, scale * _safe_quotient(C, numer, denom))
 end
 
 @inline function _amd_nu(C::T, Δx²::T, Δy²::T, Δz²::T, clip::Bool,
                          u_x::T, u_y::T, u_z::T,
                          v_x::T, v_y::T, v_z::T,
                          w_x::T, w_y::T, w_z::T) where {T}
+    scale = max(abs(u_x), abs(u_y), abs(u_z), abs(v_x), abs(v_y), abs(v_z),
+                abs(w_x), abs(w_y), abs(w_z))
+    isfinite(scale) || return T(NaN)
+    iszero(scale) && return zero(T)
+    u_x, u_y, u_z, v_x, v_y, v_z, w_x, w_y, w_z =
+        map(g -> g / scale, (u_x, u_y, u_z, v_x, v_y, v_z, w_x, w_y, w_z))
     S11 = u_x
     S22 = v_y
     S33 = w_z
@@ -613,7 +621,7 @@ end
     numer_z = Δz² * (u_z^2 * S11 + v_z^2 * S22 + w_z^2 * S33 +
                      T(2) * (u_z * v_z * S12 + u_z * w_z * S13 + v_z * w_z * S23))
     numer = -(numer_x + numer_y + numer_z)
-    return _apply_clip(clip, _safe_quotient(C, numer, denom))
+    return _apply_clip(clip, scale * _safe_quotient(C, numer, denom))
 end
 
 """
@@ -628,10 +636,18 @@ The inner sum runs over ALL velocity components i, not just one.
 @inline function _amd_kappa(C::T, Δx²::T, Δy²::T, clip::Bool,
                             u_x::T, u_y::T, v_x::T, v_y::T,
                             b_x::T, b_y::T) where {T}
+    # kappa(a*G, b*grad(theta)) = a*kappa(G, grad(theta)). The scalar
+    # scale cancels completely, while the velocity scale is restored last.
+    scale = max(abs(u_x), abs(u_y), abs(v_x), abs(v_y))
+    bscale = max(abs(b_x), abs(b_y))
+    (isfinite(scale) && isfinite(bscale)) || return T(NaN)
+    (iszero(scale) || iszero(bscale)) && return zero(T)
+    u_x, u_y, v_x, v_y = map(g -> g / scale, (u_x, u_y, v_x, v_y))
+    b_x, b_y = b_x / bscale, b_y / bscale
     denom = b_x^2 + b_y^2
     numer = -(Δx² * b_x * (u_x * b_x + v_x * b_y) +
               Δy² * b_y * (u_y * b_x + v_y * b_y))
-    return _apply_clip(clip, _safe_quotient(C, numer, denom))
+    return _apply_clip(clip, scale * _safe_quotient(C, numer, denom))
 end
 
 @inline function _amd_kappa(C::T, Δx²::T, Δy²::T, Δz²::T, clip::Bool,
@@ -639,11 +655,19 @@ end
                             v_x::T, v_y::T, v_z::T,
                             w_x::T, w_y::T, w_z::T,
                             b_x::T, b_y::T, b_z::T) where {T}
+    scale = max(abs(u_x), abs(u_y), abs(u_z), abs(v_x), abs(v_y), abs(v_z),
+                abs(w_x), abs(w_y), abs(w_z))
+    bscale = max(abs(b_x), abs(b_y), abs(b_z))
+    (isfinite(scale) && isfinite(bscale)) || return T(NaN)
+    (iszero(scale) || iszero(bscale)) && return zero(T)
+    u_x, u_y, u_z, v_x, v_y, v_z, w_x, w_y, w_z =
+        map(g -> g / scale, (u_x, u_y, u_z, v_x, v_y, v_z, w_x, w_y, w_z))
+    b_x, b_y, b_z = b_x / bscale, b_y / bscale, b_z / bscale
     denom = b_x^2 + b_y^2 + b_z^2
     numer = -(Δx² * b_x * (u_x * b_x + v_x * b_y + w_x * b_z) +
               Δy² * b_y * (u_y * b_x + v_y * b_y + w_y * b_z) +
               Δz² * b_z * (u_z * b_x + v_z * b_y + w_z * b_z))
-    return _apply_clip(clip, _safe_quotient(C, numer, denom))
+    return _apply_clip(clip, scale * _safe_quotient(C, numer, denom))
 end
 
 """

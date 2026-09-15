@@ -231,6 +231,7 @@ const OPTIONAL_TEST_FILES = [
 # Single-process CUDA tests. Run with TARANG_RUN_GPU_TESTS=true on a CUDA host
 # (the JuliaGPU Buildkite pipeline sets this).
 const GPU_TEST_FILES = [
+    "test_les_models.jl",
     "test_stochastic_forcing.jl",
     "test_stochastic_checkpoint_restart.jl",
     "test_gpu_nonlinear_optimizations.jl",

@@ -19,6 +19,8 @@ using Test
 using Random
 using Tarang
 
+isdefined(@__MODULE__, :check_amd_gradient_range) || include("les_range_helpers.jl")
+
 const _JL_OK = try
     @eval using JLArrays
     @eval using GPUArrays
@@ -60,6 +62,7 @@ end
         end
 
         n = (6, 6, 6)
+        check_amd_gradient_range((; kwargs...) -> jltwin(AMDModel(; kwargs...)), JLArray)
         G = [randn(n...) for _ in 1:9]     # 9 velocity gradients (component-major)
         B = [randn(n...) for _ in 1:3]     # 3 scalar gradients
 

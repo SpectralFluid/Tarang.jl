@@ -3,6 +3,8 @@ using Tarang
 using Statistics
 using Random
 
+include("les_range_helpers.jl")
+
 const _CUDA_AVAILABLE = try
     @eval begin
         using CUDA
@@ -755,9 +757,14 @@ end
     end
 end
 
+@testset "AMD numerical range on CPU" begin
+    check_amd_gradient_range(AMDModel)
+end
+
 if _CUDA_AVAILABLE
     @testset "LES Models GPU" begin
         CUDA.allowscalar(false)
+        check_amd_gradient_range((; kwargs...) -> AMDModel(; kwargs..., architecture=GPU()), CuArray)
         # The implementation no longer keeps separate CPU/GPU code paths — both
         # broadcast the same scalar kernel — so these tests only check that the
         # device arrays and the host→device coercion behave, against the same
