@@ -618,7 +618,9 @@ The normal coordinate is evaluated at the wall: `T(z=3) = z*sin(x)` means
 add_bc!(problem, "T(z=0) = 1.0 + 0.1 * cos(2*pi*t)")
 ```
 
-The BC value is re-evaluated **at every RK stage time** `t + c[i]·dt`, so multi-stage methods retain full formal order of accuracy even for rapidly-varying BCs. Internally this goes through `update_time_dependent_bcs!(bc_manager, stage_time)` followed by `_apply_bc_values_to_equations!`, and the resulting `ConstantOperator(value)` is written into `equation_data[eq_idx]["F"]`.
+The BC value is re-evaluated **at every RK stage time** `t + c[i]·dt` to provide
+stage-consistent data. Check timestep convergence for the specific PDE; evaluating
+boundary data at stage times alone does not guarantee the formal method order. Internally this goes through `update_time_dependent_bcs!(bc_manager, stage_time)` followed by `_apply_bc_values_to_equations!`, and the resulting `ConstantOperator(value)` is written into `equation_data[eq_idx]["F"]`.
 
 Measured on a 2D diffusion problem after 100 steps to `t = 0.1`, the enforced
 wall value tracks `1 + 0.1·cos(2πt)` to `2.2e-16`.
@@ -771,7 +773,8 @@ variables (m)` instead — that is the message the per-component `VectorField` B
 trips.
 
 **Solution**: create the required tau fields, include every one in the problem variables,
-and reference every one through a lift term:
+and give each an independent role in the implicit equations. Boundary taus
+enter through lifts; a pressure-gauge tau enters continuity directly:
 
 ```julia
 # Wrong: no tau fields, no lift terms — the BCs have nothing to act through
