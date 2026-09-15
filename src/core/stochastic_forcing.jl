@@ -835,11 +835,13 @@ function work_stratonovich(forcing::StochasticForcing{T, N, A, CA}, sol::Abstrac
     # Since F̂_stored = √Q̂ · ξ / √dt, we have ΔF̂ = √Q̂ · ξ · √dt
     domain_area = prod(forcing.domain_size)
 
-    # Use broadcasting for GPU compatibility
-    # Compute midpoint value and correlation
-    ψ_mid = (forcing.prevsol .+ sol) ./ 2
-    work_array = real.(ψ_mid .* conj.(forcing.cached_forcing))
-    work = sum(work_array)
+    # Fused mapreduce: computes Re(ψ_mid · F̂*) without temporary arrays.
+    # GPU-compatible: mapreduce dispatches to GPU kernel on CuArrays.
+    ps = forcing.prevsol
+    cf = forcing.cached_forcing
+    work = mapreduce(+, eachindex(ps); init=zero(T)) do i
+        @inbounds real((ps[i] + sol[i]) / 2 * conj(cf[i]))
+    end
 
     # The cached_forcing stores F̂ = √Q̂ · ξ / √dt
     # The forcing increment is ΔF̂ = F̂ · dt = √Q̂ · ξ · √dt
@@ -867,9 +869,11 @@ function work_ito(forcing::StochasticForcing{T, N, A, CA}, sol_prev::AbstractArr
     domain_area = prod(forcing.domain_size)
 
     # Itô work (uses previous solution, which is independent of current forcing)
-    # Use broadcasting for GPU compatibility
-    work_array = real.(sol_prev .* conj.(forcing.cached_forcing))
-    work = sum(work_array)
+    # Fused mapreduce avoids temporary arrays; GPU-compatible.
+    cf = forcing.cached_forcing
+    work = mapreduce(+, eachindex(sol_prev); init=zero(T)) do i
+        @inbounds real(sol_prev[i] * conj(cf[i]))
+    end
 
     # The Itô integral has zero mean, so we add drift correction
     # to match Stratonovich mean: ⟨W_Itô⟩ = 0 + ε·dt = ε·dt

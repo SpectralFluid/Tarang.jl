@@ -89,8 +89,8 @@ mutable struct SolverBaseData
     problem::Problem
     matrix_coupling::Vector{Bool}
     entry_cutoff::Float64
-    matsolver::Any
-    evaluator::Any
+    matsolver::Any         # Solver choice (Symbol, Tuple, or concrete solver)
+    evaluator::Any  # Union{Nothing, Evaluator} — Evaluator loaded after solvers.jl
 end
 
 function _normalize_matsolver(choice)
@@ -186,10 +186,103 @@ function sync_state_to_problem!(problem::Problem, state::Vector{<:ScalarField})
     end
 end
 
+# ============================================================================
+# Compiled RHS Plan — zero-dispatch timestepping
+# (Defined before InitialValueSolver which references CompiledRHSPlan)
+# ============================================================================
+
+"""
+    RHSInstruction
+
+A single operation in a compiled RHS execution plan.
+Each instruction operates on pre-allocated workspace fields, eliminating
+runtime type dispatch and per-timestep allocation.
+"""
+abstract type RHSInstruction end
+
+struct CopyFieldInstr <: RHSInstruction
+    src_state_idx::Int   # Index into the state vector
+    dst_ws_idx::Int      # Index into workspace
+end
+
+struct EnsureLayoutInstr <: RHSInstruction
+    ws_idx::Int
+    layout::Symbol  # :g or :c
+end
+
+struct DifferentiateInstr <: RHSInstruction
+    src_ws_idx::Int
+    dst_ws_idx::Int
+    coord::Coordinate
+    order::Int
+end
+
+struct MultiplyFieldsInstr <: RHSInstruction
+    src1_ws_idx::Int
+    src2_ws_idx::Int
+    dst_ws_idx::Int
+end
+
+struct ScaleFieldInstr <: RHSInstruction
+    src_ws_idx::Int
+    dst_ws_idx::Int
+    scale::Float64
+end
+
+struct AddFieldsInstr <: RHSInstruction
+    src1_ws_idx::Int
+    src2_ws_idx::Int
+    dst_ws_idx::Int
+end
+
+struct SubtractFieldsInstr <: RHSInstruction
+    src1_ws_idx::Int
+    src2_ws_idx::Int
+    dst_ws_idx::Int
+end
+
+struct NegateFieldInstr <: RHSInstruction
+    src_ws_idx::Int
+    dst_ws_idx::Int
+end
+
+struct GradientComponentInstr <: RHSInstruction
+    src_ws_idx::Int
+    dst_ws_idx::Int
+    coord::Coordinate
+end
+
+struct NonlinearMultiplyInstr <: RHSInstruction
+    src1_ws_idx::Int
+    src2_ws_idx::Int
+    dst_ws_idx::Int
+end
+
+"""
+    CompiledRHSPlan
+
+A pre-compiled execution plan for RHS evaluation that eliminates
+runtime type dispatch and per-timestep allocation.
+
+Created once during solver setup by walking the expression tree.
+Executed on every `evaluate_rhs` call.
+"""
+mutable struct CompiledRHSPlan
+    instructions::Vector{RHSInstruction}
+    workspace::Vector{<:ScalarField}       # Pre-allocated intermediate buffers
+    result_ws_indices::Vector{Int}       # workspace indices that hold the final RHS per state field
+    n_state_fields::Int
+    is_compiled::Bool
+
+    function CompiledRHSPlan(n_state::Int)
+        new(RHSInstruction[], ScalarField[], zeros(Int, n_state), n_state, false)
+    end
+end
+
 mutable struct InitialValueSolver <: Solver
     base::SolverBaseData
     problem::IVP
-    timestepper::Any
+    timestepper::TimeStepper
 
     # State variables
     sim_time::Float64
@@ -203,10 +296,10 @@ mutable struct InitialValueSolver <: Solver
     dt::Float64
 
     # Timestepper state for existing timesteppers.jl infrastructure
-    timestepper_state::Any
+    timestepper_state::Union{Nothing, AbstractTimestepperState}
 
     # Evaluator for analysis
-    evaluator::Union{Nothing, Any}
+    evaluator::Any  # Union{Nothing, Evaluator} — Evaluator loaded after solvers.jl
 
     # Performance tracking
     wall_time_start::Float64
@@ -214,8 +307,7 @@ mutable struct InitialValueSolver <: Solver
     performance_stats::SolverPerformanceStats
 
     # Compiled RHS plan for zero-dispatch timestepping (lazily compiled)
-    # Type is Any to avoid forward reference — actual type is Union{Nothing, CompiledRHSPlan}
-    compiled_rhs::Any
+    compiled_rhs::Union{Nothing, CompiledRHSPlan}
 end
 
 function attach_evaluator!(solver::InitialValueSolver)
@@ -407,7 +499,7 @@ mutable struct BoundaryValueSolver <: Solver
     max_iterations::Int
 
     workspace::Dict{String, AbstractArray}
-    factorization::Union{Nothing, Any}
+    factorization::Union{Nothing, Factorization}
     performance_stats::SolverPerformanceStats
     global_solver::Any
     subsystems::Tuple{Vararg{Subsystem}}
@@ -582,54 +674,67 @@ end
 function step!(solver::InitialValueSolver, dt::Float64=solver.dt)
     """Advance solution by one time step using existing timestepper infrastructure"""
 
-    start_time = time()
+    # NOTE: FieldPool is disabled until the checkout_or_alloc lifetime/aliasing
+    # issues are resolved. Multiple arithmetic operations (dot product, cross product,
+    # RHS evaluation) require simultaneous intermediate fields; the pool can return
+    # the same buffer for different live intermediates, causing silent data corruption.
+    # See: evaluate_vector_cross_product, dot_operands, evaluate_rhs.
+    pool_owner = false
 
-    solver.dt = dt
+    try
+        start_time = time()
 
-    # Update time-dependent boundary conditions BEFORE taking the step.
-    # NOTE: BCs are evaluated at t+dt and held fixed for all RK substeps.
-    # For multi-stage methods (RK443, etc.), this introduces O(dt) error at
-    # intermediate stages, potentially reducing the time integrator's formal
-    # order of accuracy for problems with rapidly varying BCs.
-    # TODO: Pass substep time into the timestepper loop for per-stage BC updates.
-    if has_time_dependent_bcs(solver.problem.bc_manager)
-        target_time = solver.sim_time + dt
-        update_time_dependent_bcs!(solver.problem.bc_manager, target_time)
-        _apply_bc_values_to_equations!(solver, target_time)
-        @debug "Updated time-dependent BCs for t=$target_time"
+        solver.dt = dt
+
+        # Update time-dependent boundary conditions BEFORE taking the step.
+        # NOTE: BCs are evaluated at t+dt and held fixed for all RK substeps.
+        # For multi-stage methods (RK443, etc.), this introduces O(dt) error at
+        # intermediate stages, potentially reducing the time integrator's formal
+        # order of accuracy for problems with rapidly varying BCs.
+        # TODO: Pass substep time into the timestepper loop for per-stage BC updates.
+        if has_time_dependent_bcs(solver.problem.bc_manager)
+            target_time = solver.sim_time + dt
+            update_time_dependent_bcs!(solver.problem.bc_manager, target_time)
+            _apply_bc_values_to_equations!(solver, target_time)
+            @debug "Updated time-dependent BCs for t=$target_time"
+        end
+
+        # Use existing timestepper infrastructure from timesteppers.jl
+        # Create TimestepperState if needed
+        if solver.timestepper_state === nothing
+            solver.timestepper_state = TimestepperState(solver.timestepper, dt, solver.state)
+        else
+            # Update timestep history for variable timestep support
+            update_timestep_history!(solver.timestepper_state, dt)
+        end
+
+        # Call existing timestepper step function from timesteppers.jl
+        step!(solver.timestepper_state, solver)
+
+        # Get the updated state from timestepper history
+        if length(solver.timestepper_state.history) > 0
+            solver.state = solver.timestepper_state.history[end]
+        end
+
+        # Sync the final state back to problem variables so users can read them directly
+        # (without this, problem variables hold stale intermediate stage data from evaluate_rhs)
+        sync_state_to_problem!(solver.problem, solver.state)
+
+        # Update time and iteration
+        solver.sim_time += dt
+        solver.iteration += 1
+
+        # Update performance statistics
+        step_time = time() - start_time
+        solver.performance_stats.total_time += step_time
+        solver.performance_stats.total_steps += 1
+
+        return solver
+    finally
+        if pool_owner
+            set_field_pool!(nothing)
+        end
     end
-
-    # Use existing timestepper infrastructure from timesteppers.jl
-    # Create TimestepperState if needed
-    if solver.timestepper_state === nothing
-        solver.timestepper_state = TimestepperState(solver.timestepper, dt, solver.state)
-    else
-        # Update timestep history for variable timestep support
-        update_timestep_history!(solver.timestepper_state, dt)
-    end
-
-    # Call existing timestepper step function from timesteppers.jl
-    step!(solver.timestepper_state, solver)
-
-    # Get the updated state from timestepper history
-    if length(solver.timestepper_state.history) > 0
-        solver.state = solver.timestepper_state.history[end]
-    end
-
-    # Sync the final state back to problem variables so users can read them directly
-    # (without this, problem variables hold stale intermediate stage data from evaluate_rhs)
-    sync_state_to_problem!(solver.problem, solver.state)
-
-    # Update time and iteration
-    solver.sim_time += dt
-    solver.iteration += 1
-
-    # Update performance statistics
-    step_time = time() - start_time
-    solver.performance_stats.total_time += step_time
-    solver.performance_stats.total_steps += 1
-
-    return solver
 end
 
 # Solver execution control
@@ -846,6 +951,9 @@ function solve!(solver::EigenvalueSolver; nev::Int=solver.nev,
     return λ, v
 end
 
+# Workspace cache for fields_to_vector (avoids re-allocation per call)
+const _fields_to_vector_cache = Dict{Int, Vector{ComplexF64}}()
+
 # Utility functions
 function fields_to_vector(fields::Vector{<:ScalarField})
     """
@@ -866,17 +974,13 @@ function fields_to_vector(fields::Vector{<:ScalarField})
     # Determine architecture from first field for synchronization
     arch = fields[1].dist.architecture
 
-    # Synchronize GPU before data transfer (ensures all GPU operations complete)
-    if is_gpu(arch)
-        synchronize(arch)
-    end
-
     # Ensure all fields are in coefficient space (following Tarang pattern)
+    # ensure_layout! handles any needed transforms (including GPU FFTs)
     for field in fields
         ensure_layout!(field, :c)
     end
 
-    # Synchronize again after layout changes (which may involve GPU FFTs)
+    # Single GPU sync after all layout changes are complete
     if is_gpu(arch)
         synchronize(arch)
     end
@@ -884,8 +988,13 @@ function fields_to_vector(fields::Vector{<:ScalarField})
     # Calculate total vector size
     total_size = sum(compute_field_vector_size(field) for field in fields)
 
-    # Allocate output vector on CPU (for sparse linear solvers)
-    vector = Vector{ComplexF64}(undef, total_size)
+    # Reuse cached vector if size matches, otherwise allocate
+    vector = get!(() -> Vector{ComplexF64}(undef, total_size),
+                  _fields_to_vector_cache, total_size)
+    if length(vector) != total_size
+        vector = resize!(vector, total_size)
+        _fields_to_vector_cache[total_size] = vector
+    end
 
     # Gather field data into vector (following Tarang gather pattern)
     offset = 1
@@ -1041,6 +1150,32 @@ function vector_to_fields(vector::AbstractVector{<:Number}, template::Vector{<:S
     end
 
     return new_state
+end
+
+"""
+    vector_to_fields!(output, vector, template)
+
+In-place variant: writes vector data into pre-existing output fields.
+No field allocation. Output fields must already have coeff data allocated.
+"""
+function vector_to_fields!(output::Vector{<:ScalarField}, vector::AbstractVector{<:Number},
+                           template::Vector{<:ScalarField})
+    offset = 1
+    for (i, field) in enumerate(template)
+        coeff_data = get_coeff_data(output[i])
+        if coeff_data === nothing
+            continue
+        end
+        local_data = get_local_data(coeff_data)
+        n = length(local_data)
+        if n > 0 && offset <= length(vector)
+            end_idx = min(offset + n - 1, length(vector))
+            copyto!(local_data, 1, vector, offset, end_idx - offset + 1)
+            offset = end_idx + 1
+        end
+        output[i].current_layout = :c
+    end
+    return output
 end
 
 function compute_field_vector_size(field::ScalarField)
@@ -1924,97 +2059,6 @@ function log_solver_performance(solver::Union{InitialValueSolver, BoundaryValueS
 end
 
 # ============================================================================
-# Compiled RHS Plan — zero-dispatch timestepping
-# ============================================================================
-
-"""
-    RHSInstruction
-
-A single operation in a compiled RHS execution plan.
-Each instruction operates on pre-allocated workspace fields, eliminating
-runtime type dispatch and per-timestep allocation.
-"""
-abstract type RHSInstruction end
-
-struct CopyFieldInstr <: RHSInstruction
-    src_state_idx::Int   # Index into the state vector
-    dst_ws_idx::Int      # Index into workspace
-end
-
-struct EnsureLayoutInstr <: RHSInstruction
-    ws_idx::Int
-    layout::Symbol  # :g or :c
-end
-
-struct DifferentiateInstr <: RHSInstruction
-    src_ws_idx::Int
-    dst_ws_idx::Int
-    coord::Coordinate
-    order::Int
-end
-
-struct MultiplyFieldsInstr <: RHSInstruction
-    src1_ws_idx::Int
-    src2_ws_idx::Int
-    dst_ws_idx::Int
-end
-
-struct ScaleFieldInstr <: RHSInstruction
-    src_ws_idx::Int
-    dst_ws_idx::Int
-    scale::Float64
-end
-
-struct AddFieldsInstr <: RHSInstruction
-    src1_ws_idx::Int
-    src2_ws_idx::Int
-    dst_ws_idx::Int
-end
-
-struct SubtractFieldsInstr <: RHSInstruction
-    src1_ws_idx::Int
-    src2_ws_idx::Int
-    dst_ws_idx::Int
-end
-
-struct NegateFieldInstr <: RHSInstruction
-    src_ws_idx::Int
-    dst_ws_idx::Int
-end
-
-struct GradientComponentInstr <: RHSInstruction
-    src_ws_idx::Int
-    dst_ws_idx::Int
-    coord::Coordinate
-end
-
-struct NonlinearMultiplyInstr <: RHSInstruction
-    src1_ws_idx::Int
-    src2_ws_idx::Int
-    dst_ws_idx::Int
-end
-
-"""
-    CompiledRHSPlan
-
-A pre-compiled execution plan for RHS evaluation that eliminates
-runtime type dispatch and per-timestep allocation.
-
-Created once during solver setup by walking the expression tree.
-Executed on every `evaluate_rhs` call.
-"""
-mutable struct CompiledRHSPlan
-    instructions::Vector{RHSInstruction}
-    workspace::Vector{<:ScalarField}       # Pre-allocated intermediate buffers
-    result_ws_indices::Vector{Int}       # workspace indices that hold the final RHS per state field
-    n_state_fields::Int
-    is_compiled::Bool
-
-    function CompiledRHSPlan(n_state::Int)
-        new(RHSInstruction[], ScalarField[], zeros(Int, n_state), n_state, false)
-    end
-end
-
 """
     _alloc_workspace_field!(plan, template) -> Int
 

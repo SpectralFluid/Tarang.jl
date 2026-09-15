@@ -1,9 +1,10 @@
 name = "Tarang"
 uuid = "3caadacf-3504-43fd-90cf-12adede613ab"
 authors = ["Subhajit Kar <subhajitkar19@gmail.com>"]
-version = "1.0.0"
+version = "1.0.1"
 
 [deps]
+AbstractFFTs = "621f4979-c628-5d54-868e-fcf4e3e8185c"
 Adapt = "79e6a3ab-5dfb-504d-930d-738a2a938a0e"
 Arpack = "7d9fca2a-8960-54d3-9f78-7d1dccf2cb97"
 ChainRulesCore = "d360d2e6-b24c-11e9-a2a3-2a2ae2dbcce4"
@@ -41,6 +42,7 @@ CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
 TarangCUDAExt = "CUDA"
 
 [compat]
+AbstractFFTs = "0.5, 1"
 Adapt = "3, 4"
 Aqua = "0.8"
 Arpack = "0.5"

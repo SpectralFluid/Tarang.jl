@@ -363,6 +363,32 @@ using Test
         lift_op2 = Tarang.create_lift_operator(manager, "tau_u1", "chebyshev_z", 1)
         @test lift_op === lift_op2  # Same object from cache
     end
+
+    @testset "BC cache tuple keys" begin
+        manager = BoundaryConditionManager()
+
+        @testset "bc_cache accepts tuple keys" begin
+            manager.bc_cache[(1, 0.5)] = 42.0
+            @test manager.bc_cache[(1, 0.5)] == 42.0
+        end
+
+        @testset "Robin-style component keys" begin
+            manager.bc_cache[(2, 1.0, :alpha)] = 0.5
+            manager.bc_cache[(2, 1.0, :beta)] = 0.3
+            manager.bc_cache[(2, 1.0, :value)] = 1.0
+
+            @test manager.bc_cache[(2, 1.0, :alpha)] == 0.5
+            @test manager.bc_cache[(2, 1.0, :beta)] == 0.3
+            @test manager.bc_cache[(2, 1.0, :value)] == 1.0
+        end
+
+        @testset "cache clear works with tuple keys" begin
+            manager.bc_cache[(3, 2.0)] = "test"
+            @test !isempty(manager.bc_cache)
+            empty!(manager.bc_cache)
+            @test isempty(manager.bc_cache)
+        end
+    end
 end
 
 println("All boundary condition tests passed!")

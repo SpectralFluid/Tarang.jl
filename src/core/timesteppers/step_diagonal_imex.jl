@@ -60,18 +60,25 @@ function step_diagonal_imex_rk222!(state::TimestepperState, solver::InitialValue
         ensure_layout!(field, :c)
     end
 
+    n_fields = length(current_state)
+
     for s in 1:stages
         state.current_substep = s
 
         # Build explicit contribution in coefficient space:
         # Ŷ_s = X̂_n + dt * Σ_{j<s} A[s,j] * F̂_j
-        Y_s = copy_state(current_state)
-        for (k, field) in enumerate(Y_s)
-            ensure_layout!(field, :c)
-            coeff_data = get_coeff_data(field)
+        # Use workspace fields instead of copy_state to avoid allocation
+        Y_s = Vector{ScalarField}(undef, n_fields)
+        for (k, src_field) in enumerate(current_state)
+            ws_idx = (s - 1) * n_fields + k
+            ws_field = get_workspace_field!(state, src_field, ws_idx)
+            copy_field_data!(ws_field, src_field)
+            ws_field.current_layout = src_field.current_layout
+            Y_s[k] = ws_field
+
+            coeff_data = get_coeff_data(ws_field)
             for j in 1:(s-1)
                 if abs(A[s, j]) > 1e-14
-                    ensure_layout!(F_stages[j][k], :c)
                     coeff_data .+= dt .* A[s, j] .* get_coeff_data(F_stages[j][k])
                 end
             end
@@ -90,7 +97,6 @@ function step_diagonal_imex_rk222!(state::TimestepperState, solver::InitialValue
     # X̂_{n+1} = X̂_n + dt * Σ b_exp[s] * F̂_s - dt * Σ b_imp[s] * L̂ * Ŷ_s
     new_state = copy_state(current_state)
     for (k, field) in enumerate(new_state)
-        ensure_layout!(field, :c)
         coeff_data = get_coeff_data(field)
         for s in 1:stages
             # Explicit contribution: +dt * b_exp[s] * F̂_s
@@ -106,11 +112,7 @@ function step_diagonal_imex_rk222!(state::TimestepperState, solver::InitialValue
         end
     end
 
-    push!(state.history, new_state)
-
-    if length(state.history) > 1
-        popfirst!(state.history)
-    end
+    _push_trim!(state.history, new_state, 1)
 end
 
 """
@@ -153,19 +155,26 @@ function step_diagonal_imex_rk443!(state::TimestepperState, solver::InitialValue
         ensure_layout!(field, :c)
     end
 
+    n_fields = length(current_state)
+
     for s in 1:stages
         state.current_substep = s
 
         # Build explicit contribution in coefficient space:
         # Ŷ_s = X̂_n + dt * Σ_{j<s} A[s,j] * F̂_j
-        Y_s = copy_state(current_state)
+        # Use workspace fields instead of copy_state to avoid allocation
+        Y_s = Vector{ScalarField}(undef, n_fields)
         γ_s = γ_diag[s]
-        for (k, field) in enumerate(Y_s)
-            ensure_layout!(field, :c)
-            coeff_data = get_coeff_data(field)
+        for (k, src_field) in enumerate(current_state)
+            ws_idx = (s - 1) * n_fields + k
+            ws_field = get_workspace_field!(state, src_field, ws_idx)
+            copy_field_data!(ws_field, src_field)
+            ws_field.current_layout = src_field.current_layout
+            Y_s[k] = ws_field
+
+            coeff_data = get_coeff_data(ws_field)
             for j in 1:(s-1)
                 if abs(A[s, j]) > 1e-14
-                    ensure_layout!(F_stages[j][k], :c)
                     coeff_data .+= dt .* A[s, j] .* get_coeff_data(F_stages[j][k])
                 end
             end
@@ -184,7 +193,6 @@ function step_diagonal_imex_rk443!(state::TimestepperState, solver::InitialValue
     # X̂_{n+1} = X̂_n + dt * Σ b_exp[s] * F̂_s - dt * Σ b_imp[s] * L̂ * Ŷ_s
     new_state = copy_state(current_state)
     for (k, field) in enumerate(new_state)
-        ensure_layout!(field, :c)
         coeff_data = get_coeff_data(field)
         for s in 1:stages
             # Explicit contribution: +dt * b_exp[s] * F̂_s
@@ -200,11 +208,7 @@ function step_diagonal_imex_rk443!(state::TimestepperState, solver::InitialValue
         end
     end
 
-    push!(state.history, new_state)
-
-    if length(state.history) > 1
-        popfirst!(state.history)
-    end
+    _push_trim!(state.history, new_state, 1)
 end
 
 """
@@ -229,13 +233,13 @@ function step_diagonal_imex_sbdf2!(state::TimestepperState, solver::InitialValue
     L_spectral = _get_spectral_linear_operator(solver)
 
     # Initialize history if needed
-    if !haskey(state.timestepper_data, "F_history")
-        state.timestepper_data["F_history"] = Vector{ScalarField}[]
-        state.timestepper_data["iteration"] = 0
+    if !haskey(state.timestepper_data, :F_history)
+        state.timestepper_data[:F_history] = Vector{ScalarField}[]
+        state.timestepper_data[:iteration] = 0
     end
 
-    iteration = state.timestepper_data["iteration"]
-    F_history = state.timestepper_data["F_history"]
+    iteration = state.timestepper_data[:iteration]
+    F_history = state.timestepper_data[:F_history]
 
     # Evaluate current RHS
     F_n = evaluate_rhs(solver, current_state, t)
@@ -254,16 +258,10 @@ function step_diagonal_imex_sbdf2!(state::TimestepperState, solver::InitialValue
             end
         end
 
-        push!(state.history, new_state)
-        if length(state.history) > 2
-            popfirst!(state.history)
-        end
+        _push_trim!(state.history, new_state, 2)
 
         # Store F history
-        push!(F_history, F_n)
-        if length(F_history) > 2
-            popfirst!(F_history)
-        end
+        _push_trim!(F_history, F_n, 2)
     else
         # SBDF2 step
         X_n = current_state
@@ -306,19 +304,13 @@ function step_diagonal_imex_sbdf2!(state::TimestepperState, solver::InitialValue
             push!(new_state, result)
         end
 
-        push!(state.history, new_state)
-        if length(state.history) > 2
-            popfirst!(state.history)
-        end
+        _push_trim!(state.history, new_state, 2)
 
         # Update F history
-        push!(F_history, F_n)
-        if length(F_history) > 2
-            popfirst!(F_history)
-        end
+        _push_trim!(F_history, F_n, 2)
     end
 
-    state.timestepper_data["iteration"] = iteration + 1
+    state.timestepper_data[:iteration] = iteration + 1
 end
 
 # Note: _get_spectral_linear_operator and set_spectral_linear_operator! are

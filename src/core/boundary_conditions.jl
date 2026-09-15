@@ -135,7 +135,7 @@ mutable struct BoundaryConditionManager{Arch<:AbstractArchitecture}
 
     # Workspace and caching
     workspace::Dict{String, AbstractArray}
-    bc_cache::Dict{String, Any}  # Stores both scalar and array BC values
+    bc_cache::Dict{Any, Any}  # Keys: tuples (bc_index, time) or (bc_index, time, :component)
     performance_stats::BCPerformanceStats
 
     # Architecture for CPU/GPU support
@@ -143,7 +143,7 @@ mutable struct BoundaryConditionManager{Arch<:AbstractArchitecture}
 
     function BoundaryConditionManager(; architecture::Arch=CPU()) where {Arch<:AbstractArchitecture}
         workspace = Dict{String, AbstractArray}()
-        bc_cache = Dict{String, Any}()
+        bc_cache = Dict{Any, Any}()
         perf_stats = BCPerformanceStats()
 
         new{Arch}(AbstractBoundaryCondition[], Dict{String, Any}(),
@@ -1210,8 +1210,8 @@ function update_time_dependent_bcs!(manager::BoundaryConditionManager, current_t
     for bc_index in manager.time_dependent_bcs
         bc = manager.conditions[bc_index]
 
-        # Cache evaluated values keyed by BC index and time (for substep reuse)
-        cache_key = "bc_$(bc_index)_t_$(current_time)"
+        # Tuple key avoids string allocation every timestep
+        cache_key = (bc_index, current_time)
 
         if isa(bc, DirichletBC) && bc.is_time_dependent
             if !haskey(manager.bc_cache, cache_key)
@@ -1228,13 +1228,12 @@ function update_time_dependent_bcs!(manager::BoundaryConditionManager, current_t
             @debug "Updated Neumann BC for $(bc.field)"
 
         elseif isa(bc, RobinBC) && bc.is_time_dependent
-            # For Robin BCs, check component keys since we store alpha, beta, value separately
-            robin_cache_key = "$(cache_key)_value"
-            if !haskey(manager.bc_cache, robin_cache_key)
+            robin_key = (bc_index, current_time, :value)
+            if !haskey(manager.bc_cache, robin_key)
                 alpha, beta, value = evaluate_bc_value(manager, bc, current_time, coords)
-                for (comp_name, comp_value) in [("alpha", alpha), ("beta", beta), ("value", value)]
-                    manager.bc_cache["$(cache_key)_$(comp_name)"] = comp_value
-                end
+                manager.bc_cache[(bc_index, current_time, :alpha)] = alpha
+                manager.bc_cache[(bc_index, current_time, :beta)] = beta
+                manager.bc_cache[robin_key] = value
             end
             @debug "Updated Robin BC for $(bc.field)"
         end
@@ -1251,16 +1250,15 @@ end
 
 function get_current_bc_value(manager::BoundaryConditionManager, bc_index::Int, current_time)
     """Retrieve the most recently cached value for a time-dependent BC."""
-    cache_key = "bc_$(bc_index)_t_$(current_time)"
     bc = manager.conditions[bc_index]
 
     if isa(bc, RobinBC)
-        alpha = get(manager.bc_cache, "$(cache_key)_alpha", nothing)
-        beta = get(manager.bc_cache, "$(cache_key)_beta", nothing)
-        value = get(manager.bc_cache, "$(cache_key)_value", nothing)
+        alpha = get(manager.bc_cache, (bc_index, current_time, :alpha), nothing)
+        beta = get(manager.bc_cache, (bc_index, current_time, :beta), nothing)
+        value = get(manager.bc_cache, (bc_index, current_time, :value), nothing)
         return (alpha, beta, value)
     else
-        return get(manager.bc_cache, cache_key, nothing)
+        return get(manager.bc_cache, (bc_index, current_time), nothing)
     end
 end
 

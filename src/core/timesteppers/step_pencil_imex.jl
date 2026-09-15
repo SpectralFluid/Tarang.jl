@@ -75,12 +75,12 @@ function step_pencil_sbdf2!(state::TimestepperState, solver::InitialValueSolver)
     end
 
     # Initialize history if needed
-    if !haskey(state.timestepper_data, "F_history_pencil")
-        state.timestepper_data["F_history_pencil"] = []
-        state.timestepper_data["iteration_pencil"] = 0
+    if !haskey(state.timestepper_data, :F_history_pencil)
+        state.timestepper_data[:F_history_pencil] = []
+        state.timestepper_data[:iteration_pencil] = 0
     end
 
-    iteration = state.timestepper_data["iteration_pencil"]
+    iteration = state.timestepper_data[:iteration_pencil]
 
     # Need 2 steps of history for SBDF2
     if iteration < 1 || length(state.history) < 2
@@ -108,11 +108,8 @@ function step_pencil_sbdf2!(state::TimestepperState, solver::InitialValueSolver)
         F_n = evaluate_rhs(solver, X_n, solver.sim_time)
 
         # Get F history
-        F_history = state.timestepper_data["F_history_pencil"]
-        pushfirst!(F_history, F_n)
-        while length(F_history) > 2
-            pop!(F_history)
-        end
+        F_history = state.timestepper_data[:F_history_pencil]
+        _prepend_trim!(F_history, F_n, 2)
 
         # For each field, apply pencil-based SBDF2
         new_state = Vector{ScalarField}(undef, length(X_n))
@@ -148,13 +145,8 @@ function step_pencil_sbdf2!(state::TimestepperState, solver::InitialValueSolver)
         end
 
         # Update state
-        push!(state.history, new_state)
-        state.timestepper_data["iteration_pencil"] += 1
-
-        # Keep history manageable
-        while length(state.history) > 3
-            popfirst!(state.history)
-        end
+        _push_trim!(state.history, new_state, 3)
+        state.timestepper_data[:iteration_pencil] += 1
 
     catch e
         @warn "step_pencil_sbdf2! failed: $e, falling back to RK222"
@@ -184,9 +176,9 @@ function step_pencil_sbdf1!(state::TimestepperState, solver::InitialValueSolver)
     end
 
     # Initialize history if needed
-    if !haskey(state.timestepper_data, "F_history_pencil")
-        state.timestepper_data["F_history_pencil"] = []
-        state.timestepper_data["iteration_pencil"] = 0
+    if !haskey(state.timestepper_data, :F_history_pencil)
+        state.timestepper_data[:F_history_pencil] = []
+        state.timestepper_data[:iteration_pencil] = 0
     end
 
     try
@@ -194,11 +186,8 @@ function step_pencil_sbdf1!(state::TimestepperState, solver::InitialValueSolver)
         F_n = evaluate_rhs(solver, current_state, solver.sim_time)
 
         # Update F history
-        F_history = state.timestepper_data["F_history_pencil"]
-        pushfirst!(F_history, F_n)
-        while length(F_history) > 2
-            pop!(F_history)
-        end
+        F_history = state.timestepper_data[:F_history_pencil]
+        _prepend_trim!(F_history, F_n, 2)
 
         # For each field, apply pencil-based SBDF1
         new_state = Vector{ScalarField}(undef, length(current_state))
@@ -220,13 +209,8 @@ function step_pencil_sbdf1!(state::TimestepperState, solver::InitialValueSolver)
         end
 
         # Update state
-        push!(state.history, new_state)
-        state.timestepper_data["iteration_pencil"] += 1
-
-        # Keep history manageable
-        while length(state.history) > 3
-            popfirst!(state.history)
-        end
+        _push_trim!(state.history, new_state, 3)
+        state.timestepper_data[:iteration_pencil] += 1
 
     catch e
         @warn "step_pencil_sbdf1! failed: $e, falling back to RK111"
@@ -420,12 +404,12 @@ function step_pencil_cnab2!(state::TimestepperState, solver::InitialValueSolver)
     end
 
     # Initialize history if needed
-    if !haskey(state.timestepper_data, "F_history_pencil")
-        state.timestepper_data["F_history_pencil"] = []
-        state.timestepper_data["iteration_pencil"] = 0
+    if !haskey(state.timestepper_data, :F_history_pencil)
+        state.timestepper_data[:F_history_pencil] = []
+        state.timestepper_data[:iteration_pencil] = 0
     end
 
-    iteration = state.timestepper_data["iteration_pencil"]
+    iteration = state.timestepper_data[:iteration_pencil]
 
     # Need 1 step of F history for CNAB2
     if iteration < 1
@@ -439,11 +423,8 @@ function step_pencil_cnab2!(state::TimestepperState, solver::InitialValueSolver)
         F_n = evaluate_rhs(solver, current_state, solver.sim_time)
 
         # Get F history
-        F_history = state.timestepper_data["F_history_pencil"]
-        pushfirst!(F_history, F_n)
-        while length(F_history) > 2
-            pop!(F_history)
-        end
+        F_history = state.timestepper_data[:F_history_pencil]
+        _prepend_trim!(F_history, F_n, 2)
 
         # For each field, apply pencil-based CNAB2
         new_state = Vector{ScalarField}(undef, length(current_state))
@@ -467,13 +448,8 @@ function step_pencil_cnab2!(state::TimestepperState, solver::InitialValueSolver)
         end
 
         # Update state
-        push!(state.history, new_state)
-        state.timestepper_data["iteration_pencil"] += 1
-
-        # Keep history manageable
-        while length(state.history) > 3
-            popfirst!(state.history)
-        end
+        _push_trim!(state.history, new_state, 3)
+        state.timestepper_data[:iteration_pencil] += 1
 
     catch e
         @warn "step_pencil_cnab2! failed: $e, falling back to RK222"
@@ -503,9 +479,9 @@ function step_pencil_cnab1!(state::TimestepperState, solver::InitialValueSolver)
     end
 
     # Initialize history if needed
-    if !haskey(state.timestepper_data, "F_history_pencil")
-        state.timestepper_data["F_history_pencil"] = []
-        state.timestepper_data["iteration_pencil"] = 0
+    if !haskey(state.timestepper_data, :F_history_pencil)
+        state.timestepper_data[:F_history_pencil] = []
+        state.timestepper_data[:iteration_pencil] = 0
     end
 
     try
@@ -513,11 +489,8 @@ function step_pencil_cnab1!(state::TimestepperState, solver::InitialValueSolver)
         F_n = evaluate_rhs(solver, current_state, solver.sim_time)
 
         # Update F history
-        F_history = state.timestepper_data["F_history_pencil"]
-        pushfirst!(F_history, F_n)
-        while length(F_history) > 2
-            pop!(F_history)
-        end
+        F_history = state.timestepper_data[:F_history_pencil]
+        _prepend_trim!(F_history, F_n, 2)
 
         # For each field, apply pencil-based CNAB1
         new_state = Vector{ScalarField}(undef, length(current_state))
@@ -539,13 +512,8 @@ function step_pencil_cnab1!(state::TimestepperState, solver::InitialValueSolver)
         end
 
         # Update state
-        push!(state.history, new_state)
-        state.timestepper_data["iteration_pencil"] += 1
-
-        # Keep history manageable
-        while length(state.history) > 3
-            popfirst!(state.history)
-        end
+        _push_trim!(state.history, new_state, 3)
+        state.timestepper_data[:iteration_pencil] += 1
 
     catch e
         @warn "step_pencil_cnab1! failed: $e, falling back to RK111"

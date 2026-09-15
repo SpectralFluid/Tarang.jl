@@ -263,3 +263,94 @@ end
     @test get_grid_data(ez[2])[] == 0.0
     @test get_grid_data(ez[3])[] == 1.0
 end
+
+@testset "Performance regression — field arithmetic" begin
+    using Tarang
+    import Tarang: _FIELD_ARITH_TMP_NAME, _local_data, combine_add, combine_multiply
+
+    coords = CartesianCoordinates("x")
+    dist = Distributor(coords; mesh=(1,), dtype=Float64)
+    basis = RealFourier(coords["x"]; size=8, bounds=(0.0, 2π))
+
+    a = ScalarField(dist, "a", (basis,), Float64)
+    b = ScalarField(dist, "b", (basis,), Float64)
+    ensure_layout!(a, :g)
+    ensure_layout!(b, :g)
+    get_grid_data(a) .= Float64.(1:8)
+    get_grid_data(b) .= Float64.(8:-1:1)
+
+    @testset "Field + produces correct result" begin
+        c = a + b
+        ensure_layout!(c, :g)
+        @test all(get_grid_data(c) .≈ 9.0)
+    end
+
+    @testset "Field - produces correct result" begin
+        c = a - b
+        ensure_layout!(c, :g)
+        expected = Float64.(1:8) .- Float64.(8:-1:1)
+        @test get_grid_data(c) ≈ expected
+    end
+
+    @testset "Field * scalar produces correct result" begin
+        c = a * 3.0
+        ensure_layout!(c, :g)
+        @test get_grid_data(c) ≈ 3.0 .* Float64.(1:8)
+    end
+
+    @testset "Scalar * Field is commutative" begin
+        c1 = a * 2.5
+        c2 = 2.5 * a
+        ensure_layout!(c1, :g)
+        ensure_layout!(c2, :g)
+        @test get_grid_data(c1) ≈ get_grid_data(c2)
+    end
+
+    @testset "Field * Field produces correct result" begin
+        c = a * b
+        ensure_layout!(c, :g)
+        @test get_grid_data(c) ≈ Float64.(1:8) .* Float64.(8:-1:1)
+    end
+
+    @testset "Result uses static name" begin
+        c = a + b
+        @test c.name == _FIELD_ARITH_TMP_NAME
+    end
+
+    @testset "Result is fresh allocation, not copy of input" begin
+        a_data_before = copy(get_grid_data(a))
+        c = a + b
+        ensure_layout!(c, :g)
+        get_grid_data(c) .= 0.0
+        @test get_grid_data(a) ≈ a_data_before
+    end
+
+    @testset "_local_data for plain Array" begin
+        arr = randn(8)
+        @test _local_data(arr) === arr
+    end
+
+    @testset "combine_add dispatch" begin
+        @test combine_add(1.0, 2.0) == 3.0
+        @test combine_add(a, b) isa ScalarField
+        @test combine_add(a, 1.0) isa ScalarField
+        @test combine_add(1.0, a) isa ScalarField
+    end
+
+    @testset "combine_multiply dispatch" begin
+        @test combine_multiply(2.0, 3.0) == 6.0
+        @test combine_multiply(a, b) isa ScalarField
+        @test combine_multiply(a, 2.0) isa ScalarField
+        @test combine_multiply(2.0, a) isa ScalarField
+    end
+
+    @testset "combine_multiply VF×VF throws" begin
+        coords2 = CartesianCoordinates("x", "y")
+        dist2 = Distributor(coords2; mesh=(1,), dtype=Float64)
+        bx = RealFourier(coords2["x"]; size=4, bounds=(0.0, 2π))
+        by = RealFourier(coords2["y"]; size=4, bounds=(0.0, 2π))
+        u = VectorField(dist2, "u", (bx, by), Float64)
+        v = VectorField(dist2, "v", (bx, by), Float64)
+        @test_throws ArgumentError combine_multiply(u, v)
+    end
+end

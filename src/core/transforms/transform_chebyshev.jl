@@ -79,7 +79,7 @@ function _chebyshev_backward(data::AbstractArray, transform::ChebyshevTransform)
         # The forward transform halves the DC (first) and the physical last DCT-I mode
         # (at index grid_size). Only undo the last-endpoint doubling if the stored last
         # coefficient IS the physical last DCT-I mode (coeff_size == grid_size).
-        scaled_real = copy(real.(host_data))
+        scaled_real = real.(host_data)  # already a new array, no copy needed
         _scale_first_along_axis!(scaled_real, axis, real_type(2.0))
         if coeff_size > 1 && coeff_size == grid_size
             _scale_last_along_axis!(scaled_real, axis, real_type(2.0))
@@ -100,7 +100,7 @@ function _chebyshev_backward(data::AbstractArray, transform::ChebyshevTransform)
         temp_real ./= real_type(2.0)
 
         if eltype(host_data) <: Complex
-            scaled_imag = copy(imag.(host_data))
+            scaled_imag = imag.(host_data)  # already a new array, no copy needed
             _scale_first_along_axis!(scaled_imag, axis, real_type(2.0))
             if coeff_size > 1 && coeff_size == grid_size
                 _scale_last_along_axis!(scaled_imag, axis, real_type(2.0))
@@ -115,6 +115,9 @@ function _chebyshev_backward(data::AbstractArray, transform::ChebyshevTransform)
         return temp_real
     end
 end
+
+_apply_forward(current, t::ChebyshevTransform) = _chebyshev_forward(current, t)
+_apply_backward(current, t::ChebyshevTransform) = _chebyshev_backward(current, t)
 
 # Chebyshev transform application functions following Tarang patterns
 function apply_chebyshev_forward!(field::ScalarField, transform::ChebyshevTransform)
@@ -250,8 +253,8 @@ end
 function apply_chebyshev_matrix_forward!(field::ScalarField, transform::ChebyshevTransform)
     """Apply forward Chebyshev transform using in-place matrix multiplication"""
 
-    if haskey(transform.matrices, "forward")
-        mat = transform.matrices["forward"]
+    if transform.forward_matrix !== nothing
+        mat = transform.forward_matrix
         # Ensure output array exists with correct size
         out_size = size(mat, 1)
         coeff_dtype = coefficient_eltype(field.dtype)
@@ -277,8 +280,8 @@ end
 function apply_chebyshev_matrix_backward!(field::ScalarField, transform::ChebyshevTransform)
     """Apply backward Chebyshev transform using in-place matrix multiplication"""
 
-    if haskey(transform.matrices, "backward")
-        mat = transform.matrices["backward"]
+    if transform.backward_matrix !== nothing
+        mat = transform.backward_matrix
         out_size = size(mat, 1)
 
         if get_coeff_data(field) === nothing

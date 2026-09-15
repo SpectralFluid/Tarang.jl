@@ -54,8 +54,8 @@ Wraps the existing FieldBuffers structure.
 """
 mutable struct SerialFieldStorage <: AbstractFieldStorage
     architecture::AbstractArchitecture
-    grid::Union{Nothing, AbstractArray, PencilArrays.Pencil}
-    coeff::Union{Nothing, AbstractArray, PencilArrays.Pencil}
+    grid::Union{Nothing, AbstractArray}   # PencilArray <: AbstractArray — no need for separate Pencil branch
+    coeff::Union{Nothing, AbstractArray}  # Reduced from 3-way to 2-way Union for better type inference
 
     function SerialFieldStorage(arch::AbstractArchitecture)
         new(arch, nothing, nothing)
@@ -74,8 +74,6 @@ const FieldBuffers = SerialFieldStorage
         return
     elseif value isa AbstractArray
         buffers.architecture = architecture(value)
-    elseif value isa PencilArrays.Pencil
-        buffers.architecture = CPU()
     end
 end
 
@@ -98,6 +96,10 @@ mutable struct ScalarField{T, S<:AbstractFieldStorage} <: Operand
     # GPU FFT preference (:auto, :cpu, :gpu)
     fft_mode::Symbol
 
+    # Pool tracking metadata (managed by FieldPool)
+    _from_pool::Bool
+    _pool_generation::Int
+
     function ScalarField(dist::Distributor, name::String="field", bases::Tuple{Vararg{Basis}}=(),
                          dtype::Type{T}=dist.dtype) where T
         domain = length(bases) > 0 ? Domain(dist, bases) : nothing
@@ -109,7 +111,7 @@ mutable struct ScalarField{T, S<:AbstractFieldStorage} <: Operand
         # Initialize scales: (1,) * dist.dim
         initial_scales = length(bases) > 0 ? tuple(ones(Float64, dist.dim)...) : nothing
 
-        field = new{T, SerialFieldStorage}(dist, name, bases, domain, dtype, storage, layout, current_layout, initial_scales, :auto)
+        field = new{T, SerialFieldStorage}(dist, name, bases, domain, dtype, storage, layout, current_layout, initial_scales, :auto, false, 0)
 
         # Allocate data if we have a domain
         if domain !== nothing
@@ -125,7 +127,7 @@ mutable struct ScalarField{T, S<:AbstractFieldStorage} <: Operand
         domain = length(bases) > 0 ? Domain(dist, bases) : nothing
         layout = length(bases) > 0 ? get_layout(dist, bases, dtype) : nothing
         initial_scales = length(bases) > 0 ? tuple(ones(Float64, dist.dim)...) : nothing
-        new{T, S}(dist, name, bases, domain, dtype, storage, layout, :g, initial_scales, :auto)
+        new{T, S}(dist, name, bases, domain, dtype, storage, layout, :g, initial_scales, :auto, false, 0)
     end
 end
 
@@ -746,13 +748,7 @@ function allocate_data!(field::ScalarField)
         # CRITICAL: Use PencilFFTs.allocate_input/allocate_output for compatibility
         # These functions are GUARANTEED to create arrays that work with the plan's mul!/ldiv!
         # Using PencilArray{T}(undef, pencil) can fail if the pencil doesn't match exactly
-        pencil_plan = nothing
-        for transform in field.dist.transforms
-            if isa(transform, PencilFFTs.PencilFFTPlan)
-                pencil_plan = transform
-                break
-            end
-        end
+        pencil_plan = _find_pencil_plan(field.dist)
 
         if pencil_plan !== nothing
             # Use PencilFFTs' official allocators - guaranteed to be compatible
@@ -813,7 +809,7 @@ the field is already in grid space.
 
 For auto-transforming access, use `grid_data(field)` or `field["g"]` instead.
 """
-get_grid_data(field::ScalarField) = field.buffers.grid
+@inline get_grid_data(field::ScalarField) = getfield(getfield(field, :storage), :grid)
 
 """
     get_coeff_data(field::ScalarField)
@@ -824,16 +820,17 @@ the field is already in coefficient space.
 
 For auto-transforming access, use `coeff_data(field)` or `field["c"]` instead.
 """
-get_coeff_data(field::ScalarField) = field.buffers.coeff
+@inline get_coeff_data(field::ScalarField) = getfield(getfield(field, :storage), :coeff)
 
 """
     set_grid_data!(field::ScalarField, data)
 
 Assign the grid data array while keeping buffer metadata consistent.
 """
-function set_grid_data!(field::ScalarField, data)
-    field.buffers.grid = data
-    _update_field_buffer_architecture!(field.buffers, data)
+@inline function set_grid_data!(field::ScalarField, data)
+    storage = getfield(field, :storage)
+    setfield!(storage, :grid, data)
+    _update_field_buffer_architecture!(storage, data)
     return field
 end
 
@@ -842,9 +839,10 @@ end
 
 Assign the coefficient data array while keeping buffer metadata consistent.
 """
-function set_coeff_data!(field::ScalarField, data)
-    field.buffers.coeff = data
-    _update_field_buffer_architecture!(field.buffers, data)
+@inline function set_coeff_data!(field::ScalarField, data)
+    storage = getfield(field, :storage)
+    setfield!(storage, :coeff, data)
+    _update_field_buffer_architecture!(storage, data)
     return field
 end
 
@@ -2034,39 +2032,36 @@ function forward_transform_axis!(field::ScalarField)
     end
 
     # Use PencilFFTs-based transforms from the distributor's transform plans
-    found_pencil_fft = false
-    for transform in field.dist.transforms
-        if isa(transform, PencilFFTs.PencilFFTPlan)
-            found_pencil_fft = true
-            # CORRECT: Apply PencilFFT to PencilArray objects
-            # PencilFFT handles transposes internally
+    pencil_plan = _find_pencil_plan(field.dist)
+    if pencil_plan !== nothing
+        # CORRECT: Apply PencilFFT to PencilArray objects
+        # PencilFFT handles transposes internally
 
-            if field.dist.use_pencil_arrays && isa(get_grid_data(field), PencilArrays.PencilArray)
-                # Apply forward transform: grid space (physical) → coefficient space (spectral)
-                # Note: mul! is the in-place version
-                # Result goes into data_c pencil
-                if get_coeff_data(field) === nothing || !isa(get_coeff_data(field), PencilArrays.PencilArray)
-                    # CRITICAL: Use PencilFFTs.allocate_output for compatible coeff-space array
-                    set_coeff_data!(field, PencilFFTs.allocate_output(transform))
-                end
+        if field.dist.use_pencil_arrays && isa(get_grid_data(field), PencilArrays.PencilArray)
+            # Apply forward transform: grid space (physical) → coefficient space (spectral)
+            # Note: mul! is the in-place version
+            # Result goes into data_c pencil
+            if get_coeff_data(field) === nothing || !isa(get_coeff_data(field), PencilArrays.PencilArray)
+                # CRITICAL: Use PencilFFTs.allocate_output for compatible coeff-space array
+                set_coeff_data!(field, PencilFFTs.allocate_output(pencil_plan))
+            end
 
-                # Apply PencilFFT: transforms AND transposes as needed
-                mul!(get_coeff_data(field), transform, get_grid_data(field))
+            # Apply PencilFFT: transforms AND transposes as needed
+            mul!(get_coeff_data(field), pencil_plan, get_grid_data(field))
 
-                @debug "Applied PencilFFT forward transform" typeof(transform) size(get_grid_data(field))
-                field.current_layout = :c
-                return  # Successfully applied transform
+            @debug "Applied PencilFFT forward transform" typeof(pencil_plan) size(get_grid_data(field))
+            field.current_layout = :c
+            return  # Successfully applied transform
+        else
+            # CRITICAL: PencilFFT found but cannot be applied - this indicates a configuration error
+            if field.dist.size > 1
+                error("PencilFFT transform found but field data is not a PencilArray. " *
+                      "In MPI mode, field data must be stored as PencilArrays for correct parallel transforms. " *
+                      "use_pencil_arrays=$(field.dist.use_pencil_arrays), " *
+                      "grid_data type=$(typeof(get_grid_data(field)))")
             else
-                # CRITICAL: PencilFFT found but cannot be applied - this indicates a configuration error
-                if field.dist.size > 1
-                    error("PencilFFT transform found but field data is not a PencilArray. " *
-                          "In MPI mode, field data must be stored as PencilArrays for correct parallel transforms. " *
-                          "use_pencil_arrays=$(field.dist.use_pencil_arrays), " *
-                          "grid_data type=$(typeof(get_grid_data(field)))")
-                else
-                    # Serial mode: fall through to standard transform
-                    @debug "PencilFFT found but using serial transform (serial execution)"
-                end
+                # Serial mode: fall through to standard transform
+                @debug "PencilFFT found but using serial transform (serial execution)"
             end
         end
     end
@@ -2091,39 +2086,36 @@ function backward_transform_axis!(field::ScalarField)
     end
 
     # Use PencilFFTs-based transforms from the distributor's transform plans
-    found_pencil_fft = false
-    for transform in field.dist.transforms
-        if isa(transform, PencilFFTs.PencilFFTPlan)
-            found_pencil_fft = true
-            # CORRECT: Apply inverse PencilFFT to PencilArray objects
+    pencil_plan = _find_pencil_plan(field.dist)
+    if pencil_plan !== nothing
+        # CORRECT: Apply inverse PencilFFT to PencilArray objects
 
-            if field.dist.use_pencil_arrays && isa(get_coeff_data(field), PencilArrays.PencilArray)
-                # Apply backward transform: coefficient space → grid space
-                if get_grid_data(field) === nothing || !isa(get_grid_data(field), PencilArrays.PencilArray)
-                    # CRITICAL: Use PencilFFTs.allocate_input for compatible grid-space array
-                    # allocate_input creates the input array for forward transform,
-                    # which is the output of backward transform
-                    set_grid_data!(field, PencilFFTs.allocate_input(transform))
-                end
+        if field.dist.use_pencil_arrays && isa(get_coeff_data(field), PencilArrays.PencilArray)
+            # Apply backward transform: coefficient space → grid space
+            if get_grid_data(field) === nothing || !isa(get_grid_data(field), PencilArrays.PencilArray)
+                # CRITICAL: Use PencilFFTs.allocate_input for compatible grid-space array
+                # allocate_input creates the input array for forward transform,
+                # which is the output of backward transform
+                set_grid_data!(field, PencilFFTs.allocate_input(pencil_plan))
+            end
 
-                # Apply inverse PencilFFT: transforms AND transposes as needed
-                # ldiv! is in-place inverse (like \ but in-place)
-                ldiv!(get_grid_data(field), transform, get_coeff_data(field))
+            # Apply inverse PencilFFT: transforms AND transposes as needed
+            # ldiv! is in-place inverse (like \ but in-place)
+            ldiv!(get_grid_data(field), pencil_plan, get_coeff_data(field))
 
-                @debug "Applied PencilFFT backward transform" typeof(transform) size(get_coeff_data(field))
-                field.current_layout = :g
-                return  # Successfully applied transform
+            @debug "Applied PencilFFT backward transform" typeof(pencil_plan) size(get_coeff_data(field))
+            field.current_layout = :g
+            return  # Successfully applied transform
+        else
+            # CRITICAL: PencilFFT found but cannot be applied - this indicates a configuration error
+            if field.dist.size > 1
+                error("PencilFFT transform found but field data is not a PencilArray. " *
+                      "In MPI mode, field data must be stored as PencilArrays for correct parallel transforms. " *
+                      "use_pencil_arrays=$(field.dist.use_pencil_arrays), " *
+                      "coeff_data type=$(typeof(get_coeff_data(field)))")
             else
-                # CRITICAL: PencilFFT found but cannot be applied - this indicates a configuration error
-                if field.dist.size > 1
-                    error("PencilFFT transform found but field data is not a PencilArray. " *
-                          "In MPI mode, field data must be stored as PencilArrays for correct parallel transforms. " *
-                          "use_pencil_arrays=$(field.dist.use_pencil_arrays), " *
-                          "coeff_data type=$(typeof(get_coeff_data(field)))")
-                else
-                    # Serial mode: fall through to standard transform
-                    @debug "PencilFFT found but using serial transform (serial execution)"
-                end
+                # Serial mode: fall through to standard transform
+                @debug "PencilFFT found but using serial transform (serial execution)"
             end
         end
     end
@@ -2395,110 +2387,79 @@ function Base.setindex!(field::TensorField, value, i::Int, j::Int)
     field.components[i, j] = value
 end
 
+# Static name for temporary arithmetic fields — avoids string allocation per operation
+const _FIELD_ARITH_TMP_NAME = "_arith_tmp"
+
+# Helper: get local data for broadcasting (handles PencilArray vs plain array)
+@inline _local_data(data::PencilArrays.PencilArray) = parent(data)
+@inline _local_data(data::AbstractArray) = data
+
 # Field arithmetic
-# IMPORTANT: Use copy() to preserve PencilArray structure in MPI mode
+# NOTE: Fresh ScalarField allocation via constructor (not copy()) avoids copying
+# data that is immediately overwritten. allocate_data!() inside the constructor
+# correctly creates PencilArray storage for MPI mode.
 function Base.:+(a::ScalarField, b::ScalarField)
-    """Add two scalar fields"""
     if a.bases != b.bases
         throw(ArgumentError("Cannot add fields with different bases"))
     end
 
-    # Use copy() to preserve PencilArray structure in MPI mode
-    result = copy(a)
-    result.name = "$(a.name)_plus_$(b.name)"
+    result = ScalarField(a.dist, _FIELD_ARITH_TMP_NAME, a.bases, a.dtype)
     ensure_layout!(a, :g)
     ensure_layout!(b, :g)
     ensure_layout!(result, :g)
 
-    # Use local data for PencilArrays
-    result_data = get_grid_data(result)
-    a_data = get_grid_data(a)
-    b_data = get_grid_data(b)
-
-    if isa(result_data, PencilArrays.PencilArray)
-        parent(result_data) .= parent(a_data) .+ parent(b_data)
-    else
-        result_data .= a_data .+ b_data
-    end
+    _local_data(get_grid_data(result)) .= _local_data(get_grid_data(a)) .+ _local_data(get_grid_data(b))
 
     return result
 end
 
 function Base.:-(a::ScalarField, b::ScalarField)
-    """Subtract two scalar fields"""
     if a.bases != b.bases
         throw(ArgumentError("Cannot subtract fields with different bases"))
     end
 
-    # Use copy() to preserve PencilArray structure in MPI mode
-    result = copy(a)
-    result.name = "$(a.name)_minus_$(b.name)"
+    result = ScalarField(a.dist, _FIELD_ARITH_TMP_NAME, a.bases, a.dtype)
     ensure_layout!(a, :g)
     ensure_layout!(b, :g)
     ensure_layout!(result, :g)
 
-    # Use local data for PencilArrays
-    result_data = get_grid_data(result)
-    a_data = get_grid_data(a)
-    b_data = get_grid_data(b)
+    _local_data(get_grid_data(result)) .= _local_data(get_grid_data(a)) .- _local_data(get_grid_data(b))
 
-    if isa(result_data, PencilArrays.PencilArray)
-        parent(result_data) .= parent(a_data) .- parent(b_data)
-    else
-        result_data .= a_data .- b_data
+    return result
+end
+
+function Base.:*(a::ScalarField, b::Real)
+    result = ScalarField(a.dist, _FIELD_ARITH_TMP_NAME, a.bases, a.dtype)
+    ensure_layout!(a, :g)
+    ensure_layout!(result, :g)
+
+    _local_data(get_grid_data(result)) .= b .* _local_data(get_grid_data(a))
+
+    return result
+end
+
+function Base.:*(a::ScalarField, b::ScalarField)
+    if a.bases != b.bases
+        throw(ArgumentError("Cannot multiply fields with different bases"))
+    end
+
+    result = ScalarField(a.dist, _FIELD_ARITH_TMP_NAME, a.bases, a.dtype)
+    ensure_layout!(a, :g)
+    ensure_layout!(b, :g)
+    ensure_layout!(result, :g)
+
+    _local_data(get_grid_data(result)) .= _local_data(get_grid_data(a)) .* _local_data(get_grid_data(b))
+
+    # Apply basic dealiasing for spectral methods (3/2 rule)
+    if has_spectral_bases(a) && length(get_grid_data(a)) > 64
+        apply_dealiasing_to_product!(result)
     end
 
     return result
 end
 
-function Base.:*(a::ScalarField, b::Union{Real, ScalarField})
-    """Multiply scalar field by scalar or another field"""
-    if isa(b, Real)
-        # Use copy() to preserve PencilArray structure in MPI mode
-        result = copy(a)
-        result.name = "$(a.name)_times_$(b)"
-        ensure_layout!(a, :g)
-        ensure_layout!(result, :g)
-
-        result_data = get_grid_data(result)
-        a_data = get_grid_data(a)
-
-        if isa(result_data, PencilArrays.PencilArray)
-            parent(result_data) .= b .* parent(a_data)
-        else
-            result_data .= b .* a_data
-        end
-
-        return result
-    else
-        if a.bases != b.bases
-            throw(ArgumentError("Cannot multiply fields with different bases"))
-        end
-        # Use copy() to preserve PencilArray structure in MPI mode
-        result = copy(a)
-        result.name = "$(a.name)_times_$(b.name)"
-        ensure_layout!(a, :g)
-        ensure_layout!(b, :g)
-        ensure_layout!(result, :g)
-
-        result_data = get_grid_data(result)
-        a_data = get_grid_data(a)
-        b_data = get_grid_data(b)
-
-        if isa(result_data, PencilArrays.PencilArray)
-            parent(result_data) .= parent(a_data) .* parent(b_data)
-        else
-            result_data .= a_data .* b_data
-        end
-
-        # Apply basic dealiasing for spectral methods (3/2 rule)
-        if has_spectral_bases(a) && length(get_grid_data(a)) > 64
-            apply_dealiasing_to_product!(result)
-        end
-
-        return result
-    end
-end
+# Commutative scalar multiplication
+Base.:*(b::Real, a::ScalarField) = a * b
 
 # I/O operations
 function save_field(field::ScalarField, filename::String, dataset_name::String="field")

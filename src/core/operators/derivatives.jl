@@ -47,8 +47,10 @@ function evaluate_divergence(div_op::Divergence, layout::Symbol=:g)
         # Sum partial derivatives of components
         coordsys = operand.coordsys
 
-        # Create result using copy() to preserve PencilArray structure
-        result = copy(operand.components[1])
+        # Create result field from pool, then copy data to preserve PencilArray structure
+        result = checkout_or_alloc(operand.components[1].bases, operand.components[1].dtype, operand.components[1].dist)
+        copy_field_data!(result, operand.components[1])
+        result.current_layout = operand.components[1].current_layout
         result.name = "div_$(operand.name)"
 
         # Initialize result to zero — ensure data is allocated even if copy didn't provide it
@@ -112,7 +114,9 @@ function evaluate_differentiate(diff_op::Differentiate, layout::Symbol=:g)
 
     # Short-circuit for zero-order derivative (identity operation)
     if order == 0
-        result = copy(operand)
+        result = checkout_or_alloc(operand.bases, operand.dtype, operand.dist)
+        copy_field_data!(result, operand)
+        result.current_layout = operand.current_layout
         result.name = "d0_$(operand.name)"
         ensure_layout!(result, layout)
         return result
@@ -129,8 +133,9 @@ function evaluate_differentiate(diff_op::Differentiate, layout::Symbol=:g)
 
     if basis_index === nothing
         # Coordinate not present in bases (constant dimension): derivative is zero
-        # Use copy() to preserve PencilArray structure in MPI mode
-        result = copy(operand)
+        result = checkout_or_alloc(operand.bases, operand.dtype, operand.dist)
+        copy_field_data!(result, operand)
+        result.current_layout = operand.current_layout
         result.name = "d$(order)_$(operand.name)_d$(coord.name)$(order)"
         ensure_layout!(result, layout)
 
@@ -159,8 +164,9 @@ function evaluate_differentiate(diff_op::Differentiate, layout::Symbol=:g)
     end
 
     basis = operand.bases[basis_index]
-    # Use copy() to preserve PencilArray structure in MPI mode
-    result = copy(operand)
+    result = checkout_or_alloc(operand.bases, operand.dtype, operand.dist)
+    copy_field_data!(result, operand)
+    result.current_layout = operand.current_layout
     result.name = "d$(order)_$(operand.name)_d$(coord.name)$(order)"
 
     # Apply differentiation based on basis type
@@ -276,13 +282,7 @@ function _evaluate_distributed_fourier_derivative!(result::ScalarField, operand:
         if dist.use_pencil_arrays && isa(coeff_data, PencilArrays.PencilArray)
             # CRITICAL: Use PencilFFTs.allocate_output for compatible coeff-space array
             # This ensures the array works with PencilFFTs' mul!/ldiv!
-            pencil_plan = nothing
-            for transform in dist.transforms
-                if isa(transform, PencilFFTs.PencilFFTPlan)
-                    pencil_plan = transform
-                    break
-                end
-            end
+            pencil_plan = _find_pencil_plan(dist)
             if pencil_plan !== nothing
                 set_coeff_data!(result, PencilFFTs.allocate_output(pencil_plan))
             else
@@ -458,6 +458,26 @@ function _apply_spectral_derivative_distributed!(coeff_data::AbstractArray,
 end
 
 """
+    _get_cached_deriv_mult(basis::FourierBasis, N::Int, L::Float64, order::Int)
+
+Get or compute cached derivative multiplier `(ik)^order` for Fourier derivatives.
+The multiplier depends only on the basis parameters and derivative order, so it
+is computed once and cached in the basis's transforms dict.
+"""
+function _get_cached_deriv_mult(basis::Union{RealFourier, ComplexFourier}, N::Int, L::Float64, order::Int)
+    # Tuple key avoids string allocation on every call
+    cache_key = (:deriv_mult, N, order)
+    cached = get(basis.transforms, cache_key, nothing)
+    if cached !== nothing
+        return cached::Vector{ComplexF64}
+    end
+    k_axis = fftfreq(N, L/N) .* 2π
+    deriv_mult = (im .* k_axis) .^ order
+    basis.transforms[cache_key] = deriv_mult
+    return deriv_mult
+end
+
+"""
     _evaluate_local_fourier_derivative!(result, operand, axis, order, layout)
 
 Evaluate Fourier derivative on a local axis (no MPI needed).
@@ -470,12 +490,9 @@ function _evaluate_local_fourier_derivative!(result::ScalarField, operand::Scala
 
     # Use grid data for computation
     # For PencilArrays, extract the parent (local) array for FFT operations
+    # Note: fft() is out-of-place (creates new output), so no copy needed
     operand_grid = get_grid_data(operand)
-    if isa(operand_grid, PencilArrays.PencilArray)
-        data_g = copy(parent(operand_grid))  # Copy local array for FFT
-    else
-        data_g = copy(operand_grid)  # Regular array copy
-    end
+    data_g = isa(operand_grid, PencilArrays.PencilArray) ? parent(operand_grid) : operand_grid
 
     dims = ndims(data_g)
     data_shape = size(data_g)
@@ -483,13 +500,8 @@ function _evaluate_local_fourier_derivative!(result::ScalarField, operand::Scala
     # Check if we're on GPU
     use_gpu = is_gpu_array(data_g)
 
-    # Compute wavenumbers for the axis
-    # For periodic FFT: k = [0, 1, ..., N/2-1, -N/2, ..., -1] * (2*pi/L)
-    # Note: Tarang's fftfreq uses sample spacing (d = L/N), not sample rate (fs = N/L)
-    k_axis_cpu = fftfreq(data_shape[axis], L/data_shape[axis]) .* 2π
-
-    # Build derivative multiplier array (ik)^order
-    deriv_mult_cpu = (im .* k_axis_cpu) .^ order
+    # Get cached derivative multiplier (avoids re-allocating wavenumber arrays every call)
+    deriv_mult_cpu = _get_cached_deriv_mult(basis, data_shape[axis], Float64(L), order)
 
     if use_gpu
         # GPU path: use broadcasting for all operations

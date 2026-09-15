@@ -26,6 +26,15 @@ function phi_functions(z::Number)
     return φ₀, φ₁, φ₂, φ₃
 end
 
+# Cached workspace for phi_functions_matrix to avoid repeated identity matrix allocation
+const _phi_identity_cache = Dict{Tuple{Int, DataType}, Matrix}()
+
+@inline function _get_identity_matrix(n::Int, T::Type)
+    get!(_phi_identity_cache, (n, T)) do
+        Matrix{T}(LinearAlgebra.I, n, n)
+    end
+end
+
 function phi_functions_matrix(A::AbstractMatrix, dt::Float64)
     """Compute matrix φ functions for exponential integrators"""
 
@@ -33,32 +42,35 @@ function phi_functions_matrix(A::AbstractMatrix, dt::Float64)
 
     # Check matrix norm for stability
     z_norm = norm(z)
+    n = size(A, 1)
+    I_mat = _get_identity_matrix(n, eltype(A))
 
     if z_norm < 1e-8
         # Use Taylor expansions for small matrices (numerically stable)
-        I = Matrix{eltype(A)}(LinearAlgebra.I, size(A, 1), size(A, 1))
+        # Pre-compute powers to reuse: z², z³, z⁴
+        z2 = z * z
+        z3 = z2 * z
+        z4 = z3 * z
 
         # Taylor series: φ₀(z) = I + z + z²/2 + z³/6 + z⁴/24
-        exp_z = I + z + (z^2)/2 + (z^3)/6 + (z^4)/24
+        exp_z = I_mat + z + z2/2 + z3/6 + z4/24
 
         # Taylor series: φ₁(z) = I + z/2 + z²/6 + z³/24 + z⁴/120
-        φ₁ = I + z/2 + (z^2)/6 + (z^3)/24 + (z^4)/120
+        φ₁ = I_mat + z/2 + z2/6 + z3/24 + z4/120
 
         # Taylor series: φ₂(z) = I/2 + z/6 + z²/24 + z³/120 + z⁴/720
-        φ₂ = I/2 + z/6 + (z^2)/24 + (z^3)/120 + (z^4)/720
+        φ₂ = I_mat/2 + z/6 + z2/24 + z3/120 + z4/720
 
         return exp_z, φ₁, φ₂
 
     elseif z_norm < 50.0
         # Use matrix exponential for moderate matrices
-        I = Matrix{eltype(A)}(LinearAlgebra.I, size(A, 1), size(A, 1))
-
         try
             exp_z = exp(z)
 
             # Use stable computation
-            φ₁ = _compute_phi1_stable(z, exp_z, I)
-            φ₂ = _compute_phi2_stable(z, exp_z, I, φ₁)
+            φ₁ = _compute_phi1_stable(z, exp_z, I_mat)
+            φ₂ = _compute_phi2_stable(z, exp_z, I_mat, φ₁)
 
             return exp_z, φ₁, φ₂
 
@@ -77,8 +89,9 @@ function _compute_phi1_stable(z, exp_z, I)
     """Stable computation of φ₁"""
     z_norm = norm(z)
     if z_norm < 1e-2
-        # Use series expansion for better accuracy
-        return I + z/2 + z^2/6 + z^3/24 + z^4/120
+        # Use series expansion for better accuracy (reuse z powers)
+        z2 = z * z
+        return I + z/2 + z2/6 + z2*z/24 + z2*z2/120
     else
         # Use left-division z \ (exp_z - I) for robustness with near-singular z,
         # rather than right-division (exp_z - I) / z which assumes z is invertible.
@@ -94,9 +107,9 @@ function _compute_phi2_stable(z, exp_z, I, φ₁)
     """
     z_norm = norm(z)
     if z_norm < 1e-2
-        # Use series expansion for better accuracy near z=0
-        # φ₂(z) = 1/2 + z/6 + z²/24 + z³/120 + z⁴/720 + O(z⁵)
-        return I/2 + z/6 + z^2/24 + z^3/120 + z^4/720
+        # Use series expansion for better accuracy near z=0 (reuse z powers)
+        z2 = z * z
+        return I/2 + z/6 + z2/24 + z2*z/120 + z2*z2/720
     else
         # Use left-division for robustness with near-singular z
         return z \ (φ₁ - I)
@@ -108,7 +121,7 @@ function _phi_functions_pade(z)
     Uses scaling-and-squaring with Padé [3/3] for better accuracy than [1/1].
     """
     n = size(z, 1)
-    I_mat = Matrix{eltype(z)}(LinearAlgebra.I, n, n)
+    I_mat = _get_identity_matrix(n, eltype(z))
 
     # Scaling: reduce norm by dividing by 2^s
     z_norm = norm(z)
@@ -150,12 +163,12 @@ function _phi_functions_krylov(A::AbstractMatrix, krylov_dim::Int=30)
     For matrix φ functions, we compute φₖ(A) by applying to identity vectors.
     """
     n = size(A, 1)
-    I_mat = Matrix{eltype(A)}(LinearAlgebra.I, n, n)
+    T = eltype(A)
 
     # Allocate result matrices
-    exp_A = similar(I_mat)
-    φ₁ = similar(I_mat)
-    φ₂ = similar(I_mat)
+    exp_A = Matrix{T}(undef, n, n)
+    φ₁ = Matrix{T}(undef, n, n)
+    φ₂ = Matrix{T}(undef, n, n)
 
     # Use ExponentialUtilities.phiv to compute φ functions column by column
     # phiv(t, A, b, k) returns [φ₀(tA)b, φ₁(tA)b, ..., φₖ(tA)b]

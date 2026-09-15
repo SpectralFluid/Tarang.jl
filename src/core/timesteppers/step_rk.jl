@@ -60,34 +60,35 @@ function step_rk_imex!(state::TimestepperState, solver::InitialValueSolver)
     # Get cached mass matrix factorization (computed once, reused)
     M_factor = M_matrix === nothing ? nothing : _get_mass_factor!(state, M_matrix)
 
-    X_n_vec = fields_to_vector(current_state)
+    X_n_vec = copy(fields_to_vector(current_state))  # copy: cache is shared across calls
     MX_n_vec = M_matrix === nothing ? X_n_vec : (M_matrix * X_n_vec)
 
-    F_exp_vecs = Vector{Vector{eltype(X_n_vec)}}(undef, stages)
-    F_imp_vecs = Vector{Vector{eltype(X_n_vec)}}(undef, stages)
+    T_vec = eltype(X_n_vec)
+    F_exp_vecs = Vector{Vector{T_vec}}(undef, stages)
+    F_imp_vecs = Vector{Vector{T_vec}}(undef, stages)
+    rhs_vec = similar(MX_n_vec)  # Pre-allocate once, reuse across stages
     # Cache LHS factorizations across timesteps. Key is (dt, a_ii) so the cache
     # automatically invalidates when dt changes (adaptive stepping).
-    lhs_cache = get!(state.timestepper_data, "imex_rk_lhs_cache") do
+    lhs_cache = get!(state.timestepper_data, :imex_rk_lhs_cache) do
         Dict{Tuple{Float64, Float64}, Any}()
     end
 
     # Loop over stages
-    for s in 1:stages
+    @inbounds for s in 1:stages
         state.current_substep = s
 
-        rhs_vec = copy(MX_n_vec)
+        copyto!(rhs_vec, MX_n_vec)
 
-        # Add explicit contributions from previous stages
+        # Accumulate explicit and implicit contributions from previous stages
         for j in 1:(s-1)
-            if abs(A_exp[s, j]) > 1e-14
-                rhs_vec .+= dt * A_exp[s, j] .* F_exp_vecs[j]
+            a_exp_sj = dt * A_exp[s, j]
+            a_imp_sj = dt * A_imp[s, j]
+            if abs(a_exp_sj) > 1e-14
+                @. rhs_vec += a_exp_sj * F_exp_vecs[j]
             end
-        end
-
-        # Subtract implicit contributions from previous stages (L on LHS)
-        for j in 1:(s-1)
-            if abs(A_imp[s, j]) > 1e-14
-                rhs_vec .-= dt * A_imp[s, j] .* F_imp_vecs[j]
+            # Subtract implicit contributions (L on LHS)
+            if abs(a_imp_sj) > 1e-14
+                @. rhs_vec -= a_imp_sj * F_imp_vecs[j]
             end
         end
 
@@ -121,25 +122,24 @@ function step_rk_imex!(state::TimestepperState, solver::InitialValueSolver)
         F_imp_vecs[s] = L_matrix * Xs_vec
     end
 
-    # Final update using b weights
-    rhs_vec = copy(MX_n_vec)
-    for s in 1:stages
-        if abs(b_exp[s]) > 1e-14
-            rhs_vec .+= dt * b_exp[s] .* F_exp_vecs[s]
+    # Final update using b weights (reuse rhs_vec buffer)
+    copyto!(rhs_vec, MX_n_vec)
+    @inbounds for s in 1:stages
+        be = dt * b_exp[s]
+        bi = dt * b_imp[s]
+        if abs(be) > 1e-14
+            @. rhs_vec += be * F_exp_vecs[s]
         end
-        if abs(b_imp[s]) > 1e-14
-            rhs_vec .-= dt * b_imp[s] .* F_imp_vecs[s]
+        if abs(bi) > 1e-14
+            @. rhs_vec -= bi * F_imp_vecs[s]
         end
     end
 
     X_new_vec = _apply_mass_inverse(M_factor, rhs_vec)
-    new_state = vector_to_fields(X_new_vec, current_state)
+    new_state = copy_state(current_state)
+    vector_to_fields!(new_state, X_new_vec, current_state)
 
-    push!(state.history, new_state)
-
-    if length(state.history) > 1
-        popfirst!(state.history)
-    end
+    _push_trim!(state.history, new_state, 1)
 end
 
 """
@@ -209,22 +209,27 @@ function _step_explicit_rk_gpu!(state::TimestepperState, solver::InitialValueSol
 
     # Store stage derivatives (k values) as field vectors
     k_stages = Vector{Vector{ScalarField}}(undef, stages)
+    n_fields = length(current_state)
 
-    for s in 1:stages
+    # Pre-build a reusable stage_state from workspace fields (avoids copy_state per stage)
+    stage_state = Vector{ScalarField}(undef, n_fields)
+    for (k, src_field) in enumerate(current_state)
+        stage_state[k] = get_workspace_field!(state, src_field, k)
+    end
+
+    @inbounds for s in 1:stages
         state.current_substep = s
 
         # Compute stage value: Y_s = X_n + dt * sum_{j<s} A[s,j] * k_j
-        if s == 1
-            # First stage: Y_1 = X_n
-            stage_state = copy_state(current_state)
-        else
-            # Start with X_n
-            stage_state = copy_state(current_state)
-            # Add contributions from previous stages
-            for j in 1:(s-1)
-                if abs(A[s, j]) > 1e-14
-                    axpy_state!(dt * A[s, j], k_stages[j], stage_state)
-                end
+        # Copy current_state into workspace (in-place, no allocation)
+        for (k, src_field) in enumerate(current_state)
+            copy_field_data!(stage_state[k], src_field)
+            stage_state[k].current_layout = src_field.current_layout
+        end
+        # Add contributions from previous stages
+        for j in 1:(s-1)
+            if abs(A[s, j]) > 1e-14
+                axpy_state!(dt * A[s, j], k_stages[j], stage_state)
             end
         end
 
@@ -235,17 +240,13 @@ function _step_explicit_rk_gpu!(state::TimestepperState, solver::InitialValueSol
 
     # Compute final update: X_{n+1} = X_n + dt * sum_s b[s] * k_s
     new_state = copy_state(current_state)
-    for s in 1:stages
+    @inbounds for s in 1:stages
         if abs(b[s]) > 1e-14
             axpy_state!(dt * b[s], k_stages[s], new_state)
         end
     end
 
-    push!(state.history, new_state)
-
-    if length(state.history) > 1
-        popfirst!(state.history)
-    end
+    _push_trim!(state.history, new_state, 1)
 end
 
 """
@@ -267,16 +268,17 @@ function _step_explicit_rk_cpu!(state::TimestepperState, solver::InitialValueSol
     # Get cached mass matrix factorization (computed once, reused)
     M_factor = M_matrix === nothing ? nothing : _get_mass_factor!(state, M_matrix)
 
-    X_n_vec = fields_to_vector(current_state)
+    X_n_vec = copy(fields_to_vector(current_state))  # copy: cache is shared across calls
     k_vecs = Vector{Vector{eltype(X_n_vec)}}(undef, stages)
+    Y_vec = similar(X_n_vec)  # Pre-allocate once, reuse across stages
 
-    for s in 1:stages
+    @inbounds for s in 1:stages
         state.current_substep = s
 
-        Y_vec = copy(X_n_vec)
+        copyto!(Y_vec, X_n_vec)
         for j in 1:(s-1)
             if abs(A[s, j]) > 1e-14
-                Y_vec .+= dt * A[s, j] .* k_vecs[j]
+                @. Y_vec += dt * A[s, j] * k_vecs[j]
             end
         end
 
@@ -286,19 +288,17 @@ function _step_explicit_rk_cpu!(state::TimestepperState, solver::InitialValueSol
         k_vecs[s] = _apply_mass_inverse(M_factor, F_vec)
     end
 
-    X_new_vec = copy(X_n_vec)
-    for s in 1:stages
+    # Compute final update (reuse Y_vec buffer)
+    copyto!(Y_vec, X_n_vec)
+    @inbounds for s in 1:stages
         if abs(b[s]) > 1e-14
-            X_new_vec .+= dt * b[s] .* k_vecs[s]
+            @. Y_vec += dt * b[s] * k_vecs[s]
         end
     end
 
-    new_state = vector_to_fields(X_new_vec, current_state)
-    push!(state.history, new_state)
-
-    if length(state.history) > 1
-        popfirst!(state.history)
-    end
+    new_state = copy_state(current_state)
+    vector_to_fields!(new_state, Y_vec, current_state)
+    _push_trim!(state.history, new_state, 1)
 end
 
 """

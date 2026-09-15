@@ -12,11 +12,11 @@ function _legendre_forward(data::AbstractArray, transform::LegendreTransform)
             return host_data
         end
 
-        if !haskey(transform.matrices, "forward")
+        if transform.forward_matrix === nothing
             return host_data
         end
 
-        mat = transform.matrices["forward"]
+        mat = transform.forward_matrix
         coeff_size = size(mat, 1)
         out_shape = ntuple(i -> i == axis ? coeff_size : size(host_data, i), ndims(host_data))
         real_type = real(eltype(host_data))
@@ -65,11 +65,11 @@ function _legendre_backward(data::AbstractArray, transform::LegendreTransform)
             return host_data
         end
 
-        if !haskey(transform.matrices, "backward")
+        if transform.backward_matrix === nothing
             return host_data
         end
 
-        mat = transform.matrices["backward"]
+        mat = transform.backward_matrix
         grid_size = size(mat, 1)
         out_shape = ntuple(i -> i == axis ? grid_size : size(host_data, i), ndims(host_data))
         real_type = real(eltype(host_data))
@@ -111,6 +111,9 @@ function _legendre_backward(data::AbstractArray, transform::LegendreTransform)
     end
 end
 
+_apply_forward(current, t::LegendreTransform) = _legendre_forward(current, t)
+_apply_backward(current, t::LegendreTransform) = _legendre_backward(current, t)
+
 function apply_legendre_forward!(field::ScalarField, transform::LegendreTransform)
     """
     Apply forward Legendre transform (grid to coefficients) with in-place operations.
@@ -121,7 +124,7 @@ function apply_legendre_forward!(field::ScalarField, transform::LegendreTransfor
     - OPTIMIZED: In-place matrix-vector multiplication
     """
 
-    if haskey(transform.matrices, "forward")
+    if transform.forward_matrix !== nothing
         set_coeff_data!(field, _legendre_forward(get_grid_data(field), transform))
         @debug "Applied Legendre forward transform: grid_size=$(transform.grid_size), coeff_size=$(transform.coeff_size)"
         return
@@ -140,7 +143,7 @@ function apply_legendre_backward!(field::ScalarField, transform::LegendreTransfo
     - OPTIMIZED: Uses workspace buffer and in-place operations
     """
 
-    if haskey(transform.matrices, "backward")
+    if transform.backward_matrix !== nothing
         set_grid_data!(field, _legendre_backward(get_coeff_data(field), transform))
         @debug "Applied Legendre backward transform: coeff_size=$(transform.coeff_size), grid_size=$(transform.grid_size)"
         return
@@ -589,15 +592,14 @@ function forward_transform_3d!(field::ScalarField, target_layout::Symbol=:c)
     ensure_layout!(field, :g)  # Start in grid space
     
     # Find appropriate 3D transform
-    for transform in field.dist.transforms
-        if isa(transform, PencilFFTs.PencilFFTPlan)
-            # Check if this is a 3D transform
-            if hasfield(typeof(transform), :dims) && length(transform.dims) <= 3
-                set_coeff_data!(field, transform * get_grid_data(field))
-                field.current_layout = :c
-                @debug "Applied 3D PencilFFT forward transform"
-                return
-            end
+    pencil_plan = _find_pencil_plan(field.dist)
+    if pencil_plan !== nothing
+        # Check if this is a 3D transform
+        if hasfield(typeof(pencil_plan), :dims) && length(pencil_plan.dims) <= 3
+            set_coeff_data!(field, pencil_plan * get_grid_data(field))
+            field.current_layout = :c
+            @debug "Applied 3D PencilFFT forward transform"
+            return
         end
     end
     
@@ -616,15 +618,14 @@ function backward_transform_3d!(field::ScalarField, target_layout::Symbol=:g)
     ensure_layout!(field, :c)  # Start in coefficient space
     
     # Find appropriate 3D transform
-    for transform in field.dist.transforms
-        if isa(transform, PencilFFTs.PencilFFTPlan)
-            # Check if this is a 3D transform (use \ for inverse transform)
-            if hasfield(typeof(transform), :dims) && length(transform.dims) <= 3
-                set_grid_data!(field, transform \ get_coeff_data(field))
-                field.current_layout = :g
-                @debug "Applied 3D PencilFFT backward transform"
-                return
-            end
+    pencil_plan = _find_pencil_plan(field.dist)
+    if pencil_plan !== nothing
+        # Check if this is a 3D transform (use \ for inverse transform)
+        if hasfield(typeof(pencil_plan), :dims) && length(pencil_plan.dims) <= 3
+            set_grid_data!(field, pencil_plan \ get_coeff_data(field))
+            field.current_layout = :g
+            @debug "Applied 3D PencilFFT backward transform"
+            return
         end
     end
     

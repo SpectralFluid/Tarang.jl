@@ -63,7 +63,7 @@ end
 # Nonlinear evaluation engine
 mutable struct NonlinearEvaluator <: AbstractNonlinearEvaluator
     dist::Distributor
-    pencil_transforms::Dict{String, Any}
+    pencil_transforms::Dict{Any, Any}  # Keys: String (setup) or Tuple (hot-path cache)
     dealiasing_factor::Float64
     temp_fields::Dict{String, ScalarField}
     memory_pool::Vector{PencilArrays.PencilArray}
@@ -71,7 +71,7 @@ mutable struct NonlinearEvaluator <: AbstractNonlinearEvaluator
     performance_stats::NonlinearPerformanceStats
 
     function NonlinearEvaluator(dist::Distributor; dealiasing_factor::Float64=3.0/2.0)
-        evaluator = new(dist, Dict{String, Any}(), dealiasing_factor, Dict{String, ScalarField}(), PencilArrays.PencilArray[],
+        evaluator = new(dist, Dict{Any, Any}(), dealiasing_factor, Dict{String, ScalarField}(), PencilArrays.PencilArray[],
                        AbstractArray[], NonlinearPerformanceStats())
         setup_nonlinear_transforms!(evaluator)
         return evaluator
@@ -120,9 +120,14 @@ mutable struct PaddedDealiasingWorkspace{T<:AbstractFloat, A<:AbstractArray{Comp
     padded2::A
     padded_product::A
 
+    # Pre-allocated spectral buffers (original size) — avoids fft() allocation
+    spec1::A
+    spec2::A
+    spec_result::A
+
     # FFT plans: FFTW.MEASURE for CPU, plain plan_fft for GPU
-    plan_forward::Any
-    plan_backward::Any
+    plan_forward::AbstractFFTPlan
+    plan_backward::AbstractFFTPlan
 
     # Architecture for dispatch
     arch::AbstractArchitecture
@@ -143,9 +148,10 @@ function _get_padded_workspace!(evaluator::NonlinearEvaluator, bases::Tuple, dty
                                 local_fourier_dims::Union{Nothing, Vector{Int}}=nothing,
                                 arch::Union{Nothing, AbstractArchitecture}=nothing) where T
     _arch = arch !== nothing ? arch : evaluator.dist.architecture
-    key = "padded_$(hash(bases))_$(dtype)_$(hash(local_shape))_$(is_gpu(_arch))"
+    # Use tuple key to avoid string allocation on every call
+    key = (hash(bases), dtype, hash(local_shape), is_gpu(_arch))
     if haskey(evaluator.pencil_transforms, key)
-        return evaluator.pencil_transforms[key]
+        return evaluator.pencil_transforms[key]::PaddedDealiasingWorkspace{T}
     end
 
     factor = evaluator.dealiasing_factor
@@ -194,6 +200,11 @@ function _get_padded_workspace!(evaluator::NonlinearEvaluator, bases::Tuple, dty
     padded2 = zeros(_arch, Complex{T}, pad_t...)
     padded_product = zeros(_arch, Complex{T}, pad_t...)
 
+    # Allocate original-size spectral buffers
+    spec1 = zeros(_arch, Complex{T}, orig_t...)
+    spec2 = zeros(_arch, Complex{T}, orig_t...)
+    spec_result = zeros(_arch, Complex{T}, orig_t...)
+
     # Create FFT plans — CPU gets FFTW.MEASURE, GPU gets plain plan_fft
     if is_gpu(_arch)
         # For GPU: AbstractFFTs.plan_fft dispatches to CUFFT (no flags arg)
@@ -207,6 +218,7 @@ function _get_padded_workspace!(evaluator::NonlinearEvaluator, bases::Tuple, dty
     ws = PaddedDealiasingWorkspace{T, typeof(padded1)}(
         orig_t, pad_t, fourier_dims,
         padded1, padded2, padded_product,
+        spec1, spec2, spec_result,
         plan_forward, plan_backward, _arch
     )
     evaluator.pencil_transforms[key] = ws
@@ -225,9 +237,10 @@ function _freq_ranges(N::Int, M::Int, is_fourier::Bool)
     Nh = N ÷ 2
     pos_orig = 1:Nh+1
     pos_pad = 1:Nh+1
-    if N > 2
-        neg_orig = N-Nh+2:N
-        neg_pad = M-Nh+2:M
+    n_neg = N - Nh - 1  # number of negative frequencies
+    if n_neg > 0
+        neg_orig = N-n_neg+1:N
+        neg_pad = M-n_neg+1:M
     else
         neg_orig = 1:0  # empty
         neg_pad = 1:0
@@ -374,12 +387,14 @@ function evaluate_padded_multiply(field1::ScalarField, field2::ScalarField,
 
     # Step 1: FFT to spectral along Fourier dimensions
     # fft/ifft dispatch to CUFFT for GPU arrays via AbstractFFTs
-    spec1 = fft(Complex{T}.(raw1_ws), ws.fourier_dims)
-    spec2 = fft(Complex{T}.(raw2_ws), ws.fourier_dims)
+    ws.spec1 .= Complex{T}.(raw1_ws)
+    ws.spec1 .= fft(ws.spec1, ws.fourier_dims)
+    ws.spec2 .= Complex{T}.(raw2_ws)
+    ws.spec2 .= fft(ws.spec2, ws.fourier_dims)
 
     # Step 2: Pad spectral coefficients
-    _pad_spectral!(ws.padded1, spec1, ws.original_shape, ws.padded_shape, ws.fourier_dims)
-    _pad_spectral!(ws.padded2, spec2, ws.original_shape, ws.padded_shape, ws.fourier_dims)
+    _pad_spectral!(ws.padded1, ws.spec1, ws.original_shape, ws.padded_shape, ws.fourier_dims)
+    _pad_spectral!(ws.padded2, ws.spec2, ws.original_shape, ws.padded_shape, ws.fourier_dims)
 
     # Step 3: IFFT to padded grid (using pre-computed plan)
     ws.padded1 .= ws.plan_backward * ws.padded1
@@ -392,8 +407,8 @@ function evaluate_padded_multiply(field1::ScalarField, field2::ScalarField,
     ws.padded_product .= ws.plan_forward * ws.padded_product
 
     # Step 6: Truncate to original coefficients
-    spec_result = zeros(ws.arch, Complex{T}, ws.original_shape...)
-    _truncate_spectral!(spec_result, ws.padded_product, ws.original_shape, ws.padded_shape, ws.fourier_dims)
+    fill!(ws.spec_result, zero(Complex{T}))
+    _truncate_spectral!(ws.spec_result, ws.padded_product, ws.original_shape, ws.padded_shape, ws.fourier_dims)
 
     # Step 7: IFFT to grid and normalize
     # Normalization: padded IFFT divides by M, but we want result on N-grid.
@@ -402,18 +417,18 @@ function evaluate_padded_multiply(field1::ScalarField, field2::ScalarField,
     for d in ws.fourier_dims
         scale *= T(ws.padded_shape[d]) / T(ws.original_shape[d])
     end
-    grid_result = ifft(spec_result, ws.fourier_dims)
+    ws.spec_result .= ifft(ws.spec_result, ws.fourier_dims)
 
     # Write result to output field
-    result = get_temp_field(evaluator, field1, "product_$(field1.name)_$(field2.name)")
+    result = ScalarField(field1.dist, "_nl_product", field1.bases, field1.dtype)
     ensure_layout!(result, :g)
     result_data = get_grid_data(result)
 
     # Extract the correctly-typed grid values
     scaled_result = if field1.dtype <: Real
-        real.(grid_result) .* scale
+        real.(ws.spec_result) .* scale
     else
-        grid_result .* scale
+        ws.spec_result .* scale
     end
 
     # Write back — handle PencilArray wrapper
@@ -466,17 +481,17 @@ Creates a padded-size PencilFFT plan and intermediate PencilArrays.
 This enables correct dealiasing on ALL dimensions (including distributed ones),
 unlike the local-only approach which can only pad non-decomposed dimensions.
 """
-mutable struct PaddedPencilFFTWorkspace
+mutable struct PaddedPencilFFTWorkspace{P, GA<:AbstractArray, SA<:AbstractArray}
     original_shape::Tuple{Vararg{Int}}
     padded_shape::Tuple{Vararg{Int}}
-    padded_plan::Any  # PencilFFTs.PencilFFTPlan for padded size
+    padded_plan::P       # PencilFFTs.PencilFFTPlan for padded size
     # Pre-allocated PencilArrays on padded grid
-    padded_grid1::Any  # PencilArray for padded physical space
-    padded_grid2::Any
-    padded_product::Any
-    padded_spec1::Any  # PencilArray for padded spectral space
-    padded_spec2::Any
-    padded_spec_product::Any
+    padded_grid1::GA     # PencilArray for padded physical space
+    padded_grid2::GA
+    padded_product::GA
+    padded_spec1::SA     # PencilArray for padded spectral space
+    padded_spec2::SA
+    padded_spec_product::SA
 end
 
 """
@@ -488,7 +503,7 @@ Returns nothing if PencilFFTs cannot be created for the padded shape.
 function _get_padded_pencil_workspace!(evaluator::NonlinearEvaluator, bases::Tuple, dist::Distributor)
     key = "padded_pencil_$(hash(bases))"
     if haskey(evaluator.pencil_transforms, key)
-        return evaluator.pencil_transforms[key]
+        return evaluator.pencil_transforms[key]::PaddedPencilFFTWorkspace
     end
 
     factor = evaluator.dealiasing_factor
@@ -521,13 +536,7 @@ function _get_padded_pencil_workspace!(evaluator::NonlinearEvaluator, bases::Tup
         # Create PencilFFT plan for the padded global shape.
         # This is a collective MPI operation — all ranks must call it.
         # Use the same transform types as the original domain's plan.
-        original_plan = nothing
-        for tr in dist.transforms
-            if isa(tr, PencilFFTs.PencilFFTPlan)
-                original_plan = tr
-                break
-            end
-        end
+        original_plan = _find_pencil_plan(dist)
 
         if original_plan === nothing
             @warn "No existing PencilFFT plan found — cannot create padded plan for distributed dealiasing" maxlog=1
@@ -611,7 +620,7 @@ function evaluate_distributed_padded_multiply(field1::ScalarField, field2::Scala
     ws.padded_spec_product .= ws.padded_plan * ws.padded_product
 
     # Step 6: Truncate padded spectral data back to original spectral PencilArrays
-    result = get_temp_field(evaluator, field1, "product_$(field1.name)_$(field2.name)")
+    result = ScalarField(field1.dist, "_nl_product", field1.bases, field1.dtype)
     ensure_layout!(result, :c)
     result_spec = get_coeff_data(result)
     fill!(parent(result_spec), zero(eltype(result_spec)))
@@ -1203,7 +1212,7 @@ function evaluate_transform_multiply(field1::ScalarField, field2::ScalarField, e
 
     # Fallback: direct multiplication + truncation-after-multiply dealiasing
     # (only reached for fields with no Fourier bases, or dealiasing_factor <= 1)
-    result = get_temp_field(evaluator, field1, "product_$(field1.name)_$(field2.name)")
+    result = ScalarField(field1.dist, "_nl_product", field1.bases, field1.dtype)
     ensure_layout!(result, :g)
 
     result_data = get_grid_data(result)
@@ -1247,12 +1256,12 @@ end
 function evaluate_2d_transform_multiply(field1::ScalarField, field2::ScalarField, evaluator::NonlinearEvaluator, shape::Tuple)
     """2D transform-based multiplication using PencilFFTs"""
     
-    # Create result field
-    result = ScalarField(field1.dist, "product_$(field1.name)_$(field2.name)", field1.bases, field1.dtype)
+    # Create result field (static name avoids string allocation per call)
+    result = ScalarField(field1.dist, "_nl_product", field1.bases, field1.dtype)
     ensure_layout!(result, :g)
-    
+
     # Try to find matching transform configuration
-    shape_key = "$(shape[1])x$(shape[2])"
+    shape_key = shape  # Use tuple directly as key (no string allocation)
     
     if haskey(evaluator.pencil_transforms, shape_key)
         # Use precomputed PencilFFT transforms
@@ -1291,7 +1300,7 @@ end
 function evaluate_3d_transform_multiply(field1::ScalarField, field2::ScalarField, evaluator::NonlinearEvaluator, shape::Tuple)
     """3D transform-based multiplication using 3D PencilFFTs"""
     
-    result = ScalarField(field1.dist, "product_$(field1.name)_$(field2.name)", field1.bases, field1.dtype)
+    result = ScalarField(field1.dist, "_nl_product", field1.bases, field1.dtype)
     ensure_layout!(result, :g)
     
     # For 3D, we need more sophisticated pencil management
@@ -1325,7 +1334,7 @@ end
 function evaluate_fallback_multiply(field1::ScalarField, field2::ScalarField, evaluator::NonlinearEvaluator)
     """Fallback multiplication for unsupported dimensions"""
 
-    result = ScalarField(field1.dist, "product_$(field1.name)_$(field2.name)", field1.bases, field1.dtype)
+    result = ScalarField(field1.dist, "_nl_product", field1.bases, field1.dtype)
     ensure_layout!(result, :g)
 
     # Simple pointwise multiplication
@@ -2260,13 +2269,7 @@ function allocate_field_data!(field::ScalarField, config::PencilConfig)
     elseif dist.use_pencil_arrays
         # CPU+MPI with PencilArrays: use PencilFFT plan's allocators for compatibility
         # CRITICAL: PencilFFTs requires arrays allocated from the plan's pencils
-        pencil_plan = nothing
-        for transform in dist.transforms
-            if isa(transform, PencilFFTs.PencilFFTPlan)
-                pencil_plan = transform
-                break
-            end
-        end
+        pencil_plan = _find_pencil_plan(dist)
 
         # Only reuse the existing plan's allocators if its global shape matches the config.
         # ensure_pencil_compatibility! may request a different global shape.

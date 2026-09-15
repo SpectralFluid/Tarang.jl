@@ -393,8 +393,8 @@ function setup_chebyshev_matrix_transform!(transform::ChebyshevTransform, grid_s
         backward_matrix[j+1, k+1] = cos(π * k * j / Nm1)
     end
 
-    transform.matrices["forward"] = sparse(forward_matrix)
-    transform.matrices["backward"] = sparse(backward_matrix)
+    transform.forward_matrix = sparse(forward_matrix)
+    transform.backward_matrix = sparse(backward_matrix)
 
     # Set scaling factors for consistency with DCT-I FFTW path
     N = grid_size
@@ -461,8 +461,8 @@ function setup_legendre_transform!(dist::Distributor, basis::Legendre, axis::Int
             backward_matrix[i, n+1] = poly_matrix[n+1, i] * normalization
         end
         
-        transform.matrices["forward"] = sparse(forward_matrix)
-        transform.matrices["backward"] = sparse(backward_matrix)
+        transform.forward_matrix = sparse(forward_matrix)
+        transform.backward_matrix = sparse(backward_matrix)
         transform.grid_points = grid_points
         transform.quad_weights = quad_weights
         

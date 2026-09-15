@@ -221,10 +221,11 @@ For spectral truncation (2/3 rule), modes with index > cutoff_dim are zeroed.
     idx = @index(Global)
     j = ((idx - 1) ÷ nx) + 1
     i = ((idx - 1) % nx) + 1
-    # Zero modes beyond cutoff in positive OR negative frequency range
-    # For complex FFT: index 1 = DC, indices 2..N/2+1 = positive, N/2+2..N = negative
-    kill_x = i > cutoff_x || (i > 1 && nx - i + 1 > cutoff_x)
-    kill_y = j > cutoff_y || (j > 1 && ny - j + 1 > cutoff_y)
+    # Zero modes beyond cutoff in both positive AND negative frequency range
+    # A mode is kept if i <= cutoff (positive) OR nx-i+1 <= cutoff (negative mirror)
+    # A mode is killed only if BOTH checks fail
+    kill_x = i > cutoff_x && (i == 1 || nx - i + 1 > cutoff_x)
+    kill_y = j > cutoff_y && (j == 1 || ny - j + 1 > cutoff_y)
     @inbounds if kill_x || kill_y
         data[i, j] = zero(eltype(data))
     end
@@ -239,9 +240,9 @@ Dealiasing kernel for 3D arrays: zero out modes beyond cutoff in each dimension.
     i = ((idx - 1) % nx) + 1
     j = (((idx - 1) ÷ nx) % ny) + 1
     k = ((idx - 1) ÷ (nx * ny)) + 1
-    kill_x = i > cutoff_x || (i > 1 && nx - i + 1 > cutoff_x)
-    kill_y = j > cutoff_y || (j > 1 && ny - j + 1 > cutoff_y)
-    kill_z = k > cutoff_z || (k > 1 && nz - k + 1 > cutoff_z)
+    kill_x = i > cutoff_x && (i == 1 || nx - i + 1 > cutoff_x)
+    kill_y = j > cutoff_y && (j == 1 || ny - j + 1 > cutoff_y)
+    kill_z = k > cutoff_z && (k == 1 || nz - k + 1 > cutoff_z)
     @inbounds if kill_x || kill_y || kill_z
         data[i, j, k] = zero(eltype(data))
     end
@@ -720,7 +721,7 @@ function Tarang._pad_spectral!(padded::CuArray{Complex{T}}, spec_data::CuArray{C
     if ndim == 2
         N1, N2 = original_shape
         M1, M2 = padded_shape
-        kernel = pad_spectral_2d_kernel!(backend, workgroup_size(GPU()))
+        kernel = pad_spectral_2d_kernel!(backend, 256)
         kernel(padded, spec_data, N1, N2, M1, M2,
                1 in fourier_dims, 2 in fourier_dims;
                ndrange=(N1, N2))
@@ -728,7 +729,7 @@ function Tarang._pad_spectral!(padded::CuArray{Complex{T}}, spec_data::CuArray{C
     elseif ndim == 3
         N1, N2, N3 = original_shape
         M1, M2, M3 = padded_shape
-        kernel = pad_spectral_3d_kernel!(backend, workgroup_size(GPU()))
+        kernel = pad_spectral_3d_kernel!(backend, 256)
         kernel(padded, spec_data, N1, N2, N3, M1, M2, M3,
                1 in fourier_dims, 2 in fourier_dims, 3 in fourier_dims;
                ndrange=(N1, N2, N3))
@@ -738,9 +739,10 @@ function Tarang._pad_spectral!(padded::CuArray{Complex{T}}, spec_data::CuArray{C
         N = original_shape[1]
         Nh = N ÷ 2
         M = padded_shape[1]
+        n_neg = N - Nh - 1
         padded[1:Nh+1] .= spec_data[1:Nh+1]
-        if N > 2
-            padded[M-Nh+2:M] .= spec_data[N-Nh+2:N]
+        if n_neg > 0
+            padded[M-n_neg+1:M] .= spec_data[N-n_neg+1:N]
         end
     end
 end
@@ -757,7 +759,7 @@ function Tarang._truncate_spectral!(result::CuArray{Complex{T}}, padded_spec::Cu
     if ndim == 2
         N1, N2 = original_shape
         M1, M2 = padded_shape
-        kernel = truncate_spectral_2d_kernel!(backend, workgroup_size(GPU()))
+        kernel = truncate_spectral_2d_kernel!(backend, 256)
         kernel(result, padded_spec, N1, N2, M1, M2,
                1 in fourier_dims, 2 in fourier_dims;
                ndrange=(N1, N2))
@@ -765,7 +767,7 @@ function Tarang._truncate_spectral!(result::CuArray{Complex{T}}, padded_spec::Cu
     elseif ndim == 3
         N1, N2, N3 = original_shape
         M1, M2, M3 = padded_shape
-        kernel = truncate_spectral_3d_kernel!(backend, workgroup_size(GPU()))
+        kernel = truncate_spectral_3d_kernel!(backend, 256)
         kernel(result, padded_spec, N1, N2, N3, M1, M2, M3,
                1 in fourier_dims, 2 in fourier_dims, 3 in fourier_dims;
                ndrange=(N1, N2, N3))
@@ -775,9 +777,10 @@ function Tarang._truncate_spectral!(result::CuArray{Complex{T}}, padded_spec::Cu
         N = original_shape[1]
         Nh = N ÷ 2
         M = padded_shape[1]
+        n_neg = N - Nh - 1
         result[1:Nh+1] .= padded_spec[1:Nh+1]
-        if N > 2
-            result[N-Nh+2:N] .= padded_spec[M-Nh+2:M]
+        if n_neg > 0
+            result[N-n_neg+1:N] .= padded_spec[M-n_neg+1:M]
         end
     end
 end

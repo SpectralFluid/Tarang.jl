@@ -14,6 +14,7 @@ using LinearAlgebra
 using LinearAlgebra: BLAS
 using SparseArrays
 using FFTW
+using AbstractFFTs: Plan as AbstractFFTPlan
 using StaticArrays
 using Parameters
 using ChainRulesCore
@@ -43,6 +44,8 @@ abstract type AbstractNonlinearEvaluator end   # Solvers → Operators bridge
 abstract type AbstractDistributedGPUConfig end  # Core → Transforms bridge
 abstract type AbstractTransposeComms end        # Core → Transforms bridge
 abstract type AbstractTransposeCounts end       # Core → Transforms bridge
+abstract type TimeStepper end                   # Solvers → Timesteppers bridge
+abstract type AbstractTimestepperState end       # Solvers → Timesteppers bridge
 
 # Custom PencilConfig struct for pencil array configuration
 struct PencilConfig
@@ -75,6 +78,7 @@ include("core/basis.jl")
 include("core/distributor.jl")
 include("core/domain.jl")
 include("core/field.jl")
+include("core/field_pool.jl")
 include("core/future.jl")
 include("core/arithmetic.jl")
 include("core/operators/operators.jl")

@@ -134,4 +134,42 @@ import Tarang: phi_functions, phi_functions_matrix
         @test exp_hA[2, 2] ≈ exp(-0.1)
         @test exp_hA[3, 3] ≈ exp(-1.0)
     end
+
+    @testset "Identity matrix caching" begin
+        import Tarang: _get_identity_matrix, _phi_identity_cache
+
+        I1 = _get_identity_matrix(4, Float64)
+        I2 = _get_identity_matrix(4, Float64)
+        @test I1 === I2  # Same object (cached)
+        @test I1 == Matrix{Float64}(LinearAlgebra.I, 4, 4)
+
+        # Different size returns different object
+        I3 = _get_identity_matrix(3, Float64)
+        @test I3 !== I1
+        @test size(I3) == (3, 3)
+
+        # Different type returns different object
+        I4 = _get_identity_matrix(4, ComplexF64)
+        @test I4 !== I1
+        @test eltype(I4) == ComplexF64
+    end
+
+    @testset "phi_functions_matrix small norm (Taylor)" begin
+        A = diagm([0.001, 0.002, 0.003])
+        dt = 0.001
+        exp_z, φ₁, φ₂ = phi_functions_matrix(A, dt)
+
+        z = dt * A
+        @test exp_z ≈ exp(z) atol=1e-10
+
+        I_mat = Matrix{Float64}(LinearAlgebra.I, 3, 3)
+        @test z * φ₁ ≈ exp(z) - I_mat atol=1e-10
+    end
+
+    @testset "phi_functions_matrix moderate norm" begin
+        A = diagm([1.0, 2.0, 3.0])
+        dt = 1.0
+        exp_z, φ₁, φ₂ = phi_functions_matrix(A, dt)
+        @test exp_z ≈ exp(dt * A) atol=1e-8
+    end
 end

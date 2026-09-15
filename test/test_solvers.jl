@@ -500,6 +500,88 @@ using Test
             true
         end
     end
+
+    @testset "History helpers" begin
+        import Tarang: _push_trim!, _prepend_trim!
+
+        @testset "_push_trim! basic" begin
+            v = [1, 2, 3]
+            _push_trim!(v, 4, 3)
+            @test v == [2, 3, 4]
+            @test length(v) == 3
+        end
+
+        @testset "_push_trim! below max" begin
+            v = [1]
+            _push_trim!(v, 2, 5)
+            @test v == [1, 2]
+        end
+
+        @testset "_push_trim! max=1 (RK pattern)" begin
+            v = [10]
+            _push_trim!(v, 20, 1)
+            @test v == [20]
+            @test length(v) == 1
+        end
+
+        @testset "_push_trim! from empty" begin
+            v = Int[]
+            _push_trim!(v, 99, 3)
+            @test v == [99]
+        end
+
+        @testset "_prepend_trim! basic" begin
+            v = [1, 2, 3]
+            _prepend_trim!(v, 0, 3)
+            @test v == [0, 1, 2]
+            @test length(v) == 3
+        end
+
+        @testset "_prepend_trim! ordering (newest first)" begin
+            v = Int[]
+            _prepend_trim!(v, 1, 3)
+            _prepend_trim!(v, 2, 3)
+            _prepend_trim!(v, 3, 3)
+            @test v == [3, 2, 1]
+        end
+
+        @testset "_prepend_trim! max=2" begin
+            v = [10, 20, 30]
+            _prepend_trim!(v, 0, 2)
+            @test v == [0, 10]
+            @test length(v) == 2
+        end
+    end
+
+    @testset "fields_to_vector regression" begin
+        coords = CartesianCoordinates("x")
+        dist = Distributor(coords; mesh=(1,), dtype=Float64)
+        basis = RealFourier(coords["x"]; size=8, bounds=(0.0, 2π))
+        f = ScalarField(dist, "f", (basis,), Float64)
+        ensure_layout!(f, :g)
+        get_grid_data(f) .= randn(8)
+        ensure_layout!(f, :c)
+
+        state = [f]
+
+        @testset "returns Vector{ComplexF64}" begin
+            vec = Tarang.fields_to_vector(state)
+            @test vec isa Vector{ComplexF64}
+        end
+
+        @testset "roundtrip fidelity" begin
+            original_data = copy(get_coeff_data(f))
+            vec = Tarang.fields_to_vector(state)
+            new_state = Tarang.vector_to_fields(vec, state)
+            ensure_layout!(new_state[1], :c)
+            @test get_coeff_data(new_state[1]) ≈ original_data
+        end
+
+        @testset "empty input" begin
+            vec = Tarang.fields_to_vector(ScalarField[])
+            @test isempty(vec)
+        end
+    end
 end
 
 println("All solver tests passed!")

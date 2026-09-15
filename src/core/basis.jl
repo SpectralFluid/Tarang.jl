@@ -270,7 +270,7 @@ Key relationships:
 """
 struct Jacobi <: JacobiBasis
     meta::BasisMeta
-    transforms::Dict{String, Any}
+    transforms::Dict{Any, Any}
     a::Float64      # Jacobi parameter a
     b::Float64      # Jacobi parameter b
     a0::Float64     # Output basis parameter a (for derivatives)
@@ -297,7 +297,7 @@ function _build_jacobi(coord::Coordinate;
 
     meta = BasisMeta(coord.coordsys, coord.name, 1, size, bounds, dealias, dtype;
                      native_bounds=JACOBI_NATIVE_BOUNDS, constant_mode_value=1.0)
-    transforms = Dict{String, Any}()
+    transforms = Dict{Any, Any}()
     product_cache = Dict{Tuple, AbstractMatrix}()
     conversion_cache = Dict{Tuple, AbstractMatrix}()
     diff_cache = Dict{Int, AbstractMatrix}()
@@ -325,7 +325,7 @@ ChebyshevT = Ultraspherical(alpha=0).
 """
 struct Ultraspherical <: JacobiBasis
     meta::BasisMeta
-    transforms::Dict{String, Any}
+    transforms::Dict{Any, Any}
     alpha::Float64  # Gegenbauer parameter
     a::Float64      # Jacobi parameter (= alpha - 1/2)
     b::Float64      # Jacobi parameter (= alpha - 1/2)
@@ -350,7 +350,7 @@ function _build_ultraspherical(coord::Coordinate;
 
     meta = BasisMeta(coord.coordsys, coord.name, 1, size, bounds, dealias, dtype;
                      native_bounds=JACOBI_NATIVE_BOUNDS, constant_mode_value=1.0)
-    transforms = Dict{String, Any}()
+    transforms = Dict{Any, Any}()
     product_cache = Dict{Tuple, AbstractMatrix}()
     conversion_cache = Dict{Tuple, AbstractMatrix}()
     diff_cache = Dict{Int, AbstractMatrix}()
@@ -377,7 +377,7 @@ Equivalent to Ultraspherical(alpha=0) or Jacobi(a=-1/2, b=-1/2).
 """
 struct ChebyshevT <: JacobiBasis
     meta::BasisMeta
-    transforms::Dict{String, Any}
+    transforms::Dict{Any, Any}
     a::Float64
     b::Float64
     a0::Float64
@@ -400,7 +400,7 @@ function _build_chebyshev_t(coord::Coordinate;
 
     meta = BasisMeta(coord.coordsys, coord.name, 1, size, bounds, dealias, dtype;
                      native_bounds=JACOBI_NATIVE_BOUNDS, constant_mode_value=1.0)
-    transforms = Dict{String, Any}()
+    transforms = Dict{Any, Any}()
     product_cache = Dict{Tuple, AbstractMatrix}()
     conversion_cache = Dict{Tuple, AbstractMatrix}()
     diff_cache = Dict{Int, AbstractMatrix}()
@@ -427,7 +427,7 @@ Equivalent to Ultraspherical(alpha=1) or Jacobi(a=1/2, b=1/2).
 """
 struct ChebyshevU <: JacobiBasis
     meta::BasisMeta
-    transforms::Dict{String, Any}
+    transforms::Dict{Any, Any}
     a::Float64
     b::Float64
     a0::Float64
@@ -450,7 +450,7 @@ function _build_chebyshev_u(coord::Coordinate;
 
     meta = BasisMeta(coord.coordsys, coord.name, 1, size, bounds, dealias, dtype;
                      native_bounds=JACOBI_NATIVE_BOUNDS, constant_mode_value=1.0)
-    transforms = Dict{String, Any}()
+    transforms = Dict{Any, Any}()
     product_cache = Dict{Tuple, AbstractMatrix}()
     conversion_cache = Dict{Tuple, AbstractMatrix}()
     diff_cache = Dict{Int, AbstractMatrix}()
@@ -483,7 +483,7 @@ spectral methods for fourth-order PDEs.
 """
 struct ChebyshevV <: JacobiBasis
     meta::BasisMeta
-    transforms::Dict{String, Any}
+    transforms::Dict{Any, Any}
     a::Float64
     b::Float64
     a0::Float64
@@ -506,7 +506,7 @@ function _build_chebyshev_v(coord::Coordinate;
 
     meta = BasisMeta(coord.coordsys, coord.name, 1, size, bounds, dealias, dtype;
                      native_bounds=JACOBI_NATIVE_BOUNDS, constant_mode_value=1.0)
-    transforms = Dict{String, Any}()
+    transforms = Dict{Any, Any}()
     product_cache = Dict{Tuple, AbstractMatrix}()
     conversion_cache = Dict{Tuple, AbstractMatrix}()
     diff_cache = Dict{Int, AbstractMatrix}()
@@ -533,7 +533,7 @@ Equivalent to Jacobi(a=0, b=0).
 """
 struct Legendre <: JacobiBasis
     meta::BasisMeta
-    transforms::Dict{String, Any}
+    transforms::Dict{Any, Any}
     a::Float64
     b::Float64
     a0::Float64
@@ -556,7 +556,7 @@ function _build_legendre(coord::Coordinate;
 
     meta = BasisMeta(coord.coordsys, coord.name, 1, size, bounds, dealias, dtype;
                      native_bounds=JACOBI_NATIVE_BOUNDS, constant_mode_value=1.0)
-    transforms = Dict{String, Any}()
+    transforms = Dict{Any, Any}()
     product_cache = Dict{Tuple, AbstractMatrix}()
     conversion_cache = Dict{Tuple, AbstractMatrix}()
     diff_cache = Dict{Int, AbstractMatrix}()
@@ -585,7 +585,7 @@ Modes: [cos(0*x), cos(1*x), -sin(1*x), cos(2*x), -sin(2*x), ...]
 """
 struct RealFourier <: FourierBasis
     meta::BasisMeta
-    transforms::Dict{String, Any}
+    transforms::Dict{Any, Any}
     # Cached wavenumbers
     _wavenumbers::Union{Nothing, Vector{Float64}}
     _product_matrix_cache::Dict{Tuple, AbstractMatrix}
@@ -598,7 +598,7 @@ function _build_real_fourier(coord::Coordinate;
                              dtype=Float64)
     meta = BasisMeta(coord.coordsys, coord.name, 1, size, bounds, dealias, dtype;
                      native_bounds=FOURIER_NATIVE_BOUNDS, constant_mode_value=1.0)
-    transforms = Dict{String, Any}()
+    transforms = Dict{Any, Any}()
     product_cache = Dict{Tuple, AbstractMatrix}()
     return RealFourier(meta, transforms, nothing, product_cache)
 end
@@ -617,7 +617,7 @@ Modes: [exp(i*0*x), exp(i*1*x), exp(-i*1*x), exp(i*2*x), exp(-i*2*x), ...]
 """
 struct ComplexFourier <: FourierBasis
     meta::BasisMeta
-    transforms::Dict{String, Any}
+    transforms::Dict{Any, Any}
     _wavenumbers::Union{Nothing, Vector{Float64}}
     _product_matrix_cache::Dict{Tuple, AbstractMatrix}
 end
@@ -629,7 +629,7 @@ function _build_complex_fourier(coord::Coordinate;
                                 dtype=ComplexF64)
     meta = BasisMeta(coord.coordsys, coord.name, 1, size, bounds, dealias, dtype;
                      native_bounds=FOURIER_NATIVE_BOUNDS, constant_mode_value=1.0)
-    transforms = Dict{String, Any}()
+    transforms = Dict{Any, Any}()
     product_cache = Dict{Tuple, AbstractMatrix}()
     return ComplexFourier(meta, transforms, nothing, product_cache)
 end

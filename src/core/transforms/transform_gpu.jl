@@ -105,7 +105,11 @@ Note: f is the first argument to support do-block syntax:
         ...
     end
 """
-function _execute_on_cpu(f::Function, data::AbstractArray)
+# Fast path for CPU arrays — avoids is_gpu_array check and enables inlining
+@inline _execute_on_cpu(f, data::Array) = f(data)
+
+# Fallback for other array types (GPU arrays, wrapped arrays)
+function _execute_on_cpu(f, data::AbstractArray)
     if is_gpu_array(data)
         host_data = Array(data)
         host_result = f(host_data)
@@ -131,30 +135,29 @@ function forward_transform!(field::ScalarField, target_layout::Symbol=:c)
     end
 
     # Find appropriate transform
-    for transform in field.dist.transforms
-        if isa(transform, PencilFFTs.PencilFFTPlan)
-            # PencilFFTs is CPU-only; if data is on GPU, move to CPU first
-            grid_data = get_grid_data(field)
-            if is_gpu_array(grid_data)
-                host_data = Array(grid_data)
-                host_result = transform * host_data
-                set_coeff_data!(field, copy_to_device(host_result, grid_data))
-            else
-                # Use in-place mul! if coeff data is already allocated
-                coeff_data = get_coeff_data(field)
-                if coeff_data !== nothing && isa(coeff_data, PencilArrays.PencilArray)
-                    try
-                        mul!(coeff_data, transform, grid_data)
-                    catch
-                        set_coeff_data!(field, transform * grid_data)
-                    end
-                else
-                    set_coeff_data!(field, transform * grid_data)
+    pencil_plan = _find_pencil_plan(field.dist)
+    if pencil_plan !== nothing
+        # PencilFFTs is CPU-only; if data is on GPU, move to CPU first
+        grid_data = get_grid_data(field)
+        if is_gpu_array(grid_data)
+            host_data = Array(grid_data)
+            host_result = pencil_plan * host_data
+            set_coeff_data!(field, copy_to_device(host_result, grid_data))
+        else
+            # Use in-place mul! if coeff data is already allocated
+            coeff_data = get_coeff_data(field)
+            if coeff_data !== nothing && isa(coeff_data, PencilArrays.PencilArray)
+                try
+                    mul!(coeff_data, pencil_plan, grid_data)
+                catch
+                    set_coeff_data!(field, pencil_plan * grid_data)
                 end
+            else
+                set_coeff_data!(field, pencil_plan * grid_data)
             end
-            field.current_layout = :c
-            return
         end
+        field.current_layout = :c
+        return
     end
 
     # CRITICAL: Guard against running local transforms on distributed data
@@ -176,13 +179,7 @@ function forward_transform!(field::ScalarField, target_layout::Symbol=:c)
 
     current = get_grid_data(field)
     for transform in field.dist.transforms
-        if isa(transform, FourierTransform)
-            current = _fourier_forward(current, transform)
-        elseif isa(transform, ChebyshevTransform)
-            current = _chebyshev_forward(current, transform)
-        elseif isa(transform, LegendreTransform)
-            current = _legendre_forward(current, transform)
-        end
+        current = _apply_forward(current, transform)
     end
 
     # Fallback for other transforms or missing plans

@@ -237,78 +237,69 @@ function _find_state_index_for_operand(operand, state::Vector{<:ScalarField}, va
     return nothing
 end
 
+"""
+    _zero_array!(a)
+
+Fill an array with zeros, handling PencilArray wrappers.
+"""
+@inline function _zero_array!(a::AbstractArray)
+    if isa(a, PencilArrays.PencilArray)
+        fill!(parent(a), zero(eltype(a)))
+    else
+        fill!(a, zero(eltype(a)))
+    end
+end
+
+"""
+    _zero_like(a)
+
+Create a zero-filled array with the same type, size, and structure as `a`.
+Uses `similar` + `fill!` instead of `copy` + `fill!` to avoid copying data
+that will be immediately overwritten with zeros.
+"""
+@inline function _zero_like(a::AbstractArray)
+    z = similar(a)
+    _zero_array!(z)
+    return z
+end
+
 function create_rhs_zero_field(template_field::ScalarField)
     """Create a zero RHS field matching the template field properties.
 
-    IMPORTANT: In MPI mode, we must use copy() to preserve the PencilArray structure.
-    Creating a new ScalarField from scratch may result in arrays with different
-    local sizes, causing DimensionMismatch errors in vector operations.
+    Uses the global FieldPool (via checkout_or_alloc) when available to avoid
+    per-RHS-evaluation allocations.  Falls back to direct ScalarField allocation
+    when no pool is active.
+
+    IMPORTANT: In MPI mode the pool field is constructed from the same dist, so
+    it already carries the correct PencilArray decomposition structure — no
+    need for similar()-based copying.
     """
 
     # Skip 0D fields (tau variables) which have no spatial data
     if isempty(template_field.bases)
-        # For 0D fields, create a simple new field (no array allocation needed)
         return ScalarField(template_field.dist, "rhs_$(template_field.name)", template_field.bases, template_field.dtype)
     end
 
-    # Check if template has data - if so, copy to preserve array structure
-    has_data = get_grid_data(template_field) !== nothing || get_coeff_data(template_field) !== nothing
+    # Check out (or allocate) a field from the pool
+    field = checkout_or_alloc(template_field.bases, template_field.dtype, template_field.dist)
+    field.current_layout = template_field.current_layout
 
-    if has_data
-        # Use copy() to preserve PencilArray structure in MPI mode
-        rhs_field = copy(template_field)
-        rhs_field.name = "rhs_$(template_field.name)"
-
-        # Zero out the data
-        if get_coeff_data(rhs_field) !== nothing
-            ensure_layout!(rhs_field, :c)
-            coeff_data = get_coeff_data(rhs_field)
-            if isa(coeff_data, PencilArrays.PencilArray)
-                fill!(parent(coeff_data), zero(eltype(coeff_data)))
-            else
-                fill!(coeff_data, zero(eltype(coeff_data)))
-            end
-        elseif get_grid_data(rhs_field) !== nothing
-            ensure_layout!(rhs_field, :g)
-            grid_data = get_grid_data(rhs_field)
-            if isa(grid_data, PencilArrays.PencilArray)
-                fill!(parent(grid_data), zero(eltype(grid_data)))
-            else
-                fill!(grid_data, zero(eltype(grid_data)))
-            end
-        end
-    else
-        # Template has no data - create new field and allocate
-        rhs_field = ScalarField(template_field.dist, "rhs_$(template_field.name)", template_field.bases, template_field.dtype)
-        if rhs_field.domain !== nothing
-            allocate_data!(rhs_field)
-        end
-
-        # Zero out newly allocated data
-        if get_coeff_data(rhs_field) !== nothing
-            ensure_layout!(rhs_field, :c)
-            coeff_data = get_coeff_data(rhs_field)
-            if coeff_data !== nothing
-                if isa(coeff_data, PencilArrays.PencilArray)
-                    fill!(parent(coeff_data), zero(eltype(coeff_data)))
-                else
-                    fill!(coeff_data, zero(eltype(coeff_data)))
-                end
-            end
-        elseif get_grid_data(rhs_field) !== nothing
-            ensure_layout!(rhs_field, :g)
-            grid_data = get_grid_data(rhs_field)
-            if grid_data !== nothing
-                if isa(grid_data, PencilArrays.PencilArray)
-                    fill!(parent(grid_data), zero(eltype(grid_data)))
-                else
-                    fill!(grid_data, zero(eltype(grid_data)))
-                end
-            end
-        end
+    # Zero the data arrays so stale pool data does not leak into the RHS
+    gd = get_grid_data(field)
+    if gd !== nothing
+        fill!(gd, zero(eltype(gd)))
+    end
+    cd = get_coeff_data(field)
+    if cd !== nothing
+        fill!(cd, zero(eltype(cd)))
     end
 
-    return rhs_field
+    # Copy scale information from template
+    if template_field.scales !== nothing
+        field.scales = template_field.scales
+    end
+
+    return field
 end
 
 """
@@ -317,15 +308,16 @@ end
 Compute state1 + scale * state2 (GPU-aware)
 """
 function add_scaled_state(state1::Vector{<:ScalarField}, state2::Vector{<:ScalarField}, scale::Float64)
-    result = ScalarField[]
+    n = length(state1)
+    result = Vector{ScalarField}(undef, n)
 
-    for (i, field1) in enumerate(state1)
+    @inbounds for i in 1:n
+        field1 = state1[i]
         field2 = state2[i]
 
         # Skip 0D fields (tau variables) which have no spatial data
         if isempty(field1.bases)
-            new_field = ScalarField(field1.dist, field1.name, field1.bases, field1.dtype)
-            push!(result, new_field)
+            result[i] = ScalarField(field1.dist, field1.name, field1.bases, field1.dtype)
             continue
         end
 
@@ -341,32 +333,29 @@ function add_scaled_state(state1::Vector{<:ScalarField}, state2::Vector{<:Scalar
         data2 = get_grid_data(field2)
         new_data = get_grid_data(new_field)
 
-        if data1 === nothing || data2 === nothing || new_data === nothing
-            push!(result, new_field)
-            continue
-        end
-
-        if is_gpu_array(data1)
-            new_data .= data1 .+ scale .* data2
-        else
-            n = length(data1)
-            use_blas = n > 2000 &&
-                       data1 isa StridedArray &&
-                       data2 isa StridedArray &&
-                       new_data isa StridedArray
-            if use_blas
-                copyto!(new_data, data1)
-                BLAS.axpy!(scale, data2, new_data)
-            elseif n > 100
-                scale_local = scale
-                @turbo for j in eachindex(new_data, data1, data2)
-                    new_data[j] = data1[j] + scale_local * data2[j]
-                end
-            else
+        if data1 !== nothing && data2 !== nothing && new_data !== nothing
+            if is_gpu_array(data1)
                 new_data .= data1 .+ scale .* data2
+            else
+                nl = length(data1)
+                use_blas = nl > 2000 &&
+                           data1 isa StridedArray &&
+                           data2 isa StridedArray &&
+                           new_data isa StridedArray
+                if use_blas
+                    copyto!(new_data, data1)
+                    BLAS.axpy!(scale, data2, new_data)
+                elseif nl > 100
+                    scale_local = scale
+                    @turbo for j in eachindex(new_data, data1, data2)
+                        new_data[j] = data1[j] + scale_local * data2[j]
+                    end
+                else
+                    new_data .= data1 .+ scale .* data2
+                end
             end
         end
-        push!(result, new_field)
+        result[i] = new_field
     end
 
     return result
@@ -518,20 +507,16 @@ end
 Create a deep copy of state
 """
 function copy_state(state::Vector{<:ScalarField})
-    new_state = ScalarField[]
+    n = length(state)
+    new_state = Vector{ScalarField}(undef, n)
 
-    for field in state
-        # Skip 0D fields (tau variables) which have no spatial data
+    @inbounds for i in 1:n
+        field = state[i]
         if isempty(field.bases)
-            new_field = ScalarField(field.dist, field.name, field.bases, field.dtype)
-            push!(new_state, new_field)
-            continue
+            new_state[i] = ScalarField(field.dist, field.name, field.bases, field.dtype)
+        else
+            new_state[i] = copy(field)
         end
-
-        # Use copy() to preserve PencilArray structure in MPI mode
-        new_field = copy(field)
-
-        push!(new_state, new_field)
     end
 
     return new_state

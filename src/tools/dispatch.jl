@@ -226,8 +226,8 @@ Invoke the constructor for `cls` with the given arguments.
 This is the final step of dispatch after all preprocessing and matching.
 Override this for types that need special construction logic.
 """
-function invoke_constructor(cls::Type, args::Tuple, kwargs::NamedTuple)
-    return cls(args...; kwargs...)
+function invoke_constructor(cls::Type{T}, args::Tuple, kwargs::NamedTuple) where T
+    return cls(args...; kwargs...)::T
 end
 
 # ---------------------------------------------------------------------------

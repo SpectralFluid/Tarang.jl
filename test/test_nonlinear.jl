@@ -43,7 +43,7 @@ using Test
         evaluator = NonlinearEvaluator(dist)
         @test isa(evaluator, NonlinearEvaluator)
         @test evaluator.dealiasing_factor == 1.5  # Default 3/2 rule
-        @test isa(evaluator.pencil_transforms, Dict{String, Any})
+        @test isa(evaluator.pencil_transforms, Dict{Any, Any})
         @test isa(evaluator.temp_fields, Dict{String, ScalarField})
         @test isa(evaluator.performance_stats, NonlinearPerformanceStats)
 
@@ -527,6 +527,24 @@ using Test
         @test config.global_shape == (64, 64)
         @test config.mesh == (1, 1)
         @test config.dtype == Float64
+    end
+
+    @testset "Cache key regression" begin
+        coords = CartesianCoordinates("x")
+        dist = Distributor(coords; mesh=(1,), dtype=Float64)
+        basis = RealFourier(coords["x"]; size=8, bounds=(0.0, 2π))
+
+        evaluator = NonlinearEvaluator(dist)
+
+        @testset "pencil_transforms accepts tuple keys" begin
+            evaluator.pencil_transforms[(:test, 1, 2)] = "test_value"
+            @test evaluator.pencil_transforms[(:test, 1, 2)] == "test_value"
+        end
+
+        @testset "pencil_transforms accepts string keys (backward compat)" begin
+            evaluator.pencil_transforms["string_key"] = "string_value"
+            @test evaluator.pencil_transforms["string_key"] == "string_value"
+        end
     end
 end
 

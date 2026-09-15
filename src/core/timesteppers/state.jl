@@ -2,18 +2,50 @@
 # Timestepper State Management
 # ============================================================================
 
+# ---------------------------------------------------------------------------
+# History rotation helpers — avoid while-loop + popfirst!/pop! overhead
+# ---------------------------------------------------------------------------
+
+"""
+    _push_trim!(vec, item, max_len)
+
+Append `item` to `vec` and remove oldest (first) entries to keep length ≤ `max_len`.
+Used for state.history where newest is last.
+"""
+@inline function _push_trim!(vec::Vector, item, max_len::Int)
+    push!(vec, item)
+    while length(vec) > max_len
+        popfirst!(vec)
+    end
+    return vec
+end
+
+"""
+    _prepend_trim!(vec, item, max_len)
+
+Prepend `item` to `vec` and remove oldest (last) entries to keep length ≤ `max_len`.
+Used for MX/LX/F histories in multistep methods where newest is first.
+"""
+@inline function _prepend_trim!(vec::Vector, item, max_len::Int)
+    pushfirst!(vec, item)
+    while length(vec) > max_len
+        pop!(vec)
+    end
+    return vec
+end
+
 """
 Timestepper state management with workspace optimization.
 
 Holds the current state, history, and workspace fields for time-stepping.
 """
-mutable struct TimestepperState
+mutable struct TimestepperState <: AbstractTimestepperState
     timestepper::TimeStepper
     dt::Float64
     history::Vector{Vector{<:ScalarField}}
     dt_history::Vector{Float64}  # Track timestep history for variable timesteps
     stage::Int
-    timestepper_data::Dict{String, Any}  # Additional data for specific timesteppers
+    timestepper_data::Dict{Symbol, Any}  # Additional data for specific timesteppers
 
     # Pre-allocated workspace fields for zero-allocation time-stepping
     workspace_fields::Vector{<:ScalarField}  # Reusable scratch fields
@@ -22,7 +54,7 @@ mutable struct TimestepperState
     # Stochastic forcing support (following GeophysicalFlows.jl pattern)
     # Forcing is computed ONCE at the beginning of each timestep and stays constant
     # across all substeps (important for Stratonovich calculus correctness)
-    forcing::Union{Nothing, Any}  # StochasticForcing or nothing
+    forcing::Union{Nothing, Forcing}  # StochasticForcing or DeterministicForcing
     current_substep::Int  # Track which substep we're in (1-indexed)
     forcing_generated::Bool  # Flag to track if forcing was generated this timestep
 
@@ -30,7 +62,7 @@ mutable struct TimestepperState
                               forcing=nothing)
         history = [copy.(initial_state)]
         dt_history = [dt]  # Initialize with current timestep
-        timestepper_data = Dict{String, Any}()
+        timestepper_data = Dict{Symbol, Any}()
 
         # Pre-allocate workspace fields based on timestepper requirements
         n_fields = length(initial_state)
@@ -125,13 +157,13 @@ end
 
 function _get_mass_factor!(state::TimestepperState, M_matrix::AbstractMatrix)
     cache = state.timestepper_data
-    if !haskey(cache, "M_factor") || get(cache, "M_factor_source", nothing) !== M_matrix
-        cache["M_factor"] = factorize(M_matrix)
-        cache["M_factor_source"] = M_matrix
-        cache["L_eff"] = nothing
-        cache["L_eff_source"] = nothing
+    if !haskey(cache, :M_factor) || get(cache, :M_factor_source, nothing) !== M_matrix
+        cache[:M_factor] = factorize(M_matrix)
+        cache[:M_factor_source] = M_matrix
+        cache[:L_eff] = nothing
+        cache[:L_eff_source] = nothing
     end
-    return cache["M_factor"]
+    return cache[:M_factor]  # May be Factorization, Diagonal, or other factorize() result
 end
 
 """
@@ -162,14 +194,14 @@ function _get_linear_operator_eff!(state::TimestepperState, L_matrix::AbstractMa
 
     M_factor = _get_mass_factor!(state, M_matrix)
     cache = state.timestepper_data
-    if !haskey(cache, "L_eff") || get(cache, "L_eff_source", nothing) !== L_matrix
-        cache["L_eff"] = M_factor \ L_matrix   # M^{-1} * L (cached, positive)
-        cache["L_eff_source"] = L_matrix
+    if !haskey(cache, :L_eff) || get(cache, :L_eff_source, nothing) !== L_matrix
+        cache[:L_eff] = M_factor \ L_matrix   # M^{-1} * L (cached, positive)
+        cache[:L_eff_source] = L_matrix
     end
 
     # Negate to convert from LHS form (M*dX/dt + L*X = F)
     # to RHS form (dX/dt = -M^{-1}*L*X + M^{-1}*F)
-    return -cache["L_eff"], M_factor
+    return -cache[:L_eff]::AbstractMatrix, M_factor
 end
 
 """
@@ -201,13 +233,13 @@ function _get_linear_operator_lhs!(state::TimestepperState, L_matrix::AbstractMa
 
     M_factor = _get_mass_factor!(state, M_matrix)
     cache = state.timestepper_data
-    if !haskey(cache, "L_eff") || get(cache, "L_eff_source", nothing) !== L_matrix
-        cache["L_eff"] = M_factor \ L_matrix   # M^{-1} * L (cached, positive)
-        cache["L_eff_source"] = L_matrix
+    if !haskey(cache, :L_eff) || get(cache, :L_eff_source, nothing) !== L_matrix
+        cache[:L_eff] = M_factor \ L_matrix   # M^{-1} * L (cached, positive)
+        cache[:L_eff_source] = L_matrix
     end
 
     # Return positive M^{-1}*L (LHS convention)
-    return cache["L_eff"], M_factor
+    return cache[:L_eff]::AbstractMatrix, M_factor
 end
 
 function _apply_mass_inverse(M_factor, vec::AbstractVector)
@@ -221,14 +253,15 @@ Fetch a matrix from `problem.parameters` ensuring it resides on CPU memory.
 If the stored matrix is a GPU array, it is copied back to CPU once and the
 problem parameter is updated in place so subsequent calls reuse the CPU copy.
 """
-function _get_problem_matrix(problem::Problem, key::AbstractString)
+function _get_problem_matrix(problem::Problem, key::AbstractString)::Union{Nothing, AbstractMatrix}
     params = problem.parameters
     key_str = key isa String ? key : String(key)
     if !haskey(params, key_str)
         return nothing
     end
     matrix = params[key_str]
-    return _ensure_cpu_matrix!(params, key_str, matrix)
+    result = _ensure_cpu_matrix!(params, key_str, matrix)
+    return result isa AbstractMatrix ? result : nothing
 end
 
 function _ensure_cpu_matrix!(params::Dict{String, Any}, key::String, matrix)

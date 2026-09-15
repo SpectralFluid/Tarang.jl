@@ -40,6 +40,11 @@ const TEST_FILES = [
     "test_operators_tensor.jl",
     "test_diagonal_imex.jl",
     "test_rksmr_convergence.jl",
+    "test_kernel_operations.jl",
+    "test_cpu_architecture.jl",
+    "test_dealiasing_math.jl",
+    "test_gpu_solver_cpu.jl",
+    "test_type_stability.jl",
 ]
 
 # Tests that may require special setup or longer runtime

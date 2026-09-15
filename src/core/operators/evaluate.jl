@@ -1,115 +1,71 @@
 """
     Main evaluate dispatch
 
-This file contains the unified evaluate() function that dispatches to
-specific operator evaluators, plus arithmetic operator evaluation functions.
+This file contains evaluate() method definitions that use Julia's multiple dispatch
+instead of runtime isa checks. Each operator type gets its own method, enabling
+the compiler to inline and optimize at compile time.
+
+Note: Cartesian operator evaluate() methods are defined in cartesian_operators.jl.
 """
 
 # ============================================================================
-# Unified Operator Evaluation Dispatcher
+# Operator Evaluation via Multiple Dispatch
 # ============================================================================
 
-"""
-    evaluate(op::Operator, layout::Symbol=:g)
-
-Unified evaluation function that dispatches to specific operator evaluators.
-"""
+# Fallback for unknown operator types
 function evaluate(op::Operator, layout::Symbol=:g)
-    # Cartesian-specific operators (defined in cartesian_operators.jl)
-    if isa(op, CartesianGradient)
-        return evaluate_cartesian_gradient(op, layout)
-    elseif isa(op, CartesianDivergence)
-        return evaluate_cartesian_divergence(op, layout)
-    elseif isa(op, CartesianCurl)
-        return evaluate_cartesian_curl(op, layout)
-    elseif isa(op, CartesianLaplacian)
-        return evaluate_cartesian_laplacian(op, layout)
-    elseif isa(op, CartesianTrace)
-        return evaluate_cartesian_trace(op, layout)
-    elseif isa(op, CartesianSkew)
-        return evaluate_cartesian_skew(op, layout)
-    elseif isa(op, CartesianComponent)
-        return evaluate_cartesian_component(op, layout)
-    # Generic operators
-    elseif isa(op, Gradient)
-        return evaluate_gradient(op, layout)
-    elseif isa(op, Divergence)
-        return evaluate_divergence(op, layout)
-    elseif isa(op, Curl)
-        return evaluate_curl(op, layout)
-    elseif isa(op, Laplacian)
-        return evaluate_laplacian(op, layout)
-    elseif isa(op, FractionalLaplacian)
-        return evaluate_fractional_laplacian(op, layout)
-    elseif isa(op, Differentiate)
-        return evaluate_differentiate(op, layout)
-    elseif isa(op, Interpolate)
-        return evaluate_interpolate(op, layout)
-    elseif isa(op, Integrate)
-        return evaluate_integrate(op, layout)
-    elseif isa(op, Average)
-        return evaluate_average(op, layout)
-    elseif isa(op, Lift)
-        return evaluate_lift(op, layout)
-    elseif isa(op, Convert)
-        return evaluate_convert(op, layout)
-    elseif isa(op, GeneralFunction)
-        return evaluate_general_function(op, layout)
-    elseif isa(op, UnaryGridFunction)
-        return evaluate_unary_grid_function(op, layout)
-    elseif isa(op, Grid)
-        return evaluate_grid(op)
-    elseif isa(op, Coeff)
-        return evaluate_coeff(op)
-    elseif isa(op, Component)
-        return evaluate_component(op)
-    elseif isa(op, RadialComponent)
-        return evaluate_radial_component(op)
-    elseif isa(op, AngularComponent)
-        return evaluate_angular_component(op)
-    elseif isa(op, AzimuthalComponent)
-        return evaluate_azimuthal_component(op)
-    elseif isa(op, Trace)
-        return evaluate_trace(op, layout)
-    elseif isa(op, Skew)
-        return evaluate_skew(op, layout)
-    elseif isa(op, TransposeComponents)
-        return evaluate_transpose_components(op, layout)
-    elseif isa(op, Outer)
-        return evaluate_outer(op, layout)
-    elseif isa(op, AdvectiveCFL)
-        return evaluate_advective_cfl(op, layout)
-    elseif isa(op, Copy)
-        return evaluate_copy(op, layout)
-    elseif isa(op, HilbertTransform)
-        return evaluate_hilbert_transform(op, layout)
-    elseif isa(op, TimeDerivative)
-        # TimeDerivative is handled by solvers, not direct evaluation
-        throw(ArgumentError(
-            "TimeDerivative (∂t) cannot be directly evaluated outside a solver. " *
-            "Use `InitialValueSolver(problem, timestepper; dt=...)` to solve time-dependent problems. " *
-            "The solver handles ∂t terms automatically via the timestepping algorithm."))
-    elseif isa(op, NegateOperator)
-        return evaluate_negate(op, layout)
-    elseif isa(op, MultiplyOperator)
-        return evaluate_multiply(op, layout)
-    elseif isa(op, AddOperator)
-        return evaluate_add(op, layout)
-    elseif isa(op, SubtractOperator)
-        return evaluate_subtract(op, layout)
-    elseif isa(op, DivideOperator)
-        return evaluate_divide(op, layout)
-    elseif isa(op, PowerOperator)
-        return evaluate_power(op, layout)
-    elseif isa(op, IndexOperator)
-        return evaluate_index(op, layout)
-    else
-        throw(ArgumentError(
-            "Evaluation not implemented for operator type $(typeof(op)). " *
-            "This operator may need to be wrapped in a solver (for ∂t terms) or " *
-            "may require a custom evaluate() method. " *
-            "Built-in operators: Add, Multiply, Differentiate, Gradient, Divergence, Curl, Laplacian."))
-    end
+    throw(ArgumentError(
+        "Evaluation not implemented for operator type $(typeof(op)). " *
+        "This operator may need to be wrapped in a solver (for ∂t terms) or " *
+        "may require a custom evaluate() method. " *
+        "Built-in operators: Add, Multiply, Differentiate, Gradient, Divergence, Curl, Laplacian."))
+end
+
+# Generic operators
+evaluate(op::Gradient, layout::Symbol=:g) = evaluate_gradient(op, layout)
+evaluate(op::Divergence, layout::Symbol=:g) = evaluate_divergence(op, layout)
+evaluate(op::Curl, layout::Symbol=:g) = evaluate_curl(op, layout)
+evaluate(op::Laplacian, layout::Symbol=:g) = evaluate_laplacian(op, layout)
+evaluate(op::FractionalLaplacian, layout::Symbol=:g) = evaluate_fractional_laplacian(op, layout)
+evaluate(op::Differentiate, layout::Symbol=:g) = evaluate_differentiate(op, layout)
+evaluate(op::Interpolate, layout::Symbol=:g) = evaluate_interpolate(op, layout)
+evaluate(op::Integrate, layout::Symbol=:g) = evaluate_integrate(op, layout)
+evaluate(op::Average, layout::Symbol=:g) = evaluate_average(op, layout)
+evaluate(op::Lift, layout::Symbol=:g) = evaluate_lift(op, layout)
+evaluate(op::Convert, layout::Symbol=:g) = evaluate_convert(op, layout)
+evaluate(op::GeneralFunction, layout::Symbol=:g) = evaluate_general_function(op, layout)
+evaluate(op::UnaryGridFunction, layout::Symbol=:g) = evaluate_unary_grid_function(op, layout)
+evaluate(op::Trace, layout::Symbol=:g) = evaluate_trace(op, layout)
+evaluate(op::Skew, layout::Symbol=:g) = evaluate_skew(op, layout)
+evaluate(op::TransposeComponents, layout::Symbol=:g) = evaluate_transpose_components(op, layout)
+evaluate(op::Outer, layout::Symbol=:g) = evaluate_outer(op, layout)
+evaluate(op::AdvectiveCFL, layout::Symbol=:g) = evaluate_advective_cfl(op, layout)
+evaluate(op::Copy, layout::Symbol=:g) = evaluate_copy(op, layout)
+evaluate(op::HilbertTransform, layout::Symbol=:g) = evaluate_hilbert_transform(op, layout)
+
+# Component extraction (no layout needed, but accept it for uniform API)
+evaluate(op::Grid, ::Symbol=:g) = evaluate_grid(op)
+evaluate(op::Coeff, ::Symbol=:g) = evaluate_coeff(op)
+evaluate(op::Component, ::Symbol=:g) = evaluate_component(op)
+evaluate(op::RadialComponent, ::Symbol=:g) = evaluate_radial_component(op)
+evaluate(op::AngularComponent, ::Symbol=:g) = evaluate_angular_component(op)
+evaluate(op::AzimuthalComponent, ::Symbol=:g) = evaluate_azimuthal_component(op)
+
+# Arithmetic operators
+evaluate(op::NegateOperator, layout::Symbol=:g) = evaluate_negate(op, layout)
+evaluate(op::MultiplyOperator, layout::Symbol=:g) = evaluate_multiply(op, layout)
+evaluate(op::AddOperator, layout::Symbol=:g) = evaluate_add(op, layout)
+evaluate(op::SubtractOperator, layout::Symbol=:g) = evaluate_subtract(op, layout)
+evaluate(op::DivideOperator, layout::Symbol=:g) = evaluate_divide(op, layout)
+evaluate(op::PowerOperator, layout::Symbol=:g) = evaluate_power(op, layout)
+evaluate(op::IndexOperator, layout::Symbol=:g) = evaluate_index(op, layout)
+
+# TimeDerivative cannot be directly evaluated
+function evaluate(op::TimeDerivative, ::Symbol=:g)
+    throw(ArgumentError(
+        "TimeDerivative (∂t) cannot be directly evaluated outside a solver. " *
+        "Use `InitialValueSolver(problem, timestepper; dt=...)` to solve time-dependent problems. " *
+        "The solver handles ∂t terms automatically via the timestepping algorithm."))
 end
 
 # ============================================================================
@@ -122,75 +78,48 @@ end
 Evaluate negation operator: returns -operand.
 """
 function evaluate_negate(op::NegateOperator, layout::Symbol=:g)
-    # Evaluate the operand first
-    operand = op.operand
-    if isa(operand, Operator)
-        result = evaluate(operand, layout)
-    elseif isa(operand, Future)
-        result = evaluate(operand; force=true)
-    else
-        result = operand
-    end
-
-    # Negate the result
-    if isa(result, ScalarField)
-        # Use copy to preserve array structure (important for MPI/PencilArrays)
-        negated = copy(result)
-        negated.name = "neg_$(result.name)"
-        ensure_layout!(negated, layout)
-        if layout == :g
-            data = get_grid_data(negated)
-            if data !== nothing
-                data .= .-data
-            end
-        else
-            data = get_coeff_data(negated)
-            if data !== nothing
-                data .= .-data
-            end
-        end
-        return negated
-    elseif isa(result, VectorField)
-        # Copy each component
-        negated = VectorField(result.dist, result.coordsys, "neg_$(result.name)", result.bases, result.dtype)
-        for (i, comp) in enumerate(result.components)
-            negated.components[i] = copy(comp)
-            negated.components[i].name = "neg_$(comp.name)"
-            ensure_layout!(negated.components[i], layout)
-            if layout == :g
-                data = get_grid_data(negated.components[i])
-                if data !== nothing
-                    data .= .-data
-                end
-            else
-                data = get_coeff_data(negated.components[i])
-                if data !== nothing
-                    data .= .-data
-                end
-            end
-        end
-        return negated
-    elseif isa(result, Number)
-        return -result
-    elseif isa(result, AbstractArray)
-        return .-result
-    else
-        throw(ArgumentError("Cannot negate result of type $(typeof(result))"))
-    end
+    result = _eval_operand(op.operand, layout)
+    return _negate_result(result, layout)
 end
+
+# Dispatch methods for negation result handling
+function _negate_result(result::ScalarField, layout::Symbol)
+    negated = checkout_or_alloc(result.bases, result.dtype, result.dist)
+    ensure_layout!(result, layout)
+    ensure_layout!(negated, layout)
+    src = layout == :g ? get_grid_data(result) : get_coeff_data(result)
+    dst = layout == :g ? get_grid_data(negated) : get_coeff_data(negated)
+    if src !== nothing && dst !== nothing
+        dst .= .-src
+    end
+    return negated
+end
+
+function _negate_result(result::VectorField, layout::Symbol)
+    negated = VectorField(result.dist, result.coordsys, "_neg", result.bases, result.dtype)
+    for (i, comp) in enumerate(result.components)
+        ensure_layout!(comp, layout)
+        ensure_layout!(negated.components[i], layout)
+        src = layout == :g ? get_grid_data(comp) : get_coeff_data(comp)
+        dst = layout == :g ? get_grid_data(negated.components[i]) : get_coeff_data(negated.components[i])
+        if src !== nothing && dst !== nothing
+            dst .= .-src
+        end
+    end
+    return negated
+end
+
+_negate_result(result::Number, ::Symbol) = -result
+_negate_result(result::AbstractArray, ::Symbol) = .-result
+_negate_result(result, ::Symbol) = throw(ArgumentError("Cannot negate result of type $(typeof(result))"))
 
 """
 Helper to evaluate any operand (Operator, Future, or Field).
+Uses dispatch instead of isa() chain.
 """
-function _eval_operand(arg, layout::Symbol)
-    if isa(arg, Operator)
-        return evaluate(arg, layout)
-    elseif isa(arg, Future)
-        return evaluate(arg; force=true)
-    else
-        return arg
-    end
-end
+_eval_operand(arg::Operator, layout::Symbol) = evaluate(arg, layout)
+_eval_operand(arg::Future, layout::Symbol) = evaluate(arg; force=true)
+_eval_operand(arg, ::Symbol) = arg  # Fields, Numbers, etc. are already evaluated
 
 """
     evaluate_multiply(op::MultiplyOperator, layout::Symbol=:g)
@@ -200,89 +129,70 @@ Evaluate multiplication operator: scalar * field or field * scalar.
 function evaluate_multiply(op::MultiplyOperator, layout::Symbol=:g)
     left = _eval_operand(op.left, layout)
     right = _eval_operand(op.right, layout)
+    return _multiply_result(left, right, layout)
+end
 
-    # Scalar * Field
-    if isa(left, Number) && isa(right, ScalarField)
-        result = copy(right)
-        result.name = "mul_$(right.name)"
-        ensure_layout!(result, layout)
-        if layout == :g
-            data = get_grid_data(result)
-            if data !== nothing
-                data .= left .* data
-            end
-        else
-            data = get_coeff_data(result)
-            if data !== nothing
-                data .= left .* data
-            end
-        end
-        return result
-    # Field * Scalar
-    elseif isa(left, ScalarField) && isa(right, Number)
-        result = copy(left)
-        result.name = "mul_$(left.name)"
-        ensure_layout!(result, layout)
-        if layout == :g
-            data = get_grid_data(result)
-            if data !== nothing
-                data .= data .* right
-            end
-        else
-            data = get_coeff_data(result)
-            if data !== nothing
-                data .= data .* right
-            end
-        end
-        return result
-    # Field * Field (element-wise in grid space)
-    elseif isa(left, ScalarField) && isa(right, ScalarField)
-        result = copy(left)
-        result.name = "mul_$(left.name)_$(right.name)"
-        ensure_layout!(left, :g)
-        ensure_layout!(right, :g)
-        ensure_layout!(result, :g)
-        left_data = get_grid_data(left)
-        right_data = get_grid_data(right)
-        res_data = get_grid_data(result)
-        if left_data !== nothing && right_data !== nothing && res_data !== nothing
-            res_data .= left_data .* right_data
-        end
-        if layout == :c
-            ensure_layout!(result, :c)
-        end
-        return result
-    # Number * VectorField (component-wise scaling)
-    elseif isa(left, Number) && isa(right, VectorField)
-        result = copy(right)
-        result.name = "mul_$(right.name)"
-        for comp in result.components
-            ensure_layout!(comp, layout)
-            data = layout == :g ? get_grid_data(comp) : get_coeff_data(comp)
-            data !== nothing && (data .= left .* data)
-        end
-        return result
-    # VectorField * Number (component-wise scaling)
-    elseif isa(left, VectorField) && isa(right, Number)
-        result = copy(left)
-        result.name = "mul_$(left.name)"
-        for comp in result.components
-            ensure_layout!(comp, layout)
-            data = layout == :g ? get_grid_data(comp) : get_coeff_data(comp)
-            data !== nothing && (data .= data .* right)
-        end
-        return result
-    # Number * Number
-    elseif isa(left, Number) && isa(right, Number)
-        return left * right
-    else
-        throw(ArgumentError(
-            "Cannot multiply $(typeof(left)) and $(typeof(right)). " *
-            "Supported: ScalarField*ScalarField, Number*ScalarField, ScalarField*Number, " *
-            "Number*VectorField, VectorField*Number. " *
-            "For dot product use `dot(u, v)` or `u ⋅ v`. " *
-            "For cross product use `cross(u, v)` or `u × v`."))
+# Dispatch methods for multiply result handling — avoids isa() chain
+function _multiply_result(left::Number, right::ScalarField, layout::Symbol)
+    result = checkout_or_alloc(right.bases, right.dtype, right.dist)
+    ensure_layout!(right, layout)
+    ensure_layout!(result, layout)
+    src = layout == :g ? get_grid_data(right) : get_coeff_data(right)
+    dst = layout == :g ? get_grid_data(result) : get_coeff_data(result)
+    if src !== nothing && dst !== nothing
+        @. dst = left * src
     end
+    return result
+end
+
+function _multiply_result(left::ScalarField, right::Number, layout::Symbol)
+    return _multiply_result(right, left, layout)
+end
+
+function _multiply_result(left::ScalarField, right::ScalarField, layout::Symbol)
+    result = checkout_or_alloc(left.bases, left.dtype, left.dist)
+    ensure_layout!(left, :g)
+    ensure_layout!(right, :g)
+    ensure_layout!(result, :g)
+    left_data = get_grid_data(left)
+    right_data = get_grid_data(right)
+    res_data = get_grid_data(result)
+    if left_data !== nothing && right_data !== nothing && res_data !== nothing
+        @. res_data = left_data * right_data
+    end
+    if layout == :c
+        ensure_layout!(result, :c)
+    end
+    return result
+end
+
+function _multiply_result(left::Number, right::VectorField, layout::Symbol)
+    result = VectorField(right.dist, right.coordsys, "_mul", right.bases, right.dtype)
+    for (i, comp) in enumerate(right.components)
+        ensure_layout!(comp, layout)
+        ensure_layout!(result.components[i], layout)
+        src = layout == :g ? get_grid_data(comp) : get_coeff_data(comp)
+        dst = layout == :g ? get_grid_data(result.components[i]) : get_coeff_data(result.components[i])
+        if src !== nothing && dst !== nothing
+            @. dst = left * src
+        end
+    end
+    return result
+end
+
+function _multiply_result(left::VectorField, right::Number, layout::Symbol)
+    return _multiply_result(right, left, layout)
+end
+
+_multiply_result(left::Number, right::Number, ::Symbol) = left * right
+
+function _multiply_result(left, right, ::Symbol)
+    throw(ArgumentError(
+        "Cannot multiply $(typeof(left)) and $(typeof(right)). " *
+        "Supported: ScalarField*ScalarField, Number*ScalarField, ScalarField*Number, " *
+        "Number*VectorField, VectorField*Number. " *
+        "For dot product use `dot(u, v)` or `u ⋅ v`. " *
+        "For cross product use `cross(u, v)` or `u × v`."))
 end
 
 """
@@ -293,37 +203,30 @@ Evaluate addition operator: field + field or field + scalar.
 function evaluate_add(op::AddOperator, layout::Symbol=:g)
     left = _eval_operand(op.left, layout)
     right = _eval_operand(op.right, layout)
+    return _add_result(left, right, layout)
+end
 
-    if isa(left, ScalarField) && isa(right, ScalarField)
-        result = copy(left)
-        result.name = "add_$(left.name)_$(right.name)"
-        ensure_layout!(left, layout)
-        ensure_layout!(right, layout)
-        ensure_layout!(result, layout)
-        if layout == :g
-            left_data = get_grid_data(left)
-            right_data = get_grid_data(right)
-            res_data = get_grid_data(result)
-            if left_data !== nothing && right_data !== nothing && res_data !== nothing
-                res_data .= left_data .+ right_data
-            end
-        else
-            left_data = get_coeff_data(left)
-            right_data = get_coeff_data(right)
-            res_data = get_coeff_data(result)
-            if left_data !== nothing && right_data !== nothing && res_data !== nothing
-                res_data .= left_data .+ right_data
-            end
-        end
-        return result
-    elseif isa(left, Number) && isa(right, Number)
-        return left + right
-    else
-        throw(ArgumentError(
-            "Cannot add $(typeof(left)) and $(typeof(right)). " *
-            "Supported: ScalarField+ScalarField, ScalarField+Number, Number+Number. " *
-            "VectorField addition: use `add_vector_fields(a, b)`."))
+function _add_result(left::ScalarField, right::ScalarField, layout::Symbol)
+    result = checkout_or_alloc(left.bases, left.dtype, left.dist)
+    ensure_layout!(left, layout)
+    ensure_layout!(right, layout)
+    ensure_layout!(result, layout)
+    left_data = layout == :g ? get_grid_data(left) : get_coeff_data(left)
+    right_data = layout == :g ? get_grid_data(right) : get_coeff_data(right)
+    res_data = layout == :g ? get_grid_data(result) : get_coeff_data(result)
+    if left_data !== nothing && right_data !== nothing && res_data !== nothing
+        @. res_data = left_data + right_data
     end
+    return result
+end
+
+_add_result(left::Number, right::Number, ::Symbol) = left + right
+
+function _add_result(left, right, ::Symbol)
+    throw(ArgumentError(
+        "Cannot add $(typeof(left)) and $(typeof(right)). " *
+        "Supported: ScalarField+ScalarField, Number+Number. " *
+        "VectorField addition: use `add_vector_fields(a, b)`."))
 end
 
 """
@@ -334,36 +237,29 @@ Evaluate subtraction operator: field - field.
 function evaluate_subtract(op::SubtractOperator, layout::Symbol=:g)
     left = _eval_operand(op.left, layout)
     right = _eval_operand(op.right, layout)
+    return _subtract_result(left, right, layout)
+end
 
-    if isa(left, ScalarField) && isa(right, ScalarField)
-        result = copy(left)
-        result.name = "sub_$(left.name)_$(right.name)"
-        ensure_layout!(left, layout)
-        ensure_layout!(right, layout)
-        ensure_layout!(result, layout)
-        if layout == :g
-            left_data = get_grid_data(left)
-            right_data = get_grid_data(right)
-            res_data = get_grid_data(result)
-            if left_data !== nothing && right_data !== nothing && res_data !== nothing
-                res_data .= left_data .- right_data
-            end
-        else
-            left_data = get_coeff_data(left)
-            right_data = get_coeff_data(right)
-            res_data = get_coeff_data(result)
-            if left_data !== nothing && right_data !== nothing && res_data !== nothing
-                res_data .= left_data .- right_data
-            end
-        end
-        return result
-    elseif isa(left, Number) && isa(right, Number)
-        return left - right
-    else
-        throw(ArgumentError(
-            "Cannot subtract $(typeof(left)) and $(typeof(right)). " *
-            "Supported: ScalarField-ScalarField, Number-Number."))
+function _subtract_result(left::ScalarField, right::ScalarField, layout::Symbol)
+    result = checkout_or_alloc(left.bases, left.dtype, left.dist)
+    ensure_layout!(left, layout)
+    ensure_layout!(right, layout)
+    ensure_layout!(result, layout)
+    left_data = layout == :g ? get_grid_data(left) : get_coeff_data(left)
+    right_data = layout == :g ? get_grid_data(right) : get_coeff_data(right)
+    res_data = layout == :g ? get_grid_data(result) : get_coeff_data(result)
+    if left_data !== nothing && right_data !== nothing && res_data !== nothing
+        @. res_data = left_data - right_data
     end
+    return result
+end
+
+_subtract_result(left::Number, right::Number, ::Symbol) = left - right
+
+function _subtract_result(left, right, ::Symbol)
+    throw(ArgumentError(
+        "Cannot subtract $(typeof(left)) and $(typeof(right)). " *
+        "Supported: ScalarField-ScalarField, Number-Number."))
 end
 
 """
@@ -374,32 +270,29 @@ Evaluate division operator: field / scalar.
 function evaluate_divide(op::DivideOperator, layout::Symbol=:g)
     left = _eval_operand(op.left, layout)
     right = _eval_operand(op.right, layout)
+    return _divide_result(left, right, layout)
+end
 
-    if isa(left, ScalarField) && isa(right, Number)
-        result = copy(left)
-        result.name = "div_$(left.name)"
-        ensure_layout!(result, layout)
-        if layout == :g
-            data = get_grid_data(result)
-            if data !== nothing
-                data .= data ./ right
-            end
-        else
-            data = get_coeff_data(result)
-            if data !== nothing
-                data .= data ./ right
-            end
-        end
-        return result
-    elseif isa(left, Number) && isa(right, Number)
-        return left / right
-    else
-        throw(ArgumentError(
-            "Cannot divide $(typeof(left)) by $(typeof(right)). " *
-            "Division is supported for ScalarField/Number and Number/Number. " *
-            "Field-by-field division is not directly supported; use pointwise: " *
-            "`get_grid_data(result) .= get_grid_data(a) ./ get_grid_data(b)`."))
+function _divide_result(left::ScalarField, right::Number, layout::Symbol)
+    result = checkout_or_alloc(left.bases, left.dtype, left.dist)
+    ensure_layout!(left, layout)
+    ensure_layout!(result, layout)
+    src = layout == :g ? get_grid_data(left) : get_coeff_data(left)
+    dst = layout == :g ? get_grid_data(result) : get_coeff_data(result)
+    if src !== nothing && dst !== nothing
+        @. dst = src / right
     end
+    return result
+end
+
+_divide_result(left::Number, right::Number, ::Symbol) = left / right
+
+function _divide_result(left, right, ::Symbol)
+    throw(ArgumentError(
+        "Cannot divide $(typeof(left)) by $(typeof(right)). " *
+        "Division is supported for ScalarField/Number and Number/Number. " *
+        "Field-by-field division is not directly supported; use pointwise: " *
+        "`get_grid_data(result) .= get_grid_data(a) ./ get_grid_data(b)`."))
 end
 
 """

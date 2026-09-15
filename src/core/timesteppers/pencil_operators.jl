@@ -250,12 +250,12 @@ mutable struct PencilLHSCache{T}
     L::PencilLinearOperator{T}
     dt::Float64
     γ::Float64
-    factors::Matrix{Any}  # Factorized LHS for each (kx, ky) mode
+    factors::Matrix{Union{Nothing, Factorization}}  # Factorized LHS for each (kx, ky) mode
 
     function PencilLHSCache{T}(L::PencilLinearOperator{T}) where T
         nkx = length(L.local_kx_range)
         nky = length(L.local_ky_range)
-        new{T}(L, 0.0, 0.0, Matrix{Any}(undef, nkx, nky))
+        new{T}(L, 0.0, 0.0, Matrix{Union{Nothing, Factorization}}(nothing, nkx, nky))
     end
 end
 
@@ -285,7 +285,7 @@ function get_pencil_lhs_factor!(
         cache.factors[ikx, iky] = lu(LHS)
     end
 
-    return cache.factors[ikx, iky]
+    return cache.factors[ikx, iky]::Factorization
 end
 
 """
@@ -455,8 +455,8 @@ Returns nothing if not configured.
 function _get_pencil_linear_operator(solver::InitialValueSolver)
     # Check solver's timestepper_state first
     if solver.timestepper_state !== nothing &&
-       haskey(solver.timestepper_state.timestepper_data, "pencil_linear_operator")
-        return solver.timestepper_state.timestepper_data["pencil_linear_operator"]
+       haskey(solver.timestepper_state.timestepper_data, :pencil_linear_operator)
+        return solver.timestepper_state.timestepper_data[:pencil_linear_operator]
     end
 
     # Check problem parameters
@@ -479,17 +479,17 @@ function _get_pencil_lhs_cache(solver::InitialValueSolver)
 
     data = solver.timestepper_state.timestepper_data
 
-    if !haskey(data, "pencil_lhs_cache")
+    if !haskey(data, :pencil_lhs_cache)
         L = _get_pencil_linear_operator(solver)
         if L !== nothing
             T = eltype(L.k2_values)
-            data["pencil_lhs_cache"] = PencilLHSCache{T}(L)
+            data[:pencil_lhs_cache] = PencilLHSCache{T}(L)
         else
             return nothing
         end
     end
 
-    return data["pencil_lhs_cache"]
+    return data[:pencil_lhs_cache]
 end
 
 """
@@ -505,9 +505,9 @@ set_pencil_linear_operator!(solver, L)
 """
 function set_pencil_linear_operator!(solver::InitialValueSolver, L::PencilLinearOperator)
     if solver.timestepper_state !== nothing
-        solver.timestepper_state.timestepper_data["pencil_linear_operator"] = L
+        solver.timestepper_state.timestepper_data[:pencil_linear_operator] = L
         # Clear any existing cache
-        delete!(solver.timestepper_state.timestepper_data, "pencil_lhs_cache")
+        delete!(solver.timestepper_state.timestepper_data, :pencil_lhs_cache)
     else
         solver.problem.parameters["pencil_linear_operator"] = L
     end

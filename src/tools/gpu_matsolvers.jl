@@ -412,6 +412,11 @@ mutable struct CuIterativeCG{T,P<:AbstractPreconditioner} <: AbstractMatSolver
     p::Any                  # Search direction
     Ap::Any                 # Matrix-vector product
     z::Any                  # Preconditioned residual
+
+    function CuIterativeCG{T,P}(A_csr, preconditioner::P, tol::Float64, maxiter::Int,
+                                 n::Int, r, p, Ap, z) where {T, P<:AbstractPreconditioner}
+        new{T,P}(A_csr, preconditioner, tol, maxiter, n, r, p, Ap, z)
+    end
 end
 
 function CuIterativeCG(matrix::AbstractMatrix;
@@ -549,6 +554,11 @@ mutable struct CuIterativeGMRES{T,P<:AbstractPreconditioner} <: AbstractMatSolve
     maxiter::Int
     restart::Int            # Restart parameter
     n::Int
+
+    function CuIterativeGMRES{T,P}(A_csr, preconditioner::P, tol::Float64, maxiter::Int,
+                                    restart::Int, n::Int) where {T, P<:AbstractPreconditioner}
+        new{T,P}(A_csr, preconditioner, tol, maxiter, restart, n)
+    end
 end
 
 function CuIterativeGMRES(matrix::AbstractMatrix;

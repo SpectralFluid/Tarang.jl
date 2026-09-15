@@ -22,8 +22,7 @@ using SparseArrays: SparseMatrixCSC, nnz
 using LoopVectorization  # For SIMD loops
 using ExponentialUtilities  # For Krylov-based φ functions
 
-# Abstract type for all timesteppers
-abstract type TimeStepper end
+# TimeStepper abstract type is forward-declared in Tarang.jl
 
 # Include submodules in dependency order
 include("phi_functions.jl")      # ETD phi function utilities

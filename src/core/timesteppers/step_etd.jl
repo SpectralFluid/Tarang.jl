@@ -60,8 +60,7 @@ function step_etd_rk222!(state::TimestepperState, solver::InitialValueSolver)
         c = a_n + dt * (φ₁_hL * N_u_n)
 
         # Convert back to field form for nonlinear evaluation
-        temp_state = copy.(current_state)
-        copy_solution_to_fields!(temp_state, c)
+        temp_state = vector_to_fields(c, current_state)
 
         # Stage 2 (corrector): Evaluate N(c) at predicted state
         F_c = evaluate_rhs(solver, temp_state, solver.sim_time + dt)
@@ -74,10 +73,10 @@ function step_etd_rk222!(state::TimestepperState, solver::InitialValueSolver)
 
         # Update state
         X_new_cpu = X_new
-        new_state = copy.(current_state)
-        copy_solution_to_fields!(new_state, X_new_cpu)
+        new_state = vector_to_fields(X_new_cpu, current_state)
 
-        push!(state.history, new_state)
+        max_history = get_max_timestep_history(state.timestepper)
+        _push_trim!(state.history, new_state, max_history)
 
         @debug "ETDRK2 step completed: dt=$dt, |X_new|=$(norm(X_new_cpu))"
 
@@ -85,12 +84,6 @@ function step_etd_rk222!(state::TimestepperState, solver::InitialValueSolver)
         @warn "ETD-RK222 failed: $e, falling back to RK222"
         step_rk222!(state, solver)
         return
-    end
-
-    # Keep only necessary history (retain one previous state for multistep startups)
-    max_history = get_max_timestep_history(state.timestepper)
-    if length(state.history) > max_history
-        popfirst!(state.history)
     end
 end
 
@@ -121,18 +114,18 @@ function step_etd_cnab2!(state::TimestepperState, solver::InitialValueSolver)
     dt = state.dt
 
     # Initialize history arrays if needed
-    if !haskey(state.timestepper_data, "F_history")
-        state.timestepper_data["F_history"] = []
-        state.timestepper_data["iteration"] = 0
+    if !haskey(state.timestepper_data, :F_history)
+        state.timestepper_data[:F_history] = []
+        state.timestepper_data[:iteration] = 0
     end
 
-    iteration = state.timestepper_data["iteration"]
+    iteration = state.timestepper_data[:iteration]
 
     # Check if we have enough history for 2-step Adams-Bashforth
     if iteration < 1 || length(state.history) < 2
         @debug "ETD-CNAB2 requires iteration >= 1, falling back to ETDRK2 for startup"
         step_etd_rk222!(state, solver)
-        state.timestepper_data["iteration"] = get(state.timestepper_data, "iteration", 0) + 1
+        state.timestepper_data[:iteration] = get(state.timestepper_data, :iteration, 0) + 1
         return
     end
 
@@ -166,11 +159,8 @@ function step_etd_cnab2!(state::TimestepperState, solver::InitialValueSolver)
         F_current_vec = _apply_mass_inverse(M_factor, fields_to_vector(F_current))
 
         # Rotate and store history
-        F_history = state.timestepper_data["F_history"]
-        pushfirst!(F_history, F_current_vec)
-
-        # Keep only needed history for Adams-Bashforth 2
-        while length(F_history) > 2; pop!(F_history); end
+        F_history = state.timestepper_data[:F_history]
+        _prepend_trim!(F_history, F_current_vec, 2)
         if length(F_history) < 2 && length(state.history) >= 2
             prev_state = state.history[end-1]
             F_prev = evaluate_rhs(solver, prev_state, solver.sim_time - dt_previous)
@@ -193,23 +183,17 @@ function step_etd_cnab2!(state::TimestepperState, solver::InitialValueSolver)
         X_new = exp_hL * X_current + dt_current * (φ₁_hL * F_extrap)
 
         # Update state
-        new_state = copy.(current_state)
-        copy_solution_to_fields!(new_state, X_new)
+        new_state = vector_to_fields(X_new, current_state)
 
-        push!(state.history, new_state)
-        state.timestepper_data["iteration"] += 1
+        _push_trim!(state.history, new_state, 4)
+        state.timestepper_data[:iteration] += 1
 
-        @debug "ETDAB2 step completed: dt=$dt_current, w1=$w1, iteration=$(state.timestepper_data["iteration"]), |X_new|=$(norm(X_new))"
+        @debug "ETDAB2 step completed: dt=$dt_current, w1=$w1, iteration=$(state.timestepper_data[:iteration]), |X_new|=$(norm(X_new))"
 
     catch e
         @warn "ETD-CNAB2 failed: $e, falling back to CNAB2"
         step_cnab2!(state, solver)
         return
-    end
-
-    # Keep reasonable history length
-    if length(state.history) > 4
-        popfirst!(state.history)
     end
 end
 
@@ -250,18 +234,18 @@ function step_etd_sbdf2!(state::TimestepperState, solver::InitialValueSolver)
     dt = state.dt
 
     # Initialize history arrays if needed
-    if !haskey(state.timestepper_data, "F_history")
-        state.timestepper_data["F_history"] = []
-        state.timestepper_data["iteration"] = 0
+    if !haskey(state.timestepper_data, :F_history)
+        state.timestepper_data[:F_history] = []
+        state.timestepper_data[:iteration] = 0
     end
 
-    iteration = state.timestepper_data["iteration"]
+    iteration = state.timestepper_data[:iteration]
 
     # Check if we have enough history for 2-step method
     if iteration < 1 || length(state.history) < 2
         @debug "ETD-SBDF2 requires iteration >= 1, falling back to ETDRK2 for startup"
         step_etd_rk222!(state, solver)
-        state.timestepper_data["iteration"] = get(state.timestepper_data, "iteration", 0) + 1
+        state.timestepper_data[:iteration] = get(state.timestepper_data, :iteration, 0) + 1
         return
     end
 
@@ -295,13 +279,8 @@ function step_etd_sbdf2!(state::TimestepperState, solver::InitialValueSolver)
         F_current_vec = _apply_mass_inverse(M_factor, fields_to_vector(F_current))
 
         # Rotate and store history
-        F_history = state.timestepper_data["F_history"]
-        pushfirst!(F_history, F_current_vec)
-
-        # Keep only needed history for 2-step method
-        while length(F_history) > 2
-            pop!(F_history)
-        end
+        F_history = state.timestepper_data[:F_history]
+        _prepend_trim!(F_history, F_current_vec, 2)
         if length(F_history) < 2 && length(state.history) >= 2
             prev_state = state.history[end-1]
             F_prev = evaluate_rhs(solver, prev_state, solver.sim_time - dt_previous)
@@ -310,7 +289,7 @@ function step_etd_sbdf2!(state::TimestepperState, solver::InitialValueSolver)
         if length(F_history) < 2
             @debug "ETD-SBDF2 missing previous RHS, falling back to ETDRK2"
             step_etd_rk222!(state, solver)
-            state.timestepper_data["iteration"] = get(state.timestepper_data, "iteration", 0) + 1
+            state.timestepper_data[:iteration] = get(state.timestepper_data, :iteration, 0) + 1
             return
         end
 
@@ -338,23 +317,17 @@ function step_etd_sbdf2!(state::TimestepperState, solver::InitialValueSolver)
         X_new = X_propagated + dt_current * (φ₁_Nₙ + inv_w * φ₂_diff)
 
         # Update state
-        new_state = copy.(current_state)
-        copy_solution_to_fields!(new_state, X_new)
+        new_state = vector_to_fields(X_new, current_state)
 
-        push!(state.history, new_state)
-        state.timestepper_data["iteration"] += 1
+        _push_trim!(state.history, new_state, 4)
+        state.timestepper_data[:iteration] += 1
 
-        @debug "ETD-MS2 step completed: dt=$dt_current, w=$w, iteration=$(state.timestepper_data["iteration"]), |X_new|=$(norm(X_new))"
+        @debug "ETD-MS2 step completed: dt=$dt_current, w=$w, iteration=$(state.timestepper_data[:iteration]), |X_new|=$(norm(X_new))"
 
     catch e
         @warn "ETD-SBDF2 failed: $e, falling back to SBDF2"
         step_sbdf2!(state, solver)
         return
-    end
-
-    # Keep reasonable history length
-    if length(state.history) > 4
-        popfirst!(state.history)
     end
 end
 

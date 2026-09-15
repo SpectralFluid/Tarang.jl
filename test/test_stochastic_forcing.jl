@@ -445,6 +445,91 @@ println("=" ^ 60)
         println("  3D Hermitian symmetry OK")
     end
 
+    # ------------------------------------------------------------------
+    # Regression tests for work computation (fused mapreduce, zero alloc)
+    # Verifies that the optimised mapreduce path produces the same
+    # numerical answers as the naive broadcast reference formulas.
+    # ------------------------------------------------------------------
+    @testset "work_stratonovich regression" begin
+        T = Float64
+        dt = 0.01
+        domain_size = (2π, 2π)
+        area = prod(domain_size)
+
+        forcing = StochasticForcing(
+            field_size=(16, 16),
+            forcing_rate=0.1,
+            k_forcing=4.0,
+            dk_forcing=2.0,
+            dt=dt,
+            domain_size=domain_size,
+            rng=MersenneTwister(77)
+        )
+
+        # Generate forcing so cached_forcing is populated
+        generate_forcing!(forcing, 0.0)
+        cf = forcing.cached_forcing
+
+        # Create deterministic solution arrays
+        Random.seed!(42)
+        prev = randn(ComplexF64, 16, 16)
+        sol  = randn(ComplexF64, 16, 16)
+
+        # Store previous solution
+        store_prevsol!(forcing, prev)
+
+        # -- Test 1: numerical value matches broadcast reference --
+        W = work_stratonovich(forcing, sol)
+
+        # Reference: broadcast-based computation (the old implementation)
+        ref = sum(real.((prev .+ sol) ./ 2 .* conj.(cf))) * dt / area
+        @test W ≈ ref atol=1e-12 rtol=1e-12
+        println("  work_stratonovich matches broadcast reference OK")
+
+        # -- Test 2: returns zero(T) when prevsol is nothing --
+        # Temporarily set prevsol to nothing
+        forcing.prevsol = nothing
+        W_nil = work_stratonovich(forcing, sol)
+        @test W_nil === zero(T)
+        println("  work_stratonovich returns zero when prevsol===nothing OK")
+    end
+
+    @testset "work_ito regression" begin
+        T = Float64
+        dt = 0.005
+        domain_size = (2π, 2π)
+        area = prod(domain_size)
+        eps_rate = 0.25  # non-default energy injection rate
+
+        forcing = StochasticForcing(
+            field_size=(16, 16),
+            forcing_rate=eps_rate,
+            k_forcing=4.0,
+            dk_forcing=2.0,
+            dt=dt,
+            domain_size=domain_size,
+            rng=MersenneTwister(88)
+        )
+
+        # Generate forcing so cached_forcing is populated
+        generate_forcing!(forcing, 0.0)
+        cf = forcing.cached_forcing
+
+        # Deterministic previous-solution array
+        Random.seed!(99)
+        sol_prev = randn(ComplexF64, 16, 16)
+
+        # -- Test: numerical value matches broadcast reference with drift --
+        W = work_ito(forcing, sol_prev)
+
+        # Reference: broadcast-based Ito work + drift correction
+        work_sum = sum(real.(sol_prev .* conj.(cf)))
+        drift    = eps_rate * dt
+        ref      = work_sum * dt / area + drift
+        @test W ≈ ref atol=1e-12 rtol=1e-12
+        println("  work_ito matches broadcast reference with drift OK")
+    end
+
 end
 
 # GPU tests (only run if CUDA is available)

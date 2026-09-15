@@ -22,14 +22,14 @@ function step_mcnab2!(state::TimestepperState, solver::InitialValueSolver)
     θ = state.timestepper.implicit_coefficient
 
     # Initialize history arrays if needed
-    if !haskey(state.timestepper_data, "MX_history")
-        state.timestepper_data["MX_history"] = []
-        state.timestepper_data["LX_history"] = []
-        state.timestepper_data["F_history"] = []
-        state.timestepper_data["iteration"] = 0
+    if !haskey(state.timestepper_data, :MX_history)
+        state.timestepper_data[:MX_history] = []
+        state.timestepper_data[:LX_history] = []
+        state.timestepper_data[:F_history] = []
+        state.timestepper_data[:iteration] = 0
     end
 
-    iteration = state.timestepper_data["iteration"]
+    iteration = state.timestepper_data[:iteration]
 
     # Check if we have enough history for MCNAB2
     if iteration < 1 || length(state.history) < 2
@@ -73,18 +73,13 @@ function step_mcnab2!(state::TimestepperState, solver::InitialValueSolver)
         F_current_vec = fields_to_vector(F_current)
 
         # Rotate and store history
-        MX_history = state.timestepper_data["MX_history"]
-        LX_history = state.timestepper_data["LX_history"]
-        F_history = state.timestepper_data["F_history"]
+        MX_history = state.timestepper_data[:MX_history]
+        LX_history = state.timestepper_data[:LX_history]
+        F_history = state.timestepper_data[:F_history]
 
-        pushfirst!(MX_history, MX_current)
-        pushfirst!(LX_history, LX_current)
-        pushfirst!(F_history, F_current_vec)
-
-        # Keep only needed history
-        while length(MX_history) > 2; pop!(MX_history); end
-        while length(LX_history) > 2; pop!(LX_history); end
-        while length(F_history) > 2; pop!(F_history); end
+        _prepend_trim!(MX_history, MX_current, 2)
+        _prepend_trim!(LX_history, LX_current, 2)
+        _prepend_trim!(F_history, F_current_vec, 2)
 
         # Build RHS: c[1]*F[0] + c[2]*F[1] - a[1]*MX[0] - b[1]*LX[0]
         rhs = c[2] * F_history[1]
@@ -98,7 +93,7 @@ function step_mcnab2!(state::TimestepperState, solver::InitialValueSolver)
         # Cache the LU factorization keyed on (a[1], b[1]) to avoid recomputing
         # when dt is constant.
         cache_key = (a[1], b[1])
-        lhs_cache = get!(state.timestepper_data, "mcnab2_lhs_cache") do
+        lhs_cache = get!(state.timestepper_data, :mcnab2_lhs_cache) do
             Dict{Tuple{Float64,Float64}, Any}()
         end
         lhs_factor = get!(lhs_cache, cache_key) do
@@ -107,23 +102,17 @@ function step_mcnab2!(state::TimestepperState, solver::InitialValueSolver)
         X_new = lhs_factor \ rhs
 
         # Update state
-        new_state = copy.(current_state)
-        copy_solution_to_fields!(new_state, X_new)
+        new_state = vector_to_fields(X_new, current_state)
 
-        push!(state.history, new_state)
-        state.timestepper_data["iteration"] += 1
+        _push_trim!(state.history, new_state, 4)
+        state.timestepper_data[:iteration] += 1
 
-        @debug "MCNAB2 step completed: dt=$dt_current, θ=$θ, iteration=$(state.timestepper_data["iteration"])"
+        @debug "MCNAB2 step completed: dt=$dt_current, θ=$θ, iteration=$(state.timestepper_data[:iteration])"
 
     catch e
         @warn "MCNAB2 failed: $e, falling back to CNAB2"
         step_cnab2!(state, solver)
         return
-    end
-
-    # Keep reasonable history length
-    if length(state.history) > 4
-        popfirst!(state.history)
     end
 end
 
@@ -151,20 +140,20 @@ function step_cnlf2!(state::TimestepperState, solver::InitialValueSolver)
     dt_current = state.dt
 
     # Initialize history tracking
-    if !haskey(state.timestepper_data, "iteration")
-        state.timestepper_data["iteration"] = 0
-        state.timestepper_data["MX_history"] = []
-        state.timestepper_data["LX_history"] = []
-        state.timestepper_data["F_history"] = []
+    if !haskey(state.timestepper_data, :iteration)
+        state.timestepper_data[:iteration] = 0
+        state.timestepper_data[:MX_history] = []
+        state.timestepper_data[:LX_history] = []
+        state.timestepper_data[:F_history] = []
     end
 
-    iteration = state.timestepper_data["iteration"]
+    iteration = state.timestepper_data[:iteration]
 
     # CNLF requires X^{n-1}, so need at least 2 history states and 1 prior step
     if iteration < 1 || length(state.history) < 2
         @debug "CNLF2 requires 2 history states, falling back to CNAB1"
         step_cnab1!(state, solver)
-        state.timestepper_data["iteration"] += 1
+        state.timestepper_data[:iteration] += 1
         return
     end
 
@@ -221,7 +210,7 @@ function step_cnlf2!(state::TimestepperState, solver::InitialValueSolver)
         # Build and solve LHS: (a[1]*M + b[1]*L) X^{n+1} = RHS
         # Cache factorization keyed on (a1, b1) for constant-dt reuse.
         cache_key = (a1, b1)
-        lhs_cache = get!(state.timestepper_data, "cnlf2_lhs_cache") do
+        lhs_cache = get!(state.timestepper_data, :cnlf2_lhs_cache) do
             Dict{Tuple{Float64,Float64}, Any}()
         end
         lhs_factor = get!(lhs_cache, cache_key) do
@@ -230,24 +219,18 @@ function step_cnlf2!(state::TimestepperState, solver::InitialValueSolver)
         X_new = lhs_factor \ rhs
 
         # Update state
-        new_state = copy.(current_state)
-        copy_solution_to_fields!(new_state, X_new)
+        new_state = vector_to_fields(X_new, current_state)
 
-        push!(state.history, new_state)
+        _push_trim!(state.history, new_state, 4)
 
-        state.timestepper_data["iteration"] += 1
+        state.timestepper_data[:iteration] += 1
 
-        @debug "CNLF2 step completed: dt=$dt_current, w1=$w1, iteration=$(state.timestepper_data["iteration"])"
+        @debug "CNLF2 step completed: dt=$dt_current, w1=$w1, iteration=$(state.timestepper_data[:iteration])"
 
     catch e
         @warn "CNLF2 failed: $e, falling back to CNAB2"
         step_cnab2!(state, solver)
         return
-    end
-
-    # Keep reasonable history length (CNLF needs 2 previous states + current)
-    if length(state.history) > 4
-        popfirst!(state.history)
     end
 
 end
@@ -335,7 +318,7 @@ function step_rksmr!(state::TimestepperState, solver::InitialValueSolver)
             push!(new_state, new_field)
         end
 
-        push!(state.history, new_state)
+        _push_trim!(state.history, new_state, 2)
 
         @debug "RKSMR (SSP-RK3) step completed: dt=$dt"
 
@@ -343,11 +326,6 @@ function step_rksmr!(state::TimestepperState, solver::InitialValueSolver)
         @warn "RKSMR failed: $e, falling back to RK443"
         step_rk443!(state, solver)
         return
-    end
-
-    # Keep only necessary history
-    if length(state.history) > 2
-        popfirst!(state.history)
     end
 end
 

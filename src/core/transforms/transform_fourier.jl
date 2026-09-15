@@ -51,20 +51,19 @@ function backward_transform!(field::ScalarField, target_layout::Symbol=:g)
     end
 
     # Find appropriate transform
-    for transform in field.dist.transforms
-        if isa(transform, PencilFFTs.PencilFFTPlan)
-            # PencilFFTs is CPU-only; if data is on GPU, move to CPU first
-            coeff_data = get_coeff_data(field)
-            if is_gpu_array(coeff_data)
-                host_data = Array(coeff_data)
-                host_result = transform \ host_data
-                set_grid_data!(field, copy_to_device(host_result, coeff_data))
-            else
-                set_grid_data!(field, transform \ coeff_data)
-            end
-            field.current_layout = :g
-            return
+    pencil_plan = _find_pencil_plan(field.dist)
+    if pencil_plan !== nothing
+        # PencilFFTs is CPU-only; if data is on GPU, move to CPU first
+        coeff_data = get_coeff_data(field)
+        if is_gpu_array(coeff_data)
+            host_data = Array(coeff_data)
+            host_result = pencil_plan \ host_data
+            set_grid_data!(field, copy_to_device(host_result, coeff_data))
+        else
+            set_grid_data!(field, pencil_plan \ coeff_data)
         end
+        field.current_layout = :g
+        return
     end
 
     # CRITICAL: Guard against running local transforms on distributed data
@@ -86,13 +85,7 @@ function backward_transform!(field::ScalarField, target_layout::Symbol=:g)
 
     current = get_coeff_data(field)
     for transform in reverse(field.dist.transforms)
-        if isa(transform, FourierTransform)
-            current = _fourier_backward(current, transform)
-        elseif isa(transform, ChebyshevTransform)
-            current = _chebyshev_backward(current, transform)
-        elseif isa(transform, LegendreTransform)
-            current = _legendre_backward(current, transform)
-        end
+        current = _apply_backward(current, transform)
     end
 
     # Fallback for other transforms
@@ -138,6 +131,10 @@ function apply_fourier_backward!(field::ScalarField, transform::FourierTransform
     """Apply backward Fourier transform"""
     set_grid_data!(field, _fourier_backward(get_coeff_data(field), transform))
 end
+
+# Dispatch methods for transform loop (replaces isa() chains)
+_apply_forward(current, t::FourierTransform) = _fourier_forward(current, t)
+_apply_backward(current, t::FourierTransform) = _fourier_backward(current, t)
 
 # Axis-aware Chebyshev helpers
 function _scale_along_axis!(data::AbstractArray, axis::Int, scale::AbstractVector{<:Real})

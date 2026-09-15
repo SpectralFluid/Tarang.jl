@@ -88,3 +88,22 @@ using Tarang
         @test isapprox(Tarang.get_grid_data(field), original; rtol=1e-10, atol=1e-10)
     end
 end
+
+@testset "Transform dispatch helpers" begin
+    using Tarang
+    import Tarang: _apply_forward, _apply_backward, _find_pencil_plan, Transform
+
+    @testset "Fallback dispatch returns data unchanged" begin
+        struct _TestUnknownTransform <: Transform end
+        data = randn(ComplexF64, 8)
+        @test _apply_forward(data, _TestUnknownTransform()) === data
+        @test _apply_backward(data, _TestUnknownTransform()) === data
+    end
+
+    @testset "_find_pencil_plan with no plans" begin
+        coords = CartesianCoordinates("x")
+        dist = Distributor(coords; mesh=(1,), dtype=Float64)
+        result = _find_pencil_plan(dist)
+        @test result === nothing
+    end
+end

@@ -396,3 +396,40 @@ end
         @test all(bc -> bc isa NeumannBC, manager.conditions)
     end
 end
+
+@testset "Derivative multiplier caching" begin
+    using Tarang
+    import Tarang: _get_cached_deriv_mult
+
+    coords = CartesianCoordinates("x")
+    dist = Distributor(coords; mesh=(1,), dtype=Float64)
+    basis = RealFourier(coords["x"]; size=16, bounds=(0.0, 2π))
+
+    N = 16
+    L = 2π
+
+    @testset "correct multiplier values" begin
+        mult = _get_cached_deriv_mult(basis, N, L, 1)
+        @test length(mult) == N
+        @test mult isa Vector{ComplexF64}
+        @test abs(mult[1]) < 1e-14  # k=0 mode
+    end
+
+    @testset "cache hit returns same object" begin
+        m1 = _get_cached_deriv_mult(basis, N, L, 1)
+        m2 = _get_cached_deriv_mult(basis, N, L, 1)
+        @test m1 === m2
+    end
+
+    @testset "different order returns different multiplier" begin
+        m1 = _get_cached_deriv_mult(basis, N, L, 1)
+        m2 = _get_cached_deriv_mult(basis, N, L, 2)
+        @test m1 !== m2
+        @test !(m1 ≈ m2)
+    end
+
+    @testset "tuple key stored in basis.transforms" begin
+        _get_cached_deriv_mult(basis, N, L, 3)
+        @test haskey(basis.transforms, (:deriv_mult, N, 3))
+    end
+end

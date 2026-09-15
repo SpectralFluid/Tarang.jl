@@ -165,13 +165,7 @@ function _batch_forward_transform!(fields::Vector{<:ScalarField})
     dist = first_field.dist
 
     # Check for PencilFFTs plan
-    pencil_plan = nothing
-    for t in dist.transforms
-        if isa(t, PencilFFTs.PencilFFTPlan)
-            pencil_plan = t
-            break
-        end
-    end
+    pencil_plan = _find_pencil_plan(dist)
 
     if pencil_plan !== nothing
         # PencilFFTs path: use the optimized PencilFFTs plan for each field
@@ -197,13 +191,7 @@ function _batch_backward_transform!(fields::Vector{<:ScalarField})
     first_field = fields[1]
     dist = first_field.dist
 
-    pencil_plan = nothing
-    for t in dist.transforms
-        if isa(t, PencilFFTs.PencilFFTPlan)
-            pencil_plan = t
-            break
-        end
-    end
+    pencil_plan = _find_pencil_plan(dist)
 
     if pencil_plan !== nothing
         _pencil_batch_backward_transform!(fields, pencil_plan)
@@ -305,33 +293,10 @@ function _stacked_forward_transform!(fields::Vector{<:ScalarField})
     end
 
     # Apply transforms to each field index
-    # Note: We transform along dimensions 2:ndims, not 1
+    # Note: We transform along dimensions 2:ndims, not 1 (shifted_axis accounts for leading field dim)
     for transform in dist.transforms
-        if isa(transform, FourierTransform)
-            # Shift axis by 1 for stacked array
-            shifted_axis = transform.axis + 1
-            dims = (shifted_axis,)
-
-            if isa(transform.basis, RealFourier)
-                if dtype <: Complex
-                    stacked = FFTW.fft(stacked, dims)
-                else
-                    stacked = FFTW.rfft(stacked, dims)
-                end
-            else
-                stacked = FFTW.fft(stacked, dims)
-            end
-
-        elseif isa(transform, ChebyshevTransform)
-            # Apply Chebyshev to each field in the stack
-            shifted_axis = transform.axis + 1
-            stacked = _stacked_chebyshev_forward(stacked, transform, shifted_axis)
-
-        elseif isa(transform, LegendreTransform)
-            # Should not reach here due to early return above
-            shifted_axis = transform.axis + 1
-            stacked = _stacked_legendre_forward(stacked, transform, shifted_axis)
-        end
+        shifted_axis = transform.axis + 1
+        stacked = _apply_stacked_forward(stacked, transform, shifted_axis, dtype)
     end
 
     # Unstack results back to fields
@@ -381,31 +346,8 @@ function _stacked_backward_transform!(fields::Vector{<:ScalarField})
 
     # Apply transforms in reverse order
     for transform in reverse(dist.transforms)
-        if isa(transform, FourierTransform)
-            shifted_axis = transform.axis + 1
-            dims = (shifted_axis,)
-
-            if isa(transform.basis, RealFourier)
-                actual_size = size(stacked, shifted_axis)
-                expected_rfft_size = div(transform.basis.meta.size, 2) + 1
-
-                if actual_size == expected_rfft_size
-                    stacked = FFTW.irfft(stacked, transform.basis.meta.size, dims)
-                else
-                    stacked = FFTW.ifft(stacked, dims)
-                end
-            else
-                stacked = FFTW.ifft(stacked, dims)
-            end
-
-        elseif isa(transform, ChebyshevTransform)
-            shifted_axis = transform.axis + 1
-            stacked = _stacked_chebyshev_backward(stacked, transform, shifted_axis)
-
-        elseif isa(transform, LegendreTransform)
-            shifted_axis = transform.axis + 1
-            stacked = _stacked_legendre_backward(stacked, transform, shifted_axis)
-        end
+        shifted_axis = transform.axis + 1
+        stacked = _apply_stacked_backward(stacked, transform, shifted_axis)
     end
 
     # Unstack results back to fields
@@ -421,6 +363,72 @@ function _stacked_backward_transform!(fields::Vector{<:ScalarField})
         field.current_layout = :g
     end
 end
+
+# ---------------------------------------------------------------------------
+# Stacked-array dispatch: each transform type handles its own forward/backward
+# on the stacked (nfields, ...) array. The `shifted_axis` is transform.axis + 1
+# to account for the leading field dimension.
+# ---------------------------------------------------------------------------
+
+"""
+    _apply_stacked_forward(stacked, transform::FourierTransform, shifted_axis, dtype)
+
+Fourier forward on a stacked array.
+"""
+function _apply_stacked_forward(stacked, transform::FourierTransform, shifted_axis, dtype)
+    dims = (shifted_axis,)
+    if isa(transform.basis, RealFourier)
+        if dtype <: Complex
+            return FFTW.fft(stacked, dims)
+        else
+            return FFTW.rfft(stacked, dims)
+        end
+    else
+        return FFTW.fft(stacked, dims)
+    end
+end
+
+function _apply_stacked_forward(stacked, transform::ChebyshevTransform, shifted_axis, dtype)
+    return _stacked_chebyshev_forward(stacked, transform, shifted_axis)
+end
+
+function _apply_stacked_forward(stacked, transform::LegendreTransform, shifted_axis, dtype)
+    return _stacked_legendre_forward(stacked, transform, shifted_axis)
+end
+
+# Fallback: skip unknown transform types in stacked path
+_apply_stacked_forward(stacked, ::Transform, shifted_axis, dtype) = stacked
+
+"""
+    _apply_stacked_backward(stacked, transform::FourierTransform, shifted_axis)
+
+Fourier backward on a stacked array.
+"""
+function _apply_stacked_backward(stacked, transform::FourierTransform, shifted_axis)
+    dims = (shifted_axis,)
+    if isa(transform.basis, RealFourier)
+        actual_size = size(stacked, shifted_axis)
+        expected_rfft_size = div(transform.basis.meta.size, 2) + 1
+        if actual_size == expected_rfft_size
+            return FFTW.irfft(stacked, transform.basis.meta.size, dims)
+        else
+            return FFTW.ifft(stacked, dims)
+        end
+    else
+        return FFTW.ifft(stacked, dims)
+    end
+end
+
+function _apply_stacked_backward(stacked, transform::ChebyshevTransform, shifted_axis)
+    return _stacked_chebyshev_backward(stacked, transform, shifted_axis)
+end
+
+function _apply_stacked_backward(stacked, transform::LegendreTransform, shifted_axis)
+    return _stacked_legendre_backward(stacked, transform, shifted_axis)
+end
+
+# Fallback: skip unknown transform types in stacked path
+_apply_stacked_backward(stacked, ::Transform, shifted_axis) = stacked
 
 """
     _stacked_chebyshev_forward(data, transform, axis)
@@ -495,8 +503,8 @@ function _stacked_chebyshev_backward(data::AbstractArray, transform::ChebyshevTr
         idx = ntuple(i -> i == axis ? (1:ncopy) : Colon(), ndims(data))
 
         if eltype(data) <: Complex
-            scaled_real = copy(real.(data))
-            scaled_imag = copy(imag.(data))
+            scaled_real = real.(data)   # already a new array, no copy needed
+            scaled_imag = imag.(data)   # already a new array, no copy needed
             _prescale_for_dct1_backward!(scaled_real, axis, coeff_size, grid_size)
             _prescale_for_dct1_backward!(scaled_imag, axis, coeff_size, grid_size)
 
@@ -525,8 +533,8 @@ function _stacked_chebyshev_backward(data::AbstractArray, transform::ChebyshevTr
 
     # No padding needed: coeff_size == grid_size
     if eltype(data) <: Complex
-        scaled_real = copy(real.(data))
-        scaled_imag = copy(imag.(data))
+        scaled_real = real.(data)   # already a new array, no copy needed
+        scaled_imag = imag.(data)   # already a new array, no copy needed
         _prescale_for_dct1_backward!(scaled_real, axis, coeff_size, grid_size)
         _prescale_for_dct1_backward!(scaled_imag, axis, coeff_size, grid_size)
 

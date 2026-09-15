@@ -8,12 +8,12 @@ for each subproblem/subsystem pair.
 
 struct CoeffSystem{T}
     data::Vector{T}
-    views::Dict{Any, UnitRange{Int}}
+    views::Dict{Tuple{Subproblem, Subsystem}, UnitRange{Int}}
 end
 
 function CoeffSystem(subproblems::Tuple{Vararg{Subproblem}}, dtype::DataType=ComplexF64)
     total = 0
-    views = Dict{Any, UnitRange{Int}}()
+    views = Dict{Tuple{Subproblem, Subsystem}, UnitRange{Int}}()
     for sp in subproblems
         for ss in sp.subsystems
             coeff_size = subsystem_coeff_size(ss, sp)

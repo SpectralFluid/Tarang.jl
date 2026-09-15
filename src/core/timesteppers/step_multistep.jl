@@ -23,12 +23,12 @@ function step_cnab1!(state::TimestepperState, solver::InitialValueSolver)
     end
 
     # Initialize history arrays if needed (following Tarang MultistepIMEX.__init__)
-    if !haskey(state.timestepper_data, "MX_history")
+    if !haskey(state.timestepper_data, :MX_history)
         T = eltype(fields_to_vector(state.history[end]))
-        state.timestepper_data["MX_history"] = Vector{T}[]
-        state.timestepper_data["LX_history"] = Vector{T}[]
-        state.timestepper_data["F_history"] = Vector{T}[]
-        state.timestepper_data["cnab1_iteration"] = 0
+        state.timestepper_data[:MX_history] = Vector{T}[]
+        state.timestepper_data[:LX_history] = Vector{T}[]
+        state.timestepper_data[:F_history] = Vector{T}[]
+        state.timestepper_data[:cnab1_iteration] = 0
     end
 
     # Get matrices from solver
@@ -41,12 +41,13 @@ function step_cnab1!(state::TimestepperState, solver::InitialValueSolver)
     end
 
     # Get CNAB1 coefficients following Tarang (timesteppers:206-220)
-    a = [1.0/dt, -1.0/dt]  # a[0], a[1]
-    b = [0.5, 0.5]         # b[0], b[1] 
-    c = [0.0, 1.0]         # c[0], c[1]
+    # Using tuples to avoid heap allocation every step
+    a = (1.0/dt, -1.0/dt)  # a[0], a[1]
+    b = (0.5, 0.5)         # b[0], b[1]
+    c = (0.0, 1.0)         # c[0], c[1]
     
     # Step 1: Convert current state to vector (following Tarang gather_inputs)
-    X_current = fields_to_vector(current_state)
+    X_current = copy(fields_to_vector(current_state))
 
     # Step 2: Compute M.X[0] and L.X[0] (following Tarang lines 142-147)
     MX_current = M_matrix * X_current
@@ -57,54 +58,43 @@ function step_cnab1!(state::TimestepperState, solver::InitialValueSolver)
     F_current_vec = fields_to_vector(F_current)
 
     # Step 4: Rotate and store history (following Tarang lines 124-126)
-    MX_history = state.timestepper_data["MX_history"]
-    LX_history = state.timestepper_data["LX_history"]
-    F_history = state.timestepper_data["F_history"]
+    MX_history = state.timestepper_data[:MX_history]
+    LX_history = state.timestepper_data[:LX_history]
+    F_history = state.timestepper_data[:F_history]
 
-    pushfirst!(MX_history, MX_current)
-    pushfirst!(LX_history, LX_current)
-    pushfirst!(F_history, F_current_vec)
-
-    # Keep only needed history for CNAB1 (amax=1, bmax=1, cmax=1)
-    # Note: F_history retains 2 entries so CNAB2 has enough startup data
-    while length(MX_history) > 1; pop!(MX_history); end
-    while length(LX_history) > 1; pop!(LX_history); end
-    while length(F_history) > 2; pop!(F_history); end
+    _prepend_trim!(MX_history, MX_current, 1)
+    _prepend_trim!(LX_history, LX_current, 1)
+    _prepend_trim!(F_history, F_current_vec, 2)
 
     # Step 5: Build RHS following Tarang exactly (timesteppers:156-166)
     # RHS = c[1] * F[0] - a[1] * MX[0] - b[1] * LX[0]
     rhs = c[2] * F_history[1]  # c[1] * F[0] (using 1-based indexing)
     if length(MX_history) >= 1  # a[1] term
-        rhs .-= a[2] * MX_history[1]  # -a[1] * MX[0]
+        @. rhs -= a[2] * MX_history[1]  # -a[1] * MX[0]
     end
     if length(LX_history) >= 1  # b[1] term
-        rhs .-= b[2] * LX_history[1]  # -b[1] * LX[0]
+        @. rhs -= b[2] * LX_history[1]  # -b[1] * LX[0]
     end
 
     # Step 6: Build and solve LHS system (following Tarang lines 174-184)
     # (a[0] * M + b[0] * L).X = RHS
     cache_key = (a[1], b[1])
-    if !haskey(state.timestepper_data, "lhs_cache") || state.timestepper_data["lhs_cache_key"] != cache_key
+    if !haskey(state.timestepper_data, :lhs_cache) || state.timestepper_data[:lhs_cache_key] != cache_key
         LHS = a[1] * M_matrix + b[1] * L_matrix  # a[0] * M + b[0] * L
-        state.timestepper_data["lhs_cache"] = factorize(LHS)
-        state.timestepper_data["lhs_cache_key"] = cache_key
+        state.timestepper_data[:lhs_cache] = factorize(LHS)
+        state.timestepper_data[:lhs_cache_key] = cache_key
     end
-    lhs_factor = state.timestepper_data["lhs_cache"]
+    lhs_factor = state.timestepper_data[:lhs_cache]::Factorization
     X_new = lhs_factor \ rhs
 
-    # Step 7: Update state (following Tarang scatter_inputs)
-    new_state = copy.(current_state)
-    copy_solution_to_fields!(new_state, X_new)
+    # Step 7: Update state
+    new_state = copy_state(current_state)
+    vector_to_fields!(new_state, X_new, current_state)
 
-    push!(state.history, new_state)
-    state.timestepper_data["cnab1_iteration"] += 1
+    _push_trim!(state.history, new_state, 3)
+    state.timestepper_data[:cnab1_iteration] += 1
 
-    @debug "CNAB1 step completed: dt=$dt, iteration=$(state.timestepper_data["cnab1_iteration"]), |X_new|=$(norm(X_new))"
-    
-    # Keep reasonable history length
-    if length(state.history) > 3
-        popfirst!(state.history)
-    end
+    @debug "CNAB1 step completed: dt=$dt, iteration=$(state.timestepper_data[:cnab1_iteration]), |X_new|=$(norm(X_new))"
 end
 
 function step_cnab2!(state::TimestepperState, solver::InitialValueSolver)
@@ -131,15 +121,15 @@ function step_cnab2!(state::TimestepperState, solver::InitialValueSolver)
     end
 
     # Initialize history arrays if needed
-    if !haskey(state.timestepper_data, "MX_history")
+    if !haskey(state.timestepper_data, :MX_history)
         T = eltype(fields_to_vector(state.history[end]))
-        state.timestepper_data["MX_history"] = Vector{T}[]
-        state.timestepper_data["LX_history"] = Vector{T}[]
-        state.timestepper_data["F_history"] = Vector{T}[]
-        state.timestepper_data["cnab2_iteration"] = 0
+        state.timestepper_data[:MX_history] = Vector{T}[]
+        state.timestepper_data[:LX_history] = Vector{T}[]
+        state.timestepper_data[:F_history] = Vector{T}[]
+        state.timestepper_data[:cnab2_iteration] = 0
     end
 
-    iteration = state.timestepper_data["cnab2_iteration"]
+    iteration = state.timestepper_data[:cnab2_iteration]
 
     # Check if we have enough history for CNAB2 (following Tarang line 274)
     if iteration < 1 || length(state.history) < 2
@@ -163,14 +153,14 @@ function step_cnab2!(state::TimestepperState, solver::InitialValueSolver)
     w1 = dt_current / dt_previous
     
     # Get CNAB2 coefficients following Tarang exactly (timesteppers:283-288)
-    a = [1.0/dt_current, -1.0/dt_current]  # a[0], a[1]
-    b = [0.5, 0.5]                         # b[0], b[1]
-    c = [0.0, 1.0 + w1/2.0, -w1/2.0]      # c[0], c[1], c[2]
+    a = (1.0/dt_current, -1.0/dt_current)  # a[0], a[1]
+    b = (0.5, 0.5)                         # b[0], b[1]
+    c = (0.0, 1.0 + w1/2.0, -w1/2.0)      # c[0], c[1], c[2]
     
     @debug "CNAB2 variable timestep: dt_current=$dt_current, dt_previous=$dt_previous, w1=$w1"
     
     # Step 1: Convert current state to vector
-    X_current = fields_to_vector(current_state)
+    X_current = copy(fields_to_vector(current_state))
 
     # Step 2: Compute M.X[0] and L.X[0] (following Tarang lines 142-147)
     MX_current = M_matrix * X_current
@@ -181,60 +171,48 @@ function step_cnab2!(state::TimestepperState, solver::InitialValueSolver)
     F_current_vec = fields_to_vector(F_current)
 
     # Step 4: Rotate and store history (following Tarang lines 124-126)
-    MX_history = state.timestepper_data["MX_history"]
-    LX_history = state.timestepper_data["LX_history"]
-    F_history = state.timestepper_data["F_history"]
+    MX_history = state.timestepper_data[:MX_history]
+    LX_history = state.timestepper_data[:LX_history]
+    F_history = state.timestepper_data[:F_history]
 
-    pushfirst!(MX_history, MX_current)
-    pushfirst!(LX_history, LX_current)
-    pushfirst!(F_history, F_current_vec)
-
-    # Keep only needed history for CNAB2 (amax=1, bmax=1, cmax=2)
-    # MX/LX only need 1 level (Crank-Nicolson is 1-step implicit)
-    # F needs 2 levels (Adams-Bashforth 2nd order explicit)
-    while length(MX_history) > 1; pop!(MX_history); end
-    while length(LX_history) > 1; pop!(LX_history); end
-    while length(F_history) > 2; pop!(F_history); end
+    _prepend_trim!(MX_history, MX_current, 1)
+    _prepend_trim!(LX_history, LX_current, 1)
+    _prepend_trim!(F_history, F_current_vec, 2)
 
     # Step 5: Build RHS following Tarang exactly (timesteppers:156-166)
     # RHS = c[1] * F[0] + c[2] * F[1] - a[1] * MX[0] - b[1] * LX[0]
     rhs = c[2] * F_history[1]  # c[1] * F[0]
     if length(F_history) >= 2  # c[2] term (Adams-Bashforth 2 extrapolation)
-        rhs .+= c[3] * F_history[2]  # c[2] * F[1]
+        @. rhs += c[3] * F_history[2]  # c[2] * F[1]
     else
         @warn "CNAB2: insufficient F_history ($(length(F_history)) < 2), falling back to first-order extrapolation" maxlog=1
     end
     if length(MX_history) >= 1  # a[1] term
-        rhs .-= a[2] * MX_history[1]  # -a[1] * MX[0]
+        @. rhs -= a[2] * MX_history[1]  # -a[1] * MX[0]
     end
     if length(LX_history) >= 1  # b[1] term
-        rhs .-= b[2] * LX_history[1]  # -b[1] * LX[0]
+        @. rhs -= b[2] * LX_history[1]  # -b[1] * LX[0]
     end
 
     # Step 6: Build and solve LHS system (following Tarang lines 174-184)
     # (a[0] * M + b[0] * L).X = RHS
     cache_key = (a[1], b[1])
-    if !haskey(state.timestepper_data, "lhs_cache") || state.timestepper_data["lhs_cache_key"] != cache_key
+    if !haskey(state.timestepper_data, :lhs_cache) || state.timestepper_data[:lhs_cache_key] != cache_key
         LHS = a[1] * M_matrix + b[1] * L_matrix  # a[0] * M + b[0] * L
-        state.timestepper_data["lhs_cache"] = factorize(LHS)
-        state.timestepper_data["lhs_cache_key"] = cache_key
+        state.timestepper_data[:lhs_cache] = factorize(LHS)
+        state.timestepper_data[:lhs_cache_key] = cache_key
     end
-    lhs_factor = state.timestepper_data["lhs_cache"]
+    lhs_factor = state.timestepper_data[:lhs_cache]::Factorization
     X_new = lhs_factor \ rhs
 
     # Step 7: Update state
-    new_state = copy.(current_state)
-    copy_solution_to_fields!(new_state, X_new)
+    new_state = copy_state(current_state)
+    vector_to_fields!(new_state, X_new, current_state)
 
-    push!(state.history, new_state)
-    state.timestepper_data["cnab2_iteration"] += 1
+    _push_trim!(state.history, new_state, 4)
+    state.timestepper_data[:cnab2_iteration] += 1
 
-    @debug "CNAB2 step completed: dt=$dt_current, w1=$w1, iteration=$(state.timestepper_data["cnab2_iteration"]), |X_new|=$(norm(X_new))"
-    
-    # Keep reasonable history length
-    if length(state.history) > 4
-        popfirst!(state.history)
-    end
+    @debug "CNAB2 step completed: dt=$dt_current, w1=$w1, iteration=$(state.timestepper_data[:cnab2_iteration]), |X_new|=$(norm(X_new))"
 end
 
 # BDF methods
@@ -255,12 +233,12 @@ function step_sbdf1!(state::TimestepperState, solver::InitialValueSolver)
     dt = state.dt
     
     # Initialize history arrays if needed
-    if !haskey(state.timestepper_data, "MX_history")
+    if !haskey(state.timestepper_data, :MX_history)
         T = eltype(fields_to_vector(state.history[end]))
-        state.timestepper_data["MX_history"] = Vector{T}[]
-        state.timestepper_data["LX_history"] = Vector{T}[]
-        state.timestepper_data["F_history"] = Vector{T}[]
-        state.timestepper_data["sbdf1_iteration"] = 0
+        state.timestepper_data[:MX_history] = Vector{T}[]
+        state.timestepper_data[:LX_history] = Vector{T}[]
+        state.timestepper_data[:F_history] = Vector{T}[]
+        state.timestepper_data[:sbdf1_iteration] = 0
     end
 
     # Check for MPI mode - SBDF methods don't support distributed data
@@ -284,12 +262,12 @@ function step_sbdf1!(state::TimestepperState, solver::InitialValueSolver)
     end
     
     # Get SBDF1 coefficients following Tarang exactly (timesteppers:247-250)
-    a = [1.0/dt, -1.0/dt]  # a[0], a[1] - BDF1 time derivative
-    b = [1.0]              # b[0] - fully implicit (not 1/2 like CNAB)
-    c = [0.0, 1.0]         # c[0], c[1] - forward Euler explicit
+    a = (1.0/dt, -1.0/dt)  # a[0], a[1] - BDF1 time derivative
+    b = (1.0,)             # b[0] - fully implicit (not 1/2 like CNAB)
+    c = (0.0, 1.0)         # c[0], c[1] - forward Euler explicit
     
     # Step 1: Convert current state to vector
-    X_current = fields_to_vector(current_state)
+    X_current = copy(fields_to_vector(current_state))
 
     # Step 2: Compute M.X[0] and L.X[0] (following Tarang MultistepIMEX pattern)
     MX_current = M_matrix * X_current
@@ -300,51 +278,41 @@ function step_sbdf1!(state::TimestepperState, solver::InitialValueSolver)
     F_current_vec = fields_to_vector(F_current)
 
     # Step 4: Rotate and store history
-    MX_history = state.timestepper_data["MX_history"]
-    LX_history = state.timestepper_data["LX_history"]
-    F_history = state.timestepper_data["F_history"]
+    MX_history = state.timestepper_data[:MX_history]
+    LX_history = state.timestepper_data[:LX_history]
+    F_history = state.timestepper_data[:F_history]
 
-    pushfirst!(MX_history, MX_current)
-    pushfirst!(LX_history, LX_current)
-    pushfirst!(F_history, F_current_vec)
-
-    # Keep only needed history for SBDF1 (amax=1, bmax=1, cmax=1)
-    while length(MX_history) > 1; pop!(MX_history); end
-    while length(LX_history) > 1; pop!(LX_history); end
-    while length(F_history) > 1; pop!(F_history); end
+    _prepend_trim!(MX_history, MX_current, 1)
+    _prepend_trim!(LX_history, LX_current, 1)
+    _prepend_trim!(F_history, F_current_vec, 1)
 
     # Step 5: Build RHS following Tarang MultistepIMEX pattern
     # RHS = c[1] * F[0] - a[1] * MX[0] - 0 * LX[0] (since bmax=1, no b[1] term)
     rhs = c[2] * F_history[1]  # c[1] * F[0]
     if length(MX_history) >= 1  # a[1] term
-        rhs .-= a[2] * MX_history[1]  # -a[1] * MX[0]
+        @. rhs -= a[2] * MX_history[1]  # -a[1] * MX[0]
     end
     # No b[1] term for SBDF1 since bmax=1
 
     # Step 6: Build and solve LHS system
     # (a[0] * M + b[0] * L).X = RHS  ->  (1/dt * M + 1 * L).X = RHS
     cache_key = (a[1], b[1])
-    if !haskey(state.timestepper_data, "lhs_cache") || state.timestepper_data["lhs_cache_key"] != cache_key
+    if !haskey(state.timestepper_data, :lhs_cache) || state.timestepper_data[:lhs_cache_key] != cache_key
         LHS = a[1] * M_matrix + b[1] * L_matrix  # a[0] * M + b[0] * L
-        state.timestepper_data["lhs_cache"] = factorize(LHS)
-        state.timestepper_data["lhs_cache_key"] = cache_key
+        state.timestepper_data[:lhs_cache] = factorize(LHS)
+        state.timestepper_data[:lhs_cache_key] = cache_key
     end
-    lhs_factor = state.timestepper_data["lhs_cache"]
+    lhs_factor = state.timestepper_data[:lhs_cache]::Factorization
     X_new = lhs_factor \ rhs
 
     # Step 7: Update state
-    new_state = copy.(current_state)
-    copy_solution_to_fields!(new_state, X_new)
+    new_state = copy_state(current_state)
+    vector_to_fields!(new_state, X_new, current_state)
 
-    push!(state.history, new_state)
-    state.timestepper_data["sbdf1_iteration"] += 1
+    _push_trim!(state.history, new_state, 3)
+    state.timestepper_data[:sbdf1_iteration] += 1
 
-    @debug "SBDF1 step completed: dt=$dt, iteration=$(state.timestepper_data["sbdf1_iteration"]), |X_new|=$(norm(X_new))"
-    
-    # Keep reasonable history length
-    if length(state.history) > 3
-        popfirst!(state.history)
-    end
+    @debug "SBDF1 step completed: dt=$dt, iteration=$(state.timestepper_data[:sbdf1_iteration]), |X_new|=$(norm(X_new))"
 end
 
 function step_sbdf2!(state::TimestepperState, solver::InitialValueSolver)
@@ -377,15 +345,15 @@ function step_sbdf2!(state::TimestepperState, solver::InitialValueSolver)
     end
 
     # Initialize history arrays if needed
-    if !haskey(state.timestepper_data, "MX_history")
+    if !haskey(state.timestepper_data, :MX_history)
         T = eltype(fields_to_vector(state.history[end]))
-        state.timestepper_data["MX_history"] = Vector{T}[]
-        state.timestepper_data["LX_history"] = Vector{T}[]
-        state.timestepper_data["F_history"] = Vector{T}[]
-        state.timestepper_data["sbdf2_iteration"] = 0
+        state.timestepper_data[:MX_history] = Vector{T}[]
+        state.timestepper_data[:LX_history] = Vector{T}[]
+        state.timestepper_data[:F_history] = Vector{T}[]
+        state.timestepper_data[:sbdf2_iteration] = 0
     end
 
-    iteration = state.timestepper_data["sbdf2_iteration"]
+    iteration = state.timestepper_data[:sbdf2_iteration]
 
     # Check if we have enough history for SBDF2 (following Tarang line 350)
     if iteration < 1 || length(state.history) < 2
@@ -409,16 +377,16 @@ function step_sbdf2!(state::TimestepperState, solver::InitialValueSolver)
     w1 = dt_current / dt_previous
     
     # Get SBDF2 coefficients following Tarang exactly (timesteppers:360-365)
-    a = [(1.0 + 2.0*w1) / (1.0 + w1) / dt_current,  # a[0]
+    a = ((1.0 + 2.0*w1) / (1.0 + w1) / dt_current,  # a[0]
          -(1.0 + w1) / dt_current,                    # a[1]
-         w1^2 / (1.0 + w1) / dt_current]              # a[2]
-    b = [1.0]                                         # b[0] - fully implicit
-    c = [0.0, 1.0 + w1, -w1]                        # c[0], c[1], c[2]
+         w1^2 / (1.0 + w1) / dt_current)              # a[2]
+    b = (1.0,)                                        # b[0] - fully implicit
+    c = (0.0, 1.0 + w1, -w1)                         # c[0], c[1], c[2]
     
     @debug "SBDF2 variable timestep: dt_current=$dt_current, dt_previous=$dt_previous, w1=$w1"
     
     # Step 1: Convert current state to vector
-    X_current = fields_to_vector(current_state)
+    X_current = copy(fields_to_vector(current_state))
 
     # Step 2: Compute M.X[0] and L.X[0]
     MX_current = M_matrix * X_current
@@ -429,57 +397,47 @@ function step_sbdf2!(state::TimestepperState, solver::InitialValueSolver)
     F_current_vec = fields_to_vector(F_current)
 
     # Step 4: Rotate and store history
-    MX_history = state.timestepper_data["MX_history"]
-    LX_history = state.timestepper_data["LX_history"]
-    F_history = state.timestepper_data["F_history"]
+    MX_history = state.timestepper_data[:MX_history]
+    LX_history = state.timestepper_data[:LX_history]
+    F_history = state.timestepper_data[:F_history]
 
-    pushfirst!(MX_history, MX_current)
-    pushfirst!(LX_history, LX_current)
-    pushfirst!(F_history, F_current_vec)
-
-    # Keep only needed history for SBDF2 (amax=2, bmax=2, cmax=2)
-    while length(MX_history) > 2; pop!(MX_history); end
-    while length(LX_history) > 2; pop!(LX_history); end
-    while length(F_history) > 2; pop!(F_history); end
+    _prepend_trim!(MX_history, MX_current, 2)
+    _prepend_trim!(LX_history, LX_current, 2)
+    _prepend_trim!(F_history, F_current_vec, 2)
 
     # Step 5: Build RHS following Tarang MultistepIMEX pattern
     # RHS = c[1]*F[0] + c[2]*F[1] - a[1]*MX[0] - a[2]*MX[1] - 0*LX terms (bmax=1)
     rhs = c[2] * F_history[1]  # c[1] * F[0]
     if length(F_history) >= 2  # c[2] term
-        rhs .+= c[3] * F_history[2]  # c[2] * F[1]
+        @. rhs += c[3] * F_history[2]  # c[2] * F[1]
     end
     if length(MX_history) >= 1  # a[1] term
-        rhs .-= a[2] * MX_history[1]  # -a[1] * MX[0]
+        @. rhs -= a[2] * MX_history[1]  # -a[1] * MX[0]
     end
     if length(MX_history) >= 2  # a[2] term
-        rhs .-= a[3] * MX_history[2]  # -a[2] * MX[1]
+        @. rhs -= a[3] * MX_history[2]  # -a[2] * MX[1]
     end
     # No b[1], b[2] terms since bmax=1 for SBDF2
 
     # Step 6: Build and solve LHS system
     # (a[0] * M + b[0] * L).X = RHS
     cache_key = (a[1], b[1])
-    if !haskey(state.timestepper_data, "lhs_cache") || state.timestepper_data["lhs_cache_key"] != cache_key
+    if !haskey(state.timestepper_data, :lhs_cache) || state.timestepper_data[:lhs_cache_key] != cache_key
         LHS = a[1] * M_matrix + b[1] * L_matrix  # a[0] * M + b[0] * L
-        state.timestepper_data["lhs_cache"] = factorize(LHS)
-        state.timestepper_data["lhs_cache_key"] = cache_key
+        state.timestepper_data[:lhs_cache] = factorize(LHS)
+        state.timestepper_data[:lhs_cache_key] = cache_key
     end
-    lhs_factor = state.timestepper_data["lhs_cache"]
+    lhs_factor = state.timestepper_data[:lhs_cache]::Factorization
     X_new = lhs_factor \ rhs
 
     # Step 7: Update state
-    new_state = copy.(current_state)
-    copy_solution_to_fields!(new_state, X_new)
+    new_state = copy_state(current_state)
+    vector_to_fields!(new_state, X_new, current_state)
 
-    push!(state.history, new_state)
-    state.timestepper_data["sbdf2_iteration"] += 1
+    _push_trim!(state.history, new_state, 4)
+    state.timestepper_data[:sbdf2_iteration] += 1
 
-    @debug "SBDF2 step completed: dt=$dt_current, w1=$w1, iteration=$(state.timestepper_data["sbdf2_iteration"]), |X_new|=$(norm(X_new))"
-    
-    # Keep reasonable history length
-    if length(state.history) > 4
-        popfirst!(state.history)
-    end
+    @debug "SBDF2 step completed: dt=$dt_current, w1=$w1, iteration=$(state.timestepper_data[:sbdf2_iteration]), |X_new|=$(norm(X_new))"
 end
 
 function step_sbdf3!(state::TimestepperState, solver::InitialValueSolver)
@@ -506,15 +464,15 @@ function step_sbdf3!(state::TimestepperState, solver::InitialValueSolver)
     end
 
     # Initialize history arrays if needed
-    if !haskey(state.timestepper_data, "MX_history")
+    if !haskey(state.timestepper_data, :MX_history)
         T = eltype(fields_to_vector(state.history[end]))
-        state.timestepper_data["MX_history"] = Vector{T}[]
-        state.timestepper_data["LX_history"] = Vector{T}[]
-        state.timestepper_data["F_history"] = Vector{T}[]
-        state.timestepper_data["sbdf3_iteration"] = 0
+        state.timestepper_data[:MX_history] = Vector{T}[]
+        state.timestepper_data[:LX_history] = Vector{T}[]
+        state.timestepper_data[:F_history] = Vector{T}[]
+        state.timestepper_data[:sbdf3_iteration] = 0
     end
 
-    iteration = state.timestepper_data["sbdf3_iteration"]
+    iteration = state.timestepper_data[:sbdf3_iteration]
 
     # Check if we have enough history for SBDF3
     if iteration < 2 || length(state.history) < 3
@@ -550,21 +508,18 @@ function step_sbdf3!(state::TimestepperState, solver::InitialValueSolver)
     end
 
     # Get SBDF3 coefficients following Tarang exactly (timesteppers:438-445)
-    a = zeros(4)
-    b = zeros(4)
-    c = zeros(4)
-
-    a[1] = (1 + w2/(1 + w2) + w1*w2/(1 + w1*(1 + w2))) / k2
-    a[2] = (-1 - w2 - w1*w2*(1 + w2)/(1 + w1)) / k2
-    a[3] = w2^2 * (w1 + 1/(1 + w2)) / k2
-    a[4] = -w1^3 * w2^2 * (1 + w2) / (1 + w1) / (1 + w1 + w1*w2) / k2
-    b[1] = 1
-    c[2] = (1 + w2)*(1 + w1*(1 + w2)) / (1 + w1)
-    c[3] = -w2*(1 + w1*(1 + w2))
-    c[4] = w1*w1*w2*(1 + w2) / (1 + w1)
+    a = ((1 + w2/(1 + w2) + w1*w2/(1 + w1*(1 + w2))) / k2,
+         (-1 - w2 - w1*w2*(1 + w2)/(1 + w1)) / k2,
+         w2^2 * (w1 + 1/(1 + w2)) / k2,
+         -w1^3 * w2^2 * (1 + w2) / (1 + w1) / (1 + w1 + w1*w2) / k2)
+    b = (1.0, 0.0, 0.0, 0.0)
+    c = (0.0,
+         (1 + w2)*(1 + w1*(1 + w2)) / (1 + w1),
+         -w2*(1 + w1*(1 + w2)),
+         w1*w1*w2*(1 + w2) / (1 + w1))
 
     # Step 1: Convert current state to vector
-    X_current = fields_to_vector(current_state)
+    X_current = copy(fields_to_vector(current_state))
 
     # Step 2: Compute M.X[0]
     MX_current = M_matrix * X_current
@@ -574,58 +529,49 @@ function step_sbdf3!(state::TimestepperState, solver::InitialValueSolver)
     F_current_vec = fields_to_vector(F_current)
 
     # Step 4: Rotate and store history (following SBDF1/SBDF2 pattern)
-    MX_history = state.timestepper_data["MX_history"]
-    F_history = state.timestepper_data["F_history"]
+    MX_history = state.timestepper_data[:MX_history]
+    F_history = state.timestepper_data[:F_history]
 
-    pushfirst!(MX_history, MX_current)
-    pushfirst!(F_history, F_current_vec)
-
-    # Keep only needed history for SBDF3 (3 levels)
-    while length(MX_history) > 3; pop!(MX_history); end
-    while length(F_history) > 3; pop!(F_history); end
+    _prepend_trim!(MX_history, MX_current, 3)
+    _prepend_trim!(F_history, F_current_vec, 3)
 
     # Step 5: Build RHS following Tarang multistep pattern
     # RHS = c[1]*F[0] + c[2]*F[1] + c[3]*F[2] - a[1]*MX[0] - a[2]*MX[1] - a[3]*MX[2]
     rhs = c[2] * F_history[1]  # c[1] * F[0]
     if length(F_history) >= 2
-        rhs .+= c[3] * F_history[2]  # c[2] * F[1]
+        @. rhs += c[3] * F_history[2]  # c[2] * F[1]
     end
     if length(F_history) >= 3
-        rhs .+= c[4] * F_history[3]  # c[3] * F[2]
+        @. rhs += c[4] * F_history[3]  # c[3] * F[2]
     end
     if length(MX_history) >= 1  # a[1] term
-        rhs .-= a[2] * MX_history[1]  # -a[1] * MX[0]
+        @. rhs -= a[2] * MX_history[1]  # -a[1] * MX[0]
     end
     if length(MX_history) >= 2  # a[2] term
-        rhs .-= a[3] * MX_history[2]  # -a[2] * MX[1]
+        @. rhs -= a[3] * MX_history[2]  # -a[2] * MX[1]
     end
     if length(MX_history) >= 3  # a[3] term
-        rhs .-= a[4] * MX_history[3]  # -a[3] * MX[2]
+        @. rhs -= a[4] * MX_history[3]  # -a[3] * MX[2]
     end
 
     # Step 6: Build and solve LHS system: (a[0]*M + b[0]*L).X(n+1) = RHS
     cache_key = (a[1], b[1])
-    if !haskey(state.timestepper_data, "lhs_cache") || state.timestepper_data["lhs_cache_key"] != cache_key
+    if !haskey(state.timestepper_data, :lhs_cache) || state.timestepper_data[:lhs_cache_key] != cache_key
         LHS = a[1] * M_matrix + b[1] * L_matrix
-        state.timestepper_data["lhs_cache"] = factorize(LHS)
-        state.timestepper_data["lhs_cache_key"] = cache_key
+        state.timestepper_data[:lhs_cache] = factorize(LHS)
+        state.timestepper_data[:lhs_cache_key] = cache_key
     end
-    lhs_factor = state.timestepper_data["lhs_cache"]
+    lhs_factor = state.timestepper_data[:lhs_cache]::Factorization
     X_new = lhs_factor \ rhs
 
-    # Step 7: Convert back to fields and update state
-    new_state = copy.(current_state)
-    copy_solution_to_fields!(new_state, X_new)
+    # Step 7: Update state
+    new_state = copy_state(current_state)
+    vector_to_fields!(new_state, X_new, current_state)
 
-    push!(state.history, new_state)
-    state.timestepper_data["sbdf3_iteration"] += 1
+    _push_trim!(state.history, new_state, 4)
+    state.timestepper_data[:sbdf3_iteration] += 1
 
     @debug "SBDF3 step completed: dt=$k2, w2=$w2, w1=$w1, |X_new|=$(norm(X_new))"
-
-    # Keep only necessary history for SBDF3
-    if length(state.history) > 4
-        popfirst!(state.history)
-    end
 end
 
 function step_sbdf4!(state::TimestepperState, solver::InitialValueSolver)
@@ -652,15 +598,15 @@ function step_sbdf4!(state::TimestepperState, solver::InitialValueSolver)
     end
 
     # Initialize history arrays if needed
-    if !haskey(state.timestepper_data, "MX_history")
+    if !haskey(state.timestepper_data, :MX_history)
         T = eltype(fields_to_vector(state.history[end]))
-        state.timestepper_data["MX_history"] = Vector{T}[]
-        state.timestepper_data["LX_history"] = Vector{T}[]
-        state.timestepper_data["F_history"] = Vector{T}[]
-        state.timestepper_data["sbdf4_iteration"] = 0
+        state.timestepper_data[:MX_history] = Vector{T}[]
+        state.timestepper_data[:LX_history] = Vector{T}[]
+        state.timestepper_data[:F_history] = Vector{T}[]
+        state.timestepper_data[:sbdf4_iteration] = 0
     end
 
-    iteration = state.timestepper_data["sbdf4_iteration"]
+    iteration = state.timestepper_data[:sbdf4_iteration]
 
     # Check if we have enough history for SBDF4
     if iteration < 3 || length(state.history) < 4
@@ -702,23 +648,20 @@ function step_sbdf4!(state::TimestepperState, solver::InitialValueSolver)
     A2 = 1 + w2*(1 + w3)
     A3 = 1 + w1*A2
 
-    a = zeros(5)
-    b = zeros(5)
-    c = zeros(5)
-
-    a[1] = (1 + w3/(1 + w3) + w2*w3/A2 + w1*w2*w3/A3) / k3
-    a[2] = (-1 - w3*(1 + (w2*(1 + w3)/(1 + w2)) * (1 + w1*A2/A1))) / k3
-    a[3] = w3 * (w3/(1 + w3) + (w2*w3*(A3 + w1))/(1 + w1)) / k3
-    a[4] = -(w2^3 * w3^2 * (1 + w3) * A3) / ((1 + w2) * A2 * k3)
-    a[5] = ((1 + w3) * A2 * w1^4 * w2^3 * w3^2) / ((1 + w1) * A1 * A3 * k3)
-    b[1] = 1
-    c[2] = (w2 * (1 + w3) * ((1 + w3)*(A3 + w1) + (1 + w1)/w2)) / ((1 + w2) * A1)
-    c[3] = -(A2 * A3 * w3) / (1 + w1)
-    c[4] = (w2^2 * w3 * (1 + w3) * A3) / (1 + w2)
-    c[5] = -(w1^3 * w2^2 * w3 * (1 + w3) * A2) / ((1 + w1) * A1)
+    a = ((1 + w3/(1 + w3) + w2*w3/A2 + w1*w2*w3/A3) / k3,
+         (-1 - w3*(1 + (w2*(1 + w3)/(1 + w2)) * (1 + w1*A2/A1))) / k3,
+         w3 * (w3/(1 + w3) + (w2*w3*(A3 + w1))/(1 + w1)) / k3,
+         -(w2^3 * w3^2 * (1 + w3) * A3) / ((1 + w2) * A2 * k3),
+         ((1 + w3) * A2 * w1^4 * w2^3 * w3^2) / ((1 + w1) * A1 * A3 * k3))
+    b = (1.0, 0.0, 0.0, 0.0, 0.0)
+    c = (0.0,
+         (w2 * (1 + w3) * ((1 + w3)*(A3 + w1) + (1 + w1)/w2)) / ((1 + w2) * A1),
+         -(A2 * A3 * w3) / (1 + w1),
+         (w2^2 * w3 * (1 + w3) * A3) / (1 + w2),
+         -(w1^3 * w2^2 * w3 * (1 + w3) * A2) / ((1 + w1) * A1))
 
     # Step 1: Convert current state to vector
-    X_current = fields_to_vector(current_state)
+    X_current = copy(fields_to_vector(current_state))
 
     # Step 2: Compute M.X[0]
     MX_current = M_matrix * X_current
@@ -728,65 +671,56 @@ function step_sbdf4!(state::TimestepperState, solver::InitialValueSolver)
     F_current_vec = fields_to_vector(F_current)
 
     # Step 4: Rotate and store history (following SBDF1/SBDF2/SBDF3 pattern)
-    MX_history = state.timestepper_data["MX_history"]
-    F_history = state.timestepper_data["F_history"]
+    MX_history = state.timestepper_data[:MX_history]
+    F_history = state.timestepper_data[:F_history]
 
-    pushfirst!(MX_history, MX_current)
-    pushfirst!(F_history, F_current_vec)
-
-    # Keep only needed history for SBDF4 (4 levels)
-    while length(MX_history) > 4; pop!(MX_history); end
-    while length(F_history) > 4; pop!(F_history); end
+    _prepend_trim!(MX_history, MX_current, 4)
+    _prepend_trim!(F_history, F_current_vec, 4)
 
     # Step 5: Build RHS following Tarang multistep pattern
     # RHS = c[1]*F[0] + c[2]*F[1] + c[3]*F[2] + c[4]*F[3]
     #     - a[1]*MX[0] - a[2]*MX[1] - a[3]*MX[2] - a[4]*MX[3]
     rhs = c[2] * F_history[1]  # c[1] * F[0]
     if length(F_history) >= 2
-        rhs .+= c[3] * F_history[2]  # c[2] * F[1]
+        @. rhs += c[3] * F_history[2]  # c[2] * F[1]
     end
     if length(F_history) >= 3
-        rhs .+= c[4] * F_history[3]  # c[3] * F[2]
+        @. rhs += c[4] * F_history[3]  # c[3] * F[2]
     end
     if length(F_history) >= 4
-        rhs .+= c[5] * F_history[4]  # c[4] * F[3]
+        @. rhs += c[5] * F_history[4]  # c[4] * F[3]
     end
     if length(MX_history) >= 1  # a[1] term
-        rhs .-= a[2] * MX_history[1]  # -a[1] * MX[0]
+        @. rhs -= a[2] * MX_history[1]  # -a[1] * MX[0]
     end
     if length(MX_history) >= 2  # a[2] term
-        rhs .-= a[3] * MX_history[2]  # -a[2] * MX[1]
+        @. rhs -= a[3] * MX_history[2]  # -a[2] * MX[1]
     end
     if length(MX_history) >= 3  # a[3] term
-        rhs .-= a[4] * MX_history[3]  # -a[3] * MX[2]
+        @. rhs -= a[4] * MX_history[3]  # -a[3] * MX[2]
     end
     if length(MX_history) >= 4  # a[4] term
-        rhs .-= a[5] * MX_history[4]  # -a[4] * MX[3]
+        @. rhs -= a[5] * MX_history[4]  # -a[4] * MX[3]
     end
 
     # Step 6: Build and solve LHS system: (a[0]*M + b[0]*L).X(n+1) = RHS
     cache_key = (a[1], b[1])
-    if !haskey(state.timestepper_data, "lhs_cache") || state.timestepper_data["lhs_cache_key"] != cache_key
+    if !haskey(state.timestepper_data, :lhs_cache) || state.timestepper_data[:lhs_cache_key] != cache_key
         LHS = a[1] * M_matrix + b[1] * L_matrix
-        state.timestepper_data["lhs_cache"] = factorize(LHS)
-        state.timestepper_data["lhs_cache_key"] = cache_key
+        state.timestepper_data[:lhs_cache] = factorize(LHS)
+        state.timestepper_data[:lhs_cache_key] = cache_key
     end
-    lhs_factor = state.timestepper_data["lhs_cache"]
+    lhs_factor = state.timestepper_data[:lhs_cache]::Factorization
     X_new = lhs_factor \ rhs
 
-    # Step 7: Convert back to fields and update state
-    new_state = copy.(current_state)
-    copy_solution_to_fields!(new_state, X_new)
+    # Step 7: Update state
+    new_state = copy_state(current_state)
+    vector_to_fields!(new_state, X_new, current_state)
 
-    push!(state.history, new_state)
-    state.timestepper_data["sbdf4_iteration"] += 1
+    _push_trim!(state.history, new_state, 5)
+    state.timestepper_data[:sbdf4_iteration] += 1
 
     @debug "SBDF4 step completed: dt=$k3, w3=$w3, w2=$w2, w1=$w1, |X_new|=$(norm(X_new))"
-
-    # Keep only necessary history for SBDF4
-    if length(state.history) > 5
-        popfirst!(state.history)
-    end
 end
 
 # Exponential Time Differencing methods

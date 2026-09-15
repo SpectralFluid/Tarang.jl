@@ -294,3 +294,96 @@ end
     @test isapprox(Tarang.get_grid_data(g.components[1]), expected_gx; rtol=1e-6)
     @test isapprox(Tarang.get_grid_data(g.components[2]), expected_gz; rtol=1e-6)
 end
+
+# ============================================================================
+# Operator evaluate dispatch
+# ============================================================================
+
+@testset "Operator evaluate dispatch" begin
+    using Tarang
+    import Tarang: _negate_result, _multiply_result, _add_result,
+                   _subtract_result, _divide_result
+
+    coords = CartesianCoordinates("x")
+    dist = Distributor(coords; mesh=(1,), dtype=Float64)
+    basis = RealFourier(coords["x"]; size=8, bounds=(0.0, 2π))
+
+    f = ScalarField(dist, "f", (basis,), Float64)
+    ensure_layout!(f, :g)
+    get_grid_data(f) .= Float64.(1:8)
+
+    g = ScalarField(dist, "g", (basis,), Float64)
+    ensure_layout!(g, :g)
+    get_grid_data(g) .= Float64.(8:-1:1)
+
+    @testset "_negate_result ScalarField" begin
+        r = _negate_result(f, :g)
+        @test r isa ScalarField
+        ensure_layout!(r, :g)
+        @test get_grid_data(r) ≈ .-Float64.(1:8)
+    end
+
+    @testset "_negate_result Number" begin
+        @test _negate_result(5, :g) == -5
+        @test _negate_result(3.14, :c) == -3.14
+    end
+
+    @testset "_negate_result AbstractArray" begin
+        arr = [1.0, 2.0, 3.0]
+        @test _negate_result(arr, :g) ≈ [-1.0, -2.0, -3.0]
+    end
+
+    @testset "_multiply_result Number×ScalarField" begin
+        r = _multiply_result(3.0, f, :g)
+        @test r isa ScalarField
+        ensure_layout!(r, :g)
+        @test get_grid_data(r) ≈ 3.0 .* Float64.(1:8)
+    end
+
+    @testset "_multiply_result ScalarField×Number (commutative)" begin
+        r = _multiply_result(f, 3.0, :g)
+        @test r isa ScalarField
+        ensure_layout!(r, :g)
+        @test get_grid_data(r) ≈ 3.0 .* Float64.(1:8)
+    end
+
+    @testset "_multiply_result ScalarField×ScalarField" begin
+        r = _multiply_result(f, g, :g)
+        @test r isa ScalarField
+        ensure_layout!(r, :g)
+        @test get_grid_data(r) ≈ Float64.(1:8) .* Float64.(8:-1:1)
+    end
+
+    @testset "_multiply_result Number×Number" begin
+        @test _multiply_result(3, 4, :g) == 12
+    end
+
+    @testset "_multiply_result unsupported throws" begin
+        @test_throws ArgumentError _multiply_result("a", "b", :g)
+    end
+
+    @testset "_add_result ScalarField pair" begin
+        r = _add_result(f, g, :g)
+        @test r isa ScalarField
+        ensure_layout!(r, :g)
+        @test all(get_grid_data(r) .≈ 9.0)
+    end
+
+    @testset "_subtract_result ScalarField pair" begin
+        r = _subtract_result(f, g, :g)
+        @test r isa ScalarField
+        ensure_layout!(r, :g)
+        @test get_grid_data(r) ≈ Float64.(1:8) .- Float64.(8:-1:1)
+    end
+
+    @testset "_divide_result ScalarField/Number" begin
+        r = _divide_result(f, 2.0, :g)
+        @test r isa ScalarField
+        ensure_layout!(r, :g)
+        @test get_grid_data(r) ≈ Float64.(1:8) ./ 2.0
+    end
+
+    @testset "_divide_result unsupported throws" begin
+        @test_throws ArgumentError _divide_result("a", "b", :g)
+    end
+end
