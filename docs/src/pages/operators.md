@@ -32,7 +32,7 @@ add_equation!(problem, "∂t(T) = -u*∂x(T) - w*∂z(T)")
 Δ(field)
 
 # Example: Diffusion equation
-add_equation!(problem, "∂t(T) = kappa*Δ(T)")
+add_equation!(problem, "∂t(T) - kappa*Δ(T) = 0")
 ```
 
 ### Fractional Laplacian
@@ -60,7 +60,7 @@ invsqrtlap(field)      # Same as fraclap(f, -0.5)
 
 ```julia
 # SQG buoyancy equation with fractional dissipation
-add_equation!(problem, "∂t(θ) = -u⋅∇(θ) + κ*fraclap(θ, 0.5)")
+add_equation!(problem, "∂t(θ) - κ*fraclap(θ, 0.5) = -u⋅∇(θ)")
 
 # Can also be used on LHS (implicit treatment)
 add_equation!(problem, "∂t(θ) + κ*fraclap(θ, 0.5) = -u⋅∇(θ)")
@@ -89,13 +89,13 @@ hyperlap(field, 8)   # 16th-order: (-Δ)⁸ = |k|¹⁶
 
 ```julia
 # 2D turbulence with biharmonic hyperviscosity
-add_equation!(problem, "∂t(ω) = -u⋅∇(ω) - ν₄*Δ²(ω)")
+add_equation!(problem, "∂t(ω) + ν₄*Δ²(ω) = -u⋅∇(ω)")
 
 # 3D turbulence with 8th-order hyperviscosity
-add_equation!(problem, "∂t(u) = -u⋅∇(u) - ∇(p) - ν₈*Δ⁴(u)")
+add_equation!(problem, "∂t(u) + ∇(p) + ν₈*Δ⁴(u) = -u⋅∇(u)")
 
 # General n-th order using hyperlap
-add_equation!(problem, "∂t(u) = -u⋅∇(u) - ν*hyperlap(u, 4)")
+add_equation!(problem, "∂t(u) + ν*hyperlap(u, 4) = -u⋅∇(u)")
 ```
 
 **Why use hyperviscosity?**
@@ -126,7 +126,7 @@ Converts scalar to vector field.
 
 ```julia
 # grad(p) = ∇p
-add_equation!(problem, "∂t(u) = -grad(p)")
+add_equation!(problem, "∂t(u) + grad(p) = 0")
 
 # Components:
 # ∂p/∂x, ∂p/∂y, ∂p/∂z
@@ -205,7 +205,7 @@ Tarang supports Unicode mathematical notation for cleaner, more readable code:
 
 ```julia
 # Unicode syntax
-add_equation!(problem, "∂t(u) + u⋅∇(u) = nu*Δ(u) - ∇(p)")
+add_equation!(problem, "∂t(u) + ∇(p) - nu*Δ(u) = -u⋅∇(u)")
 ```
 
 ### In Code
@@ -245,7 +245,7 @@ In Julia REPL or editors with Julia support:
 
 ```julia
 # Equations are strings parsed symbolically
-add_equation!(problem, "∂t(T) + u*∂x(T) = kappa*Δ(T)")
+add_equation!(problem, "∂t(T) - kappa*Δ(T) = -u*∂x(T)")
 
 # Supports:
 # - Addition/subtraction: +, -
@@ -327,7 +327,7 @@ The equation parser recognizes all built-in operators:
 # sin, cos, tan, exp, log, sqrt, abs, tanh
 
 # Use operators directly
-add_equation!(problem, "∂t(T) = -ux*∂x(T) - uz*∂z(T) + kappa*Δ(T)")
+add_equation!(problem, "∂t(T) - kappa*Δ(T) = -ux*∂x(T) - uz*∂z(T)")
 ```
 
 ## Performance Tips

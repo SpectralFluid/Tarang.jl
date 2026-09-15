@@ -56,11 +56,11 @@ tau_u2 = ScalarField(dist, "tau_u2", (x_basis,))  # For BC at z=1
 # Step 2: Add ALL fields to problem (including tau fields)
 problem = LBVP([u, tau_u1, tau_u2])
 
-# Step 3: Add substitution for source term
-add_substitution!(problem, "f", f)
+# Step 3: Add source term parameter
+add_parameters!(problem, f=f)
 
 # Step 4: Add equation with lift() operators (Dedalus-style string format)
-add_equation!(problem, "Δ(u) + lift(tau_u1) + lift(tau_u2) = f")
+add_equation!(problem, "Δ(u) + lift(tau_u1, -1) + lift(tau_u2, -2) = f")
 
 # Step 5: Add boundary conditions
 add_bc!(problem, "u(z=0) = 0")   # u(z=0) = 0
@@ -86,7 +86,7 @@ tau_T2 = ScalarField(dist, "tau_T2", (x_basis,))
 problem = LBVP([T, tau_T1, tau_T2])
 
 # Add equation with lift terms (Dedalus-style string format)
-add_equation!(problem, "Δ(T) + lift(tau_T1) + lift(tau_T2) = source")
+add_equation!(problem, "Δ(T) + lift(tau_T1, -1) + lift(tau_T2, -2) = source")
 
 # Boundary conditions
 add_bc!(problem, "T(z=0) = 1")   # T(z=0) = 1
@@ -110,11 +110,11 @@ tau_p = ScalarField(dist, "tau_p", ())
 # Pass vector fields directly to problem
 problem = IVP([u, p, tau_u1, tau_u2, tau_p])
 
-# Add substitutions
-add_substitution!(problem, "nu", nu)
+# Add parameters
+add_parameters!(problem, nu=nu)
 
 # Momentum equation (single vector equation)
-add_equation!(problem, "∂t(u) - nu*Δ(u) + ∇(p) + lift(tau_u2) = -u⋅∇(u)")
+add_equation!(problem, "∂t(u) - nu*Δ(u) + ∇(p) + lift(tau_u2, -2) = -u⋅∇(u)")
 
 # Continuity with tau_p (removes degeneracy)
 add_equation!(problem, "div(u) + tau_p = 0")
@@ -137,7 +137,7 @@ tau_T2 = ScalarField(dist, "tau_T2", (x_basis,))
 
 problem = LBVP([T, tau_T1, tau_T2])
 
-add_equation!(problem, "Δ(T) + lift(tau_T1) + lift(tau_T2) = source")
+add_equation!(problem, "Δ(T) + lift(tau_T1, -1) + lift(tau_T2, -2) = source")
 
 # Neumann: specify derivative at boundary
 add_bc!(problem, "∂z(T)(z=0) = 1")   # ∂T/∂z(z=0) = 1
@@ -165,11 +165,9 @@ tau_T2 = ScalarField(dist, "tau_T2", (x_basis,))
 problem = LBVP([T, tau_T1, tau_T2])
 
 # Add parameters
-add_substitution!(problem, "h", 10.0)   # Heat transfer coefficient
-add_substitution!(problem, "k", 1.0)    # Thermal conductivity
-add_substitution!(problem, "T_amb", 25.0)
+add_parameters!(problem, h=10.0, k=1.0, T_amb=25.0)
 
-add_equation!(problem, "Δ(T) + lift(tau_T1) + lift(tau_T2) = source")
+add_equation!(problem, "Δ(T) + lift(tau_T1, -1) + lift(tau_T2, -2) = source")
 
 # Convective heat transfer at top: h*T + k*dT/dn = h*T_ambient
 add_bc!(problem, "h*T(z=1) + k*∂z(T)(z=1) = h*T_amb")
@@ -198,7 +196,7 @@ x_basis = RealFourier(coords["x"], size=128, bounds=(0.0, 2π))
 The `lift()` operator places tau corrections at specific spectral modes. In the string equation format:
 
 ```julia
-"Δ(u) + lift(tau_u1) + lift(tau_u2) = f"
+"Δ(u) + lift(tau_u1, -1) + lift(tau_u2, -2) = f"
 ```
 
 The tau field name in the lift() operator should match the tau field name you created.
@@ -225,7 +223,7 @@ tau_u4 = ScalarField(dist, "tau_u4", (x_basis,))
 problem = LBVP([u, tau_u1, tau_u2, tau_u3, tau_u4])
 
 # Biharmonic equation with all four lift terms
-add_equation!(problem, "Δ(Δ(u)) + lift(tau_u1) + lift(tau_u2) + lift(tau_u3) + lift(tau_u4) = f")
+add_equation!(problem, "Δ(Δ(u)) + lift(tau_u1, -1) + lift(tau_u2, -2) + lift(tau_u3, -3) + lift(tau_u4, -4) = f")
 
 # Clamped beam: u = 0 and du/dz = 0 at both ends
 add_bc!(problem, "u(z=0) = 0")
@@ -264,12 +262,11 @@ dpdx = -1.0
 # Create problem with all fields
 problem = IVP([u, p, tau_u1, tau_u2, tau_p])
 
-# Add parameter substitutions
-add_substitution!(problem, "nu", nu)
-add_substitution!(problem, "dpdx", dpdx)
+# Add parameters
+add_parameters!(problem, nu=nu, dpdx=dpdx)
 
 # Momentum equation (vector form) - dpdx is the driving pressure gradient
-add_equation!(problem, "∂t(u) - nu*Δ(u) + ∇(p) + lift(tau_u2) = -u⋅∇(u) - dpdx*ex")
+add_equation!(problem, "∂t(u) - nu*Δ(u) + ∇(p) + lift(tau_u2, -2) = -u⋅∇(u) - dpdx*ex")
 
 # Continuity with tau_p (removes degeneracy)
 add_equation!(problem, "div(u) + tau_p = 0")
@@ -313,18 +310,17 @@ Pr = 1.0   # Prandtl number
 problem = IVP([u, p, T, tau_u1, tau_u2, tau_T1, tau_T2, tau_p])
 
 # Add parameter substitutions
-add_substitution!(problem, "Ra", Ra)
-add_substitution!(problem, "Pr", Pr)
+add_parameters!(problem, Ra=Ra, Pr=Pr)
 
 # Momentum equation (vector form with buoyancy)
 # ez is the unit vector in z-direction
-add_equation!(problem, "∂t(u) - Pr*Δ(u) + ∇(p) + lift(tau_u2) = -u⋅∇(u) + Ra*Pr*T*ez")
+add_equation!(problem, "∂t(u) - Pr*Δ(u) + ∇(p) - Ra*Pr*T*ez + lift(tau_u2, -2) = -u⋅∇(u)")
 
 # Continuity with tau_p (removes degeneracy)
 add_equation!(problem, "div(u) + tau_p = 0")
 
 # Temperature equation
-add_equation!(problem, "∂t(T) - Δ(T) + lift(tau_T2) = -u⋅∇(T)")
+add_equation!(problem, "∂t(T) - Δ(T) + lift(tau_T2, -2) = -u⋅∇(T)")
 
 # Boundary conditions (vector notation for velocity)
 add_bc!(problem, "u(z=0) = 0")   # No-slip bottom
@@ -379,7 +375,7 @@ add_bc!(problem, "u(z=0) = 0")
 # Correct: Create tau fields and add lift terms
 tau_u1 = ScalarField(dist, "tau_u1", (x_basis,))
 tau_u2 = ScalarField(dist, "tau_u2", (x_basis,))
-add_equation!(problem, "Δ(u) + lift(tau_u1) + lift(tau_u2) = f")
+add_equation!(problem, "Δ(u) + lift(tau_u1, -1) + lift(tau_u2, -2) = f")
 add_bc!(problem, "u(z=0) = 0")
 add_bc!(problem, "u(z=1) = 0")
 ```

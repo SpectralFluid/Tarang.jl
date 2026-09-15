@@ -94,30 +94,16 @@ Initialize GPU matrix solvers if CUDA is available.
 Called from the main module __init__ function.
 """
 function _init_gpu_solvers!()
-    # Check if CUDA extension is already loaded (preferred path)
-    cuda_loaded = false
+    # Check if CUDA extension is loaded (provides GPU helper implementations)
     try
         cuda_mod = Base.get_extension(@__MODULE__, :TarangCUDAExt)
         if cuda_mod !== nothing
-            cuda_loaded = true
+            CUDA_AVAILABLE[] = true
+            _register_gpu_solvers()
+            @info "GPU matrix solvers enabled (CUDA available via extension)"
         end
-    catch
-    end
-
-    if !cuda_loaded
-        try
-            @eval using CUDA
-            if CUDA.functional()
-                CUDA_AVAILABLE[] = true
-                @info "GPU matrix solvers enabled (CUDA available)"
-                _register_gpu_helpers()
-                _register_gpu_solvers()
-            else
-                @debug "CUDA found but not functional - GPU solvers disabled"
-            end
-        catch e
-            @debug "CUDA not available - GPU solvers disabled: $e"
-        end
+    catch e
+        @debug "GPU solver initialization failed: $e"
     end
 end
 
@@ -185,20 +171,8 @@ For symmetric positive definite matrices only.
 """
 function _gpu_ic0 end
 
-# Register GPU helper implementations when CUDA is loaded
-function _register_gpu_helpers()
-    @eval begin
-        _gpu_zeros(T::Type, dims...) = CUDA.zeros(T, dims...)
-        _gpu_array(data::AbstractArray, T::Type) = CuVector{T}(data)
-        _gpu_array(data::AbstractMatrix, T::Type) = CuMatrix{T}(data)
-        _gpu_sparse_csr(A::SparseMatrixCSC, T::Type) = CUDA.CUSPARSE.CuSparseMatrixCSR(SparseMatrixCSC{T, Int32}(A))
-        _gpu_axpy!(α, x, y) = CUDA.axpy!(α, x, y)
-        _is_gpu_array(a) = a isa CuArray
-        _is_gpu_array(::Any) = false
-        _gpu_ilu0(A_csr) = CUDA.CUSPARSE.ilu02(A_csr)
-        _gpu_ic0(A_csr) = CUDA.CUSPARSE.ic02(A_csr)
-    end
-end
+# GPU helper implementations (_gpu_zeros, _gpu_array, etc.) are now defined
+# in ext/cuda/utils.jl via the CUDA extension, eliminating runtime @eval.
 
 # ============================================================================
 # Preconditioner infrastructure (must be defined before iterative solvers)

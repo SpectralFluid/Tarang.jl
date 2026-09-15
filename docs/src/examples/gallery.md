@@ -152,8 +152,8 @@ domain = Domain(dist, (x,))
 T = ScalarField(dist, "T", (x,))
 
 problem = IVP([T])
-add_equation!(problem, "∂t(T) = kappa*lap(T)")
-problem.parameters["kappa"] = 0.01
+add_equation!(problem, "∂t(T) - kappa*lap(T) = 0")
+problem.namespace["kappa"] = 0.01
 
 add_equation!(problem, "T(x=0) = 1")
 add_equation!(problem, "T(x=1) = 0")

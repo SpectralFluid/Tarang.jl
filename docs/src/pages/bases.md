@@ -177,7 +177,7 @@ field = ScalarField(dist, "T", (x_basis, z_basis), Float64)
 Tarang.ensure_layout!(field, :g)
 
 # Access grid data
-data = field.data_g
+data = get_grid_data(field)
 
 # Transform back to spectral
 Tarang.ensure_layout!(field, :c)

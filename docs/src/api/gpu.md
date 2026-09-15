@@ -110,51 +110,28 @@ gpu_squared_magnitude!(result, z)  # result = |z|²
 
 ## Memory Management
 
-### Memory Pool
+Tarang uses CUDA.jl's built-in memory pool. No custom pooling layer.
 
 ```julia
-# Pool statistics
-stats = memory_pool_stats()
+# Data transfers
+async_copy_to_gpu!(gpu_dest, cpu_src)
+async_copy_to_cpu!(cpu_dest, gpu_src)
 
-# Clear cached memory
-clear_memory_pool!()
+# GPU memory status (CUDA.jl)
+CUDA.memory_status()
 
-# Allocate from pool
-buffer = pool_allocate(Float64, 1024)
-pool_release!(buffer)
+# Reclaim unused GPU memory
+CUDA.reclaim()
 ```
 
-### Pinned Memory
+## Tensor Cores
 
 ```julia
-# Get pinned buffer for async transfers
-buffer = get_pinned_buffer(Float64, size)
+# Enable for Volta+ GPUs (faster matrix ops, reduced precision)
+enable_tensor_cores!()
 
-# Async copy operations
-async_copy_to_gpu!(gpu_dest, pinned_src)
-async_copy_to_cpu!(pinned_dest, gpu_src)
-```
-
-### Memory Info
-
-```julia
-# GPU memory status
-info = gpu_memory_info()
-# Returns: (free_bytes, total_bytes, used_bytes)
-
-# Check if allocation is possible
-can_alloc = check_gpu_memory(required_bytes)
-```
-
-## Stream Management
-
-```julia
-# Get dedicated streams
-compute_stream = get_compute_stream()
-transfer_stream = get_transfer_stream()
-
-# Synchronize all streams
-sync_streams!()
+# Disable for strict IEEE compliance
+disable_tensor_cores!()
 ```
 
 ## FFT Plans
@@ -271,12 +248,6 @@ gpu_unpack_from_transpose!(data, buffer, counts, displs, dim, nranks)
 ### GPU Config
 
 ```julia
-# Initialize GPU configuration
-init_gpu_config!()
-
-# Get/set configuration
-config = GPU_CONFIG
-
 # Tensor core support (Ampere+)
 enable_tensor_cores!()
 disable_tensor_cores!()

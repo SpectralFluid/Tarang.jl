@@ -217,23 +217,20 @@ function setup_pencil_fft_transforms_2d!(dist::Distributor, domain::Domain,
     # - Fourier axes: can be parallelized (PencilFFTs handles transposes)
     # - Non-Fourier axes (Chebyshev, Legendre): keep local
     #
-    # Strategy:
-    # - 2D all-Fourier: slab decomposition (decompose dim 2, keep dim 1 local)
-    # - 2D Chebyshev-Fourier: decompose only Fourier axis
-    # - 3D all-Fourier: pencil decomposition (decompose dims 2,3, keep dim 1 local)
-    # - 3D with non-Fourier: decompose only Fourier axes
-    #
-    # For PencilFFTs, we create the pencil directly with the correct decomp_dims
-    # Create pencil using default PencilArrays decomposition
-    # For MPITopology{M}, PencilArrays decomposes the rightmost M dimensions by default
-    # PencilFFTs handles the internal transposes needed for FFT on fully decomposed data
-    #
-    # For 2D data with 2D mesh: both dimensions decomposed, PencilFFTs transposes as needed
-    # For 3D data with 2D mesh: dims (2,3) decomposed, dim 1 local - standard pencil FFT
+    # Decomposition strategy: decompose ONLY Fourier axes, keep Chebyshev local.
+    # The pencil IMEX solve requires the full Chebyshev array on each rank.
+    # Select the last mesh_dim Fourier axes for decomposition (PencilArrays convention).
+    mesh_dim = length(dist.mesh)
+    if length(fourier_axes) >= mesh_dim
+        decomp_dims = Tuple(fourier_axes[end-mesh_dim+1:end])
+    else
+        error("Cannot decompose $mesh_dim dimensions with only $(length(fourier_axes)) Fourier axes. " *
+              "Chebyshev axes must remain local. Reduce mesh dimensionality or add Fourier axes.")
+    end
     if dist.mpi_topology === nothing
         dist.mpi_topology = PencilArrays.MPITopology(dist.comm, dist.mesh)
     end
-    pencil = PencilArrays.Pencil(dist.mpi_topology, global_shape)
+    pencil = PencilArrays.Pencil(dist.mpi_topology, global_shape, decomp_dims)
 
     # Try to create PencilFFT plan
     # CRITICAL: If this fails in MPI mode, we CANNOT safely fall back to local FFTW
@@ -242,10 +239,12 @@ function setup_pencil_fft_transforms_2d!(dist::Distributor, domain::Domain,
         fft_plan = PencilFFTs.PencilFFTPlan(pencil, transforms)
         push!(dist.transforms, fft_plan)
 
-        # CRITICAL: Store the plan's input/output pencils for field allocation
-        # PencilFFTs requires arrays allocated from these specific pencils
-        dist.pencil_fft_input = first(fft_plan.plans).pencil_in
-        dist.pencil_fft_output = last(fft_plan.plans).pencil_out
+        # Store the plan's input/output pencils for field allocation.
+        # Use public PencilFFTs API (allocate_input/output) instead of internal .plans field.
+        _tmp_in = PencilFFTs.allocate_input(fft_plan)
+        _tmp_out = PencilFFTs.allocate_output(fft_plan)
+        dist.pencil_fft_input = PencilArrays.pencil(_tmp_in)
+        dist.pencil_fft_output = PencilArrays.pencil(_tmp_out)
     catch e
         if dist.size > 1
             # In MPI mode, failing to create parallel FFT is a critical error

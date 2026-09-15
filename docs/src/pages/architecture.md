@@ -7,40 +7,60 @@ Overview of Tarang.jl's internal architecture.
 ```
 Tarang.jl/
 ├── src/
-│   ├── Tarang.jl          # Main module
-│   ├── core/              # Core functionality
-│   │   ├── coordinates.jl
-│   │   ├── basis.jl
-│   │   ├── domain.jl
-│   │   ├── field.jl
-│   │   ├── distributor.jl
-│   │   ├── operators.jl
-│   │   ├── transforms.jl
-│   │   ├── problems.jl
+│   ├── Tarang.jl              # Main module
+│   ├── core/                  # Core functionality
+│   │   ├── architectures.jl     # CPU/GPU abstraction
+│   │   ├── coords.jl           # Coordinate systems
+│   │   ├── basis.jl            # Spectral bases (Fourier, Chebyshev, Legendre)
+│   │   ├── distributor.jl      # MPI distribution
+│   │   ├── domain.jl           # Domain construction
+│   │   ├── field.jl            # Hub: includes field/ sub-files
+│   │   ├── field/
+│   │   │   ├── field_types.jl     # ScalarField, VectorField, TensorField
+│   │   │   ├── field_data.jl      # Data access, allocation, components
+│   │   │   ├── field_layout.jl    # Layout transitions, transforms
+│   │   │   └── field_exports.jl   # Export declarations
+│   │   ├── operators/           # Differential operators (hub + sub-files)
+│   │   ├── transforms/          # Spectral transforms (hub + sub-files)
+│   │   ├── problems.jl         # Hub: includes problems/ sub-files
+│   │   ├── problems/
+│   │   │   ├── problem_types.jl   # IVP, LBVP, NLBVP, EVP
+│   │   │   ├── problem_parsing.jl # Expression parsing
+│   │   │   ├── problem_matrices.jl# Matrix building for solvers
+│   │   │   └── problem_utils.jl   # Validation, introspection
+│   │   ├── solvers.jl           # Hub: includes solvers/ sub-files
+│   │   ├── solvers/
+│   │   │   ├── solver_types.jl       # Solver definitions
+│   │   │   ├── solver_stepping.jl    # Time stepping, BVP/EVP solve
+│   │   │   ├── solver_compiled_rhs.jl# RHS compilation & execution
+│   │   │   └── solver_utils.jl       # Diagnostics, exports
+│   │   ├── timesteppers/        # Time integration (hub + sub-files)
 │   │   ├── boundary_conditions.jl
-│   │   ├── solvers.jl
-│   │   └── evaluator.jl
-│   ├── tools/             # Utilities and I/O
-│   │   ├── array.jl         # Array manipulation utilities
-│   │   ├── cache.jl         # Caching utilities
-│   │   ├── config.jl        # Configuration management
-│   │   ├── dispatch.jl      # Multiple dispatch helpers
-│   │   ├── exceptions.jl    # Custom exception types
-│   │   ├── general.jl       # General utilities
-│   │   ├── logging.jl       # MPI-aware logging
-│   │   ├── matsolvers.jl    # Matrix solvers
-│   │   ├── netcdf_merge.jl  # NetCDF merging
-│   │   ├── netcdf_output.jl # NetCDF output handlers
-│   │   ├── parallel.jl      # Parallel utilities
-│   │   ├── parsing.jl       # Expression parsing
-│   │   ├── progress.jl      # Progress tracking
-│   │   ├── random_arrays.jl # Random array generation
-│   │   └── temporal_filters.jl # Time integration filters
-│   └── extras/            # Convenience functions
-│       ├── flow_tools.jl
-│       └── quick_domains.jl
-├── test/                  # Tests
-└── docs/                  # Documentation
+│   │   ├── evaluator.jl
+│   │   └── nonlinear.jl
+│   ├── tools/                 # Utilities and I/O
+│   │   ├── config.jl            # Configuration management
+│   │   ├── netcdf_output.jl     # NetCDF output handlers
+│   │   ├── netcdf_merge.jl      # NetCDF file merging
+│   │   ├── matsolvers.jl        # CPU matrix solvers
+│   │   ├── gpu_matsolvers.jl    # GPU matrix solvers
+│   │   └── ...                  # logging, parsing, progress, etc.
+│   └── extras/                # Convenience functions
+│       ├── quick_domains.jl     # PeriodicDomain, ChannelDomain, etc.
+│       ├── flow_tools.jl        # Energy, enstrophy, CFL diagnostics
+│       └── plot_tools.jl        # Plotting utilities (experimental)
+├── ext/                       # CUDA extension (loaded when CUDA.jl available)
+│   ├── TarangCUDAExt.jl         # Extension entry point
+│   └── cuda/                    # GPU implementations
+│       ├── config.jl              # Device ID, tensor cores
+│       ├── memory.jl              # CPU↔GPU data transfer
+│       ├── architecture.jl        # GPU type methods
+│       ├── transforms.jl          # CUFFT plans
+│       ├── kernels.jl             # KernelAbstractions GPU kernels
+│       ├── dct.jl                 # DCT for Chebyshev basis
+│       └── ...                    # batched FFT, NCCL, pencil, etc.
+├── test/                      # Tests
+└── docs/                      # Documentation
 ```
 
 ## Core Components

@@ -370,14 +370,47 @@ but negative indices are recommended for tau method boundary conditions.
 
 Example:
 ```julia
-# Typical tau method usage: lift tau to highest modes
-tau = ScalarField(dist, "tau", ())  # Tau variable (no spectral basis)
-lift_term = lift(tau, chebyshev_basis, -1)  # Lift to last Chebyshev mode
-lift_term2 = lift(tau, chebyshev_basis, -2)  # Lift to second-to-last mode
+# Short form (auto-detects basis — recommended)
+lift(tau_u1, -1)   # Lift to last mode
+lift(tau_u2, -2)   # Lift to second-to-last mode
+
+# Explicit form (when auto-detection fails)
+lift(tau_u1, z_basis, -1)
 ```
 """
 function lift(operand::Operand, basis::Basis, n::Int)
     return multiclass_new(Lift, operand, basis, n)
+end
+
+"""
+    lift(operand, n)
+
+Short form — auto-detects the lift basis by finding the non-periodic basis
+that the tau field is missing compared to the other problem fields.
+Matches Dedalus syntax: `lift(tau, -1)`.
+
+The basis is inferred from the operand's distributor: it finds the first
+non-Fourier basis in the problem that the tau field doesn't have.
+"""
+function lift(operand::Operand, n::Int)
+    op_bases = operand.bases
+    dist = operand.dist
+
+    # Look through all cached domains in the distributor to find the full basis set
+    for (bases_key, _) in dist.layouts
+        if length(bases_key) > length(op_bases)
+            for basis in bases_key
+                if !(basis in op_bases) && !is_fourier_basis(basis)
+                    return multiclass_new(Lift, operand, basis, n)
+                end
+            end
+        end
+    end
+
+    throw(ArgumentError(
+        "lift(operand, n): cannot auto-detect basis. " *
+        "No non-periodic basis found that the tau field is missing. " *
+        "Use the 3-argument form: lift(operand, basis, n)"))
 end
 
 # ============================================================================

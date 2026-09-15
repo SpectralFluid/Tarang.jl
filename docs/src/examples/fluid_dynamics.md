@@ -27,10 +27,10 @@ uz = ScalarField(dist, "uz", (x_basis, z_basis), Float64)
 p = ScalarField(dist, "p", (x_basis, z_basis), Float64)
 
 problem = IVP([ux, uz, p])
-problem.parameters["nu"] = 1.0/Re
+problem.namespace["nu"] = 1.0/Re
 
-Tarang.add_equation!(problem, "∂t(ux) + ux*∂x(ux) + uz*∂z(ux) + ∂x(p) = nu*Δ(ux)")
-Tarang.add_equation!(problem, "∂t(uz) + ux*∂x(uz) + uz*∂z(uz) + ∂z(p) = nu*Δ(uz)")
+Tarang.add_equation!(problem, "∂t(ux) + ∂x(p) - nu*Δ(ux) = -ux*∂x(ux) - uz*∂z(ux)")
+Tarang.add_equation!(problem, "∂t(uz) + ∂z(p) - nu*Δ(uz) = -ux*∂x(uz) - uz*∂z(uz)")
 Tarang.add_equation!(problem, "∂x(ux) + ∂z(uz) = 0")
 
 # Bottom, left, right walls: no-slip
@@ -72,8 +72,8 @@ function init_kh!(ux, uz, δ, A)
     Tarang.ensure_layout!(uz, :g)
 
     for i in eachindex(x), j in eachindex(z)
-        ux.data_g[i,j] = tanh((z[j] - 0.5) / δ)
-        uz.data_g[i,j] = A * sin(2π * x[i]) * exp(-((z[j]-0.5)/δ)^2)
+        get_grid_data(ux)[i,j] = tanh((z[j] - 0.5) / δ)
+        get_grid_data(uz)[i,j] = A * sin(2π * x[i]) * exp(-((z[j]-0.5)/δ)^2)
     end
 end
 
@@ -88,16 +88,16 @@ Convection with both temperature and salinity.
 
 ```julia
 problem = IVP([ux, uz, p, T, S])
-problem.parameters["Pr"] = 7.0    # Prandtl
-problem.parameters["tau"] = 0.01  # Diffusivity ratio
-problem.parameters["Ra_T"] = 1e6  # Thermal Rayleigh
-problem.parameters["Ra_S"] = 1e5  # Solutal Rayleigh
+problem.namespace["Pr"] = 7.0    # Prandtl
+problem.namespace["tau"] = 0.01  # Diffusivity ratio
+problem.namespace["Ra_T"] = 1e6  # Thermal Rayleigh
+problem.namespace["Ra_S"] = 1e5  # Solutal Rayleigh
 
-Tarang.add_equation!(problem, "∂t(ux) + ... = Pr*Δ(ux)")
-Tarang.add_equation!(problem, "∂t(uz) + ... = Pr*Δ(uz) + Ra_T*Pr*T - Ra_S*Pr*S")
+Tarang.add_equation!(problem, "∂t(ux) + ... - Pr*Δ(ux) = 0")
+Tarang.add_equation!(problem, "∂t(uz) + ... - Pr*Δ(uz) = Ra_T*Pr*T - Ra_S*Pr*S")
 Tarang.add_equation!(problem, "∂x(ux) + ∂z(uz) = 0")
-Tarang.add_equation!(problem, "∂t(T) + ... = Δ(T)")
-Tarang.add_equation!(problem, "∂t(S) + ... = tau*Δ(S)")
+Tarang.add_equation!(problem, "∂t(T) + ... - Δ(T) = 0")
+Tarang.add_equation!(problem, "∂t(S) + ... - tau*Δ(S) = 0")
 ```
 
 ### Rotating Convection
@@ -105,14 +105,14 @@ Tarang.add_equation!(problem, "∂t(S) + ... = tau*Δ(S)")
 With Coriolis force.
 
 ```julia
-problem.parameters["Ek"] = 1e-4   # Ekman number
-problem.parameters["Ra"] = 1e7
+problem.namespace["Ek"] = 1e-4   # Ekman number
+problem.namespace["Ra"] = 1e7
 
 # Include Coriolis term: 2Ω × u
 Tarang.add_equation!(problem,
-    "∂t(ux) + ... = Pr*Δ(ux) - (2/Ek)*uy")
+    "∂t(ux) + ... - Pr*Δ(ux) + (2/Ek)*uy = 0")
 Tarang.add_equation!(problem,
-    "∂t(uy) + ... = Pr*Δ(uy) + (2/Ek)*ux")
+    "∂t(uy) + ... - Pr*Δ(uy) - (2/Ek)*ux = 0")
 ```
 
 ## Stratified Flows
@@ -121,12 +121,12 @@ Tarang.add_equation!(problem,
 
 ```julia
 problem = IVP([ux, uz, p, b])  # b = buoyancy
-problem.parameters["N2"] = 1.0  # Brunt-Väisälä frequency squared
+problem.namespace["N2"] = 1.0  # Brunt-Väisälä frequency squared
 
-Tarang.add_equation!(problem, "∂t(ux) + ... + ∂x(p) = nu*Δ(ux)")
-Tarang.add_equation!(problem, "∂t(uz) + ... + ∂z(p) = nu*Δ(uz) + b")
+Tarang.add_equation!(problem, "∂t(ux) + ... + ∂x(p) - nu*Δ(ux) = 0")
+Tarang.add_equation!(problem, "∂t(uz) + ... + ∂z(p) - nu*Δ(uz) = b")
 Tarang.add_equation!(problem, "∂x(ux) + ∂z(uz) = 0")
-Tarang.add_equation!(problem, "∂t(b) + N2*uz + ... = kappa*Δ(b)")
+Tarang.add_equation!(problem, "∂t(b) + N2*uz + ... - kappa*Δ(b) = 0")
 ```
 
 ## Turbulence

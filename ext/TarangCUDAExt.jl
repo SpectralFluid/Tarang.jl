@@ -68,20 +68,8 @@ include("cuda/transpose_kernels.jl")  # TransposableField GPU support
 # ============================================================================
 
 # GPU Configuration and Device Management
-export GPUConfig, GPU_CONFIG
-export init_gpu_config!, get_compute_stream, get_transfer_stream, sync_streams!
 export ensure_device!  # Multi-GPU device context management
-
-# Tensor Core support
 export enable_tensor_cores!, disable_tensor_cores!
-
-# Memory pool
-export GPUMemoryPool, GPU_MEMORY_POOL
-export pool_allocate, pool_release!, clear_memory_pool!, memory_pool_stats
-
-# Pinned memory
-export PinnedBufferPool, PINNED_BUFFER_POOL
-export get_pinned_buffer, release_pinned_buffer!, clear_pinned_buffer_pool!
 export async_copy_to_gpu!, async_copy_to_cpu!
 
 # FFT plans and transforms

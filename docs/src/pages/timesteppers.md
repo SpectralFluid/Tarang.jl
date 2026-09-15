@@ -321,7 +321,7 @@ end
 
 ```julia
 # Reduce timestep if solver becomes unstable
-if any(isnan, field.data_g)
+if any(isnan, get_grid_data(field))
     solver.dt *= 0.5
     error("NaN detected, reduce timestep")
 end

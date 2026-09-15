@@ -410,35 +410,22 @@ Runtime verification that CUDA-aware MPI actually works.
 Performs a small test transfer to verify functionality.
 """
 const _CUDA_AWARE_MPI_VERIFIED = Ref{Union{Nothing, Bool}}(nothing)
-const _CUDA_AWARE_MPI_LOCK = ReentrantLock()
 
 function _verify_cuda_aware_mpi()
-    # Fast path: already verified (no lock needed for read of immutable result)
-    val = _CUDA_AWARE_MPI_VERIFIED[]
-    val !== nothing && return val
+    _CUDA_AWARE_MPI_VERIFIED[] !== nothing && return _CUDA_AWARE_MPI_VERIFIED[]
 
-    lock(_CUDA_AWARE_MPI_LOCK) do
-        # Double-check under lock
-        _CUDA_AWARE_MPI_VERIFIED[] !== nothing && return _CUDA_AWARE_MPI_VERIFIED[]
-
-        try
-            if !has_cuda()
-                @debug "CUDA-aware MPI disabled: CUDA not available"
-                _CUDA_AWARE_MPI_VERIFIED[] = false
-                return false
-            end
-
-            result = check_cuda_aware_mpi()
-            if !result
-                @debug "CUDA-aware MPI not detected. Set TARANG_CUDA_AWARE_MPI=1 to force-enable if your MPI supports GPU buffers."
-            end
-            _CUDA_AWARE_MPI_VERIFIED[] = result
-            return result
-        catch e
-            @debug "CUDA-aware MPI verification failed: $e"
+    try
+        if !has_cuda()
             _CUDA_AWARE_MPI_VERIFIED[] = false
             return false
         end
+        result = check_cuda_aware_mpi()
+        _CUDA_AWARE_MPI_VERIFIED[] = result
+        return result
+    catch e
+        @debug "CUDA-aware MPI verification failed: $e"
+        _CUDA_AWARE_MPI_VERIFIED[] = false
+        return false
     end
 end
 

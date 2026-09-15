@@ -282,26 +282,9 @@ function _validate_chunk_divisibility(count::Int, divisor::Int, dim::Int, rank::
     end
 end
 
-# Cache for small GPU arrays (chunk_sizes, displs) used in pack/unpack kernels.
-# Keyed by (device_id, tag, length) to avoid per-call CuArray allocation.
-# Device ID is included for multi-GPU correctness.
-const _GPU_INT_CACHE = Dict{Tuple{Int, Int, Int}, CuArray{Int, 1}}()
-const _GPU_INT_CACHE_LOCK = ReentrantLock()
-
-function _to_gpu_cached(cpu_array::Vector{Int}, tag::Int)
-    n = length(cpu_array)
-    dev_id = CUDA.deviceid(CUDA.device())
-    key = (dev_id, tag, n)
-    lock(_GPU_INT_CACHE_LOCK) do
-        gpu_arr = get(_GPU_INT_CACHE, key, nothing)
-        if gpu_arr === nothing
-            gpu_arr = CuArray{Int}(undef, n)
-            _GPU_INT_CACHE[key] = gpu_arr
-        end
-        copyto!(gpu_arr, cpu_array)
-        return gpu_arr
-    end
-end
+# Convert small CPU int arrays to GPU. These are tiny (2-8 elements for MPI
+# process counts), so allocation cost is negligible — no caching needed.
+_to_gpu(cpu_array::Vector{Int}) = CuArray(cpu_array)
 
 """
     gpu_pack_for_transpose!(buffer, data, counts, displs, dim, nranks)
@@ -345,9 +328,9 @@ function gpu_pack_for_transpose!(buffer::CuArray, data::CuArray,
             end
         end
 
-        chunk_sizes_gpu = _to_gpu_cached(chunk_sizes, 1)
-        displs_gpu = _to_gpu_cached(displs, 2)
-        prefix_sums_gpu = _to_gpu_cached(cumsum(chunk_sizes), 3)
+        chunk_sizes_gpu = _to_gpu(chunk_sizes)
+        displs_gpu = _to_gpu(displs)
+        prefix_sums_gpu = _to_gpu(cumsum(chunk_sizes))
 
         kernel = pack_for_transpose_kernel_3d!(CUDABackend())
         kernel(buffer, data, Nx, Ny, Nz, nranks, dim, chunk_sizes_gpu, displs_gpu, prefix_sums_gpu;
@@ -372,9 +355,9 @@ function gpu_pack_for_transpose!(buffer::CuArray, data::CuArray,
             end
         end
 
-        chunk_sizes_gpu = _to_gpu_cached(chunk_sizes, 1)
-        displs_gpu = _to_gpu_cached(displs, 2)
-        prefix_sums_gpu = _to_gpu_cached(cumsum(chunk_sizes), 3)
+        chunk_sizes_gpu = _to_gpu(chunk_sizes)
+        displs_gpu = _to_gpu(displs)
+        prefix_sums_gpu = _to_gpu(cumsum(chunk_sizes))
 
         kernel = pack_for_transpose_kernel_2d!(CUDABackend())
         kernel(buffer, data, Nx, Ny, nranks, dim, chunk_sizes_gpu, displs_gpu, prefix_sums_gpu;
@@ -431,9 +414,9 @@ function gpu_unpack_from_transpose!(data::CuArray, buffer::CuArray,
             end
         end
 
-        chunk_sizes_gpu = _to_gpu_cached(chunk_sizes, 4)  # tags 4-6 for unpack
-        displs_gpu = _to_gpu_cached(displs, 5)
-        prefix_sums_gpu = _to_gpu_cached(cumsum(chunk_sizes), 6)
+        chunk_sizes_gpu = _to_gpu(chunk_sizes)
+        displs_gpu = _to_gpu(displs)
+        prefix_sums_gpu = _to_gpu(cumsum(chunk_sizes))
 
         kernel = unpack_from_transpose_kernel_3d!(CUDABackend())
         kernel(data, buffer, Nx, Ny, Nz, nranks, dim, chunk_sizes_gpu, displs_gpu, prefix_sums_gpu;
@@ -458,9 +441,9 @@ function gpu_unpack_from_transpose!(data::CuArray, buffer::CuArray,
             end
         end
 
-        chunk_sizes_gpu = _to_gpu_cached(chunk_sizes, 4)
-        displs_gpu = _to_gpu_cached(displs, 5)
-        prefix_sums_gpu = _to_gpu_cached(cumsum(chunk_sizes), 6)
+        chunk_sizes_gpu = _to_gpu(chunk_sizes)
+        displs_gpu = _to_gpu(displs)
+        prefix_sums_gpu = _to_gpu(cumsum(chunk_sizes))
 
         kernel = unpack_from_transpose_kernel_2d!(CUDABackend())
         kernel(data, buffer, Nx, Ny, nranks, dim, chunk_sizes_gpu, displs_gpu, prefix_sums_gpu;

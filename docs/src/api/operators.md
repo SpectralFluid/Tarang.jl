@@ -29,7 +29,7 @@ Tarang.jl uses Unicode mathematical symbols for readable, publication-quality co
 
 **Example** - Navier-Stokes equation:
 ```julia
-add_equation!(problem, "∂t(u) + u⋅∇(u) = -∇(p) + nu*Δ(u)")
+add_equation!(problem, "∂t(u) + ∇(p) - nu*Δ(u) = -u⋅∇(u)")
 ```
 
 **Typing Unicode in Julia**:
@@ -77,7 +77,7 @@ coords = CartesianCoordinates("x", "z")
 problem = IVP([u, w, p])
 
 # Pressure gradient in momentum equation
-add_equation!(problem, "∂t(u) = -∇(p)")
+add_equation!(problem, "∂t(u) + ∇(p) = 0")
 
 # Expands to:
 # ∂t(u_x) = -∂x(p)
@@ -187,7 +187,7 @@ Computes the Laplacian (second derivative) of a field.
 **Syntax**:
 ```julia
 # In equations
-add_equation!(problem, "∂t(T) = kappa*Δ(T)")
+add_equation!(problem, "∂t(T) - kappa*Δ(T) = 0")
 
 # Programmatic
 ∇²T = Δ(T)
@@ -209,12 +209,12 @@ add_equation!(problem, "∂t(T) = kappa*Δ(T)")
 
 ```julia
 # Diffusion equation
-add_equation!(problem, "∂t(T) = kappa*Δ(T)")
+add_equation!(problem, "∂t(T) - kappa*Δ(T) = 0")
 ```
 
 ```julia
 # Viscous term in Navier-Stokes
-add_equation!(problem, "∂t(u) = nu*Δ(u) - ∇(p)")
+add_equation!(problem, "∂t(u) + ∇(p) - nu*Δ(u) = 0")
 ```
 
 ```julia
@@ -295,7 +295,7 @@ add_equation!(problem, "∂x(∂x(∂x(∂x(psi)))) + 2*∂x(∂x(∂z(∂z(psi)
 
 ```julia
 # Hyperdiffusion (for numerical stability)
-add_equation!(problem, "∂t(T) = -nu4*Δ(Δ(T))")
+add_equation!(problem, "∂t(T) + nu4*Δ(Δ(T)) = 0")
 ```
 
 ---
@@ -316,8 +316,8 @@ dt(field)   # ASCII
 
 ```julia
 # Evolution equations
-add_equation!(problem, "∂t(u) = -u*∂x(u) + nu*Δ(u)")
-add_equation!(problem, "∂t(T) = -u*∂x(T) + kappa*Δ(T)")
+add_equation!(problem, "∂t(u) - nu*Δ(u) = -u*∂x(u)")
+add_equation!(problem, "∂t(T) - kappa*Δ(T) = -u*∂x(T)")
 ```
 
 **Note**: Only use in IVP (Initial Value Problems). Not valid for BVP or EVP.
@@ -385,7 +385,7 @@ Combine operators for complex expressions.
 # For vector field u
 # ∇²u = (∇²u_x, ∇²u_y, ∇²u_z)
 
-add_equation!(problem, "∂t(u) = nu*Δ(u)")
+add_equation!(problem, "∂t(u) - nu*Δ(u) = 0")
 # Automatically applies componentwise
 ```
 
@@ -481,10 +481,10 @@ The equation parser recognizes all registered operators. Use them directly in eq
 # sin, cos, tan, exp, log, sqrt, abs, tanh
 
 # Example: diffusion equation
-add_equation!(problem, "∂t(T) = kappa*Δ(T)")
+add_equation!(problem, "∂t(T) - kappa*Δ(T) = 0")
 
 # Example: advection-diffusion
-add_equation!(problem, "∂t(T) + u⋅∇(T) = kappa*Δ(T)")
+add_equation!(problem, "∂t(T) - kappa*Δ(T) = -u⋅∇(T)")
 ```
 
 For complex expressions, compute terms programmatically and use the result:
@@ -507,11 +507,11 @@ Tarang.jl parses equation strings into operator applications:
 
 ```julia
 # String equation
-add_equation!(problem, "∂t(u) + u*∂x(u) = nu*Δ(u) - ∂x(p)")
+add_equation!(problem, "∂t(u) + ∂x(p) - nu*Δ(u) = -u*∂x(u)")
 
 # Parsed as:
-# LHS: ∂t(u) + u*∂x(u)
-# RHS: nu*Δ(u) - ∂x(p)
+# LHS: ∂t(u) + ∂x(p) - nu*Δ(u)
+# RHS: -u*∂x(u)
 ```
 
 **Supported operations**:

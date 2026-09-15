@@ -51,16 +51,16 @@ T = ScalarField(dist, "T", (x_basis, z_basis), Float64)
 
 ```julia
 problem = IVP([ux, uz, p, T])
-problem.parameters["Ra"] = Ra
-problem.parameters["Pr"] = Pr
+problem.namespace["Ra"] = Ra
+problem.namespace["Pr"] = Pr
 
 Tarang.add_equation!(problem,
-    "∂t(ux) + ux*∂x(ux) + uz*∂z(ux) + ∂x(p) = Pr*Δ(ux)")
+    "∂t(ux) + ∂x(p) - Pr*Δ(ux) = -ux*∂x(ux) - uz*∂z(ux)")
 Tarang.add_equation!(problem,
-    "∂t(uz) + ux*∂x(uz) + uz*∂z(uz) + ∂z(p) = Pr*Δ(uz) + Ra*Pr*T")
+    "∂t(uz) + ∂z(p) - Pr*Δ(uz) - Ra*Pr*T = -ux*∂x(uz) - uz*∂z(uz)")
 Tarang.add_equation!(problem, "∂x(ux) + ∂z(uz) = 0")
 Tarang.add_equation!(problem,
-    "∂t(T) + ux*∂x(T) + uz*∂z(T) = Δ(T)")
+    "∂t(T) - Δ(T) = -ux*∂x(T) - uz*∂z(T)")
 ```
 
 ### Boundary Conditions
@@ -82,7 +82,7 @@ Tarang.add_equation!(problem, "T(z=1) = 0")  # Cold
 ```julia
 # Random perturbations to trigger instability
 Tarang.ensure_layout!(T, :g)
-T.data_g .= 0.5 .+ 0.01 .* randn(size(T.data_g))
+get_grid_data(T) .= 0.5 .+ 0.01 .* randn(size(get_grid_data(T)))
 Tarang.ensure_layout!(T, :c)
 ```
 
@@ -124,7 +124,7 @@ end
 ```julia
 # Temperature field
 Tarang.ensure_layout!(T, :g)
-heatmap(T.data_g',
+heatmap(get_grid_data(T)',
     xlabel="x", ylabel="z",
     title="Temperature at t=$(solver.sim_time)",
     colorbar=true

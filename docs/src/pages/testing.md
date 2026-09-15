@@ -71,8 +71,8 @@ end
 
     # Test data
     Tarang.ensure_layout!(field, :g)
-    field.data_g .= 1.0
-    @test all(field.data_g .== 1.0)
+    get_grid_data(field) .= 1.0
+    @test all(get_grid_data(field) .== 1.0)
 end
 ```
 
@@ -85,7 +85,7 @@ end
 
     # Initialize in grid space
     Tarang.ensure_layout!(field, :g)
-    field.data_g .= sin.(x_grid)
+    get_grid_data(field) .= sin.(x_grid)
 
     # Transform to spectral
     Tarang.ensure_layout!(field, :c)
@@ -94,7 +94,7 @@ end
     Tarang.ensure_layout!(field, :g)
 
     # Check roundtrip
-    @test field.data_g ≈ sin.(x_grid) atol=1e-10
+    @test get_grid_data(field) ≈ sin.(x_grid) atol=1e-10
 end
 ```
 

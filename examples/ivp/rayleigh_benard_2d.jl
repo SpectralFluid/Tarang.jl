@@ -64,8 +64,8 @@ add_equation!(problem, "div(u) + tau_p = 0")
 # Buoyancy: ∂b/∂t - κ∇²b = -u·∇b
 add_equation!(problem, "∂t(b) - kappa*Δ(b) + lift(tau_b1, -1) + lift(tau_b2, -2) = -u⋅∇(b)")
 
-# Momentum: ∂u/∂t - ν∇²u + ∇p = -u·∇u + b*ez
-add_equation!(problem, "∂t(u) - nu*Δ(u) + ∇(p) + lift(tau_u1, -1) + lift(tau_u2, -2) = -u⋅∇(u) + b*ez")
+# Momentum: ∂u/∂t - ν∇²u + ∇p - b*ez = -u·∇u
+add_equation!(problem, "∂t(u) - nu*Δ(u) + ∇(p) - b*ez + lift(tau_u1, -1) + lift(tau_u2, -2) = -u⋅∇(u)")
 
 # Boundary conditions
 fixed_value!(problem, "b", "z", 0.0, Lz)   # Hot bottom

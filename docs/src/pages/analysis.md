@@ -57,7 +57,7 @@ function compute_kinetic_energy(u, reducer)
 
     for component in u.components
         Tarang.ensure_layout!(component, :g)
-        local_energy += sum(component.data_g.^2) / 2
+        local_energy += sum(get_grid_data(component).^2) / 2
     end
 
     return reduce_scalar(reducer, local_energy, MPI.SUM)
@@ -87,7 +87,7 @@ function compute_reynolds_number(u, nu, L, reducer)
     Tarang.ensure_layout!(u.components[1], :g)
 
     # RMS velocity
-    local_u2 = sum(u.components[1].data_g.^2)
+    local_u2 = sum(get_grid_data(u.components[1]).^2)
     global_u2 = reduce_scalar(reducer, local_u2, MPI.SUM)
     u_rms = sqrt(global_u2 / total_points)
 
@@ -105,7 +105,7 @@ function compute_nusselt(T, w, L, kappa, reducer)
     Tarang.ensure_layout!(w, :g)
 
     # Convective heat flux
-    local_flux = sum(T.data_g .* w.data_g)
+    local_flux = sum(get_grid_data(T) .* get_grid_data(w))
     global_flux = reduce_scalar(reducer, local_flux, MPI.SUM)
 
     # Normalize
@@ -136,7 +136,7 @@ function compute_spectrum(field, kmax)
     for (i, ki) in enumerate(k)
         k_bin = round(Int, abs(ki))
         if 1 <= k_bin <= kmax
-            E_k[k_bin] += abs2(field.data_c[i])
+            E_k[k_bin] += abs2(get_coeff_data(field)[i])
         end
     end
 
@@ -162,7 +162,7 @@ function compute_3d_spectrum(u, kmax)
             k_bin = round(Int, k_mag)
 
             if 1 <= k_bin <= kmax
-                E_k[k_bin] += abs2(component.data_c[i,j,k])
+                E_k[k_bin] += abs2(get_coeff_data(component)[i,j,k])
             end
         end
     end
@@ -210,7 +210,7 @@ function horizontal_average(field)
     Tarang.ensure_layout!(field, :g)
 
     # Average over x (first axis)
-    mean(field.data_g, dims=1)
+    mean(get_grid_data(field), dims=1)
 end
 ```
 
@@ -220,7 +220,7 @@ end
 function volume_average(field, reducer)
     Tarang.ensure_layout!(field, :g)
 
-    local_sum = sum(field.data_g)
+    local_sum = sum(get_grid_data(field))
     global_sum = reduce_scalar(reducer, local_sum, MPI.SUM)
 
     return global_sum / total_points

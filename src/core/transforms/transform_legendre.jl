@@ -487,7 +487,19 @@ function setup_pencil_fft_transforms_3d!(dist::Distributor, domain::Domain,
     else
         dist.dtype <: Complex ? dist.dtype : Complex{dist.dtype}
     end
-    pencil = create_pencil(dist, global_shape, 1, dtype=pencil_dtype)
+    # Decomposition strategy: decompose ONLY Fourier axes, keep Chebyshev local.
+    # The pencil IMEX solve requires the full Chebyshev array on each rank.
+    mesh_dim = length(dist.mesh)
+    if length(fourier_axes) >= mesh_dim
+        decomp_dims = Tuple(fourier_axes[end-mesh_dim+1:end])
+    else
+        error("Cannot decompose $mesh_dim dimensions with only $(length(fourier_axes)) Fourier axes. " *
+              "Chebyshev axes must remain local. Reduce mesh dimensionality or add Fourier axes.")
+    end
+    if dist.mpi_topology === nothing
+        dist.mpi_topology = PencilArrays.MPITopology(dist.comm, dist.mesh)
+    end
+    pencil = PencilArrays.Pencil(dist.mpi_topology, global_shape, decomp_dims)
 
     # Try to create PencilFFT plan
     # CRITICAL: If this fails in MPI mode, we CANNOT safely fall back to local FFTW
@@ -496,10 +508,12 @@ function setup_pencil_fft_transforms_3d!(dist::Distributor, domain::Domain,
         fft_plan = PencilFFTs.PencilFFTPlan(pencil, transforms)
         push!(dist.transforms, fft_plan)
 
-        # CRITICAL: Store the plan's input/output pencils for field allocation
-        # This provides a fallback if plan lookup fails in allocate_data!
-        dist.pencil_fft_input = first(fft_plan.plans).pencil_in
-        dist.pencil_fft_output = last(fft_plan.plans).pencil_out
+        # Store the plan's input/output pencils for field allocation.
+        # Use public PencilFFTs API (allocate_input/output) instead of internal .plans field.
+        _tmp_in = PencilFFTs.allocate_input(fft_plan)
+        _tmp_out = PencilFFTs.allocate_output(fft_plan)
+        dist.pencil_fft_input = PencilArrays.pencil(_tmp_in)
+        dist.pencil_fft_output = PencilArrays.pencil(_tmp_out)
 
         @info "Set up 3D PencilFFT transform for axes $fourier_axes with global shape $global_shape"
         @info "3D parallel decomposition: $(join(dist.mesh, " × ")) processes"

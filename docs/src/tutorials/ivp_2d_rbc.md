@@ -130,21 +130,19 @@ tau_u2 = VectorField(dist, coords, "tau_u2", (x_basis,), dtype)  # Velocity at z
 # Collect all state variables (vector fields passed directly)
 problem = IVP([u, p, T, tau_u1, tau_u2, tau_p, tau_T1, tau_T2])
 
-# Add substitutions for parameters (Dedalus-style)
-add_substitution!(problem, "Ra", Ra)
-add_substitution!(problem, "Pr", Pr)
-add_substitution!(problem, "Lz", H)
+# Add parameters
+add_parameters!(problem, Ra=Ra, Pr=Pr, Lz=H)
 
 # Equations use vector notation (Dedalus-style)
 # Continuity: ∇·u = 0
 add_equation!(problem, "div(u) + tau_p = 0")
 
 # Temperature equation: ∂T/∂t - ∇²T = -u·∇T
-add_equation!(problem, "∂t(T) - Δ(T) + lift(tau_T2) = -u⋅∇(T)")
+add_equation!(problem, "∂t(T) - Δ(T) + lift(tau_T2, -2) = -u⋅∇(T)")
 
-# Momentum (vector equation): ∂u/∂t - Pr∇²u + ∇p = -u·∇u + Ra*Pr*T*ez
+# Momentum (vector equation): ∂u/∂t - Pr∇²u + ∇p - Ra*Pr*T*ez = -u·∇u
 # ez is the unit vector in z-direction (buoyancy acts vertically)
-add_equation!(problem, "∂t(u) - Pr*Δ(u) + ∇(p) + lift(tau_u2) = -u⋅∇(u) + Ra*Pr*T*ez")
+add_equation!(problem, "∂t(u) - Pr*Δ(u) + ∇(p) - Ra*Pr*T*ez + lift(tau_u2, -2) = -u⋅∇(u)")
 ```
 
 ### Boundary Conditions
@@ -400,7 +398,7 @@ Study the transition to turbulence:
 Ra_values = [1e4, 1e5, 1e6, 1e7]
 
 for Ra in Ra_values
-    problem.parameters["Ra"] = Ra
+    problem.namespace["Ra"] = Ra
     # ... run simulation and save Nu
 end
 ```

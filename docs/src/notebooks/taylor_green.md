@@ -52,15 +52,15 @@ p = ScalarField(dist, "p", (x_basis, y_basis, z_basis), Float64)
 
 ```julia
 problem = IVP([ux, uy, uz, p])
-problem.parameters["nu"] = nu
+problem.namespace["nu"] = nu
 
 # Momentum equations
 Tarang.add_equation!(problem,
-    "∂t(ux) + ux*∂x(ux) + uy*∂y(ux) + uz*∂z(ux) + ∂x(p) = nu*Δ(ux)")
+    "∂t(ux) + ∂x(p) - nu*Δ(ux) = -ux*∂x(ux) - uy*∂y(ux) - uz*∂z(ux)")
 Tarang.add_equation!(problem,
-    "∂t(uy) + ux*∂x(uy) + uy*∂y(uy) + uz*∂z(uy) + ∂y(p) = nu*Δ(uy)")
+    "∂t(uy) + ∂y(p) - nu*Δ(uy) = -ux*∂x(uy) - uy*∂y(uy) - uz*∂z(uy)")
 Tarang.add_equation!(problem,
-    "∂t(uz) + ux*∂x(uz) + uy*∂y(uz) + uz*∂z(uz) + ∂z(p) = nu*Δ(uz)")
+    "∂t(uz) + ∂z(p) - nu*Δ(uz) = -ux*∂x(uz) - uy*∂y(uz) - uz*∂z(uz)")
 
 # Continuity
 Tarang.add_equation!(problem, "∂x(ux) + ∂y(uy) + ∂z(uz) = 0")
@@ -98,9 +98,9 @@ function taylor_green_ic!(ux, uy, uz)
     Tarang.ensure_layout!(uz, :g)
 
     for i in eachindex(x), j in eachindex(y), k in eachindex(z)
-        ux.data_g[i,j,k] =  cos(x[i]) * sin(y[j]) * cos(z[k])
-        uy.data_g[i,j,k] = -sin(x[i]) * cos(y[j]) * cos(z[k])
-        uz.data_g[i,j,k] = 0.0
+        get_grid_data(ux)[i,j,k] =  cos(x[i]) * sin(y[j]) * cos(z[k])
+        get_grid_data(uy)[i,j,k] = -sin(x[i]) * cos(y[j]) * cos(z[k])
+        get_grid_data(uz)[i,j,k] = 0.0
     end
 
     Tarang.ensure_layout!(ux, :c)
@@ -119,7 +119,7 @@ function kinetic_energy(ux, uy, uz)
     Tarang.ensure_layout!(uy, :g)
     Tarang.ensure_layout!(uz, :g)
 
-    return 0.5 * mean(ux.data_g.^2 + uy.data_g.^2 + uz.data_g.^2)
+    return 0.5 * mean(get_grid_data(ux).^2 + get_grid_data(uy).^2 + get_grid_data(uz).^2)
 end
 
 function enstrophy(ux, uy, uz)
@@ -199,7 +199,7 @@ plot(times, relative_error,
 Tarang.ensure_layout!(ux, :g)
 slice_idx = N÷2
 
-ux_slice = ux.data_g[:, :, slice_idx]
+ux_slice = get_grid_data(ux)[:, :, slice_idx]
 heatmap(ux_slice',
     xlabel="x", ylabel="y",
     title="ux at z=π, t=$(solver.sim_time)"

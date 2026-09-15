@@ -32,22 +32,22 @@ using BenchmarkTools
 
 ```julia
 # Bad: Creates new arrays
-field.data_g = field.data_g .+ other.data_g
+get_grid_data(field) .= get_grid_data(field) .+ get_grid_data(other)
 
 # Good: In-place operation
-field.data_g .+= other.data_g
+get_grid_data(field) .+= get_grid_data(other)
 ```
 
 ### Pre-allocate Work Arrays
 
 ```julia
 # Once at setup
-work = similar(field.data_g)
+work = similar(get_grid_data(field))
 
 # Reuse in loop
 for step in 1:nsteps
     work .= compute_rhs(field)
-    field.data_g .+= dt .* work
+    get_grid_data(field) .+= dt .* work
 end
 ```
 

@@ -127,8 +127,8 @@ problem = IVP([ω])
 # Vorticity equation: ∂ω/∂t = -μω + ν∇²ω - J(ψ,ω) + ξ
 # Note: Forcing ξ is NOT in the equation string - it's added automatically!
 add_equation!(problem, "∂t(ω) + μ*ω - ν*Δ(ω) = -J(ψ, ω)")
-problem.parameters["ν"] = ν
-problem.parameters["μ"] = μ
+problem.namespace["ν"] = ν
+problem.namespace["μ"] = μ
 
 # Register stochastic forcing - it will be added to ω's RHS automatically
 add_stochastic_forcing!(problem, :ω, forcing)
@@ -171,18 +171,18 @@ println("=" ^ 60)
 
 for step in 1:nsteps
     # Store previous solution for Stratonovich work calculation (optional diagnostic)
-    store_prevsol!(forcing, ω.data_c)
+    store_prevsol!(forcing, get_coeff_data(ω))
 
     # Advance one timestep - forcing is generated and applied automatically!
     step!(solver)
 
     # Compute work done by forcing (Stratonovich) - optional diagnostic
-    W = work_stratonovich(forcing, ω.data_c)
+    W = work_stratonovich(forcing, get_coeff_data(ω))
 
     # Periodic diagnostics
     if step % 100 == 0 || step == 1
-        E = compute_energy(ω.data_c, domain.grid)
-        Z = compute_enstrophy(ω.data_c)
+        E = compute_energy(get_coeff_data(ω), domain.grid)
+        Z = compute_enstrophy(get_coeff_data(ω))
 
         push!(t_save, solver.sim_time)
         push!(E_save, E)
@@ -276,7 +276,7 @@ forcing = StochasticForcing(
 ```julia
 for step in 1:nsteps
     # 1. Store ψⁿ for Stratonovich work
-    store_prevsol!(forcing, ω.data_c)
+    store_prevsol!(forcing, get_coeff_data(ω))
 
     # 2. Generate F̂ (new forcing each timestep)
     F_hat = generate_forcing!(forcing, t, 1)
@@ -288,7 +288,7 @@ for step in 1:nsteps
     step!(solver)
 
     # 5. Compute work done
-    W = work_stratonovich(forcing, ω.data_c)
+    W = work_stratonovich(forcing, get_coeff_data(ω))
 end
 ```
 

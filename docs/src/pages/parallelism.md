@@ -84,7 +84,7 @@ Full Domain:        Decomposed:
 
 ```julia
 # Local data on this process
-local_data = field.data_g
+local_data = get_grid_data(field)
 local_size = size(local_data)
 
 # Global size
@@ -108,11 +108,11 @@ Communication happens automatically during:
 
 ```julia
 # Global reduction using MPI directly
-local_max = maximum(field.data_g)
+local_max = maximum(get_grid_data(field))
 global_max = MPI.Allreduce(local_max, MPI.MAX, MPI.COMM_WORLD)
 
 # Global sum
-local_sum = sum(field.data_g)
+local_sum = sum(get_grid_data(field))
 global_sum = MPI.Allreduce(local_sum, MPI.SUM, MPI.COMM_WORLD)
 ```
 

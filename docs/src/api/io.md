@@ -451,7 +451,7 @@ function save_checkpoint(solver, filename)
 
     for (name, field) in solver.problem.fields
         Tarang.ensure_layout!(field, :c)
-        state["fields"][name] = copy(field.data_c)
+        state["fields"][name] = copy(get_coeff_data(field))
     end
 
     if MPI.Comm_rank(MPI.COMM_WORLD) == 0
@@ -473,7 +473,7 @@ function load_checkpoint!(solver, filename)
 
     for (name, data) in state["fields"]
         field = solver.problem.fields[name]
-        field.data_c .= data
+        get_coeff_data(field) .= data
         field.current_layout = :c
     end
 end

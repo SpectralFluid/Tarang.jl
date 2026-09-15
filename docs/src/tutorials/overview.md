@@ -93,7 +93,7 @@ Problems with dynamics confined to surfaces or boundaries.
 **Typical structure**:
 ```julia
 problem = IVP(fields)
-add_equation!(problem, "∂t(u) = -u*∂x(u) + nu*Δ(u)")
+add_equation!(problem, "∂t(u) - nu*Δ(u) = -u*∂x(u)")
 solver = InitialValueSolver(problem, RK222())
 
 while solver.sim_time < t_end

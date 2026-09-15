@@ -49,8 +49,8 @@ field.dist          # Distributor
 field.bases         # Tuple of spectral bases
 field.dtype         # Data type (Float64, etc.)
 field.current_layout # :g (grid) or :c (coefficient)
-field.data_g        # Grid space data (when in :g layout)
-field.data_c        # Coefficient data (when in :c layout)
+get_grid_data(field)   # Grid space data (when in :g layout)
+get_coeff_data(field)  # Coefficient data (when in :c layout)
 ```
 
 ## Data Access
@@ -62,7 +62,7 @@ field.data_c        # Coefficient data (when in :c layout)
 Tarang.ensure_layout!(field, :g)
 
 # Access data
-data = field.data_g
+data = get_grid_data(field)
 
 # Modify values
 data[10, 20] = 1.0
@@ -76,7 +76,7 @@ data .= sin.(x_grid) .* cos.(z_grid)
 Tarang.ensure_layout!(field, :c)
 
 # Access spectral coefficients
-coeffs = field.data_c
+coeffs = get_coeff_data(field)
 
 # Set specific modes
 coeffs[1, 1] = 0.0  # Zero mean
@@ -88,7 +88,7 @@ coeffs[1, 1] = 0.0  # Zero mean
 
 ```julia
 Tarang.ensure_layout!(field, :g)
-field.data_g .= 1.0
+get_grid_data(field) .= 1.0
 ```
 
 ### From Function
@@ -102,7 +102,7 @@ function initialize_field!(field, f)
     z = get_grid(field.bases[2])
 
     for i in eachindex(x), j in eachindex(z)
-        field.data_g[i, j] = f(x[i], z[j])
+        get_grid_data(field)[i, j] = f(x[i], z[j])
     end
 end
 
@@ -119,7 +119,7 @@ function add_perturbation!(field, amplitude; seed=42)
     Tarang.ensure_layout!(field, :g)
 
     Random.seed!(seed + field.dist.rank)
-    field.data_g .+= amplitude .* (rand(size(field.data_g)...) .- 0.5)
+    get_grid_data(field) .+= amplitude .* (rand(size(get_grid_data(field))...) .- 0.5)
 end
 
 add_perturbation!(T, 0.01)
@@ -141,19 +141,19 @@ T3 = deepcopy(T)
 
 ```julia
 # In-place operations (preferred)
-field.data_g .+= other.data_g
-field.data_g .*= 2.0
+get_grid_data(field) .+= get_grid_data(other)
+get_grid_data(field) .*= 2.0
 
 # Scaling
-field.data_g ./= maximum(abs.(field.data_g))
+get_grid_data(field) ./= maximum(abs.(get_grid_data(field)))
 ```
 
 ### Reductions
 
 ```julia
 # Local operations
-local_max = maximum(field.data_g)
-local_sum = sum(field.data_g)
+local_max = maximum(get_grid_data(field))
+local_sum = sum(get_grid_data(field))
 
 # Global MPI reductions
 reducer = GlobalArrayReducer(dist.comm)
@@ -220,10 +220,10 @@ end
 function magnitude(u)
     Tarang.ensure_layout!(u.components[1], :g)
 
-    mag = zeros(size(u.components[1].data_g))
+    mag = zeros(size(get_grid_data(u.components[1])))
     for c in u.components
         Tarang.ensure_layout!(c, :g)
-        mag .+= c.data_g.^2
+        mag .+= get_grid_data(c).^2
     end
 
     return sqrt.(mag)
@@ -246,12 +246,12 @@ end
 
 ```julia
 # Create work arrays once
-work = similar(field.data_g)
+work = similar(get_grid_data(field))
 
 # Reuse in computation
 for step in 1:nsteps
     work .= compute_rhs(field)
-    field.data_g .+= dt .* work
+    get_grid_data(field) .+= dt .* work
 end
 ```
 
@@ -260,10 +260,10 @@ end
 ```julia
 # Avoid allocations
 # Bad:
-field.data_g = field.data_g + other.data_g
+get_grid_data(field) = get_grid_data(field) + get_grid_data(other)
 
 # Good:
-field.data_g .+= other.data_g
+get_grid_data(field) .+= get_grid_data(other)
 ```
 
 ## Parallel Considerations
@@ -274,7 +274,7 @@ Each process holds only its portion of the field:
 
 ```julia
 # Local array size
-local_size = size(field.data_g)
+local_size = size(get_grid_data(field))
 
 # This is smaller than global size
 global_size = field.bases[1].size, field.bases[2].size

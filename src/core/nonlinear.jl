@@ -543,10 +543,29 @@ function _get_padded_pencil_workspace!(evaluator::NonlinearEvaluator, bases::Tup
             return nothing
         end
 
-        # Create padded plan using the same pencil configuration pattern
-        input_pencil = first(original_plan.plans).pencil_in
-        padded_pencil = PencilArrays.Pencil(input_pencil.topology, pad_t, input_pencil.decomp_dims)
-        transforms = Tuple(PencilFFTs.Transforms.FFT() for _ in 1:length(pad_t))
+        # Create padded plan using the stored input pencil (avoids internal PencilFFTs API)
+        input_pencil = dist.pencil_fft_input
+        padded_pencil = PencilArrays.Pencil(dist.mpi_topology, pad_t, input_pencil.decomp_dims)
+
+        # Build transforms matching the original domain's basis types.
+        # RFFT on the first RealFourier axis produces half-spectrum (N/2+1);
+        # using FFT instead would create a full-spectrum (N) shape mismatch
+        # when copying spectral data between original and padded arrays.
+        transform_list = Any[]
+        first_real_fourier = true
+        for basis in bases
+            if isa(basis, RealFourier)
+                if first_real_fourier
+                    push!(transform_list, PencilFFTs.Transforms.RFFT())
+                    first_real_fourier = false
+                else
+                    push!(transform_list, PencilFFTs.Transforms.FFT())
+                end
+            elseif isa(basis, ComplexFourier)
+                push!(transform_list, PencilFFTs.Transforms.FFT())
+            end
+        end
+        transforms = Tuple(transform_list)
         padded_plan = PencilFFTs.PencilFFTPlan(padded_pencil, transforms)
 
         # Pre-allocate PencilArrays for both physical and spectral space

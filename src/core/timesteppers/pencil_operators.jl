@@ -60,6 +60,249 @@ struct PencilLinearOperator{T<:AbstractFloat}
     fourier_basis_indices::Vector{Int}           # Indices of Fourier bases
 end
 
+# ============================================================================
+# Solve Layout Utilities
+# ============================================================================
+# The pencil IMEX solve requires Chebyshev-local data: all Nz physical points
+# for each Fourier mode. PencilFFTs output may have Chebyshev distributed
+# (the last FFT dimension ends up local, pushing Chebyshev into the decomposed
+# set). These utilities transpose between PencilFFT output and the "solve
+# layout" where Fourier modes are distributed and Chebyshev is local.
+# ============================================================================
+
+"""Compute local range for a Fourier axis distributed across `mesh_dim` in solve layout."""
+function _solve_layout_range(dist::Distributor, global_size::Int, mesh_dim::Int)
+    if dist.size <= 1 || dist.mesh === nothing || mesh_dim > length(dist.mesh)
+        return (1, global_size)
+    end
+    n_procs = dist.mesh[mesh_dim]
+    n_procs <= 1 && return (1, global_size)
+    coord = get_process_coordinate(dist, mesh_dim)
+    base = div(global_size, n_procs)
+    rem = mod(global_size, n_procs)
+    start = coord * base + min(coord, rem) + 1
+    count = base + (coord < rem ? 1 : 0)
+    return (start, start + count - 1)
+end
+
+"""Block partition: returns (counts, offsets) vectors for 0-indexed ranks."""
+function _block_counts(global_size::Int, nprocs::Int)
+    base = div(global_size, nprocs)
+    rem = mod(global_size, nprocs)
+    counts = [base + (r < rem ? 1 : 0) for r in 0:nprocs-1]
+    offsets = [sum(counts[1:r]) for r in 0:nprocs]
+    return counts, offsets
+end
+
+"""Check if MPI transpose is needed between PencilFFT output and solve layout."""
+_needs_solve_transpose(dist::Distributor) = dist.use_pencil_arrays && dist.size > 1
+
+"""
+Get or create cached partition info and MPI buffers for solve-layout transposes.
+Stored in `cache_dict` (typically `state.timestepper_data`) to avoid repeated
+MPI.Allgather calls and buffer allocations across timesteps.
+"""
+function _get_transpose_info!(cache_dict::Dict, dist::Distributor, L::PencilLinearOperator,
+                              nkx_global::Int, nz_local::Int, ::Type{T}) where T
+    key = :solve_transpose_info
+    if haskey(cache_dict, key)
+        info = cache_dict[key]
+        if info.nkx_global == nkx_global && info.nz_local == nz_local && eltype(info.send_buf) === T
+            return info
+        end
+    end
+
+    nprocs = dist.size
+    rank = dist.rank
+    nz_global = L.Nz
+
+    kx_counts, kx_offs = _block_counts(nkx_global, nprocs)
+    z_counts = MPI.Allgather(nz_local, dist.comm)
+    z_offs = [sum(z_counts[1:r]) for r in 0:nprocs]
+    nkx_local = kx_counts[rank + 1]
+
+    fwd_s = [kx_counts[j+1] * nz_local for j in 0:nprocs-1]
+    fwd_r = [nkx_local * z_counts[j+1] for j in 0:nprocs-1]
+    max_buf = max(sum(fwd_s), sum(fwd_r))
+
+    info = (
+        nkx_global = nkx_global, nz_local = nz_local, nz_global = nz_global,
+        nkx_local = nkx_local,
+        kx_counts = kx_counts, kx_offs = kx_offs,
+        z_counts = z_counts, z_offs = z_offs,
+        fwd_s_counts = fwd_s, fwd_r_counts = fwd_r,
+        send_buf = Vector{T}(undef, max_buf),
+        recv_buf = Vector{T}(undef, max_buf),
+    )
+    cache_dict[key] = info
+    return info
+end
+
+"""
+Transpose coefficient data from PencilFFT output layout to Chebyshev-local solve layout.
+For serial, returns the underlying array directly (no copy).
+Pass `cache` (a Dict, e.g. `state.timestepper_data`) to reuse partition info and MPI buffers.
+"""
+function _to_solve_layout(data, dist::Distributor, L::PencilLinearOperator{T};
+                          cache::Union{Nothing,Dict}=nothing) where T
+    if !_needs_solve_transpose(dist)
+        return data isa PencilArrays.PencilArray ? parent(data) : data
+    end
+    src = data isa PencilArrays.PencilArray ? parent(data) : data
+    if length(L.fourier_basis_indices) == 1
+        return _transpose_fft_to_solve_2d(src, dist, L, cache)
+    else
+        error("3D mixed Fourier-Chebyshev MPI solve transpose not yet implemented. " *
+              "Use TransposableField for 3D mixed domains, or serial execution.")
+    end
+end
+
+"""Transpose solve-layout data back into PencilFFT output layout."""
+function _from_solve_layout!(dest, src::AbstractArray, dist::Distributor, L::PencilLinearOperator{T};
+                             cache::Union{Nothing,Dict}=nothing) where T
+    if !_needs_solve_transpose(dist)
+        dest_arr = dest isa PencilArrays.PencilArray ? parent(dest) : dest
+        copyto!(dest_arr, src)
+        return
+    end
+    dest_arr = dest isa PencilArrays.PencilArray ? parent(dest) : dest
+    if length(L.fourier_basis_indices) == 1
+        _transpose_solve_to_fft_2d!(dest_arr, src, dist, L, cache)
+    else
+        error("3D mixed Fourier-Chebyshev MPI solve transpose not yet implemented.")
+    end
+end
+
+"""2D FFT-output → solve-layout transpose via MPI.Alltoallv."""
+function _transpose_fft_to_solve_2d(
+    src::AbstractArray{T,2},
+    dist::Distributor,
+    L::PencilLinearOperator,
+    cache::Union{Nothing,Dict}
+) where T
+    nkx_global = size(src, 1)
+    nz_local = size(src, 2)
+    comm = dist.comm
+    nprocs = dist.size
+
+    # Get cached partition info and buffers (or create on first call)
+    if cache !== nothing
+        info = _get_transpose_info!(cache, dist, L, nkx_global, nz_local, T)
+    else
+        kx_counts, kx_offs = _block_counts(nkx_global, nprocs)
+        z_counts = MPI.Allgather(nz_local, comm)
+        z_offs = [sum(z_counts[1:r]) for r in 0:nprocs]
+        nkx_local = kx_counts[dist.rank + 1]
+        fwd_s = [kx_counts[j+1] * nz_local for j in 0:nprocs-1]
+        fwd_r = [nkx_local * z_counts[j+1] for j in 0:nprocs-1]
+        max_buf = max(sum(fwd_s), sum(fwd_r))
+        info = (nkx_global=nkx_global, nz_local=nz_local, nz_global=L.Nz,
+                nkx_local=nkx_local, kx_counts=kx_counts, kx_offs=kx_offs,
+                z_counts=z_counts, z_offs=z_offs,
+                fwd_s_counts=fwd_s, fwd_r_counts=fwd_r,
+                send_buf=Vector{T}(undef, max_buf), recv_buf=Vector{T}(undef, max_buf))
+    end
+
+    (; kx_counts, kx_offs, z_counts, z_offs, nkx_local, nz_global,
+       fwd_s_counts, fwd_r_counts, send_buf, recv_buf) = info
+
+    # Pack: for dest rank j, send rows for their kx range
+    pos = 0
+    for j in 0:nprocs-1
+        kx_start = kx_offs[j+1] + 1
+        nkx_j = kx_counts[j+1]
+        for iz in 1:nz_local
+            for ikx in 1:nkx_j
+                pos += 1
+                send_buf[pos] = src[kx_start + ikx - 1, iz]
+            end
+        end
+    end
+
+    MPI.Alltoallv!(MPI.VBuffer(send_buf, fwd_s_counts), MPI.VBuffer(recv_buf, fwd_r_counts), comm)
+
+    # Unpack into freshly allocated (nkx_local, nz_global) — caller keeps this
+    dst = Array{T}(undef, nkx_local, nz_global)
+    pos = 0
+    for j in 0:nprocs-1
+        z_start = z_offs[j+1] + 1
+        nz_j = z_counts[j+1]
+        for iz in 1:nz_j
+            for ikx in 1:nkx_local
+                pos += 1
+                dst[ikx, z_start + iz - 1] = recv_buf[pos]
+            end
+        end
+    end
+    return dst
+end
+
+"""2D solve-layout → FFT-output transpose via MPI.Alltoallv."""
+function _transpose_solve_to_fft_2d!(
+    dst::AbstractArray{T,2},
+    src::AbstractArray{T,2},
+    dist::Distributor,
+    L::PencilLinearOperator,
+    cache::Union{Nothing,Dict}
+) where T
+    nkx_global = size(dst, 1)
+    nz_local = size(dst, 2)
+    nkx_local = size(src, 1)
+    comm = dist.comm
+    nprocs = dist.size
+
+    if cache !== nothing
+        info = _get_transpose_info!(cache, dist, L, nkx_global, nz_local, T)
+    else
+        kx_counts, kx_offs = _block_counts(nkx_global, nprocs)
+        z_counts = MPI.Allgather(nz_local, comm)
+        z_offs = [sum(z_counts[1:r]) for r in 0:nprocs]
+        fwd_s = [kx_counts[j+1] * nz_local for j in 0:nprocs-1]
+        fwd_r = [nkx_local * z_counts[j+1] for j in 0:nprocs-1]
+        max_buf = max(sum(fwd_s), sum(fwd_r))
+        info = (nkx_global=nkx_global, nz_local=nz_local, nz_global=L.Nz,
+                nkx_local=nkx_local, kx_counts=kx_counts, kx_offs=kx_offs,
+                z_counts=z_counts, z_offs=z_offs,
+                fwd_s_counts=fwd_s, fwd_r_counts=fwd_r,
+                send_buf=Vector{T}(undef, max_buf), recv_buf=Vector{T}(undef, max_buf))
+    end
+
+    (; kx_counts, kx_offs, z_counts, z_offs, nkx_local,
+       fwd_s_counts, fwd_r_counts, send_buf, recv_buf) = info
+
+    # Reverse direction: s/r counts are swapped relative to forward
+    rev_s_counts = fwd_r_counts
+    rev_r_counts = fwd_s_counts
+
+    # Pack: for dest rank j, send our kx rows for their z range
+    pos = 0
+    for j in 0:nprocs-1
+        z_start = z_offs[j+1] + 1
+        nz_j = z_counts[j+1]
+        for iz in 1:nz_j
+            for ikx in 1:nkx_local
+                pos += 1
+                send_buf[pos] = src[ikx, z_start + iz - 1]
+            end
+        end
+    end
+
+    MPI.Alltoallv!(MPI.VBuffer(send_buf, rev_s_counts), MPI.VBuffer(recv_buf, rev_r_counts), comm)
+
+    # Unpack into (nkx_global, nz_local)
+    pos = 0
+    for j in 0:nprocs-1
+        kx_start = kx_offs[j+1] + 1
+        nkx_j = kx_counts[j+1]
+        for iz in 1:nz_local
+            for ikx in 1:nkx_j
+                pos += 1
+                dst[kx_start + ikx - 1, iz] = recv_buf[pos]
+            end
+        end
+    end
+end
+
 """
     PencilLinearOperator(dist::Distributor, bases::Tuple, operator_type::Symbol; kwargs...)
 
@@ -136,7 +379,7 @@ function PencilLinearOperator(
     if length(fourier_bases) == 1
         # 2D: single Fourier direction
         k_vals_global = T.(wavenumbers(fourier_bases[1]))
-        kx_start, kx_end = get_local_range(dist, length(k_vals_global), fourier_indices[1])
+        kx_start, kx_end = _solve_layout_range(dist, length(k_vals_global), 1)
         local_kx_range = kx_start:kx_end
         k_vals = k_vals_global[local_kx_range]
         Nk_local = length(k_vals)
@@ -149,8 +392,8 @@ function PencilLinearOperator(
         # 3D: two Fourier directions
         kx_vals_global = T.(wavenumbers(fourier_bases[1]))
         ky_vals_global = T.(wavenumbers(fourier_bases[2]))
-        kx_start, kx_end = get_local_range(dist, length(kx_vals_global), fourier_indices[1])
-        ky_start, ky_end = get_local_range(dist, length(ky_vals_global), fourier_indices[2])
+        kx_start, kx_end = _solve_layout_range(dist, length(kx_vals_global), 1)
+        ky_start, ky_end = _solve_layout_range(dist, length(ky_vals_global), 2)
         local_kx_range = kx_start:kx_end
         local_ky_range = ky_start:ky_end
         kx_vals = kx_vals_global[local_kx_range]

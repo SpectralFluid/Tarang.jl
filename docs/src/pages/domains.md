@@ -119,7 +119,7 @@ Data stored as real values at collocation points:
 
 ```julia
 Tarang.ensure_layout!(field, :g)
-# field.data_g contains real grid values
+# get_grid_data(field) contains real grid values
 # Shape: (Nx, Nz) for 2D
 ```
 
@@ -129,7 +129,7 @@ Data stored as spectral coefficients:
 
 ```julia
 Tarang.ensure_layout!(field, :c)
-# field.data_c contains spectral coefficients
+# get_coeff_data(field) contains spectral coefficients
 # Shape depends on basis types
 ```
 
@@ -163,7 +163,7 @@ Process 3: x ∈ [64:128], z ∈ [32:64]
 
 ```julia
 # Local data array
-local_data = field.data_g
+local_data = get_grid_data(field)
 
 # Local array size
 local_size = size(local_data)

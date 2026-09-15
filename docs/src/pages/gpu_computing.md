@@ -115,49 +115,27 @@ backward_transform!(field)  # IFFT in x, IDCT in z
 
 ## GPU Memory Management
 
-### Memory Pools
+Tarang relies on CUDA.jl's built-in memory pool (following the Oceananigans.jl approach).
+No custom pooling is needed — CUDA.jl handles allocation efficiently.
 
-Tarang uses memory pooling to reduce allocation overhead:
-
-```julia
-using TarangCUDAExt: GPUMemoryPool, pool_allocate, pool_release!
-
-# Get memory pool statistics
-stats = memory_pool_stats()
-println("Allocated: $(stats.allocated_bytes) bytes")
-println("Cached: $(stats.cached_bytes) bytes")
-
-# Clear the memory pool (frees cached memory)
-clear_memory_pool!()
+Configure the pool via environment variable:
+```bash
+export JULIA_CUDA_MEMORY_POOL=binned  # default, efficient for repeated allocations
 ```
 
-### Pinned Memory for MPI
-
-For efficient GPU-MPI transfers:
+### Data Transfers
 
 ```julia
-using TarangCUDAExt: get_pinned_buffer, async_copy_to_gpu!, async_copy_to_cpu!
+# CPU → GPU
+async_copy_to_gpu!(gpu_array, cpu_array)
 
-# Get a pinned CPU buffer for async transfers
-buffer = get_pinned_buffer(Float64, 1024)
-
-# Async copy operations
-async_copy_to_gpu!(gpu_array, buffer)
-async_copy_to_cpu!(buffer, gpu_array)
+# GPU → CPU
+async_copy_to_cpu!(cpu_array, gpu_array)
 ```
 
-### Memory Monitoring
-
+For pinned memory (faster MPI transfers), use CUDA.jl directly:
 ```julia
-using TarangCUDAExt: gpu_memory_info, check_gpu_memory
-
-# Get current memory usage
-info = gpu_memory_info()
-println("Free: $(info.free_bytes / 1e9) GB")
-println("Total: $(info.total_bytes / 1e9) GB")
-
-# Check if allocation will fit
-can_allocate = check_gpu_memory(required_bytes)
+CUDA.Mem.pin(cpu_array)  # page-lock for faster DMA transfers
 ```
 
 ## Custom GPU Kernels
@@ -302,14 +280,9 @@ distributed_backward_transform!(tf)
    end
    ```
 
-4. **Use streams for overlap** - Overlap computation and communication
+4. **Synchronize when needed** - Ensure GPU operations complete before CPU access
    ```julia
-   using TarangCUDAExt: get_compute_stream, get_transfer_stream, sync_streams!
-
-   compute_stream = get_compute_stream()
-   transfer_stream = get_transfer_stream()
-   # ... overlap operations
-   sync_streams!()
+   CUDA.synchronize()  # Wait for all GPU operations to finish
    ```
 
 ### Profiling

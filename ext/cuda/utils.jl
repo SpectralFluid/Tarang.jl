@@ -785,3 +785,21 @@ function Tarang._truncate_spectral!(result::CuArray{Complex{T}}, padded_spec::Cu
     end
 end
 
+# ============================================================================
+# GPU MatSolvers Helper Implementations
+# ============================================================================
+# These extend the abstract function stubs defined in Tarang/src/tools/gpu_matsolvers.jl
+# to provide CUDA-backed implementations for GPU matrix solvers.
+
+using SparseArrays: SparseMatrixCSC
+
+Tarang._gpu_zeros(T::Type, dims...) = CUDA.zeros(T, dims...)
+Tarang._gpu_array(data::AbstractArray, T::Type) = CuVector{T}(data)
+Tarang._gpu_array(data::AbstractMatrix, T::Type) = CuMatrix{T}(data)
+Tarang._gpu_sparse_csr(A::SparseMatrixCSC, T::Type) = CUDA.CUSPARSE.CuSparseMatrixCSR(SparseMatrixCSC{T, Int32}(A))
+Tarang._gpu_axpy!(α, x, y) = CUDA.axpy!(α, x, y)
+Tarang._is_gpu_array(a::CuArray) = true
+Tarang._is_gpu_array(::Any) = false
+Tarang._gpu_ilu0(A_csr) = CUDA.CUSPARSE.ilu02(A_csr)
+Tarang._gpu_ic0(A_csr) = CUDA.CUSPARSE.ic02(A_csr)
+

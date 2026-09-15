@@ -51,14 +51,14 @@ p = ScalarField(dist, "p", (x_basis, z_basis), Float64)
 
 ```julia
 problem = IVP([ux, uz, p])
-problem.parameters["nu"] = nu
-problem.parameters["dpdx"] = dpdx
+problem.namespace["nu"] = nu
+problem.namespace["dpdx"] = dpdx
 
 # Momentum equations
 Tarang.add_equation!(problem,
-    "∂t(ux) + ux*∂x(ux) + uz*∂z(ux) + ∂x(p) = nu*Δ(ux) - dpdx")
+    "∂t(ux) + ∂x(p) - nu*Δ(ux) = -ux*∂x(ux) - uz*∂z(ux) - dpdx")
 Tarang.add_equation!(problem,
-    "∂t(uz) + ux*∂x(uz) + uz*∂z(uz) + ∂z(p) = nu*Δ(uz)")
+    "∂t(uz) + ∂z(p) - nu*Δ(uz) = -ux*∂x(uz) - uz*∂z(uz)")
 
 # Continuity
 Tarang.add_equation!(problem, "∂x(ux) + ∂z(uz) = 0")
@@ -97,11 +97,11 @@ z_grid = get_grid(z_basis)
 Tarang.ensure_layout!(ux, :g)
 
 for i in 1:Nx, j in 1:Nz
-    ux.data_g[i, j] = poiseuille_profile(z_grid[j], Lz, dpdx, nu)
+    get_grid_data(ux)[i, j] = poiseuille_profile(z_grid[j], Lz, dpdx, nu)
 end
 
 # Add small perturbation
-ux.data_g .+= 0.01 .* randn(size(ux.data_g))
+get_grid_data(ux) .+= 0.01 .* randn(size(get_grid_data(ux)))
 Tarang.ensure_layout!(ux, :c)
 ```
 
@@ -126,7 +126,7 @@ while solver.sim_time < t_end
 
     if solver.iteration % 100 == 0
         Tarang.ensure_layout!(ux, :g)
-        u_centerline = mean(ux.data_g[:, Nz÷2])
+        u_centerline = mean(get_grid_data(ux)[:, Nz÷2])
         println("t = $(solver.sim_time), u_center = $u_centerline")
     end
 end
@@ -140,7 +140,7 @@ end
 Tarang.ensure_layout!(ux, :g)
 
 # Average over x
-u_profile = mean(ux.data_g, dims=1)[:]
+u_profile = mean(get_grid_data(ux), dims=1)[:]
 z_points = get_grid(z_basis)
 
 # Analytical

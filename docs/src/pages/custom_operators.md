@@ -42,7 +42,7 @@ The equation parser recognizes all built-in operators. Use them directly:
 # sin, cos, tan, exp, log, sqrt, abs, tanh
 
 # Use operators directly in equations
-Tarang.add_equation!(problem, "∂t(T) = -ux*∂x(T) - uz*∂z(T) + kappa*Δ(T)")
+Tarang.add_equation!(problem, "∂t(T) - kappa*Δ(T) = -ux*∂x(T) - uz*∂z(T)")
 ```
 
 ## Spectral Differentiation
@@ -55,7 +55,7 @@ function fourier_derivative(field, basis, order=1)
     Tarang.ensure_layout!(field, :c)
 
     # Multiply by (ik)^order
-    field.data_c .*= (1im .* k) .^ order
+    get_coeff_data(field) .*= (1im .* k) .^ order
 
     return field
 end
@@ -69,7 +69,7 @@ function chebyshev_derivative(field, basis)
 
     # Use differentiation matrix
     D = chebyshev_diff_matrix(basis.size)
-    field.data_c = D * field.data_c
+    get_coeff_data(field) .= D * get_coeff_data(field)
 
     return field
 end
@@ -85,11 +85,11 @@ function integrate(field, dim)
 
     if dim == 1  # x-direction
         dx = field.bases[1].length / field.bases[1].size
-        return sum(field.data_g, dims=1) * dx
+        return sum(get_grid_data(field), dims=1) * dx
     elseif dim == 2  # z-direction
         # Chebyshev: use quadrature weights
         weights = chebyshev_weights(field.bases[2])
-        return sum(field.data_g .* weights', dims=2)
+        return sum(get_grid_data(field) .* weights', dims=2)
     end
 end
 ```
@@ -156,13 +156,13 @@ end
 ```julia
 function convective_derivative(u, f)
     # (u·∇)f
-    result = zeros(size(f.data_g))
+    result = zeros(size(get_grid_data(f)))
 
     for (i, comp) in enumerate(u.components)
         Tarang.ensure_layout!(comp, :g)
         df = d_operators[i](f)
         Tarang.ensure_layout!(df, :g)
-        result .+= comp.data_g .* df.data_g
+        result .+= get_grid_data(comp) .* get_grid_data(df)
     end
 
     return result
@@ -177,7 +177,7 @@ function nonlinear_advection(u)
     result = similar(u)
 
     for (j, uj) in enumerate(u.components)
-        result.components[j].data_g .= convective_derivative(u, uj)
+        get_grid_data(result.components[j]) .= convective_derivative(u, uj)
     end
 
     return result

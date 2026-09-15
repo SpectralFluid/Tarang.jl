@@ -114,11 +114,8 @@ function step_pencil_sbdf2!(state::TimestepperState, solver::InitialValueSolver)
         new_state = Vector{ScalarField}(undef, length(X_n))
 
         for (i, field) in enumerate(X_n)
-            # Create output field
             new_field = copy(field)
             ensure_layout!(new_field, :c)
-
-            # Get data from history
             ensure_layout!(field, :c)
             ensure_layout!(X_nm1[i], :c)
             ensure_layout!(F_history[1][i], :c)
@@ -126,19 +123,32 @@ function step_pencil_sbdf2!(state::TimestepperState, solver::InitialValueSolver)
                 ensure_layout!(F_history[2][i], :c)
             end
 
-            data_n = get_coeff_data(field)
-            data_nm1 = get_coeff_data(X_nm1[i])
-            data_F_n = get_coeff_data(F_history[1][i])
-            data_new = get_coeff_data(new_field)
+            # Transpose to solve layout (Chebyshev-local) if MPI with PencilFFTs
+            needs_transpose = _needs_solve_transpose(field.dist)
+            if needs_transpose
+                data_n = _to_solve_layout(get_coeff_data(field), field.dist, L; cache=state.timestepper_data)
+                data_nm1 = _to_solve_layout(get_coeff_data(X_nm1[i]), field.dist, L; cache=state.timestepper_data)
+                data_F_n = _to_solve_layout(get_coeff_data(F_history[1][i]), field.dist, L; cache=state.timestepper_data)
+                data_F_nm1 = length(F_history) >= 2 ? _to_solve_layout(get_coeff_data(F_history[2][i]), field.dist, L; cache=state.timestepper_data) : nothing
+                data_new = similar(data_n)
+            else
+                data_n = get_coeff_data(field)
+                data_nm1 = get_coeff_data(X_nm1[i])
+                data_F_n = get_coeff_data(F_history[1][i])
+                data_F_nm1 = length(F_history) >= 2 ? get_coeff_data(F_history[2][i]) : nothing
+                data_new = get_coeff_data(new_field)
+            end
 
-            # Build RHS for each pencil and solve
             lhs_cache = _get_pencil_lhs_cache!(state, "sbdf2_lhs", (dt, a0))
             _pencil_sbdf2_field!(
-                data_new, data_n, data_nm1, data_F_n,
-                length(F_history) >= 2 ? get_coeff_data(F_history[2][i]) : nothing,
+                data_new, data_n, data_nm1, data_F_n, data_F_nm1,
                 L, dt, a0, a1, a2;
                 ext_c1=ext_c1, ext_c2=ext_c2, lhs_cache=lhs_cache
             )
+
+            if needs_transpose
+                _from_solve_layout!(get_coeff_data(new_field), data_new, field.dist, L; cache=state.timestepper_data)
+            end
 
             new_state[i] = new_field
         end
@@ -197,12 +207,24 @@ function step_pencil_sbdf1!(state::TimestepperState, solver::InitialValueSolver)
             ensure_layout!(field, :c)
             ensure_layout!(F_n[i], :c)
 
-            data_n = get_coeff_data(field)
-            data_F_n = get_coeff_data(F_n[i])
-            data_new = get_coeff_data(new_field)
+            # Transpose to solve layout (Chebyshev-local) if MPI with PencilFFTs
+            needs_transpose = _needs_solve_transpose(field.dist)
+            if needs_transpose
+                data_n = _to_solve_layout(get_coeff_data(field), field.dist, L; cache=state.timestepper_data)
+                data_F_n = _to_solve_layout(get_coeff_data(F_n[i]), field.dist, L; cache=state.timestepper_data)
+                data_new = similar(data_n)
+            else
+                data_n = get_coeff_data(field)
+                data_F_n = get_coeff_data(F_n[i])
+                data_new = get_coeff_data(new_field)
+            end
 
             lhs_cache = _get_pencil_lhs_cache!(state, "sbdf1_lhs", dt)
             _pencil_sbdf1_field!(data_new, data_n, data_F_n, L, dt; lhs_cache=lhs_cache)
+
+            if needs_transpose
+                _from_solve_layout!(get_coeff_data(new_field), data_new, field.dist, L; cache=state.timestepper_data)
+            end
 
             new_state[i] = new_field
         end
@@ -439,15 +461,31 @@ function step_pencil_cnab2!(state::TimestepperState, solver::InitialValueSolver)
             ensure_layout!(new_field, :c)
             ensure_layout!(field, :c)
             ensure_layout!(F_history[1][i], :c)
+            if length(F_history) >= 2
+                ensure_layout!(F_history[2][i], :c)
+            end
 
-            data_n = get_coeff_data(field)
-            data_F_n = get_coeff_data(F_history[1][i])
-            data_F_nm1 = length(F_history) >= 2 ? get_coeff_data(F_history[2][i]) : nothing
-            data_new = get_coeff_data(new_field)
+            needs_transpose = _needs_solve_transpose(field.dist)
+            if needs_transpose
+                data_n = _to_solve_layout(get_coeff_data(field), field.dist, L; cache=state.timestepper_data)
+                data_F_n = _to_solve_layout(get_coeff_data(F_history[1][i]), field.dist, L; cache=state.timestepper_data)
+                data_F_nm1 = length(F_history) >= 2 ? _to_solve_layout(get_coeff_data(F_history[2][i]), field.dist, L; cache=state.timestepper_data) : nothing
+                data_new = similar(data_n)
+            else
+                data_n = get_coeff_data(field)
+                data_F_n = get_coeff_data(F_history[1][i])
+                data_F_nm1 = length(F_history) >= 2 ? get_coeff_data(F_history[2][i]) : nothing
+                data_new = get_coeff_data(new_field)
+            end
 
             dt_prev = get_previous_timestep(state)
             lhs_cache = _get_pencil_lhs_cache!(state, "cnab_lhs", dt)
-            _pencil_cnab2_field!(data_new, data_n, data_F_n, data_F_nm1, L, dt; dt_prev=dt_prev, lhs_cache=lhs_cache)
+            rhs_cache = _get_pencil_lhs_cache!(state, "cnab_rhs", dt)
+            _pencil_cnab2_field!(data_new, data_n, data_F_n, data_F_nm1, L, dt; dt_prev=dt_prev, lhs_cache=lhs_cache, rhs_cache=rhs_cache)
+
+            if needs_transpose
+                _from_solve_layout!(get_coeff_data(new_field), data_new, field.dist, L; cache=state.timestepper_data)
+            end
 
             new_state[i] = new_field
         end
@@ -506,12 +544,24 @@ function step_pencil_cnab1!(state::TimestepperState, solver::InitialValueSolver)
             ensure_layout!(field, :c)
             ensure_layout!(F_n[i], :c)
 
-            data_n = get_coeff_data(field)
-            data_F_n = get_coeff_data(F_n[i])
-            data_new = get_coeff_data(new_field)
+            needs_transpose = _needs_solve_transpose(field.dist)
+            if needs_transpose
+                data_n = _to_solve_layout(get_coeff_data(field), field.dist, L; cache=state.timestepper_data)
+                data_F_n = _to_solve_layout(get_coeff_data(F_n[i]), field.dist, L; cache=state.timestepper_data)
+                data_new = similar(data_n)
+            else
+                data_n = get_coeff_data(field)
+                data_F_n = get_coeff_data(F_n[i])
+                data_new = get_coeff_data(new_field)
+            end
 
             lhs_cache = _get_pencil_lhs_cache!(state, "cnab_lhs", dt)
-            _pencil_cnab1_field!(data_new, data_n, data_F_n, L, dt; lhs_cache=lhs_cache)
+            rhs_cache = _get_pencil_lhs_cache!(state, "cnab_rhs", dt)
+            _pencil_cnab1_field!(data_new, data_n, data_F_n, L, dt; lhs_cache=lhs_cache, rhs_cache=rhs_cache)
+
+            if needs_transpose
+                _from_solve_layout!(get_coeff_data(new_field), data_new, field.dist, L; cache=state.timestepper_data)
+            end
 
             new_state[i] = new_field
         end
@@ -541,7 +591,8 @@ function _pencil_cnab1_field!(
     data_F_n::AbstractArray,
     L::PencilLinearOperator{T},
     dt::Real;
-    lhs_cache::Union{Nothing, Dict}=nothing
+    lhs_cache::Union{Nothing, Dict}=nothing,
+    rhs_cache::Union{Nothing, Dict}=nothing
 ) where T
 
     ndims = length(L.fourier_basis_indices)
@@ -567,7 +618,9 @@ function _pencil_cnab1_field!(
                     LHS = (1 + θ * dt * ν * k2) * sparse(I, Nz, Nz) - θ * dt * ν * L.chebyshev_D2
                     lu(LHS)
                 end
-                RHS_mat = (1 - (1-θ) * dt * ν * k2) * sparse(I, Nz, Nz) + (1-θ) * dt * ν * L.chebyshev_D2
+                RHS_mat = _get_or_factorize!(rhs_cache, (ikx, 1)) do
+                    (1 - (1-θ) * dt * ν * k2) * sparse(I, Nz, Nz) + (1-θ) * dt * ν * L.chebyshev_D2
+                end
 
                 pencil_n = @view data_n[ikx, :]
                 pencil_F = @view data_F_n[ikx, :]
@@ -592,7 +645,9 @@ function _pencil_cnab1_field!(
                         LHS = (1 + θ * dt * ν * k2) * sparse(I, Nz, Nz) - θ * dt * ν * L.chebyshev_D2
                         lu(LHS)
                     end
-                    RHS_mat = (1 - (1-θ) * dt * ν * k2) * sparse(I, Nz, Nz) + (1-θ) * dt * ν * L.chebyshev_D2
+                    RHS_mat = _get_or_factorize!(rhs_cache, (ikx, iky)) do
+                        (1 - (1-θ) * dt * ν * k2) * sparse(I, Nz, Nz) + (1-θ) * dt * ν * L.chebyshev_D2
+                    end
 
                     pencil_n = @view data_n[ikx, iky, :]
                     pencil_F = @view data_F_n[ikx, iky, :]
@@ -622,7 +677,8 @@ function _pencil_cnab2_field!(
     L::PencilLinearOperator{T},
     dt::Real;
     dt_prev::Real=dt,
-    lhs_cache::Union{Nothing, Dict}=nothing
+    lhs_cache::Union{Nothing, Dict}=nothing,
+    rhs_cache::Union{Nothing, Dict}=nothing
 ) where T
 
     ndims = length(L.fourier_basis_indices)
@@ -650,7 +706,9 @@ function _pencil_cnab2_field!(
                     LHS = (1 + θ * dt * ν * k2) * sparse(I, Nz, Nz) - θ * dt * ν * L.chebyshev_D2
                     lu(LHS)
                 end
-                RHS_mat = (1 - (1-θ) * dt * ν * k2) * sparse(I, Nz, Nz) + (1-θ) * dt * ν * L.chebyshev_D2
+                RHS_mat = _get_or_factorize!(rhs_cache, (ikx, 1)) do
+                    (1 - (1-θ) * dt * ν * k2) * sparse(I, Nz, Nz) + (1-θ) * dt * ν * L.chebyshev_D2
+                end
 
                 pencil_n = @view data_n[ikx, :]
                 pencil_F_n = @view data_F_n[ikx, :]
@@ -681,7 +739,9 @@ function _pencil_cnab2_field!(
                         LHS = (1 + θ * dt * ν * k2) * sparse(I, Nz, Nz) - θ * dt * ν * L.chebyshev_D2
                         lu(LHS)
                     end
-                    RHS_mat = (1 - (1-θ) * dt * ν * k2) * sparse(I, Nz, Nz) + (1-θ) * dt * ν * L.chebyshev_D2
+                    RHS_mat = _get_or_factorize!(rhs_cache, (ikx, iky)) do
+                        (1 - (1-θ) * dt * ν * k2) * sparse(I, Nz, Nz) + (1-θ) * dt * ν * L.chebyshev_D2
+                    end
 
                     pencil_n = @view data_n[ikx, iky, :]
                     pencil_F_n = @view data_F_n[ikx, iky, :]

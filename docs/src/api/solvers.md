@@ -220,8 +220,8 @@ success = solve!(solver)
 ```julia
 # Steady Navier-Stokes
 problem = NLBVP([u, v, p])
-add_equation!(problem, "u*∂x(u) + v*∂z(u) + ∂x(p) = nu*Δ(u)")
-add_equation!(problem, "u*∂x(v) + v*∂z(v) + ∂z(p) = nu*Δ(v)")
+add_equation!(problem, "∂x(p) - nu*Δ(u) = -u*∂x(u) - v*∂z(u)")
+add_equation!(problem, "∂z(p) - nu*Δ(v) = -u*∂x(v) - v*∂z(v)")
 add_equation!(problem, "∂x(u) + ∂z(v) = 0")
 
 solver = NonlinearBoundaryValueSolver(problem)
@@ -481,7 +481,7 @@ Ra_values = [1e4, 5e4, 1e5, 5e5, 1e6]
 
 solution = nothing
 for Ra in Ra_values
-    problem.parameters["Ra"] = Ra
+    problem.namespace["Ra"] = Ra
 
     if solution !== nothing
         # Use previous solution as initial guess
@@ -595,13 +595,13 @@ T = ScalarField(dist, "T", (x_basis, z_basis))
 
 # Define problem
 problem = IVP([u.components[1], u.components[2], p, T])
-problem.parameters["Ra"] = 1e6
-problem.parameters["Pr"] = 1.0
+problem.namespace["Ra"] = 1e6
+problem.namespace["Pr"] = 1.0
 
-add_equation!(problem, "∂t(u) + u*∂x(u) + w*∂z(u) + ∂x(p) = Pr*Δ(u)")
-add_equation!(problem, "∂t(w) + u*∂x(w) + w*∂z(w) + ∂z(p) = Pr*Δ(w) + Ra*Pr*T")
+add_equation!(problem, "∂t(u) + ∂x(p) - Pr*Δ(u) = -u*∂x(u) - w*∂z(u)")
+add_equation!(problem, "∂t(w) + ∂z(p) - Pr*Δ(w) - Ra*Pr*T = -u*∂x(w) - w*∂z(w)")
 add_equation!(problem, "∂x(u) + ∂z(w) = 0")
-add_equation!(problem, "∂t(T) + u*∂x(T) + w*∂z(T) = Δ(T)")
+add_equation!(problem, "∂t(T) - Δ(T) = -u*∂x(T) - w*∂z(T)")
 
 # Boundary conditions
 add_equation!(problem, "u(z=0) = 0")

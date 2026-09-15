@@ -77,7 +77,7 @@ Pkg.add(["CUDA", "KernelAbstractions"])
 Pkg.add(["MPI", "PencilArrays", "PencilFFTs"])
 ```
 
-### Hello World: 1D Diffusion (5 lines)
+### 1D Diffusion
 
 ```julia
 using Tarang
@@ -86,7 +86,7 @@ domain = PeriodicDomain(64)                     # 64-point periodic [0, 2π]
 T = ScalarField(domain, "T")                    # Temperature field
 
 problem = IVP([T])
-add_substitution!(problem, "kappa", 0.01)
+add_parameters!(problem, kappa=0.01)
 add_equation!(problem, "∂t(T) - kappa*Δ(T) = 0")
 
 solver = InitialValueSolver(problem, RK222(); dt=0.01)
@@ -106,9 +106,8 @@ T = ScalarField(domain, "T")                   # Temperature
 p = ScalarField(domain, "p")                   # Pressure
 
 problem = IVP([u, p, T])
-add_substitution!(problem, "Pr", 1.0)
-add_substitution!(problem, "Ra", 2e6)
-add_equation!(problem, "∂t(u) - Pr*Δ(u) + ∇(p) = -u⋅∇(u) + Ra*Pr*T*ez")
+add_parameters!(problem, Pr=1.0, Ra=2e6)
+add_equation!(problem, "∂t(u) - Pr*Δ(u) + ∇(p) - Ra*Pr*T*ez = -u⋅∇(u)")
 add_equation!(problem, "div(u) = 0")
 add_equation!(problem, "∂t(T) - Δ(T) = -u⋅∇(T)")
 add_bc!(problem, "u(z=0) = 0")

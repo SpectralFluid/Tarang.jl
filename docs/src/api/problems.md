@@ -86,8 +86,8 @@ NLBVP(fields::Vector{<:AbstractField})
 ```julia
 # Steady Navier-Stokes
 problem = NLBVP([u, v, p])
-add_equation!(problem, "u*∂x(u) + v*∂z(u) = -∂x(p) + nu*Δ(u)")
-add_equation!(problem, "u*∂x(v) + v*∂z(v) = -∂z(p) + nu*Δ(v)")
+add_equation!(problem, "∂x(p) - nu*Δ(u) = -u*∂x(u) - v*∂z(u)")
+add_equation!(problem, "∂z(p) - nu*Δ(v) = -u*∂x(v) - v*∂z(v)")
 add_equation!(problem, "∂x(u) + ∂z(v) = 0")
 ```
 
@@ -153,10 +153,10 @@ add_equation!(problem, equation_string::String)
 
 ```julia
 # Diffusion
-add_equation!(problem, "∂t(T) = kappa*Δ(T)")
+add_equation!(problem, "∂t(T) - kappa*Δ(T) = 0")
 
 # Wave equation
-add_equation!(problem, "∂t(∂t(u)) = c^2*Δ(u)")
+add_equation!(problem, "∂t(∂t(u)) - c^2*Δ(u) = 0")
 
 # Poisson
 add_equation!(problem, "Δ(phi) = rho")
@@ -166,13 +166,13 @@ add_equation!(problem, "Δ(phi) = rho")
 
 ```julia
 # Navier-Stokes momentum
-add_equation!(problem, "∂t(u) + u*∂x(u) + w*∂z(u) = -∂x(p) + nu*Δ(u)")
+add_equation!(problem, "∂t(u) + ∂x(p) - nu*Δ(u) = -u*∂x(u) - w*∂z(u)")
 
 # Energy equation with dissipation
-add_equation!(problem, "∂t(T) + u*∂x(T) + w*∂z(T) = kappa*Δ(T) + Q")
+add_equation!(problem, "∂t(T) - kappa*Δ(T) = -u*∂x(T) - w*∂z(T) + Q")
 
 # With parameters
-add_equation!(problem, "∂t(T) = kappa*Δ(T) + Ra*Pr*w")
+add_equation!(problem, "∂t(T) - kappa*Δ(T) = Ra*Pr*w")
 ```
 
 #### Using Fields and Parameters
@@ -181,10 +181,10 @@ add_equation!(problem, "∂t(T) = kappa*Δ(T) + Ra*Pr*w")
 # Fields are referenced by name
 add_equation!(problem, "∂t(u) = -u*∂x(u)")  # u is a field
 
-# Parameters from problem.parameters
-problem.parameters["nu"] = 0.01
-problem.parameters["Ra"] = 1e6
-add_equation!(problem, "∂t(u) = nu*Δ(u) + Ra*T")
+# Parameters from problem.namespace
+problem.namespace["nu"] = 0.01
+problem.namespace["Ra"] = 1e6
+add_equation!(problem, "∂t(u) - nu*Δ(u) = Ra*T")
 ```
 
 ---
@@ -198,39 +198,39 @@ add_equation!(problem, "∂t(u) = nu*Δ(u) + Ra*T")
 problem = IVP([u, p, T])
 
 # Set dimensionless parameters
-problem.parameters["Re"] = 1000.0      # Reynolds number
-problem.parameters["Pr"] = 0.7         # Prandtl number
-problem.parameters["Ra"] = 1e6         # Rayleigh number
+problem.namespace["Re"] = 1000.0      # Reynolds number
+problem.namespace["Pr"] = 0.7         # Prandtl number
+problem.namespace["Ra"] = 1e6         # Rayleigh number
 
 # Set physical parameters
-problem.parameters["nu"] = 1e-3        # Kinematic viscosity
-problem.parameters["kappa"] = 1e-3     # Thermal diffusivity
-problem.parameters["g"] = 9.81         # Gravitational acceleration
+problem.namespace["nu"] = 1e-3        # Kinematic viscosity
+problem.namespace["kappa"] = 1e-3     # Thermal diffusivity
+problem.namespace["g"] = 9.81         # Gravitational acceleration
 ```
 
 ### Using Parameters in Equations
 
 ```julia
 # Reference by name in equations
-add_equation!(problem, "∂t(u) = -u*∂x(u) + nu*Δ(u)")
-add_equation!(problem, "∂t(T) = -u*∂x(T) + kappa*Δ(T)")
+add_equation!(problem, "∂t(u) - nu*Δ(u) = -u*∂x(u)")
+add_equation!(problem, "∂t(T) - kappa*Δ(T) = -u*∂x(T)")
 
 # Dimensionless formulation
-add_equation!(problem, "∂t(u) = -u*∂x(u) + (1/Re)*Δ(u)")
-add_equation!(problem, "∂t(T) = -u*∂x(T) + (1/(Re*Pr))*Δ(T) + Ra*Pr*w")
+add_equation!(problem, "∂t(u) - (1/Re)*Δ(u) = -u*∂x(u)")
+add_equation!(problem, "∂t(T) - (1/(Re*Pr))*Δ(T) = -u*∂x(T) + Ra*Pr*w")
 ```
 
 ### Modifying Parameters
 
 ```julia
 # Change parameter value
-problem.parameters["Ra"] = 1e7
+problem.namespace["Ra"] = 1e7
 
 # Access parameter
-Ra = problem.parameters["Ra"]
+Ra = problem.namespace["Ra"]
 
 # Iterate over parameters
-for (name, value) in problem.parameters
+for (name, value) in problem.namespace
     println("$name = $value")
 end
 ```
@@ -411,8 +411,8 @@ validate_problem(problem)
 
 ```julia
 problem = IVP([u, v, p])
-add_equation!(problem, "∂t(u) = -u*∂x(u) - v*∂z(u) - ∂x(p) + nu*Δ(u)")
-add_equation!(problem, "∂t(v) = -u*∂x(v) - v*∂z(v) - ∂z(p) + nu*Δ(v)")
+add_equation!(problem, "∂t(u) + ∂x(p) - nu*Δ(u) = -u*∂x(u) - v*∂z(u)")
+add_equation!(problem, "∂t(v) + ∂z(p) - nu*Δ(v) = -u*∂x(v) - v*∂z(v)")
 add_equation!(problem, "∂x(u) + ∂z(v) = 0")
 
 # Add boundary conditions
@@ -434,24 +434,23 @@ Define intermediate variables for readability:
 
 ```julia
 # Define substitution
-add_substitution!(problem, "omega", "∂x(v) - ∂z(u)")
+add_parameters!(problem, omega="∂x(v) - ∂z(u)")
 
 # Use in equations
-add_equation!(problem, "∂t(omega) = -u*∂x(omega) - v*∂z(omega) + nu*Δ(omega)")
+add_equation!(problem, "∂t(omega) - nu*Δ(omega) = -u*∂x(omega) - v*∂z(omega)")
 ```
 
 ### Common Substitutions
 
 ```julia
 # Vorticity
-add_substitution!(problem, "omega", "∂x(v) - ∂z(u)")
+add_parameters!(problem, omega="∂x(v) - ∂z(u)")
 
 # Kinetic energy
-add_substitution!(problem, "KE", "0.5*(u^2 + v^2 + w^2)")
+add_parameters!(problem, KE="0.5*(u^2 + v^2 + w^2)")
 
 # Strain rate
-add_substitution!(problem, "S11", "∂x(u)")
-add_substitution!(problem, "S12", "0.5*(∂x(v) + ∂z(u))")
+add_parameters!(problem, S11="∂x(u)", S12="0.5*(∂x(v) + ∂z(u))")
 ```
 
 ---
@@ -506,14 +505,14 @@ T = ScalarField(dist, "T", (x_basis, z_basis))
 problem = IVP([u.components[1], u.components[2], p, T])
 
 # Parameters
-problem.parameters["Ra"] = 1e6
-problem.parameters["Pr"] = 1.0
+problem.namespace["Ra"] = 1e6
+problem.namespace["Pr"] = 1.0
 
 # Equations
-add_equation!(problem, "∂t(u) + u*∂x(u) + w*∂z(u) + ∂x(p) = Pr*Δ(u)")
-add_equation!(problem, "∂t(w) + u*∂x(w) + w*∂z(w) + ∂z(p) = Pr*Δ(w) + Ra*Pr*T")
+add_equation!(problem, "∂t(u) + ∂x(p) - Pr*Δ(u) = -u*∂x(u) - w*∂z(u)")
+add_equation!(problem, "∂t(w) + ∂z(p) - Pr*Δ(w) - Ra*Pr*T = -u*∂x(w) - w*∂z(w)")
 add_equation!(problem, "∂x(u) + ∂z(w) = 0")
-add_equation!(problem, "∂t(T) + u*∂x(T) + w*∂z(T) = Δ(T)")
+add_equation!(problem, "∂t(T) - Δ(T) = -u*∂x(T) - w*∂z(T)")
 
 # Boundary conditions
 add_equation!(problem, "u(z=0) = 0")

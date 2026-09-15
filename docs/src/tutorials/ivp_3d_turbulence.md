@@ -80,8 +80,8 @@ problem = IVP([u, p])
 Re = 1000.0  # Reynolds number (based on domain scale)
 nu = 1.0 / Re
 
-# Add parameter substitutions (Dedalus-style)
-add_substitution!(problem, "nu", nu)
+# Add parameters
+add_parameters!(problem, nu=nu)
 
 # Momentum equation (single vector equation)
 add_equation!(problem, "∂t(u) - nu*Δ(u) + ∇(p) = -u⋅∇(u)")

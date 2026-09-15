@@ -255,12 +255,12 @@ problem = LBVP([u, tau_u1, tau_u2])
 # Step 3: Add equation with lift() operators
 # The lift() terms place tau values at specific spectral modes
 add_equation!(problem,
-    lap(u) + lift(tau_u1, zbasis, -1) + lift(tau_u2, zbasis, -2) - f
+    "lap(u) + lift(tau_u1, -1) + lift(tau_u2, -2) = f"
 )
 
 # Step 4: Add boundary conditions
-add_equation!(problem, "u(z=0) = 0")
-add_equation!(problem, "u(z=1) = 0")
+add_bc!(problem, "u(z=0) = 0")
+add_bc!(problem, "u(z=1) = 0")
 
 # Solve
 solver = BoundaryValueSolver(problem)
@@ -272,20 +272,15 @@ solve!(solver)
 The `lift()` operator "lifts" a lower-dimensional tau field into the full domain by placing its values at specific spectral modes:
 
 ```julia
-lift(tau_field, basis, n)
+lift(tau_field, n)               # auto-detects basis (recommended)
+lift(tau_field, basis, n)        # explicit basis
 ```
 
-**Arguments:**
-- `tau_field` - The tau field (lives on reduced bases)
-- `basis` - The basis along which to lift (typically the non-periodic direction)
-- `n` - Which spectral mode to modify
+The 2-argument form auto-detects the non-periodic basis (Chebyshev/Legendre) that the tau field is missing. This matches the Dedalus syntax.
 
 **Mode indexing (`n`):**
-- `n = 0` → First mode (mode 0)
 - `n = -1` → Last mode (N-1)
 - `n = -2` → Second-to-last mode (N-2)
-
-**Why specific modes?** The tau method works by replacing the highest-order spectral equations with boundary conditions. The `lift()` operator places tau contributions at these modes.
 
 ### Comparison: Tarang vs. Dedalus
 
@@ -294,9 +289,9 @@ Tarang.jl closely follows the Dedalus design pattern:
 | Feature | Dedalus (Python) | Tarang.jl (Julia) |
 |---------|------------------|-------------------|
 | Create tau field | `tau_p = dist.Field(name='tau_p', bases=xbasis)` | `tau_p = ScalarField(dist, "tau_p", (xbasis,))` |
-| Lift operator | `lift(tau_p, -1)` | `lift(tau_p, zbasis, -1)` |
-| Add to equation | `"lap(u) + lift(tau_p, -1) = f"` | `lap(u) + lift(tau_p, zbasis, -1) - f` |
-| Add BC | `problem.add_bc("u(z=0) = 0")` | `add_equation!(problem, "u(z=0) = 0")` |
+| Lift operator | `lift(tau_p, -1)` | `lift(tau_p, -1)` |
+| Add to equation | `"lap(u) + lift(tau_p, -1) = f"` | `"lap(u) + lift(tau_p, -1) = f"` |
+| Add BC | `problem.add_bc("u(z=0) = 0")` | `add_bc!(problem, "u(z=0) = 0")` |
 
 **Dedalus example:**
 ```python
@@ -316,9 +311,9 @@ tau_u1 = ScalarField(dist, "tau_u1", (xbasis,))
 tau_u2 = ScalarField(dist, "tau_u2", (xbasis,))
 
 problem = LBVP([u, tau_u1, tau_u2])
-add_equation!(problem, lap(u) + lift(tau_u1, zbasis, -1) + lift(tau_u2, zbasis, -2) - f)
-add_equation!(problem, "u(z=0) = 0")
-add_equation!(problem, "u(z=1) = 0")
+add_equation!(problem, "lap(u) + lift(tau_u1, -1) + lift(tau_u2, -2) = f")
+add_bc!(problem, "u(z=0) = 0")
+add_bc!(problem, "u(z=1) = 0")
 ```
 
 ### Why Explicit Tau Fields?
@@ -343,16 +338,18 @@ The Dedalus approach (explicit tau fields) has several advantages:
 ### Checking Boundary Condition Satisfaction
 
 ```julia
-# After solving, verify BCs are satisfied
-u_at_left = evaluate(u, z=0.0)
-u_at_right = evaluate(u, z=1.0)
+# After solving, verify BCs are satisfied by checking boundary values
+ensure_layout!(u, :g)
+grid = local_grids(dist, xbasis, zbasis)
+u_data = get_grid_data(u)
 
-@assert abs(u_at_left - 0.0) < 1e-10 "Left BC not satisfied"
-@assert abs(u_at_right - 0.0) < 1e-10 "Right BC not satisfied"
+# Check values at z boundaries (first and last z-index on Chebyshev grid)
+@assert maximum(abs.(u_data[:, 1])) < 1e-10 "Left BC not satisfied"
+@assert maximum(abs.(u_data[:, end])) < 1e-10 "Right BC not satisfied"
 
 # You can also inspect tau field values
-println("tau_u1 values: ", tau_u1.data_c)
-println("tau_u2 values: ", tau_u2.data_c)
+println("tau_u1 values: ", get_coeff_data(tau_u1))
+println("tau_u2 values: ", get_coeff_data(tau_u2))
 ```
 
 ## Number of Tau Terms Required
@@ -405,7 +402,7 @@ problem = IVP([u, p, tau_u1, tau_u2, tau_p])
 
 # Equations
 add_equation!(problem, "div(u) + tau_p = 0")  # tau_p removes degeneracy
-add_equation!(problem, "∂t(u) - nu*Δ(u) + ∇(p) + lift(tau_u2) = -u⋅∇(u)")
+add_equation!(problem, "∂t(u) - nu*Δ(u) + ∇(p) + lift(tau_u2, -1) = -u⋅∇(u)")
 
 # Boundary conditions
 add_bc!(problem, "u(z=0) = 0")
@@ -443,14 +440,13 @@ tau_u2 = VectorField(dist, coords, "tau_u2", (x_basis,))  # For evolution equati
 lift_basis = derivative_basis(z_basis)
 
 # First-order gradient substitution with tau correction
-# grad_u = ∇(u) + ez*lift(tau_u1, lift_basis, -1)
-add_substitution!(problem, "grad_u", "∇(u) + ez*lift(tau_u1)")
+add_parameters!(problem, grad_u="∇(u) + ez*lift(tau_u1, -1)")
 
 # Continuity: trace(grad_u) + tau_p = 0
 add_equation!(problem, "trace(grad_u) + tau_p = 0")
 
 # Momentum using div(grad_u) instead of Δ(u)
-add_equation!(problem, "∂t(u) - nu*div(grad_u) + ∇(p) + lift(tau_u2) = -u⋅∇(u)")
+add_equation!(problem, "∂t(u) - nu*div(grad_u) + ∇(p) + lift(tau_u2, -1) = -u⋅∇(u)")
 ```
 
 ### Why First-Order is Better

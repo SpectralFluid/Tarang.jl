@@ -104,8 +104,8 @@ bad = boundary_advection_diffusion_setup(
 function set_velocity!(bad, t)
     # Example: rotating flow
     x, y = get_coordinates(bad)
-    bad.velocities["concentration"].components[1].data_g .= -sin.(y)
-    bad.velocities["concentration"].components[2].data_g .= sin.(x)
+    get_grid_data(bad.velocities["concentration"].components[1]) .= -sin.(y)
+    get_grid_data(bad.velocities["concentration"].components[2]) .= sin.(x)
 end
 ```
 
@@ -172,7 +172,7 @@ y = range(0, Ly, length=Ny)
 X = [xi for xi in x, _ in y]
 Y = [yj for _ in x, yj in y]
 
-θ.data_g .= exp.(-((X .- π).^2 ./ 0.5 .+ (Y .- π).^2 ./ 0.3))
+get_grid_data(θ) .= exp.(-((X .- π).^2 ./ 0.5 .+ (Y .- π).^2 ./ 0.3))
 
 # Time stepping
 dt = 0.001
@@ -214,8 +214,8 @@ qg = boundary_advection_diffusion_setup(
 )
 
 # Set different initial conditions at each surface
-qg.fields["theta_bot"].data_g .= initial_bottom
-qg.fields["theta_top"].data_g .= initial_top
+get_grid_data(qg.fields["theta_bot"]) .= initial_bottom
+get_grid_data(qg.fields["theta_top"]) .= initial_top
 
 # Both surfaces evolve together
 for step in 1:nsteps
@@ -231,7 +231,7 @@ Custom source terms can be added:
 # Gaussian forcing centered at (π, π)
 function my_forcing(bad, boundary_name)
     θ = bad.fields[boundary_name]
-    Nx, Ny = size(θ.data_g)
+    Nx, Ny = size(get_grid_data(θ))
 
     x = range(0, bad.params["Lx"], length=Nx)
     y = range(0, bad.params["Ly"], length=Ny)

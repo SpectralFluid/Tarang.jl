@@ -111,10 +111,10 @@ Create an Initial Value Problem (IVP):
 problem = IVP([T])
 
 # Add the heat equation
-add_equation!(problem, "∂t(T) = kappa*lap(T)")
+add_equation!(problem, "∂t(T) - kappa*lap(T) = 0")
 
 # Set diffusion coefficient
-problem.parameters["kappa"] = 1.0
+problem.namespace["kappa"] = 1.0
 ```
 
 The equation uses symbolic notation:
@@ -217,8 +217,8 @@ T = ScalarField(dist, "T", (x_basis, z_basis))
 
 # Problem
 problem = IVP([T])
-add_equation!(problem, "∂t(T) = kappa*lap(T)")
-problem.parameters["kappa"] = 0.01
+add_equation!(problem, "∂t(T) - kappa*lap(T) = 0")
+problem.namespace["kappa"] = 0.01
 
 # Boundary conditions (Dedalus-style syntax auto-detected)
 add_equation!(problem, "T(z=0) = 1")
@@ -278,9 +278,9 @@ problem = IVP([u.components[1], u.components[2], p, T])
 Add and modify parameters easily:
 
 ```julia
-problem.parameters["Ra"] = 1e6  # Rayleigh number
-problem.parameters["Pr"] = 0.7  # Prandtl number
-problem.parameters["kappa"] = 0.01  # Thermal diffusivity
+problem.namespace["Ra"] = 1e6  # Rayleigh number
+problem.namespace["Pr"] = 0.7  # Prandtl number
+problem.namespace["kappa"] = 0.01  # Thermal diffusivity
 ```
 
 ### Adaptive Time Stepping

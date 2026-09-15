@@ -127,14 +127,14 @@ using Tarang
 reducer = GlobalArrayReducer(dist.comm)
 
 # Compute global max
-u_max = reduce_scalar(reducer, maximum(abs.(u.data_g)), MPI.MAX)
+u_max = reduce_scalar(reducer, maximum(abs.(get_grid_data(u))), MPI.MAX)
 
 # Compute global mean
-u_mean = reduce_scalar(reducer, mean(u.data_g), MPI.SUM) / dist.size
+u_mean = reduce_scalar(reducer, mean(get_grid_data(u)), MPI.SUM) / dist.size
 
 # Compute global energy
 function global_energy(u, reducer)
-    local_energy = sum(u.data_g.^2) / 2
+    local_energy = sum(get_grid_data(u).^2) / 2
     return reduce_scalar(reducer, local_energy, MPI.SUM)
 end
 ```
@@ -146,7 +146,7 @@ function compute_reynolds_number(u, nu, L)
     ensure_layout!(u, :g)
 
     # RMS velocity
-    u_rms = sqrt(mean(u.data_g.^2))
+    u_rms = sqrt(mean(get_grid_data(u).^2))
 
     # Reynolds number
     Re = u_rms * L / nu
@@ -165,7 +165,7 @@ function compute_nusselt(T, uz, L, kappa)
     ensure_layout!(uz, :g)
 
     # Convective heat flux
-    flux_conv = mean(T.data_g .* uz.data_g)
+    flux_conv = mean(get_grid_data(T) .* get_grid_data(uz))
 
     # Conductive flux (from temperature gradient)
     dT = 1.0  # Temperature difference
@@ -185,7 +185,7 @@ end
 function compute_1d_spectrum(u, axis)
     ensure_layout!(u, :c)  # Spectral space
 
-    data = u.data_c
+    data = get_coeff_data(u)
     N = size(data, axis)
 
     # Sum over other dimensions
@@ -219,7 +219,7 @@ function compute_shell_spectrum(u, kmax)
         k_bin = round(Int, k_mag)
 
         if 1 <= k_bin <= kmax
-            E_k[k_bin] += abs2(u.data_c[i,j,k])
+            E_k[k_bin] += abs2(get_coeff_data(u)[i,j,k])
             counts[k_bin] += 1
         end
     end
@@ -264,7 +264,7 @@ using Plots
 
 function plot_field(field, title="")
     ensure_layout!(field, :g)
-    data = field.data_g
+    data = get_grid_data(field)
 
     heatmap(data',
         xlabel="x", ylabel="z",
@@ -285,7 +285,7 @@ using CairoMakie
 
 function plot_field_makie(field)
     ensure_layout!(field, :g)
-    data = field.data_g
+    data = get_grid_data(field)
 
     fig = Figure()
     ax = Axis(fig[1,1], xlabel="x", ylabel="z")
@@ -311,7 +311,7 @@ function save_checkpoint(solver, filename)
 
     for (name, field) in solver.problem.fields
         ensure_layout!(field, :c)
-        state["fields"][name] = copy(field.data_c)
+        state["fields"][name] = copy(get_coeff_data(field))
     end
 
     if MPI.Comm_rank(MPI.COMM_WORLD) == 0
@@ -334,7 +334,7 @@ function load_checkpoint!(solver, filename)
 
     for (name, data) in state["fields"]
         field = solver.problem.fields[name]
-        field.data_c .= data
+        get_coeff_data(field) .= data
         field.current_layout = :c
     end
 end
