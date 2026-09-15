@@ -312,6 +312,16 @@ compute_eddy_viscosity!(sgs_model,
 νₑ = get_eddy_viscosity(sgs_model)
 ```
 
+### Numerical Evaluation
+
+The CPU and GPU implementations use the same scalar kernels. Before evaluating
+the contractions, AMD normalizes velocity gradients and, for diffusivity,
+scalar gradients independently. It restores the velocity scale afterward;
+the scalar-gradient scale cancels. This preserves the expected scaling across
+very small and large gradient magnitudes without an absolute epsilon cutoff.
+Zero gradients give zero closure coefficients, while nonfinite gradients remain
+visible as NaN. Clipping negative predictions still follows `clip_negative`.
+
 ### Choosing the AMD Constant
 
 The constant $C$ depends on the numerical discretization:

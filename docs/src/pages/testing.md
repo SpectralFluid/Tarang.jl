@@ -95,6 +95,15 @@ actual CUDA restart behavior when hardware is available. Multi-rank restart
 coverage lives in `test_mpi_checkpoint_restart.jl`. A skipped CUDA test is not
 evidence of a hardware pass.
 
+LES coverage follows the same pattern. `test_les_models.jl` belongs to both
+`TEST_FILES` and `GPU_TEST_FILES`; it compares the closures with independent
+tensor-contraction references and runs CUDA cases when a device is available.
+`les_range_helpers.jl` supplies analytic AMD cases shared by that file and
+`test_les_models_gpu_compat.jl`. Those cases exercise small and large gradient
+scales, 2D/3D, Float32/Float64, and both clipping modes on CPU, JLArrays, and CUDA.
+JLArrays runs with scalar indexing disabled and provides device compatibility
+coverage without substituting for an actual CUDA run.
+
 Beyond feature tests, several files are *ratchets* that pin a population the
 codebase must not grow — `test_layout_discipline_ratchet.jl`,
 `test_backend_dispatch_ratchet.jl`, `test_hasfield_ratchet.jl`,

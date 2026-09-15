@@ -31,6 +31,7 @@ src/
 │   │   ├── field_data/       storage, copies, scales (dealiasing) — per-field data
 │   │   └── field_layout/     :g/:c layout transitions and field arithmetic
 │   ├── forcing/              stochastic + deterministic forcing (types, generation, application)
+│   ├── les_models.jl         array-level Smagorinsky and AMD closures; shared CPU/GPU kernels
 │   ├── nonlinear/            nonlinear products, 3/2 padding, dealiasing
 │   ├── operators/            symbolic operator tree
 │   │   ├── derivatives/      Fourier / polynomial derivatives, matrix apply
@@ -229,6 +230,28 @@ stochastic, and solver persistence. NetCDF writes stage device arrays to host
 memory explicitly. Restart validates metadata across all processor files
 before changing destination fields. See [I/O](../api/io.md) for restart
 compatibility, including the Julia-version restriction for stochastic state.
+
+## LES model ownership
+
+`src/core/load_models.jl` loads `src/core/les_models.jl`, which owns the
+`SmagorinskyModel` and `AMDModel` types, gradient validation, eddy viscosity and
+diffusivity calculations, SGS stress, and diagnostics. Both backends broadcast
+the same scalar kernels over architecture-specific arrays. There is no separate
+CUDA AMD implementation under `ext/cuda/`; the extension supplies device arrays
+and transfers through the architecture interface.
+
+AMD normalizes velocity gradients before forming their contractions, then
+restores the velocity scale. Its scalar diffusivity additionally normalizes
+scalar gradients, whose scale cancels. This avoids the intermediate powers of
+very small or large gradients that previously produced zero or NaN despite a
+representable result.
+
+These closures consume grid-space gradient arrays and return eddy viscosity,
+diffusivity, or stress arrays. They are not automatically attached to the solver RHS. Callers
+must apply the divergence of the full symmetric SGS stress, including the
+contribution from spatially varying viscosity; see [LES Models](les_models.md).
+The CPU, reference-device, and CUDA test ownership is described in
+[Testing](testing.md).
 
 ## RHS execution policy
 
