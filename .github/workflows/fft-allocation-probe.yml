@@ -1,0 +1,29 @@
+name: FFT allocation probe
+on:
+  push:
+    branches: [ci/fft-allocation-probe]
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      JULIA_NUM_THREADS: '2,1'
+      OMP_NUM_THREADS: '1'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: julia-actions/setup-julia@v1
+        with:
+          version: '1.12'
+      - uses: julia-actions/cache@v1
+      - name: Prepare focused environment
+        shell: julia --color=yes {0}
+        run: |
+          using Pkg
+          ENV["JULIA_PKG_PRECOMPILE_AUTO"] = "0"
+          Pkg.activate(".fft-probe-env")
+          Pkg.develop(path=pwd())
+          Pkg.add(["CUDA", "FFTW"])
+      - name: Diagnose FFT allocations
+        run: julia --startup-file=no --check-bounds=yes --code-coverage=user --project=.fft-probe-env test/fft_allocation_probe.jl
