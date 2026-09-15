@@ -8,8 +8,8 @@
 </div>
 ```
 
-[![Build Status](https://github.com/subhk/Tarang.jl/workflows/CI/badge.svg)](https://github.com/subhk/Tarang.jl/actions)
-[![Documentation](https://img.shields.io/badge/docs-stable-blue.svg)](https://subhk.github.io/Tarang.jl/stable)
+[![Build Status](https://github.com/SpectralFluid/Tarang.jl/workflows/CI/badge.svg)](https://github.com/SpectralFluid/Tarang.jl/actions)
+[![Documentation](https://img.shields.io/badge/docs-stable-blue.svg)](https://spectralfluid.github.io/Tarang.jl/stable)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
 
 ---
@@ -95,7 +95,7 @@ in the stable manual automatically.
 
 ```julia
 using Pkg
-Pkg.add(url="https://github.com/subhk/Tarang.jl")
+Pkg.add(url="https://github.com/SpectralFluid/Tarang.jl")
 ```
 
 That is the whole serial installation. MPI, PencilArrays, PencilFFTs and KernelAbstractions are
@@ -382,7 +382,7 @@ Only CUDA is a `[weakdeps]` package extension.
 
 ## Contributing
 
-We welcome contributions! See our [GitHub repository](https://github.com/subhk/Tarang.jl) for:
+We welcome contributions! See our [GitHub repository](https://github.com/SpectralFluid/Tarang.jl) for:
 - Bug reports and feature requests
 - Documentation improvements
 - Pull requests
@@ -397,7 +397,7 @@ If you use Tarang.jl in your research, please cite:
 @software{tarang_jl,
   author = {Kar, Subhajit},
   title  = {Tarang.jl: A Spectral PDE Solver for Julia},
-  url    = {https://github.com/subhk/Tarang.jl},
+  url    = {https://github.com/SpectralFluid/Tarang.jl},
   year   = {2024}
 }
 ```

@@ -12,8 +12,8 @@ julia --project=. -e 'using Pkg; Pkg.test()'
 
 ### Specific Test File
 
-Every file under `test/` is self-contained (it starts with `using Test, Tarang`),
-so it can be included on its own:
+Most feature test files can be included on their own. Check the file's imports
+and setup first; registry checks and runner helpers need their driver context:
 
 ```bash
 julia --project=. -e 'using Test, Tarang; include("test/test_solvers.jl")'
@@ -72,18 +72,28 @@ testset when no functional device is present.
 There is no hand-maintained list of test files in the runner. `test/file_lists.jl`
 is the single registry, and every driver reads it:
 
-| List | Files | Run by |
-|---|---|---|
-| `TEST_FILES` | ~170 | `Pkg.test()` on every CI job |
-| `OPTIONAL_TEST_FILES` | 7 | `Pkg.test()` with `TARANG_RUN_OPTIONAL_TESTS=true` |
-| `GPU_TEST_FILES` | 5 | `test/run_gpu_ci.jl` on a CUDA host (Buildkite) |
-| `MPI_TEST_FILES` | 58 | `test/run_mpi_ci.jl [nprocs]`, one `mpiexec` world per file |
-| `DISTRIBUTED_GPU_TEST_FILES` | 8 | `TARANG_MPI_FILESET=distributed_gpu test/run_mpi_ci.jl 2` (CUDA + NCCL) |
+| List | Run by |
+|---|---|
+| `TEST_FILES` | `Pkg.test()` on every CPU CI job |
+| `OPTIONAL_TEST_FILES` | `Pkg.test()` with `TARANG_RUN_OPTIONAL_TESTS=true` |
+| `GPU_TEST_FILES` | `test/run_gpu_ci.jl` on a CUDA host (Buildkite) |
+| `MPI_TEST_FILES` | `test/run_mpi_ci.jl [nprocs]`, one MPI world per file |
+| `DISTRIBUTED_GPU_TEST_FILES` | `TARANG_MPI_FILESET=distributed_gpu julia --project=. test/run_mpi_ci.jl 2` (CUDA + NCCL) |
 
 `test_test_inventory.jl` runs first and fails if a `test_*.jl` file on disk is
 missing from the registry, a registered file is missing on disk, or a registered
 file is not tracked by git (a file that was never `git add`ed passes locally and
-fails on every clean clone). Register new files in exactly one list.
+fails on every clean clone). Register new files in the appropriate execution
+groups. A file may belong to more than one group when it covers both CPU and
+CUDA behavior, or both single-process and distributed execution. The registry
+is the source of truth for the current file lists.
+
+For example, `test_stochastic_forcing.jl` and
+`test_stochastic_checkpoint_restart.jl` run in both the default and GPU groups.
+The latter checks CPU restart continuity, device staging with `JLArrays`, and
+actual CUDA restart behavior when hardware is available. Multi-rank restart
+coverage lives in `test_mpi_checkpoint_restart.jl`. A skipped CUDA test is not
+evidence of a hardware pass.
 
 Beyond feature tests, several files are *ratchets* that pin a population the
 codebase must not grow — `test_layout_discipline_ratchet.jl`,

@@ -4,6 +4,10 @@ This page is a contributor map of Tarang.jl. It describes ownership and the
 runtime path without duplicating type definitions that are easier to read in
 the source.
 
+Use the website's **dev** version for the structure on `main`; **stable**
+describes the latest tagged release. The published manual is built from
+`docs/src/`, with navigation and deployment configured in `docs/make.jl`.
+
 ## Package layout
 
 ```text
@@ -40,15 +44,25 @@ src/
 │   ├── timesteppers/         RK, multistep, diagonal-IMEX, ETD schemes and path selection
 │   ├── transforms/           serial transforms, layout rules, GPU dispatch hooks
 │   └── transpose/            TransposableField: MPI pencil transposes (pack/unpack, async)
-├── tools/                    matrix solvers (sparse, GPU, batched), NetCDF I/O, checkpoints,
-│   └── temporal_filters/     config, logging, parallel helpers, temporal filters
+├── tools/                    matrix solvers, NetCDF I/O, checkpoints, config, logging
+│   └── temporal_filters/     temporal, wave/mean, and GQL filters
 └── extras/
     └── flow_tools/           CFL, spectra, QG/streamfunction diagnostics, quick domains, plotting
 
 ext/
-└── TarangCUDAExt.jl
-    └── cuda/                 device architecture, cuFFT/DCT-I transforms, Chebyshev derivative
-                              kernels, batched matsolvers, NCCL transposes, memory
+├── TarangCUDAExt.jl          extension module and ordered CUDA includes
+└── cuda/                    device architecture, cuFFT/DCT-I transforms, Chebyshev
+                             derivatives, batched matsolvers, NCCL transposes, memory
+
+test/
+├── file_lists.jl             shared CPU, optional, GPU, MPI, and distributed GPU registry
+├── runtests.jl               package test runner
+├── run_gpu_ci.jl             CUDA test driver
+└── run_mpi_ci.jl             launches each registered MPI test in its own process world
+
+docs/
+├── make.jl                  Documenter build, navigation, and deployment
+└── src/                     published manual, tutorials, API pages, and assets
 ```
 
 `src/load_order.jl` is the whole include order, as twelve manifests. Each one
@@ -70,9 +84,10 @@ owning manifest and never as a one-off include in `src/Tarang.jl`:
 | 11 | `extras/load_extras.jl` | flow tools, plot tools, quick domains, analysis tasks |
 | 12 | `tools/load_pretty_printing.jl` | `show` methods |
 
-Most `src/core/*.jl` files at the top level (`field.jl`, `operators/operators.jl`,
-`transforms.jl`, ...) are aggregators that include the directory of the same
-name; the implementation lives in the directory.
+Entry points such as `src/core/field.jl`, `src/core/operators/operators.jl`,
+`src/core/transforms.jl`, and `src/core/stochastic_forcing.jl` aggregate
+implementation files from their respective directories. Forcing is split
+under `src/core/forcing/`.
 
 ## Dependency direction
 
@@ -179,7 +194,7 @@ the working alternative.
 | Path | File | When |
 |---|---|---|
 | per-mode subproblem RK / multistep | `step_subproblem_rk.jl`, `step_subproblem_multistep.jl` | any coupled (Chebyshev/Jacobi) axis; CPU, MPI, and single GPU |
-| batched per-mode RK | `step_subproblem_rk_batched.jl` | as above, 2D, one Fourier axis; default on GPU, `batched_modes=true` on CPU |
+| batched per-mode RK | `step_subproblem_rk_batched.jl` | supported 2D/3D Fourier–Chebyshev layouts; default on GPU, `batched_modes=true` on CPU |
 | global-matrix IMEX | `step_rk.jl`, `step_multistep.jl`, `step_global_matrix.jl`, `step_etd.jl` | serial CPU with no subproblems (pure Fourier) |
 | explicit field path | `step_rk.jl` (`_step_explicit_rk_gpu!`), `step_multistep_field.jl` | GPU or MPI pure-Fourier problem with no implicit operator |
 | serial diagonal IMEX | `step_diagonal_imex.jl` | Selected internally by `RK222`, `RK443`, or `SBDF2` on GPU Fourier problems or serial problems with an attached diagonal operator: per-mode division by `1 + a·dt·L̂(k)` |
@@ -187,6 +202,33 @@ the working alternative.
 
 The user-facing consequences (which scheme runs where, and what refuses) are
 tabulated in [Time Steppers](timesteppers.md#Where-each-scheme-runs).
+
+`core/timesteppers/types.jl` declares `const RK443_IMEX = RK443`.
+Both names therefore use the same dispatch, workspace allocation, and backend
+capability traits. Changes to RK443 belong in the shared implementation.
+`core/timesteppers/state.jl` owns reusable stage fields and timestepper buffers;
+per-mode solve buffers and factorizations belong to subsystem caches.
+
+## Output and checkpoint ownership
+
+Persistence is layered under `src/tools/` so the field and solver core does not
+depend on file formats:
+
+| Layer | Files | Responsibility |
+|---|---|---|
+| Scheduled output | `netcdf_group_api.jl`, `netcdf_output.jl` | NetCDF groups, output handlers, and host staging for file writes |
+| Reconstruction | `netcdf_merge.jl`, `netcdf_merge_layout.jl` | processor-file discovery, coverage validation, and spectral reconstruction |
+| Slab I/O | `netcdf_slab_io.jl` | index-range intersections and local slab reads, without fields, solvers, or MPI collectives |
+| Field persistence | `field_netcdf_io.jl` | field metadata, layouts, and redistribution across restart decompositions |
+| Stochastic state | `stochastic_checkpoint.jl` | forcing configuration, private RNG state, cached draw, and update time |
+| Solver restart | `solver_checkpoint.jl` | collective preflight, field restoration, simulation clock, and restartable timestepper checks |
+
+`tools/load_output.jl` loads scheduled output before the evaluator;
+`tools/load_runtime.jl` loads reconstruction and slab I/O before field,
+stochastic, and solver persistence. NetCDF writes stage device arrays to host
+memory explicitly. Restart validates metadata across all processor files
+before changing destination fields. See [I/O](../api/io.md) for restart
+compatibility, including the Julia-version restriction for stochastic state.
 
 ## RHS execution policy
 

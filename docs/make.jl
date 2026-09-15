@@ -26,7 +26,7 @@ end
 # HTML format configuration
 format = Documenter.HTML(
     prettyurls = get(ENV, "CI", "false") == "true",
-    canonical = "https://subhk.github.io/Tarang.jl/stable",
+    canonical = "https://spectralfluid.github.io/Tarang.jl/stable",
     assets = [
         "assets/custom.css",
     ],
@@ -34,7 +34,7 @@ format = Documenter.HTML(
     collapselevel = 2,
     sidebar_sitename = true,
     edit_link = "main",
-    repolink = "https://github.com/subhk/Tarang.jl",
+    repolink = "https://github.com/SpectralFluid/Tarang.jl",
     size_threshold = 200 * 1024^2,  # 200 MiB
     size_threshold_warn = 10 * 1024^2   # 10 MiB warning
 )
@@ -108,7 +108,7 @@ println("Generating documentation with Documenter.jl...")
 makedocs(;
     modules = tarang_loaded ? [Tarang] : Module[],
     authors = "Subhajit Kar",
-    repo = "https://github.com/subhk/Tarang.jl/blob/{commit}{path}#{line}",
+    repo = "https://github.com/SpectralFluid/Tarang.jl/blob/{commit}{path}#{line}",
     sitename = "Tarang.jl",
     format = format,
     pages = pages,
@@ -138,7 +138,7 @@ if get(ENV, "CI", "false") == "true"
     println("Deploying documentation...")
 
     deploydocs(;
-        repo = "github.com/subhk/Tarang.jl.git",
+        repo = "github.com/SpectralFluid/Tarang.jl.git",
         devbranch = "main",
         target = "build",
         deps = nothing,
