@@ -597,6 +597,12 @@ function _implicit_ncc_matrix(ncc_operand)
             return ImplicitNCCUnsupported(
                 "the coefficient field `$(field.name)` has no coefficient-space data available")
         end
+        # PencilArray storage can permute the logical axes and split either
+        # axis across ranks. Inspect one global logical array so DC selection
+        # is correct and every rank takes the same branch before transforms.
+        if coeffs isa PencilArrays.PencilArray
+            coeffs = gather_array(field.dist, coeffs)
+        end
         maxabs = maximum(abs, coeffs)
         # Identically zero coefficient: the term genuinely vanishes. Return a real zero
         # matrix rather than `nothing`, which would have left the operand unscaled (q ≡ 1).
@@ -618,7 +624,8 @@ function _implicit_ncc_matrix(ncc_operand)
 
     # q on the coupled-axis grid. Because q is constant along the Fourier directions, the
     # fiber at the first index of every other axis is the entire coefficient profile.
-    g = Array(grid_data!(field))
+    grid = grid_data!(field)
+    g = grid isa PencilArrays.PencilArray ? gather_array(field.dist, grid) : Array(grid)
     idx = ntuple(d -> (d == jax ? Colon() : 1), ndims(g))
     qfiber = vec(g[idx...])
     if length(qfiber) != Nc
@@ -666,7 +673,7 @@ function _ncc_temp_field(coupled_basis)
     N      = coupled_basis.meta.size
     cname  = coupled_basis.meta.element_label
     coord  = CartesianCoordinates(cname)
-    dist   = Distributor(coord; dtype=Float64)
+    dist   = Distributor(coord; dtype=Float64, comm=MPI.COMM_SELF)
     b1     = _rebuild_jacobi_1d(coupled_basis, coord[cname], N, Float64(lo), Float64(hi))
     b1 === nothing && return nothing
     return ScalarField(Domain(dist, (b1,)), "_ncc_tmp")

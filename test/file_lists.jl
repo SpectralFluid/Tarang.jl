@@ -67,6 +67,7 @@ const TEST_FILES = [
     "test_solvers.jl",
     "test_cpu_matsolver_concurrency.jl",
     "test_bvp_solve.jl",
+    "test_nlbvp_newton_regressions.jl",
     "test_evp_solve.jl",
     "test_subproblem_modes.jl",
     "test_problem_matrices_support.jl",

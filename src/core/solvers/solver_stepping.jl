@@ -431,11 +431,23 @@ function solve_nonlinear!(solver::BoundaryValueSolver)
     # operator dF = orig_L − frechet(rhs). dF carries the current-state NCCs
     # (e.g. ∂(u²)/∂u = 2u), so build_matrices! rebuilds it fresh each iteration.
     origL = [get(ed, "L", nothing) for ed in eqd]
+    base_state = [copy(f) for f in state]
+    state_names = Set(f.name for f in state)
+    for f in base_state
+        name = string(gensym(:newton_base))
+        while name in state_names
+            name = string(gensym(:newton_base))
+        end
+        f.name = name
+        push!(state_names, name)
+    end
+    snapshots = IdDict{Any, Any}(f => base for (f, base) in zip(state, base_state))
     dF_expr = Vector{Any}(undef, length(eqd))
     for (i, ed) in enumerate(eqd)
         rhs_expr = get(ed, "rhs", nothing)
         fr = (rhs_expr === nothing) ? 0 :
-             frechet_differential(rhs_expr, problem.variables, problem.variables)
+             frechet_differential(_newton_snapshot_expression(rhs_expr, snapshots),
+                                  base_state, state)
         dF_expr[i] = (origL[i] === nothing) ? origL[i] :
                      ((fr === 0 || fr === nothing) ? origL[i] : origL[i] - fr)
     end
@@ -518,11 +530,14 @@ function solve_nonlinear!(solver::BoundaryValueSolver)
         end
 
         # --- Rebuild dF per subproblem (Jacobian at current state) ---
+        copy_solution_to_fields!(base_state, x)
         # The state (and hence any state-dependent NCC coefficient) changed since
         # the last build: clear the cross-subproblem implicit-NCC memo so each
         # rank recomputes it exactly once this pass (rank-uniform collectives).
         _invalidate_implicit_ncc_memo!()
-        for (i, ed) in enumerate(eqd); ed["L"] = dF_expr[i]; end
+        for (i, ed) in enumerate(eqd)
+            ed["L"] = _newton_materialize_coefficients(dF_expr[i], state)
+        end
         for sp in sps; sp.L_min === nothing || build_matrices!(sp, ["L"], solver); end
 
         # --- Newton step: dF_sp δ = F_sp ; x_sp ← x_sp − δ ; scatter ---

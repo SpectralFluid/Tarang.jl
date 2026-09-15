@@ -44,6 +44,30 @@ _gather(u) = (gd = get_grid_data(u);
     dom = Domain(dist, (zb, xb))
     lb  = derivative_basis(zb, 1)
 
+    @testset "NCC inspection uses global logical axes" begin
+        coefficient = ScalarField(dom, "coefficient")
+        ensure_layout!(coefficient, :g)
+        gv = PencilArrays.global_view(get_grid_data(coefficient))
+        zfull = [Lz/2 * (1-cos(π*(k-1)/(Nz-1))) for k in 1:Nz]
+        for I in CartesianIndices(gv)
+            gv[I] = zfull[I[1]] * (Lz-zfull[I[1]])
+        end
+        matrix = Tarang._implicit_ncc_matrix(coefficient)
+        expected = zeros(ComplexF64, Nz)
+        expected[1], expected[3] = 0.5, -0.5
+        @test matrix isa AbstractMatrix
+        @test matrix[:, 1] ≈ expected atol=1e-12
+
+        ensure_layout!(coefficient, :g)
+        gv = PencilArrays.global_view(get_grid_data(coefficient))
+        for I in CartesianIndices(gv)
+            gv[I] = sin(2π * (I[2]-1)/Nx)
+        end
+        # Every rank must reject Fourier coupling, including ranks whose local
+        # coefficient slice does not contain a nonzero Fourier coefficient.
+        @test Tarang._implicit_ncc_matrix(coefficient) isa Tarang.ImplicitNCCUnsupported
+    end
+
     @testset "Linear BVP matches serial" begin
         u    = ScalarField(dom, "u")
         tau1 = ScalarField(dist, "tau1", (), Float64)
