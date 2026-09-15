@@ -71,6 +71,7 @@ GPU BVP does not imply nonlinear GPU support. See
 
 ## Further reading
 
+- [Lane–Emden application](../tutorials/nlbvp_lane_emden.md): radial reduction, the nonzero solution branch, and resolution refinement.
 - [Tau method](../pages/tau_method.md) and [boundary conditions](../tutorials/boundary_conditions.md).
 - [Problem API](../api/problems.md) and [solver reference](../pages/solvers.md#BoundaryValueSolver).
 - [Eigenvalue problems](eigenvalue.md): analyze a linearized operator about a chosen state.

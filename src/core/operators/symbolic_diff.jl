@@ -448,6 +448,46 @@ function frechet_differential(F, vars::Vector, perts::Vector)
     return foldl(_simplify_add, terms)
 end
 
+# Newton matrix assembly must distinguish the current state (an NCC) from the
+# correction variable. Reusing the same field for both makes products such as
+# 3*u^2*δu look nonlinear to the matrix builder, which then omits the term.
+_newton_snapshot_expression(f::ScalarField, snapshots::IdDict) = get(snapshots, f, f)
+function _newton_snapshot_expression(expr, snapshots::IdDict)
+    if expr isa Operator && any(f -> has(expr, f), keys(snapshots))
+        error("Newton coefficient snapshots are unsupported for $(typeof(expr))")
+    end
+    return expr
+end
+
+function _newton_snapshot_expression(op::Union{
+        AddOperator, SubtractOperator, MultiplyOperator, DivideOperator,
+        PowerOperator, NegateOperator, Copy, Differentiate, Laplacian,
+        FractionalLaplacian, Gradient, Divergence, TimeDerivative,
+        UnaryGridFunction, GeneralFunction}, snapshots::IdDict)
+    args = map(fieldnames(typeof(op))) do name
+        value = getfield(op, name)
+        value isa Operand ? _newton_snapshot_expression(value, snapshots) : value
+    end
+    return Base.typename(typeof(op)).wrapper(args...)
+end
+
+_newton_materialize_coefficients(expr, state) = expr
+function _newton_materialize_coefficients(op::Operator, state)
+    if !_depends_on_vars(op, state) && !_is_const_or_param_local(op) &&
+       _is_scalar_coefficient(op)
+        # The implicit NCC builder accepts fields. Evaluate compound frozen
+        # coefficients (e.g. -r*u_base^2) afresh at this Newton iterate.
+        return evaluate_solver_expression(op, state; layout=:g, template=first(state))
+    end
+    names = fieldnames(typeof(op))
+    args = map(names) do name
+        value = getfield(op, name)
+        value isa Operand ? _newton_materialize_coefficients(value, state) : value
+    end
+    all(args[i] === getfield(op, names[i]) for i in eachindex(names)) && return op
+    return Base.typename(typeof(op)).wrapper(args...)
+end
+
 """
     build_symbolic_jacobian(problem, state_fields)
 

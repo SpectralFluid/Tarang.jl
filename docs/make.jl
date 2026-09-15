@@ -59,9 +59,11 @@ pages = Any[
         ],
         "Linear Boundary Value Problems" => Any[
             "Setup & Linear Solve" => "problems/linear_boundary_value.md",
+            "2D Poisson" => "tutorials/lbvp_2d_poisson.md",
         ],
         "Nonlinear Boundary Value Problems" => Any[
             "Setup & Newton Iteration" => "problems/nonlinear_boundary_value.md",
+            "Lane–Emden" => "tutorials/nlbvp_lane_emden.md",
         ],
         "Eigenvalue Problems" => Any[
             "Setup & Spectrum" => "problems/eigenvalue.md",

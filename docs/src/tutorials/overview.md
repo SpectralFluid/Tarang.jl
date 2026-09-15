@@ -52,12 +52,16 @@ Steady-state problems with boundary conditions.
 | Tutorial | Description | Complexity | Key Features |
 |----------|-------------|------------|--------------|
 | [Poisson equation](../problems/linear_boundary_value.md) | Steady linear solve | Beginner | Tau constraints, analytic solution |
+| [2D Poisson](lbvp_2d_poisson.md) | Periodic strip with mixed walls | Intermediate | Filtered forcing, solution heatmap, residual checks |
 
 ### Nonlinear Boundary Value Problems
 
 [The nonlinear BVP guide](../problems/nonlinear_boundary_value.md) gives a
 self-contained Newton solve, explains the initial guess and convergence controls,
 and verifies the solution against an analytic profile.
+
+The [Lane–Emden tutorial](nlbvp_lane_emden.md) develops a radial application,
+checks the nonzero solution branch, and plots resolution refinement.
 
 ### Eigenvalue Problems (EigenvalueProblem)
 
