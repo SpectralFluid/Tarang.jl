@@ -74,6 +74,13 @@ no_slip!(problem, "u", "z", 0.0)            # No-slip bottom
 no_slip!(problem, "u", "z", Lz)             # No-slip top
 add_bc!(problem, "integ(p) = 0")            # Pressure gauge
 
+# ─── NetCDF Output ────────────────────────────────────────────
+snapshots = add_file_handler("snapshots", dist, Dict("b" => b, "p" => p);
+                             sim_dt=1.0, max_writes=100)
+add_task!(snapshots, b; name="buoyancy")
+add_task!(snapshots, u.components[1]; name="ux")
+add_task!(snapshots, u.components[2]; name="uz")
+
 # ─── Solver ───────────────────────────────────────────────────
 solver = InitialValueSolver(problem, RK222(); dt=max_dt)
 solver.stop_sim_time = stop_time

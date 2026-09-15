@@ -144,7 +144,7 @@ using Tarang, MPI
 MPI.Init()
 
 coords = CartesianCoordinates("x")
-dist = Distributor(coords, mesh=(4,))
+dist = Distributor(coords; mesh=(4,), device=CPU())
 
 x = ChebyshevT(coords["x"], size=64, bounds=(0.0, 1.0))
 domain = Domain(dist, (x,))

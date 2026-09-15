@@ -98,6 +98,16 @@ end
 _needs_solve_transpose(dist::Distributor) = dist.use_pencil_arrays && dist.size > 1
 
 """
+Check if MPI transpose is needed, accounting for actual data layout.
+Returns false if Chebyshev is already local (nz_local == Nz).
+"""
+function _needs_solve_transpose(dist::Distributor, data, L::PencilLinearOperator)
+    dist.use_pencil_arrays && dist.size > 1 || return false
+    nz_local = size(data, L.chebyshev_basis_idx)
+    return nz_local != L.Nz
+end
+
+"""
 Get or create cached partition info and MPI buffers for solve-layout transposes.
 Stored in `cache_dict` (typically `state.timestepper_data`) to avoid repeated
 MPI.Allgather calls and buffer allocations across timesteps.
@@ -145,10 +155,12 @@ Pass `cache` (a Dict, e.g. `state.timestepper_data`) to reuse partition info and
 """
 function _to_solve_layout(data, dist::Distributor, L::PencilLinearOperator{T};
                           cache::Union{Nothing,Dict}=nothing) where T
-    if !_needs_solve_transpose(dist)
-        return data isa PencilArrays.PencilArray ? parent(data) : data
+    if !_needs_solve_transpose(dist, data, L)
+        # Serial or Chebyshev already local: return plain array in logical order
+        return data isa PencilArrays.PencilArray ? collect(data) : data
     end
-    src = data isa PencilArrays.PencilArray ? parent(data) : data
+    # Use collect() to get logically-ordered array (parent() may have permuted dims)
+    src = data isa PencilArrays.PencilArray ? collect(data) : data
     if length(L.fourier_basis_indices) == 1
         return _transpose_fft_to_solve_2d(src, dist, L, cache)
     else
@@ -160,14 +172,14 @@ end
 """Transpose solve-layout data back into PencilFFT output layout."""
 function _from_solve_layout!(dest, src::AbstractArray, dist::Distributor, L::PencilLinearOperator{T};
                              cache::Union{Nothing,Dict}=nothing) where T
-    if !_needs_solve_transpose(dist)
-        dest_arr = dest isa PencilArrays.PencilArray ? parent(dest) : dest
-        copyto!(dest_arr, src)
+    if !_needs_solve_transpose(dist, dest, L)
+        # Serial or Chebyshev already local: copy via broadcasting (handles PencilArray permutation)
+        dest .= src
         return
     end
-    dest_arr = dest isa PencilArrays.PencilArray ? parent(dest) : dest
+    # Pass PencilArray directly — reverse transpose writes via logical indexing
     if length(L.fourier_basis_indices) == 1
-        _transpose_solve_to_fft_2d!(dest_arr, src, dist, L, cache)
+        _transpose_solve_to_fft_2d!(dest, src, dist, L, cache)
     else
         error("3D mixed Fourier-Chebyshev MPI solve transpose not yet implemented.")
     end

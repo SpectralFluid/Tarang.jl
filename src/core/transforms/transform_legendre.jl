@@ -438,41 +438,30 @@ function setup_pencil_fft_transforms_3d!(dist::Distributor, domain::Domain,
     # NOTE: RFFT can only be applied to the first transform dimension in PencilFFTs.
     # Case 1: First Fourier axis is RealFourier → RFFT, subsequent RealFourier → FFT (OK with warning)
     # Case 2: First Fourier axis is NOT RealFourier but later one is → ERROR (shape mismatch)
+    # Build transforms for ALL dimensions: Fourier axes get RFFT/FFT, others get NoTransform.
+    # PencilFFTPlan requires exactly N transforms for N-dimensional data.
     transform_list = []
     uses_rfft = false
-    first_fourier_is_real = length(fourier_axes) > 0 && isa(domain.bases[fourier_axes[1]], RealFourier)
-    realfourier_warning_shown = false
+    first_fourier_axis = isempty(fourier_axes) ? 0 : fourier_axes[1]
+    first_fourier_is_real = first_fourier_axis > 0 && isa(domain.bases[first_fourier_axis], RealFourier)
 
-    for (i, axis) in enumerate(fourier_axes)
-        basis = domain.bases[axis]
+    for (dim, basis) in enumerate(domain.bases)
         if isa(basis, RealFourier)
-            if i == 1
-                # First Fourier axis is RealFourier - can use RFFT (real-to-complex)
+            if dim == first_fourier_axis
                 push!(transform_list, PencilFFTs.Transforms.RFFT())
                 uses_rfft = true
             elseif first_fourier_is_real
-                # First axis is RealFourier (gets RFFT), subsequent RealFourier must use FFT
-                # This produces full complex output for axis 2+, but axis 1 still gets half-spectrum
-                if !realfourier_warning_shown
-                    @warn "RealFourier basis on axis $axis is not the first Fourier axis. " *
-                          "Using FFT instead of RFFT for this axis (output will be full complex size N, " *
-                          "not half-spectrum N/2+1). The first RealFourier axis still uses RFFT correctly." maxlog=1
-                    realfourier_warning_shown = true
-                end
                 push!(transform_list, PencilFFTs.Transforms.FFT())
             else
-                # First Fourier axis is NOT RealFourier, but this one is - ERROR
-                # RFFT can only be applied to dimension 1 in PencilFFTs
-                error("RealFourier basis on axis $axis cannot use RFFT because the first Fourier axis " *
-                      "(axis $(fourier_axes[1])) is not RealFourier. In MPI mode with PencilFFTs, " *
-                      "RFFT can only be applied to dimension 1. Using FFT would produce full complex " *
-                      "arrays (size N) where RealFourier expects half-spectrum (size N/2+1). " *
-                      "Please reorder your domain bases to place RealFourier first, " *
-                      "or use ComplexFourier for this axis.")
+                error("RealFourier basis on axis $dim cannot use RFFT because the first Fourier axis " *
+                      "(axis $first_fourier_axis) is not RealFourier. In MPI mode with PencilFFTs, " *
+                      "RFFT can only be applied to dimension 1. Please reorder your domain bases " *
+                      "to place RealFourier first, or use ComplexFourier for this axis.")
             end
-        else
-            # ComplexFourier uses FFT (complex-to-complex)
+        elseif isa(basis, ComplexFourier)
             push!(transform_list, PencilFFTs.Transforms.FFT())
+        else
+            push!(transform_list, PencilFFTs.Transforms.NoTransform())
         end
     end
     transforms = Tuple(transform_list)

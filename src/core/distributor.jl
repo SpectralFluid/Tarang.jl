@@ -86,11 +86,12 @@ mutable struct Distributor
                         comm::MPI.Comm=MPI.COMM_WORLD,
                         mesh::Union{Nothing, Tuple{Vararg{Int}}}=nothing,
                         dtype::Type=Float64,
+                        device::Union{AbstractArchitecture, Nothing}=nothing,
                         arch::Union{AbstractArchitecture, Nothing}=nothing,
                         architecture::AbstractArchitecture=CPU(),
                         use_pencil_arrays::Union{Nothing, Bool}=nothing)
-        # Allow both `arch=` and `architecture=` kwargs; `arch` takes precedence
-        architecture = arch !== nothing ? arch : architecture
+        # Allow `device=`, `arch=`, and `architecture=` kwargs; device > arch > architecture
+        architecture = device !== nothing ? device : (arch !== nothing ? arch : architecture)
 
         # Ensure MPI is initialized and not finalized before using communicator
         if MPI.Finalized()

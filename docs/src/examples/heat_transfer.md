@@ -11,7 +11,7 @@ using Tarang, MPI
 MPI.Init()
 
 coords = CartesianCoordinates("x")
-dist = Distributor(coords; mesh=(1,), dtype=Float64)
+dist = Distributor(coords; mesh=(1,), dtype=Float64, device=CPU())
 basis = ChebyshevT(coords["x"]; size=64, bounds=(0.0, 1.0))
 
 T = ScalarField(dist, "T", (basis,), Float64)
@@ -43,7 +43,7 @@ MPI.Finalize()
 
 ```julia
 coords = CartesianCoordinates("x", "z")
-dist = Distributor(coords; mesh=(2, 2), dtype=Float64)
+dist = Distributor(coords; mesh=(2, 2), dtype=Float64, device=CPU())
 
 x_basis = ChebyshevT(coords["x"]; size=64, bounds=(0.0, 1.0))
 z_basis = ChebyshevT(coords["z"]; size=64, bounds=(0.0, 1.0))

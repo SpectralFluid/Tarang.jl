@@ -124,7 +124,7 @@ function step_pencil_sbdf2!(state::TimestepperState, solver::InitialValueSolver)
             end
 
             # Transpose to solve layout (Chebyshev-local) if MPI with PencilFFTs
-            needs_transpose = _needs_solve_transpose(field.dist)
+            needs_transpose = _needs_solve_transpose(field.dist, get_coeff_data(field), L)
             if needs_transpose
                 data_n = _to_solve_layout(get_coeff_data(field), field.dist, L; cache=state.timestepper_data)
                 data_nm1 = _to_solve_layout(get_coeff_data(X_nm1[i]), field.dist, L; cache=state.timestepper_data)
@@ -208,7 +208,7 @@ function step_pencil_sbdf1!(state::TimestepperState, solver::InitialValueSolver)
             ensure_layout!(F_n[i], :c)
 
             # Transpose to solve layout (Chebyshev-local) if MPI with PencilFFTs
-            needs_transpose = _needs_solve_transpose(field.dist)
+            needs_transpose = _needs_solve_transpose(field.dist, get_coeff_data(field), L)
             if needs_transpose
                 data_n = _to_solve_layout(get_coeff_data(field), field.dist, L; cache=state.timestepper_data)
                 data_F_n = _to_solve_layout(get_coeff_data(F_n[i]), field.dist, L; cache=state.timestepper_data)
@@ -465,7 +465,7 @@ function step_pencil_cnab2!(state::TimestepperState, solver::InitialValueSolver)
                 ensure_layout!(F_history[2][i], :c)
             end
 
-            needs_transpose = _needs_solve_transpose(field.dist)
+            needs_transpose = _needs_solve_transpose(field.dist, get_coeff_data(field), L)
             if needs_transpose
                 data_n = _to_solve_layout(get_coeff_data(field), field.dist, L; cache=state.timestepper_data)
                 data_F_n = _to_solve_layout(get_coeff_data(F_history[1][i]), field.dist, L; cache=state.timestepper_data)
@@ -544,7 +544,7 @@ function step_pencil_cnab1!(state::TimestepperState, solver::InitialValueSolver)
             ensure_layout!(field, :c)
             ensure_layout!(F_n[i], :c)
 
-            needs_transpose = _needs_solve_transpose(field.dist)
+            needs_transpose = _needs_solve_transpose(field.dist, get_coeff_data(field), L)
             if needs_transpose
                 data_n = _to_solve_layout(get_coeff_data(field), field.dist, L; cache=state.timestepper_data)
                 data_F_n = _to_solve_layout(get_coeff_data(F_n[i]), field.dist, L; cache=state.timestepper_data)

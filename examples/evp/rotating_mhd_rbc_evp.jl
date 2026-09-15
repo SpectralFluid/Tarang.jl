@@ -64,7 +64,7 @@ function setup_rotating_mhd_convection_evp(;
     
     # Create coordinate system and domain
     coords = SphericalCoordinates('φ', 'θ', 'r')
-    dist = Distributor(coords, dtype=dtype, mesh=determine_mesh(comm))
+    dist = Distributor(coords; dtype=dtype, mesh=determine_mesh(comm), device=CPU())
     
     # Create spherical shell basis
     shell = ShellBasis(coords, shape=(Nphi, Ntheta, Nr), radii=(Ri, Ro), 
@@ -591,18 +591,28 @@ function run_mhd_convection_stability_analysis()
     @info "  Linear vs Weak: $(results_linear[2].Ra_critical / results_weak[2].Ra_critical)"
     @info "="^60
     
+    # Save results to NetCDF
+    using NetCDF
+    ncfile = "mhd_rbc_stability.nc"
+    cases = ["weak_dipolar", "strong_dipolar", "linear"]
+    Ra_c = [results_weak[2].Ra_critical, results_strong[2].Ra_critical, results_linear[2].Ra_critical]
+    nccreate(ncfile, "Ra_critical", "case", length(cases))
+    ncwrite(Ra_c, ncfile, "Ra_critical")
+    ncputatt(ncfile, "Ra_critical", Dict("cases" => join(cases, ",")))
+    @info "Saved critical Rayleigh numbers to $ncfile"
+
     return results_weak, results_strong, results_linear
 end
 
 # Run the analysis if script is executed directly
 if abspath(PROGRAM_FILE) == @__FILE__
-    # Initialize MPI  
+    # Initialize MPI
     MPI.Init()
-    
+
     try
         # Run stability analysis
         run_mhd_convection_stability_analysis()
-        
+
     finally
         # Finalize MPI
         MPI.Finalize()

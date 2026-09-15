@@ -27,11 +27,13 @@ p = ScalarField(domain, "p")
 domain = PeriodicDomain(64, 64, 64; L=(1.0, 1.0, 1.0))
 
 # GPU
-domain = PeriodicDomain(256, 256; arch=GPU())
+domain = PeriodicDomain(256, 256; device=GPU())
 ```
 """
 function PeriodicDomain(N::Integer...; L=nothing, dtype::Type=Float64,
+                        device::Union{AbstractArchitecture, Nothing}=nothing,
                         arch::AbstractArchitecture=CPU(), dealias::Real=3/2)
+    arch = device !== nothing ? device : arch
     ndim = length(N)
     if ndim < 1 || ndim > 3
         throw(ArgumentError("PeriodicDomain supports 1D, 2D, or 3D (got $(ndim)D)"))

@@ -26,7 +26,7 @@ k = 3.117  # Critical wavenumber
 
 # Domain
 coords = CartesianCoordinates("z")
-dist = Distributor(coords; mesh=(1,), dtype=Float64)
+dist = Distributor(coords; mesh=(1,), dtype=Float64, device=CPU())
 z_basis = ChebyshevT(coords["z"]; size=64, bounds=(0.0, 1.0))
 
 # Fields (complex amplitudes)

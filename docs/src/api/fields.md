@@ -136,11 +136,11 @@ tau_xy = tau.components[1, 2]
 
 ## GPU Fields
 
-All field operations work on GPU arrays when the domain uses `arch=GPU()`:
+All field operations work on GPU arrays when the domain uses `device=GPU()`:
 
 ```julia
 using CUDA
-domain = PeriodicDomain(256, 256; arch=GPU())
+domain = PeriodicDomain(256, 256; device=GPU())
 u = ScalarField(domain, "u")    # Data lives on GPU
 forward_transform!(u)            # Uses cuFFT
 ```

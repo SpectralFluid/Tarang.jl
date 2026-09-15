@@ -35,7 +35,7 @@ using CUDA
 
 # Create distributor with GPU architecture
 coords = CartesianCoordinates("x", "y")
-dist = Distributor(coords; mesh=(1,), dtype=Float64, architecture=GPU())
+dist = Distributor(coords; mesh=(1,), dtype=Float64, device=GPU())
 
 # Create bases and fields (automatically on GPU)
 xbasis = Fourier(coords, "x", 256)
@@ -50,10 +50,10 @@ field = ScalarField(dist, "u", (xbasis, ybasis))
 
 ```julia
 # CPU execution (default)
-dist_cpu = Distributor(coords; architecture=CPU())
+dist_cpu = Distributor(coords; device=CPU())
 
 # GPU execution
-dist_gpu = Distributor(coords; architecture=GPU())
+dist_gpu = Distributor(coords; device=GPU())
 
 # Check architecture
 arch = dist_gpu.architecture  # GPU()
@@ -68,7 +68,7 @@ When fields are on GPU, transforms automatically use CUFFT:
 ```julia
 using Tarang, CUDA
 
-dist = Distributor(coords; architecture=GPU())
+dist = Distributor(coords; device=GPU())
 field = ScalarField(dist, "u", (xbasis, ybasis))
 
 # Initialize with GPU data
@@ -105,7 +105,7 @@ GPU DCT for Chebyshev bases:
 xbasis = Fourier(coords, "x", 256)      # FFT
 zbasis = ChebyshevT(coords, "z", 64)    # DCT
 
-dist = Distributor(coords; architecture=GPU())
+dist = Distributor(coords; device=GPU())
 field = ScalarField(dist, "T", (xbasis, zbasis))
 
 # Transforms automatically select FFT or DCT per dimension
@@ -213,7 +213,7 @@ end
 
 # Create distributed GPU setup
 coords = CartesianCoordinates("x", "y", "z")
-dist = Distributor(coords; mesh=(2, 2), architecture=GPU())
+dist = Distributor(coords; mesh=(2, 2), device=GPU())
 
 # Each rank has its own GPU memory
 field = ScalarField(dist, "u", bases)
@@ -255,7 +255,7 @@ distributed_backward_transform!(tf)
 
 1. **Use Float32 when possible** - 2x memory bandwidth, often sufficient accuracy
    ```julia
-   dist = Distributor(coords; dtype=Float32, architecture=GPU())
+   dist = Distributor(coords; dtype=Float32, device=GPU())
    ```
 
 2. **Batch operations** - Minimize kernel launches

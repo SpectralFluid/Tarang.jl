@@ -17,7 +17,7 @@ Lx, Lz = 1.0, 1.0
 Nx, Nz = 128, 128
 
 coords = CartesianCoordinates("x", "z")
-dist = Distributor(coords; mesh=(1,), dtype=Float64)
+dist = Distributor(coords; mesh=(1,), dtype=Float64, device=CPU())
 
 x_basis = ChebyshevT(coords["x"]; size=Nx, bounds=(0.0, Lx))
 z_basis = ChebyshevT(coords["z"]; size=Nz, bounds=(0.0, Lz))
@@ -58,7 +58,7 @@ Shear layer instability in periodic domain.
 ```julia
 # Setup
 coords = CartesianCoordinates("x", "z")
-dist = Distributor(coords; mesh=(2, 2), dtype=Float64)
+dist = Distributor(coords; mesh=(2, 2), dtype=Float64, device=CPU())
 
 x_basis = RealFourier(coords["x"]; size=256, bounds=(0.0, 1.0))
 z_basis = RealFourier(coords["z"]; size=256, bounds=(0.0, 1.0))

@@ -18,17 +18,17 @@ scale_op = KernelOperation(scale_kernel!) do y, α, x
 end
 
 # Example data
-arch = GPU()  # or CPU()
-x = ones(arch, Float64, 1024)
-y = zeros(arch, Float64, 1024)
+device = GPU()  # or CPU()
+x = ones(device, Float64, 1024)
+y = zeros(device, Float64, 1024)
 
 # Launch via the operation (auto-selects backend, workgroup, etc.)
-scale_op(arch, y, 2.0, x)
+scale_op(device, y, 2.0, x)
 ```
 
 Key benefits:
 
-- Backend selection is driven by `arch` (a `CPU()`/`GPU()` or array).
+- Backend selection is driven by `device` (a `CPU()`/`GPU()` singleton).
 - Workgroup size and synchronization are handled via `launch!`.
 - You can pass `ndrange`/`dependencies` keywords to `scale_op` when needed.
 ```

@@ -563,6 +563,8 @@ function _get_padded_pencil_workspace!(evaluator::NonlinearEvaluator, bases::Tup
                 end
             elseif isa(basis, ComplexFourier)
                 push!(transform_list, PencilFFTs.Transforms.FFT())
+            else
+                push!(transform_list, PencilFFTs.Transforms.NoTransform())
             end
         end
         transforms = Tuple(transform_list)

@@ -44,6 +44,12 @@ add_equation!(problem, "∂t(q) + nu*Δ⁴(q)  = -u⋅∇(q)")     # PV evolutio
 
 add_bc!(problem, "integ(ψ) = 0")
 
+# ─── NetCDF Output ────────────────────────────────────────────
+snapshots = add_file_handler("snapshots", dist, Dict("q" => q, "ψ" => ψ);
+                             sim_dt=1.0, max_writes=100)
+add_task!(snapshots, q; name="potential_vorticity")
+add_task!(snapshots, ψ; name="streamfunction")
+
 # ─── Solver ───────────────────────────────────────────────────
 solver = InitialValueSolver(problem, RK222(); dt=max_dt)
 

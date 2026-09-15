@@ -130,8 +130,8 @@ run!(solver; stop_time=10.0, log_interval=100)  # Run with progress
 ```julia
 using Tarang, CUDA
 
-# Just add arch=GPU() — everything else stays the same
-domain = PeriodicDomain(512, 512; arch=GPU(), dtype=Float32)
+# Just add device=GPU() — everything else stays the same
+domain = PeriodicDomain(512, 512; device=GPU(), dtype=Float32)
 field = ScalarField(domain, "u")
 forward_transform!(field)   # Uses cuFFT automatically
 ```

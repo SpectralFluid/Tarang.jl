@@ -126,7 +126,7 @@ end
 coords = CartesianCoordinates("x", "y")
 nprocs = MPI.Comm_size(comm)
 mesh = nprocs == 1 ? (1, 1) : (1, nprocs)  # Decompose in y for >1 proc
-dist = Distributor(coords; mesh=mesh, dtype=Float64)
+dist = Distributor(coords; mesh=mesh, dtype=Float64, device=CPU())
 
 # Bases (doubly periodic Fourier)
 basis_x = RealFourier(coords["x"]; size=Nx, bounds=(0.0, Lx))
@@ -439,6 +439,21 @@ if rank == 0
     println("  - Some wave energy leaks through the filter")
     println("  - For sharper separation, use ButterworthFilter")
     println()
+
+    # Save final state to NetCDF
+    using NetCDF
+    ncfile = "rswm_exponential_output.nc"
+    nccreate(ncfile, "u", "x", Nx, "y", Ny)
+    nccreate(ncfile, "v", "x", Nx, "y", Ny)
+    nccreate(ncfile, "eta", "x", Nx, "y", Ny)
+    nccreate(ncfile, "u_mean", "x", Nx, "y", Ny)
+    nccreate(ncfile, "v_mean", "x", Nx, "y", Ny)
+    ncwrite(u_data, ncfile, "u")
+    ncwrite(v_data, ncfile, "v")
+    ncwrite(η_data, ncfile, "eta")
+    ncwrite(u_mean, ncfile, "u_mean")
+    ncwrite(v_mean, ncfile, "v_mean")
+    println("\nSaved final state to $ncfile")
 end
 
 MPI.Finalize()

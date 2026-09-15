@@ -74,7 +74,7 @@ println("\n--- Creating Domain with Architecture ---")
 coordsys = CartesianCoordinates(2, "xy")
 
 # Create distributor with GPU architecture
-dist = Distributor(coordsys, architecture=arch)
+dist = Distributor(coordsys, device=arch)
 println("Distributor architecture: $(typeof(dist.architecture))")
 
 # Define bases
