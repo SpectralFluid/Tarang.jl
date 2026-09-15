@@ -61,6 +61,7 @@ at `t=0`; a time-evolving boundary belongs in an
 
 ## Further reading
 
+- [2D Poisson application](../tutorials/lbvp_2d_poisson.md): mixed wall conditions, filtered random forcing, and CairoMakie figures.
 - [Tau method](../pages/tau_method.md): residual corrections, lift representation, and gauges.
 - [Boundary conditions](../tutorials/boundary_conditions.md): Dirichlet, Neumann, Robin, and vector constraints.
 - [Nonlinear BVPs](nonlinear_boundary_value.md): when the equation depends nonlinearly on the unknown.
