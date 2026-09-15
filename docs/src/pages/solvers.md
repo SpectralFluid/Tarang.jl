@@ -1,6 +1,8 @@
 # Solvers
 
-Solvers integrate PDEs in time or solve for steady states.
+Solvers evolve fields, solve steady equations, or compute eigenvalues. Start with
+the [problem-type guides](problems.md#Problem-Types) for complete workflows; this
+page collects solver options and methods.
 
 ## InitialValueSolver
 

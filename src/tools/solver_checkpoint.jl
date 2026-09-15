@@ -76,6 +76,11 @@ end
 Write `solver.state` and the simulation clock to NetCDF. Serial runs produce
 `<path>.nc`; under MPI each rank writes `<path>/<name>_p<rank>.nc` with no gather.
 
+Registered stochastic forcings also store their RNG, cached realization, and
+cache clock. These host-only payloads support CPU/GPU and rank-count changes,
+but require the same Julia major/minor version for RNG deserialization.
+Previous-solution work-diagnostic scratch is not checkpointed.
+
 Zero-dimensional tau variables are skipped: they carry no spatial data and are
 re-solved from the state on the next step.
 
@@ -88,6 +93,9 @@ walked into the solver's next collective.
 function save_state(solver::InitialValueSolver, path::AbstractString)
     isempty(solver.state) && error("save_state: solver.state is empty; nothing to write.")
     dist = solver.state[1].dist
+    forcing_payload = _collectively(dist, "save_state stochastic forcing") do
+        _stochastic_checkpoint_payload(solver)
+    end
     target = _slab_output_path!(dist, path, "save_state")
 
     # Transpose EVERY field to grid space before the write loop, not inside it.
@@ -113,6 +121,7 @@ function save_state(solver::InitialValueSolver, path::AbstractString)
             write_local_slab(target, field.name, host, local_start, global_shape)
         end
 
+        _write_stochastic_checkpoint!(target, forcing_payload)
         ncputatt(target, "global", Dict("sim_time" => Float64(solver.sim_time),
                                         "iteration" => Int(solver.iteration),
                                         "dt" => Float64(solver.dt)))
@@ -123,6 +132,30 @@ end
 """Clock attributes every checkpoint must carry."""
 const _CHECKPOINT_CLOCK_ATTRS = ("sim_time", "iteration", "dt")
 
+"""Validate completion and a common simulation clock in every checkpoint slab."""
+function _checkpoint_clock(src::SlabSource, path::AbstractString)
+    reference = nothing
+    for file in src.files
+        attrs = netcdf_file_info(file).gatts
+        missing_attrs = filter(k -> !haskey(attrs, k), _CHECKPOINT_CLOCK_ATTRS)
+        isempty(missing_attrs) || error(
+            "load_state!: '$path' is missing the required clock attribute(s) " *
+            "$(join(missing_attrs, ", ")) in '$file'. The checkpoint is incomplete " *
+            "(save_state writes clock attributes last in every slab) or is " *
+            "save_field output. No state has been restored.")
+        clock = (sim_time=Float64(attrs["sim_time"]),
+                 iteration=Int(attrs["iteration"]), dt=Float64(attrs["dt"]))
+        if reference === nothing
+            reference = clock
+        elseif clock != reference
+            error("load_state!: inconsistent checkpoint clock attributes in '$path': " *
+                  "'$file' has $clock, but '$(first(src.files))' has $reference. " *
+                  "The slabs belong to different simulation states; no state has been restored.")
+        end
+    end
+    return reference
+end
+
 """
     load_state!(solver, path) -> solver
 
@@ -130,22 +163,24 @@ Restore `solver.state` and the simulation clock from a checkpoint written at any
 rank count. Discards the timestepper's cached state so the scheme restarts from
 the loaded fields.
 
-All three clock attributes are REQUIRED. Treating them as optional made the two
-paths that produce a clock-less file — `save_state` dying between its field
-writes and its final `ncputatt` (the field writes are the slow part, so that is
-the likely crash window), and pointing `load_state!` at `save_field` output,
-which writes no global attributes at all and accepts the same path form — return
-successfully with the fields correctly restored and the clock silently left at
-`sim_time = 0.0, iteration = 0`. The restart then integrates for the wrong
-duration, stamps the wrong output timestamps, and evaluates any time-dependent
-forcing at the wrong time, all with correct-looking field values.
+Registered stochastic forcing must match the saved configuration. A legacy
+checkpoint without forcing state cannot reproduce a stochastic trajectory and
+is rejected for a stochastically forced solver before any fields are restored.
 
-The whole body is one `_collectively` region (see its docstring for why nesting
-it around `load_field!`'s own guard is safe).
+Every slab must carry all three clock attributes with identical values. Validate
+them before restoring any fields: a save interrupted on one rank can leave its
+slab without completion attributes, or leave a complete slab from an older save.
+The metadata check has its own collective exit so no rank can begin a field
+transpose while another rank is rejecting the checkpoint.
 """
 function load_state!(solver::InitialValueSolver, path::AbstractString)
     isempty(solver.state) && error("load_state!: solver.state is empty; nothing to restore.")
     dist = solver.state[1].dist
+
+    src, clock, forcing_state = _collectively(dist, "load_state! checkpoint metadata") do
+        src = open_slab_source(path)
+        (src, _checkpoint_clock(src, path), _prepare_stochastic_restart(solver, src))
+    end
 
     _collectively(dist, "load_state!") do
         for field in solver.state
@@ -153,23 +188,10 @@ function load_state!(solver::InitialValueSolver, path::AbstractString)
             load_field!(field, path, field.name)
         end
 
-        src = open_slab_source(path)
-        attrs = netcdf_file_info(first(src.files)).gatts
-
-        missing_attrs = filter(k -> !haskey(attrs, k), _CHECKPOINT_CLOCK_ATTRS)
-        isempty(missing_attrs) || error(
-            "load_state!: '$path' is missing the required clock attribute(s) " *
-            "$(join(missing_attrs, ", ")). The fields loaded, but the simulation clock " *
-            "cannot be restored, so continuing would integrate for the wrong duration " *
-            "with correct-looking field values. Either the checkpoint is incomplete " *
-            "(save_state writes the clock attributes LAST, after every field, so a run " *
-            "that died mid-write leaves exactly this) or '$path' is save_field output, " *
-            "which writes field data with no global attributes at all. Files scanned: " *
-            "$(src.files).")
-
-        solver.sim_time = Float64(attrs["sim_time"])
-        solver.iteration = Int(attrs["iteration"])
-        solver.dt = Float64(attrs["dt"])
+        solver.sim_time = clock.sim_time
+        solver.iteration = clock.iteration
+        solver.dt = clock.dt
+        _restore_stochastic_restart!(forcing_state)
 
         # A checkpoint variable with no matching solver.state field is not an
         # error -- a file may legitimately hold more than this solver needs --

@@ -572,6 +572,19 @@ Read them with `NetCDF.ncgetatt(file, "global", name)`.
 `save_state` writes every evolved field in `solver.state` plus `sim_time`,
 `iteration` and `dt`. `load_state!` reads it back.
 
+For registered `StochasticForcing` and `SeparableStochasticForcing`, checkpoints
+also preserve the RNG state, cached realization, forcing timestep, and cache
+timestamp. Rebuild the same forcing configuration before loading; its initial
+seed may differ because loading restores the saved RNG. The next noise draws
+then continue the saved sequence, including when the CPU/MPI rank count changes.
+
+Stochastic checkpoints require the same Julia major/minor version as the writer
+because they contain a serialized Julia RNG. A missing payload, incompatible
+configuration, or inconsistent state across slabs is rejected before restoring
+fields. Older checkpoints without forcing state cannot resume a stochastically
+forced solver. Previous-solution scratch used by `work_stratonovich` is cleared;
+call `store_prevsol!` before the next step as usual.
+
 ```julia
 save_state(solver, "checkpoints/run1")
 # ... later, or in a new process ...
@@ -588,13 +601,12 @@ works out the range it needs and reads only the overlapping hyperslabs.
 NetCDF reads into host memory, so the loader stages through a host buffer and
 then performs one explicit upload into the field's existing device storage.
 
-What is actually tested: **single-device GPU staging**, via JLArray emulation on
-a serial 1-D field — it proves `load_field!` uploads into the device array
-rather than replacing it with a host array. **GPU + MPI checkpointing is
-untested.** It takes a different geometry branch entirely (first-dims
-decomposition with the TransposableField convention, not the PencilArrays one),
-no test executes that branch, and this repository's GPU CI pipeline is inert.
-Treat a distributed GPU checkpoint as unverified.
+Single-device staging is tested with JLArray emulation, including a 2-D Fourier
+solver checkpoint and stochastic forcing transferred from CPU to device and
+back. CUDA restart tests for standard and separable forcing are registered in
+GPU CI and require actual CUDA hardware. **GPU + MPI checkpointing is untested:**
+it takes the TransposableField geometry path rather than the tested CPU
+PencilArrays path. Treat a distributed GPU checkpoint as unverified.
 
 ### Restart fidelity
 

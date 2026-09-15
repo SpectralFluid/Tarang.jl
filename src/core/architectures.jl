@@ -431,6 +431,18 @@ multi-GPU process never shares cached buffers or plans across devices.
 """
 _device_cache_token(::AbstractArray) = nothing
 
+# All readers and writers of basis.transforms must use the same lock: even a
+# cache hit can race with a Dict rehash caused by another kind of cache entry.
+const _BASIS_CACHE_LOCK = ReentrantLock()
+
+"""Get or build a basis cache entry atomically. This protects the dictionary,
+not subsequent use of mutable scratch stored in it."""
+function _get_basis_cache!(build::F, basis, key) where {F}
+    lock(_BASIS_CACHE_LOCK) do
+        get!(build, basis.transforms, key)
+    end
+end
+
 """
     _get_device_basis_cache!(build_host, basis, tag::Symbol, data::AbstractArray, keyparts...)
 
@@ -440,19 +452,18 @@ shares a cached buffer across devices, and every call site keys device identity
 the same way. On a miss, `build_host()` produces the host array, which is
 uploaded to `data`'s device WITHOUT eltype conversion — callers convert to the
 target precision in `build_host` (include the eltype in `keyparts` when it can
-vary). `basis.transforms` writes are unlocked by convention: basis caches are
-touched from the single-threaded solve loop only.
+vary). Cache lookup and construction are synchronized with every other
+`basis.transforms` accessor through `_get_basis_cache!`.
 """
 function _get_device_basis_cache!(build_host::Function, basis, tag::Symbol,
                                   data::AbstractArray, keyparts...)
     key = (tag, keyparts..., _device_cache_token(data))
-    cached = get(basis.transforms, key, nothing)
-    cached !== nothing && return cached
-    host = build_host()
-    dev = similar(data, eltype(host), size(host))
-    copyto!(dev, host)
-    basis.transforms[key] = dev
-    return dev
+    return _get_basis_cache!(basis, key) do
+        host = build_host()
+        dev = similar(data, eltype(host), size(host))
+        copyto!(dev, host)
+        dev
+    end
 end
 
 # ============================================================================

@@ -5,16 +5,16 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/subhk/Tarang.jl/actions/workflows/CI.yml"><img src="https://github.com/subhk/Tarang.jl/actions/workflows/CI.yml/badge.svg" alt="CI"></a>
-  <a href="https://github.com/subhk/Tarang.jl/actions/workflows/Documentation.yml"><img src="https://github.com/subhk/Tarang.jl/actions/workflows/Documentation.yml/badge.svg" alt="Documentation build"></a>
+  <a href="https://github.com/SpectralFluid/Tarang.jl/actions/workflows/CI.yml"><img src="https://github.com/SpectralFluid/Tarang.jl/actions/workflows/CI.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/SpectralFluid/Tarang.jl/actions/workflows/Documentation.yml"><img src="https://github.com/SpectralFluid/Tarang.jl/actions/workflows/Documentation.yml/badge.svg" alt="Documentation build"></a>
   <a href="https://codecov.io/gh/subhk/Tarang.jl"><img src="https://codecov.io/gh/subhk/Tarang.jl/branch/main/graph/badge.svg" alt="Coverage"></a>
-  <a href="https://github.com/subhk/Tarang.jl/releases"><img src="https://img.shields.io/github/v/release/subhk/Tarang.jl?label=release" alt="Latest release"></a>
+  <a href="https://github.com/SpectralFluid/Tarang.jl/releases"><img src="https://img.shields.io/github/v/release/SpectralFluid/Tarang.jl?label=release" alt="Latest release"></a>
   <a href="https://julialang.org"><img src="https://img.shields.io/badge/julia-1.10%2B-9558B2.svg" alt="Julia 1.10+"></a>
   <a href="https://github.com/JuliaTesting/Aqua.jl"><img src="https://raw.githubusercontent.com/JuliaTesting/Aqua.jl/master/badge.svg" alt="Aqua QA"></a>
   <a href="https://github.com/aviatesk/JET.jl"><img src="https://img.shields.io/badge/JET.jl-tested-blue.svg" alt="JET"></a>
   <a href="https://cuda.juliagpu.org/stable/"><img src="https://img.shields.io/badge/GPU-CUDA-76B900.svg" alt="CUDA GPU support"></a>
   <a href="https://juliaparallel.org/MPI.jl/stable/"><img src="https://img.shields.io/badge/MPI-enabled-2F6DB3.svg" alt="MPI support"></a>
-  <a href="https://subhk.github.io/Tarang.jl/stable"><img src="https://img.shields.io/badge/docs-stable-blue.svg" alt="Documentation"></a>
+  <a href="https://spectralfluid.github.io/Tarang.jl/stable"><img src="https://img.shields.io/badge/docs-stable-blue.svg" alt="Documentation"></a>
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License: MIT"></a>
 </p>
 
@@ -30,7 +30,7 @@
 using Pkg
 
 # Basic installation
-Pkg.add(url="https://github.com/subhk/Tarang.jl")
+Pkg.add(url="https://github.com/SpectralFluid/Tarang.jl")
 
 # With MPI support
 Pkg.add(["MPI", "PencilArrays", "PencilFFTs"])

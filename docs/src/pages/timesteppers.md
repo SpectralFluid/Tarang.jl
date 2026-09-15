@@ -77,6 +77,9 @@ timestepper = RK443()
 - **Stability**: L-stable
 - **Use case**: High accuracy requirements, stiff problems
 
+`RK443_IMEX` is a compatibility alias for `RK443`, so `RK443_IMEX()` constructs
+the same timestepper type and has the same CPU, GPU, and MPI execution paths.
+
 ### RKSMR
 
 The Spalart–Moser–Rogers semi-implicit scheme, stored as an equivalent four-stage additive Runge-Kutta tableau.

@@ -33,6 +33,7 @@ const TEST_FILES = [
     "test_problems.jl",
     "test_operators_basic.jl",
     "test_interpolation.jl",
+    "test_review_numerics_checkpoint.jl",
     "test_matrix_apply.jl",
     "test_field_layout_operations.jl",
     "test_layout_discipline_ratchet.jl",   # layout is a mutable Symbol and get_*_data does not consult it — reading the wrong buffer is stale numbers, not an error; pins the manual-management population
@@ -81,6 +82,7 @@ const TEST_FILES = [
     "test_cartesian_operators.jl",
     "test_stochastic_forcing.jl",
     "test_separable_stochastic_forcing.jl",
+    "test_stochastic_checkpoint_restart.jl",
     "test_temporal_filters.jl",
     "test_temporal_filters_extended.jl",
     "test_arithmetic.jl",
@@ -229,6 +231,9 @@ const OPTIONAL_TEST_FILES = [
 # Single-process CUDA tests. Run with TARANG_RUN_GPU_TESTS=true on a CUDA host
 # (the JuliaGPU Buildkite pipeline sets this).
 const GPU_TEST_FILES = [
+    "test_les_models.jl",
+    "test_stochastic_forcing.jl",
+    "test_stochastic_checkpoint_restart.jl",
     "test_gpu_nonlinear_optimizations.jl",
     "test_gpu_rk_optimizations_cuda.jl",
     "test_gpu_optional_workspaces_cuda.jl",

@@ -39,8 +39,6 @@ on the GPU and computations use GPU-optimized broadcasting.
 3. Abkar, M., Bae, H.J., Moin, P. (2016). "Minimum-dissipation scalar transport model"
 """
 
-# LinearAlgebra already in Tarang.jl
-
 # ============================================================================
 # Abstract Types
 # ============================================================================
@@ -66,18 +64,9 @@ abstract type EddyViscosityModel <: SGSModel end
 """
     _validate_gradient_arrays(reference, arrays...)
 
-Validate every input gradient array against `reference` — the model's own output
-array, which is what the kernels actually iterate.
-
-This check is deliberately NOT wrapped in `@boundscheck`. It used to be, and that
-made it vanish under `--check-bounds=no` (a plausible flag for a production LES
-run) while the kernels still ran `@inbounds`: an undersized gradient array was
-then read past its end, which segfaults for a large mismatch and silently returns
-values read from unowned memory for a small one. One predictable branch per call
-is nothing against the O(N) work that follows.
-
-`reference` is the model's array rather than `model.field_size`, so a mutated
-`field_size` cannot desync the validated shape from the iterated one.
+Validate gradients against the output buffer's shape, not mutable `field_size`.
+Keep validation outside `@boundscheck`: the kernels use `@inbounds`, so shape
+checks must remain active under `--check-bounds=no`.
 """
 function _validate_gradient_arrays(reference::AbstractArray, arrays...)
     expected_size = size(reference)
@@ -95,13 +84,9 @@ end
 """
     _reject_nonlocal_array(i, arr)
 
-Reject array types whose element order does not match the model's own array.
-
-The kernels pair cells positionally against a rank-local dense array. A
-`PencilArray` reports the same `size` but stores its data in (possibly permuted)
-parent order, so mixing one in passes a size check and then silently pairs the
-wrong cells — measured at 75% of cells mispaired for a `Permutation(3,2,1)`
-pencil. Fail loudly with the fix instead.
+Require the same storage order as the model's rank-local dense arrays.
+A `PencilArray` may have permuted storage despite a matching size; callers must
+pass `get_local_data(field)` or `parent(array)`.
 """
 @inline function _reject_nonlocal_array(i::Int, arr::AbstractArray)
     if arr isa PencilArrays.PencilArray
@@ -117,23 +102,13 @@ end
 """
     _safe_quotient(C, numer, denom)
 
-Return `C * numer / denom`, guarding only the genuine `0/0`.
-
-`denom` is `|∇u|²` (or `|∇b|²`) — a DIMENSIONAL quantity. The previous guard
-compared it against an absolute `100*eps(T)`, which made the result depend on the
-caller's choice of units and dtype and broke the model's exact invariances: κₑ is
-mathematically unchanged by `b → αb`, yet a Float64 scalar scaled by 1e-8 (a trace
-species in mixing-ratio units) returned identically zero, and in Float32 an
-ordinary weakly-turbulent field had 89% of its cells silently zeroed. No guard
-that large is needed: `numer` is `O(denom^1.5)`, so the quotient stays finite for
-every `denom > 0` down to the smallest subnormal.
-
-NaN propagates deliberately. Returning zero for a blown-up velocity field would
-hide the blow-up at the one place a solver would naturally notice it.
+Return `C * (numer / denom)` for normalized AMD contractions; return zero for a
+zero denominator and propagate NaN. Avoid an absolute epsilon cutoff, which
+would make the result depend on the gradient's units.
 """
 @inline function _safe_quotient(C::T, numer::T, denom::T) where {T}
     isnan(denom) && return T(NaN)
-    return denom > zero(T) ? C * numer / denom : zero(T)
+    return denom > zero(T) ? C * (numer / denom) : zero(T)
 end
 
 """
@@ -150,9 +125,7 @@ Clip a negative eddy-viscosity/diffusivity predictor to zero when requested.
 Geometric-mean filter width `(Δ₁ Δ₂ … Δ_N)^(1/N)`, derived on demand so a mutated
 `filter_width` can never disagree with it.
 """
-# Signature requires at least one element: `NTuple{N,T}` also matches the empty
-# tuple, which leaves `T` unbound (Aqua flags it, and `prod(())^(1/0)` is
-# meaningless anyway). `N` comes from the tuple length, which is static.
+# Require a nonempty tuple so the mean is defined and `T` remains bound.
 @inline function _effective_delta(filter_width::Tuple{T, Vararg{T}}) where {T}
     return T(prod(filter_width)^(1 / length(filter_width)))
 end
@@ -160,10 +133,8 @@ end
 """
     _validate_model_params(constant_name, constant, filter_width, field_size)
 
-Shared constructor validation for the SGS models. Previously absent, which let
-`filter_width = (-1,-1,-1)` construct an AMD model silently (the sign vanished in
-the squaring) while raising `DomainError` from the geometric mean in Smagorinsky,
-and let `C = -5` (anti-dissipative), zero widths, and empty grids through.
+Require a finite nonnegative model constant, finite positive filter widths,
+and positive grid extents.
 """
 function _validate_model_params(constant_name::Symbol, constant::Real,
                                 filter_width::NTuple{N, Real},
@@ -197,9 +168,7 @@ function _coerce_arrays_to_architecture(arch::AbstractArchitecture, arrays::Abst
     return tuple((_ensure_array_on_architecture(arch, arr) for arr in arrays)...)
 end
 
-# One method per architecture rather than an `is_gpu` branch: a GPU model that
-# reaches a build without the CUDA extension now fails on the missing
-# `on_architecture(::GPU, _)` method instead of silently taking the host path.
+# Architecture dispatch requires a device transfer implementation for GPU models.
 @inline function _ensure_array_on_architecture(::CPU, arr::AbstractArray)
     is_gpu_array(arr) && error(
         "A CPU LES model cannot consume GPU gradient arrays; CPU fallback is disabled. " *
@@ -346,7 +315,7 @@ end
 
 Compute eddy viscosity from velocity gradient components.
 
-GPU-aware: Uses broadcasting for GPU arrays, optimized SIMD loops for CPU.
+Uses shared scalar kernels broadcast over CPU or GPU arrays.
 
 ## 2D Case
 ```julia
@@ -361,12 +330,8 @@ compute_eddy_viscosity!(model, ∂u∂x, ∂u∂y, ∂u∂z, ∂v∂x, ∂v∂y,
 # ----------------------------------------------------------------------------
 # Pointwise kernels
 # ----------------------------------------------------------------------------
-# One scalar function per formula, broadcast over whatever array type the model
-# holds. CPU and GPU previously ran separately hand-written implementations of
-# the same algebra: they happened to agree bitwise, but every future edit had to
-# be mirrored by hand, and the GPU branch materialised up to eight field-sized
-# temporaries per call (≈1 GB at 256³ Float64 for AMD 3-D). Broadcasting one
-# scalar kernel needs none and cannot drift.
+# CPU and GPU broadcast the same scalar kernels, fusing intermediate arithmetic
+# without allocating field-sized temporaries.
 
 """
     _smag_strain(gradients...)
@@ -585,6 +550,12 @@ most easily got wrong.
 """
 @inline function _amd_nu(C::T, Δx²::T, Δy²::T, clip::Bool,
                          u_x::T, u_y::T, v_x::T, v_y::T) where {T}
+    # nu(a*G) = a*nu(G) for a > 0. Normalize BEFORE squaring/cubing;
+    # all intermediates in the gradient contraction then remain O(1).
+    scale = max(abs(u_x), abs(u_y), abs(v_x), abs(v_y))
+    isfinite(scale) || return T(NaN)
+    iszero(scale) && return zero(T)
+    u_x, u_y, v_x, v_y = map(g -> g / scale, (u_x, u_y, v_x, v_y))
     S11 = u_x
     S22 = v_y
     S12 = T(0.5) * (u_y + v_x)
@@ -592,13 +563,19 @@ most easily got wrong.
     numer_x = Δx² * (u_x^2 * S11 + T(2) * u_x * v_x * S12 + v_x^2 * S22)
     numer_y = Δy² * (u_y^2 * S11 + T(2) * u_y * v_y * S12 + v_y^2 * S22)
     numer = -(numer_x + numer_y)
-    return _apply_clip(clip, _safe_quotient(C, numer, denom))
+    return _apply_clip(clip, scale * _safe_quotient(C, numer, denom))
 end
 
 @inline function _amd_nu(C::T, Δx²::T, Δy²::T, Δz²::T, clip::Bool,
                          u_x::T, u_y::T, u_z::T,
                          v_x::T, v_y::T, v_z::T,
                          w_x::T, w_y::T, w_z::T) where {T}
+    scale = max(abs(u_x), abs(u_y), abs(u_z), abs(v_x), abs(v_y), abs(v_z),
+                abs(w_x), abs(w_y), abs(w_z))
+    isfinite(scale) || return T(NaN)
+    iszero(scale) && return zero(T)
+    u_x, u_y, u_z, v_x, v_y, v_z, w_x, w_y, w_z =
+        map(g -> g / scale, (u_x, u_y, u_z, v_x, v_y, v_z, w_x, w_y, w_z))
     S11 = u_x
     S22 = v_y
     S33 = w_z
@@ -613,7 +590,7 @@ end
     numer_z = Δz² * (u_z^2 * S11 + v_z^2 * S22 + w_z^2 * S33 +
                      T(2) * (u_z * v_z * S12 + u_z * w_z * S13 + v_z * w_z * S23))
     numer = -(numer_x + numer_y + numer_z)
-    return _apply_clip(clip, _safe_quotient(C, numer, denom))
+    return _apply_clip(clip, scale * _safe_quotient(C, numer, denom))
 end
 
 """
@@ -628,10 +605,18 @@ The inner sum runs over ALL velocity components i, not just one.
 @inline function _amd_kappa(C::T, Δx²::T, Δy²::T, clip::Bool,
                             u_x::T, u_y::T, v_x::T, v_y::T,
                             b_x::T, b_y::T) where {T}
+    # kappa(a*G, b*grad(theta)) = a*kappa(G, grad(theta)). The scalar
+    # scale cancels completely, while the velocity scale is restored last.
+    scale = max(abs(u_x), abs(u_y), abs(v_x), abs(v_y))
+    bscale = max(abs(b_x), abs(b_y))
+    (isfinite(scale) && isfinite(bscale)) || return T(NaN)
+    (iszero(scale) || iszero(bscale)) && return zero(T)
+    u_x, u_y, v_x, v_y = map(g -> g / scale, (u_x, u_y, v_x, v_y))
+    b_x, b_y = b_x / bscale, b_y / bscale
     denom = b_x^2 + b_y^2
     numer = -(Δx² * b_x * (u_x * b_x + v_x * b_y) +
               Δy² * b_y * (u_y * b_x + v_y * b_y))
-    return _apply_clip(clip, _safe_quotient(C, numer, denom))
+    return _apply_clip(clip, scale * _safe_quotient(C, numer, denom))
 end
 
 @inline function _amd_kappa(C::T, Δx²::T, Δy²::T, Δz²::T, clip::Bool,
@@ -639,11 +624,19 @@ end
                             v_x::T, v_y::T, v_z::T,
                             w_x::T, w_y::T, w_z::T,
                             b_x::T, b_y::T, b_z::T) where {T}
+    scale = max(abs(u_x), abs(u_y), abs(u_z), abs(v_x), abs(v_y), abs(v_z),
+                abs(w_x), abs(w_y), abs(w_z))
+    bscale = max(abs(b_x), abs(b_y), abs(b_z))
+    (isfinite(scale) && isfinite(bscale)) || return T(NaN)
+    (iszero(scale) || iszero(bscale)) && return zero(T)
+    u_x, u_y, u_z, v_x, v_y, v_z, w_x, w_y, w_z =
+        map(g -> g / scale, (u_x, u_y, u_z, v_x, v_y, v_z, w_x, w_y, w_z))
+    b_x, b_y, b_z = b_x / bscale, b_y / bscale, b_z / bscale
     denom = b_x^2 + b_y^2 + b_z^2
     numer = -(Δx² * b_x * (u_x * b_x + v_x * b_y + w_x * b_z) +
               Δy² * b_y * (u_y * b_x + v_y * b_y + w_y * b_z) +
               Δz² * b_z * (u_z * b_x + v_z * b_y + w_z * b_z))
-    return _apply_clip(clip, _safe_quotient(C, numer, denom))
+    return _apply_clip(clip, scale * _safe_quotient(C, numer, denom))
 end
 
 """
@@ -651,7 +644,7 @@ end
 
 Compute AMD eddy viscosity from velocity gradient components.
 
-GPU-aware: Uses broadcasting for GPU arrays, optimized SIMD loops for CPU.
+Uses shared scalar kernels broadcast over CPU or GPU arrays.
 
 ## 2D Case
 ```julia
@@ -728,21 +721,16 @@ end
 
 Compute eddy diffusivity for scalar transport using AMD model.
 
-GPU-aware: Uses broadcasting for GPU arrays, optimized SIMD loops for CPU.
+Uses shared scalar kernels broadcast over CPU or GPU arrays.
 
 For a scalar field b with gradient ∇b, the AMD eddy diffusivity
-(Abkar, Bae & Moin 2016, eq. 2.7) is the FULL double contraction over the
-scaled-gradient direction k AND all velocity components i:
+(Abkar, Bae & Moin 2016, eq. 2.7) contracts over the scaled-gradient direction k
+and all velocity components i:
 
     κₑ = max(0, κₑ†),   κₑ† = -C · [ Σₖ δₖ² (∂ₖ uᵢ)(∂ₖ b)(∂ᵢ b) ] / [ (∂ₗ b)(∂ₗ b) ]
 
-i.e. for each direction k form the inner sum Σᵢ (∂ₖ uᵢ)(∂ᵢ b) over ALL velocity
-components uᵢ, weight by δₖ²(∂ₖ b), and sum over k. The method therefore needs
-every velocity-gradient component ∂uᵢ/∂xₖ (2D: 4 of them; 3D: 9), passed in
-component-major order, followed by the scalar gradients ∂b/∂xₖ.
-(An earlier version summed only a single velocity component, contracting the
-scaled velocity gradient with the SAME scalar-gradient direction twice — that is
-NOT the AMD diffusivity and is fixed here.)
+Pass every velocity-gradient component ∂uᵢ/∂xₖ (2D: 4; 3D: 9) in component-major
+order, followed by the scalar gradients ∂b/∂xₖ.
 """
 function compute_eddy_diffusivity!(
     model::AMDModel{T, 2, A, Arch},

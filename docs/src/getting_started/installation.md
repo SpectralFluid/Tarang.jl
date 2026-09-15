@@ -62,7 +62,7 @@ The package is currently hosted on GitHub and can be installed directly:
 
 ```julia
 using Pkg
-Pkg.add(url="https://github.com/subhk/Tarang.jl")
+Pkg.add(url="https://github.com/SpectralFluid/Tarang.jl")
 Pkg.add(["FFTW", "KernelAbstractions", "MPI", "NetCDF", "PencilArrays"])
 
 using MPI
@@ -84,7 +84,7 @@ Windows uses the `MPI.mpiexec()` launcher pattern shown below instead; the
 For development or to get the latest features:
 
 ```bash
-git clone https://github.com/subhk/Tarang.jl.git
+git clone https://github.com/SpectralFluid/Tarang.jl.git
 cd Tarang.jl
 julia --project=. -e 'using Pkg; Pkg.instantiate()'
 ```
@@ -291,7 +291,7 @@ RUN julia -e 'using Pkg; \
     Pkg.add("MPIPreferences"); \
     using MPIPreferences; \
     MPIPreferences.use_system_binary(); \
-    Pkg.add(url="https://github.com/subhk/Tarang.jl"); \
+    Pkg.add(url="https://github.com/SpectralFluid/Tarang.jl"); \
     Pkg.add(["FFTW", "KernelAbstractions", "MPI", "NetCDF", "PencilArrays"]); \
     Pkg.precompile()'
 

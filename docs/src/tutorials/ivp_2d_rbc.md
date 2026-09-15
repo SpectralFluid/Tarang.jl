@@ -70,7 +70,10 @@ and replace `∇²T` with `∇·∇_T` and `∇²u` with `∇·∇_u`. The equat
 \end{aligned}
 ```
 
-with five tau fields (`τ_p`, `τ_{T_1}`, `τ_{T_2}`, `τ_{u_1}`, `τ_{u_2}`) supplying the extra degrees of freedom needed to enforce the five algebraic constraints (2 T BCs, 2 u BCs, 1 pressure gauge). See the [Tau method](../pages/tau_method.md) page for why the first-order formulation is recommended.
+The five tau fields comprise two scalar temperature fields, two vector velocity
+fields, and the scalar pressure-gauge tau. The wall conditions supply six scalar
+rows per Fourier mode; the gauge adds one row at DC, matching seven scalar tau
+DOFs there. See the [Tau method](../pages/tau_method.md) page for the formulation.
 
 ## Complete implementation
 
@@ -126,7 +129,9 @@ u = VectorField(domain, "u")
 
 ### Tau fields
 
-Five tau fields for five algebraic constraints. Each "drops the coupled direction" — they live on `(xbasis,)` only, not on both axes, because the lift injects them at a single Chebyshev mode.
+Boundary taus retain the tangential Fourier basis `(xbasis,)` and omit the
+coupled `z` direction. The spatially constant pressure-gauge tau has no bases.
+Count scalar components when balancing unknowns and constraints.
 
 ```julia
 tau_p  = ScalarField(dist, "tau_p",  (),         Float64)
@@ -153,7 +158,9 @@ grad_T = grad(T) + ez * τ_lift(tau_T1)
 
 The `lift_basis = derivative_basis(zbasis)` is the idiomatic convention (see the [Tau method](../pages/tau_method.md) page for the reason). The closure `τ_lift(A)` injects the tau field at the last Chebyshev coefficient (`-1` = last mode, wraparound-indexed).
 
-`grad_u` and `grad_T` are the augmented gradients — they carry the tau corrections that will enforce the bottom-wall BCs on the gradient itself.
+`grad_u` and `grad_T` are augmented-gradient expressions. Their tau corrections
+are solved together with the evolution-equation taus to satisfy both walls;
+they do not impose separate boundary conditions on the gradients.
 
 ### Problem and equations
 
@@ -178,7 +185,8 @@ add_equation!(problem,
 Key substitutions:
 - `trace(grad_u)` replaces `div(u)` in the continuity equation and implicitly carries the `τ_{u_1}` lift.
 - `div(grad_T)` replaces `∇²T`; `div(grad_u)` replaces `∇²u`.
-- `τ_lift(tau_T2)` and `τ_lift(tau_u2)` are the tau corrections for the evolution-equation side (top-wall BCs).
+- `τ_lift(tau_T2)` and `τ_lift(tau_u2)` enter the evolution equations directly.
+  Their placement does not assign them to the top wall.
 
 ### Boundary conditions
 

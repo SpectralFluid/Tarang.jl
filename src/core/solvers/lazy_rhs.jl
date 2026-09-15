@@ -1244,19 +1244,16 @@ Keyed by `(order, uses_rfft)` since the basis (hence N and L) is fixed; this
 mirrors `_get_cached_deriv_mult` for the non-lazy path and avoids reallocating
 the wavenumber-multiplier array on every RHS evaluation.
 """
-function _get_cached_lazy_deriv_mult(basis::FourierBasis, order::Int, uses_rfft::Bool)
+function _get_cached_lazy_deriv_mult(basis::FourierBasis, order::Int, uses_rfft::Bool)::Vector{ComplexF64}
     cache_key = (:lazy_deriv_mult, order, uses_rfft)
-    cached = get(basis.transforms, cache_key, nothing)
-    cached !== nothing && return cached::Vector{ComplexF64}
-
-    k_axis = if isa(basis, RealFourier)
-        uses_rfft ? wavenumbers_rfft(basis) : wavenumbers_fft(basis)
-    else
-        wavenumbers(basis)
+    return _get_basis_cache!(basis, cache_key) do
+        k_axis = if isa(basis, RealFourier)
+            uses_rfft ? wavenumbers_rfft(basis) : wavenumbers_fft(basis)
+        else
+            wavenumbers(basis)
+        end
+        ComplexF64.((im .* k_axis) .^ order)
     end
-    deriv_mult = ComplexF64.((im .* k_axis) .^ order)
-    basis.transforms[cache_key] = deriv_mult
-    return deriv_mult
 end
 
 """Return the cached Fourier multiplier on the same backend as `data`.
@@ -1327,12 +1324,9 @@ end
 """Reusable matmul scratch for `_apply_1d_matrix!`, cached per basis by shape+eltype."""
 function _diff_matmul_buffer(basis, data::AbstractArray)
     key = (:diff_matmul_tmp, size(data), eltype(data))
-    buf = get(basis.transforms, key, nothing)
-    if buf === nothing
-        buf = similar(data)
-        basis.transforms[key] = buf
+    return _get_basis_cache!(basis, key) do
+        similar(data)
     end
-    return buf
 end
 
 # Function barrier: `tmp` arrives `Any`-typed from the `Dict{Any,Any}` basis.transforms

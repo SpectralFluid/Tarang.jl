@@ -1,8 +1,10 @@
 # Architecture and Codebase Structure
 
-This page is a contributor map of Tarang.jl. It describes ownership and the
-runtime path without duplicating type definitions that are easier to read in
-the source.
+This page maps source ownership, dependencies, and solver execution in Tarang.jl.
+
+Use the website's **dev** version for the structure on `main`; **stable**
+describes the latest tagged release. The published manual is built from
+`docs/src/`, with navigation and deployment configured in `docs/make.jl`.
 
 ## Package layout
 
@@ -27,6 +29,7 @@ src/
 │   │   ├── field_data/       storage, copies, scales (dealiasing) — per-field data
 │   │   └── field_layout/     :g/:c layout transitions and field arithmetic
 │   ├── forcing/              stochastic + deterministic forcing (types, generation, application)
+│   ├── les_models.jl         array-level Smagorinsky and AMD closures; shared CPU/GPU kernels
 │   ├── nonlinear/            nonlinear products, 3/2 padding, dealiasing
 │   ├── operators/            symbolic operator tree
 │   │   ├── derivatives/      Fourier / polynomial derivatives, matrix apply
@@ -40,15 +43,25 @@ src/
 │   ├── timesteppers/         RK, multistep, diagonal-IMEX, ETD schemes and path selection
 │   ├── transforms/           serial transforms, layout rules, GPU dispatch hooks
 │   └── transpose/            TransposableField: MPI pencil transposes (pack/unpack, async)
-├── tools/                    matrix solvers (sparse, GPU, batched), NetCDF I/O, checkpoints,
-│   └── temporal_filters/     config, logging, parallel helpers, temporal filters
+├── tools/                    matrix solvers, NetCDF I/O, checkpoints, config, logging
+│   └── temporal_filters/     temporal, wave/mean, and GQL filters
 └── extras/
     └── flow_tools/           CFL, spectra, QG/streamfunction diagnostics, quick domains, plotting
 
 ext/
-└── TarangCUDAExt.jl
-    └── cuda/                 device architecture, cuFFT/DCT-I transforms, Chebyshev derivative
-                              kernels, batched matsolvers, NCCL transposes, memory
+├── TarangCUDAExt.jl          extension module and ordered CUDA includes
+└── cuda/                    device architecture, cuFFT/DCT-I transforms, Chebyshev
+                             derivatives, batched matsolvers, NCCL transposes, memory
+
+test/
+├── file_lists.jl             shared CPU, optional, GPU, MPI, and distributed GPU registry
+├── runtests.jl               package test runner
+├── run_gpu_ci.jl             CUDA test driver
+└── run_mpi_ci.jl             launches each registered MPI test in its own process world
+
+docs/
+├── make.jl                  Documenter build, navigation, and deployment
+└── src/                     published manual, tutorials, API pages, and assets
 ```
 
 `src/load_order.jl` is the whole include order, as twelve manifests. Each one
@@ -70,9 +83,10 @@ owning manifest and never as a one-off include in `src/Tarang.jl`:
 | 11 | `extras/load_extras.jl` | flow tools, plot tools, quick domains, analysis tasks |
 | 12 | `tools/load_pretty_printing.jl` | `show` methods |
 
-Most `src/core/*.jl` files at the top level (`field.jl`, `operators/operators.jl`,
-`transforms.jl`, ...) are aggregators that include the directory of the same
-name; the implementation lives in the directory.
+Entry points such as `src/core/field.jl`, `src/core/operators/operators.jl`,
+`src/core/transforms.jl`, and `src/core/stochastic_forcing.jl` aggregate
+implementation files from their respective directories. Forcing is split
+under `src/core/forcing/`.
 
 ## Dependency direction
 
@@ -151,8 +165,7 @@ For an InitialValueProblem, trace these files:
    structure, and whether global matrices and subproblems were assembled.
 6. `core/solvers/solver_stepping.jl` refreshes dynamic boundary conditions and
    calls the timestepper dispatcher (`core/timesteppers/dispatch.jl`), which
-   first runs the loud guards (stochastic-forcing compatibility, the single-GPU
-   implicit-operator refusal).
+   checks stochastic-forcing and single-GPU implicit-operator compatibility.
 7. `core/timesteppers/step_selection.jl` chooses the runtime path; the
    per-scheme `step_*!` functions then run one of the paths below.
 
@@ -172,14 +185,13 @@ refresh BCs → evaluate RHS → per-mode solve → update fields
 
 ### Timestepper runtime paths
 
-Every scheme picks one of these paths from the same facts. There is never a
-silent fourth option: a configuration with no correct path raises and names
-the working alternative.
+Runtime selection uses the execution plan and timestepper capabilities.
+Unsupported configurations raise an error.
 
 | Path | File | When |
 |---|---|---|
 | per-mode subproblem RK / multistep | `step_subproblem_rk.jl`, `step_subproblem_multistep.jl` | any coupled (Chebyshev/Jacobi) axis; CPU, MPI, and single GPU |
-| batched per-mode RK | `step_subproblem_rk_batched.jl` | as above, 2D, one Fourier axis; default on GPU, `batched_modes=true` on CPU |
+| batched per-mode RK | `step_subproblem_rk_batched.jl` | supported 2D/3D Fourier–Chebyshev layouts; default on GPU, `batched_modes=true` on CPU |
 | global-matrix IMEX | `step_rk.jl`, `step_multistep.jl`, `step_global_matrix.jl`, `step_etd.jl` | serial CPU with no subproblems (pure Fourier) |
 | explicit field path | `step_rk.jl` (`_step_explicit_rk_gpu!`), `step_multistep_field.jl` | GPU or MPI pure-Fourier problem with no implicit operator |
 | serial diagonal IMEX | `step_diagonal_imex.jl` | Selected internally by `RK222`, `RK443`, or `SBDF2` on GPU Fourier problems or serial problems with an attached diagonal operator: per-mode division by `1 + a·dt·L̂(k)` |
@@ -187,6 +199,46 @@ the working alternative.
 
 The user-facing consequences (which scheme runs where, and what refuses) are
 tabulated in [Time Steppers](timesteppers.md#Where-each-scheme-runs).
+
+`core/timesteppers/types.jl` declares `const RK443_IMEX = RK443`.
+Both names therefore use the same dispatch, workspace allocation, and backend
+capability traits. Changes to RK443 belong in the shared implementation.
+`core/timesteppers/state.jl` owns reusable stage fields and timestepper buffers;
+per-mode solve buffers and factorizations belong to subsystem caches.
+
+## Output and checkpoint ownership
+
+Persistence is layered under `src/tools/` so the field and solver core does not
+depend on file formats:
+
+| Layer | Files | Responsibility |
+|---|---|---|
+| Scheduled output | `netcdf_group_api.jl`, `netcdf_output.jl` | NetCDF groups, output handlers, and host staging for file writes |
+| Reconstruction | `netcdf_merge.jl`, `netcdf_merge_layout.jl` | processor-file discovery, coverage validation, and spectral reconstruction |
+| Slab I/O | `netcdf_slab_io.jl` | index-range intersections and local slab reads, without fields, solvers, or MPI collectives |
+| Field persistence | `field_netcdf_io.jl` | field metadata, layouts, and redistribution across restart decompositions |
+| Stochastic state | `stochastic_checkpoint.jl` | forcing configuration, private RNG state, cached draw, and update time |
+| Solver restart | `solver_checkpoint.jl` | collective preflight, field restoration, simulation clock, and restartable timestepper checks |
+
+`tools/load_output.jl` loads scheduled output before the evaluator;
+`tools/load_runtime.jl` loads reconstruction and slab I/O before field,
+stochastic, and solver persistence. NetCDF writes stage device arrays to host
+memory explicitly. Restart validates metadata across all processor files
+before changing destination fields. See [I/O](../api/io.md) for restart
+compatibility, including the Julia-version restriction for stochastic state.
+
+## LES model ownership
+
+`src/core/load_models.jl` loads `src/core/les_models.jl`, which owns the
+`SmagorinskyModel` and `AMDModel` types, gradient validation, eddy viscosity and
+diffusivity calculations, SGS stress, and diagnostics. Both backends broadcast
+the same scalar kernels over architecture-specific arrays. There is no separate
+CUDA AMD implementation under `ext/cuda/`; the extension supplies device arrays
+and transfers through the architecture interface.
+
+Callers supply grid-space gradients and apply the resulting stress to the RHS.
+See [LES Models](les_models.md) for AMD gradient normalization and the full
+variable-viscosity stress, and [Testing](testing.md) for CPU/JLArrays/CUDA coverage.
 
 ## RHS execution policy
 
@@ -251,15 +303,9 @@ The two conventions it encodes differ: with PencilArrays the **last**
 **first** ones are. Both live in `src/core/distributor/distributor_core.jl` and
 nowhere else.
 
-Do not re-derive the rule at a call site. It was previously written out by hand
-in seventeen places, and two of those copies drifted apart — the array allocator
-and the index math disagreed about which axes were split, so a field's shape and
-the meaning of its indices no longer matched, with no error raised.
-`test_decomposition_convention.jl` scans `src/` for hand-rolled copies, checking
-the arithmetic as well as the comments, and fails if one reappears.
-
-`ndim` is the *field's* dimensionality, which is not always `dist.dim`; pass the
-one you mean.
+Use these helpers at call sites; `test_decomposition_convention.jl` detects
+independent copies of the axis arithmetic. Pass the field's dimensionality as
+`ndim`, which can differ from `dist.dim`.
 
 ## Extension checklist
 

@@ -1,6 +1,8 @@
 # Tutorials Overview
 
-This section contains comprehensive tutorials that guide you through solving various types of PDEs with Tarang.jl. Each tutorial builds on concepts from previous ones, so we recommend following them in order if you're new to spectral methods or Tarang.jl.
+Start with the [problem-type guides](../pages/problems.md#Problem-Types) for a
+complete IVP, linear BVP, nonlinear BVP, or EVP example. This directory groups
+the longer tutorials by application and technique.
 
 ## Tutorial Path
 
@@ -49,8 +51,13 @@ Steady-state problems with boundary conditions.
 
 | Tutorial | Description | Complexity | Key Features |
 |----------|-------------|------------|--------------|
-| Steady Convection | Fixed temperature Rayleigh-Bénard | Intermediate | LinearBoundaryValueProblem, sparse linear solve |
-| Stokes Flow | Low Reynolds number flow | Beginner | Simple BVP example |
+| [Poisson equation](../problems/linear_boundary_value.md) | Steady linear solve | Beginner | Tau constraints, analytic solution |
+
+### Nonlinear Boundary Value Problems
+
+[The nonlinear BVP guide](../problems/nonlinear_boundary_value.md) gives a
+self-contained Newton solve, explains the initial guess and convergence controls,
+and verifies the solution against an analytic profile.
 
 ### Eigenvalue Problems (EigenvalueProblem)
 
@@ -86,123 +93,20 @@ Problems with dynamics confined to surfaces or boundaries.
 
 ### Initial Value Problems (InitialValueProblem)
 
-**When to use**: Time-dependent PDEs where you know the initial state and want to evolve forward in time.
-
-**Examples**:
-- Fluid dynamics (Navier-Stokes)
-- Heat diffusion
-- Wave propagation
-- Reaction-diffusion systems
-
-**Typical structure** (1D viscous Burgers, complete and runnable):
-```julia
-using Tarang
-
-coords = CartesianCoordinates("x")
-dist   = Distributor(coords; dtype=Float64, device=CPU())
-xbasis = RealFourier(coords["x"]; size=32, bounds=(0.0, 2π))
-domain = Domain(dist, (xbasis,))
-u      = ScalarField(domain, "u")
-
-problem = InitialValueProblem([u])
-add_parameters!(problem, nu=0.05)          # names used in equation strings must be parameters
-add_equation!(problem, "∂t(u) - nu*Δ(u) = -u*∂x(u)")
-set!(u, x -> sin(x))                       # serial only — under MPI use `local_grids` (below)
-
-solver = InitialValueSolver(problem, RK222(); dt=1e-3)
-
-t_end = 0.02
-while solver.sim_time < t_end
-    step!(solver)
-end
-```
-
-`step!(solver)` uses `solver.dt`. `step!(solver, dt)` steps with `dt` **and stores it**:
-`solver.dt` is overwritten, so every later bare `step!(solver)` keeps using the new value. The
-`run!(solver; stop_time=…, stop_iteration=…)` driver is the usual alternative to writing the loop
-yourself, and is what you need if you want CFL control or file output (below).
+[Initial value problems](../problems/initial_value.md) evolve fields in time with
+`InitialValueSolver`, a timestepper, and initial data.
 
 ### Boundary Value Problems (BVP)
 
-**When to use**: Steady-state problems where you solve for the spatial distribution given boundary conditions.
-
-**Types**:
-- **LinearBoundaryValueProblem**: Linear boundary value problems
-- **NonlinearBoundaryValueProblem**: Nonlinear boundary value problems (require iteration)
-
-**Examples**:
-- Steady-state heat conduction
-- Poisson equation
-- Steady Stokes flow
-
-**Typical structure** (tau method: one `tau` variable per BC, lifted into the
-bulk equation and declared via `add_parameters!`; BCs use `add_bc!`):
-```julia
-using Tarang
-
-coords = CartesianCoordinates("x", "z")
-dist   = Distributor(coords; dtype=Float64, device=CPU())
-xb = RealFourier(coords["x"]; size=4,  bounds=(0.0, 2π))
-zb = ChebyshevT(coords["z"];  size=16, bounds=(0.0, 1.0))
-domain = Domain(dist, (xb, zb))
-
-T    = ScalarField(domain, "T")
-tau1 = ScalarField(dist, "tau1", (xb,), Float64)   # one tau per BC, carrying the Fourier basis
-tau2 = ScalarField(dist, "tau2", (xb,), Float64)
-lb2  = derivative_basis(zb, 2)
-
-problem = LinearBoundaryValueProblem([T, tau1, tau2])
-add_parameters!(problem; l1=lift(tau1, lb2, -1), l2=lift(tau2, lb2, -2))
-add_equation!(problem, "Δ(T) + l1 + l2 = -2")
-add_bc!(problem, "T(z=0) = 0")
-add_bc!(problem, "T(z=1) = 1")
-
-solver = BoundaryValueSolver(problem)
-solve!(solver)     # recovers T = 2z - z² to 1.7e-16
-```
-
-The BVP path supports both mixed Fourier+Chebyshev and pure single-axis Chebyshev
-domains; see the [Problems API](../api/problems.md) for a complete, runnable example.
+[Linear BVPs](../problems/linear_boundary_value.md) solve a steady linear system.
+[Nonlinear BVPs](../problems/nonlinear_boundary_value.md) use an initial guess and
+Newton iteration. Both use `BoundaryValueSolver` and explicit boundary constraints.
 
 ### Eigenvalue Problems (EigenvalueProblem)
 
-**When to use**: Linear stability analysis, computing normal modes, or finding eigenvalues of differential operators.
-
-**Examples**:
-- Hydrodynamic stability
-- Normal mode analysis
-- Resonance frequencies
-
-**Typical structure** (growth rates of the Dirichlet Laplacian on `z ∈ [0, 1]`):
-```julia
-using Tarang
-
-coords = CartesianCoordinates("z")
-dist   = Distributor(coords; dtype=Float64, device=CPU())
-zb     = ChebyshevT(coords["z"]; size=32, bounds=(0.0, 1.0))
-domain = Domain(dist, (zb,))
-
-u    = ScalarField(domain, "u")
-tau1 = ScalarField(dist, "tau1", (), Float64)
-tau2 = ScalarField(dist, "tau2", (), Float64)
-lb2  = derivative_basis(zb, 2)
-
-# tau variables + lift handle the bounded-direction BCs (tau method)
-problem = EigenvalueProblem([u, tau1, tau2]; eigenvalue=:σ)
-add_parameters!(problem; l1=lift(tau1, lb2, -1), l2=lift(tau2, lb2, -2))
-# The eigenvalue REPLACES the time derivative: keep dt(u) to build the mass matrix.
-# Do NOT write `σ*u = ...` — that builds an empty M and returns no eigenvalues.
-add_equation!(problem, "dt(u) - Δ(u) - l1 - l2 = 0")
-add_bc!(problem, "u(z=0) = 0")
-add_bc!(problem, "u(z=1) = 0")
-
-solver = EigenvalueSolver(problem; nev=5, which=:SM)
-eigenvalues, eigenvectors = solve!(solver)
-# eigenvalues ≈ [-9.8696, -39.478, -88.826, -157.91, -246.74] = -(nπ)², i.e. pure decay
-```
-
-See the [Problems API](../api/problems.md) for the full eigenvalue convention
-(`L x = σ M x`, with `M` assembled from `dt(·)` terms).
+[Eigenvalue problems](../problems/eigenvalue.md) compute growth rates and modes
+with `EigenvalueSolver`. The [stability tutorial](eigenvalue_problems.md)
+extends the workflow to hydrodynamic examples.
 
 ## Choosing a Tutorial
 

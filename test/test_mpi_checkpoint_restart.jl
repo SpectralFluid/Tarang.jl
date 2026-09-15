@@ -8,6 +8,7 @@ using Tarang
 using MPI
 using PencilArrays
 using Test
+using Random
 
 MPI.Initialized() || MPI.Init()
 const COMM = MPI.COMM_WORLD
@@ -180,6 +181,103 @@ MPI.Barrier(COMM)
 # place, a real failure fails the SAME testset on every rank at once, so they
 # either all reach this `finally` together or none of them do.
 try
+    @testset "stochastic checkpoint preserves the next draw across rank counts (rank=$RANK)" begin
+        function forced_build(; comm=COMM, seed=42)
+            solver, _ = _build(RK222(), 0.02; comm)
+            forcing = StochasticForcing(field_size=(NX, NY), dt=0.02,
+                k_forcing=2.0, dk_forcing=1.0, rng=MersenneTwister(seed))
+            add_stochastic_forcing!(solver.problem, :u, forcing)
+            return solver, forcing
+        end
+        source, forcing = forced_build()
+        for _ in 1:2
+            step!(source, 0.02)
+        end
+        path = joinpath(CHK_ROOT, "stochastic")
+        written = save_state(source, path)
+        target, restored = forced_build(; seed=999)
+        load_state!(target, path)
+        @test _agree(restored.cached_forcing == forcing.cached_forcing)
+        step!(source, 0.02)
+        step!(target, 0.02)
+        @test _agree(restored.cached_forcing == forcing.cached_forcing)
+        @test _agree(isapprox(parent(grid_data!(target.state[1])), parent(grid_data!(source.state[1]))))
+        serial_ok = true
+        if RANK == 0
+            try
+                serial, serial_forcing = forced_build(; comm=MPI.COMM_SELF, seed=777)
+                load_state!(serial, path)
+                step!(serial, 0.02)
+                serial_ok = serial_forcing.cached_forcing == forcing.cached_forcing
+            catch
+                serial_ok = false
+            end
+        end
+        @test _agree(serial_ok)
+
+        # A rank with a different random stream cannot be silently accepted.
+        if RANK == 1
+            bytes = Tarang.ncread(written, Tarang._STOCHASTIC_CHECKPOINT_VAR)
+            bytes[end] = xor(bytes[end], Int8(1))
+            Tarang.ncwrite(bytes, written, Tarang._STOCHASTIC_CHECKPOINT_VAR)
+        end
+        MPI.Barrier(COMM)
+        before = copy(parent(grid_data!(target.state[1])))
+        failed = try
+            load_state!(target, path)
+            false
+        catch
+            true
+        end
+        @test _agree(failed)
+        @test _agree(parent(grid_data!(target.state[1])) == before)
+    end
+
+    @testset "checkpoint metadata failures stop every rank before restoring fields (rank=$RANK)" begin
+        path = joinpath(CHK_ROOT, "metadata")
+        donor, _ = _build(RK222(), 0.02)
+        step!(donor, 0.02)
+        written = save_state(donor, path)
+        MPI.Barrier(COMM)
+
+        # A complete stale slab is geometrically valid but belongs to another time.
+        if RANK == 1
+            Tarang.ncputatt(written, "global", Dict("sim_time" => 9.0))
+        end
+        MPI.Barrier(COMM)
+        restored, _ = _build(RK222(), 0.02)
+        original = copy(parent(get_coeff_data(restored.state[1])))
+        rejected = try
+            load_state!(restored, path)
+            false
+        catch err
+            err isa ErrorException
+        end
+        @test _agree(rejected)
+        @test _agree(restored.sim_time == 0.0 && restored.iteration == 0)
+        @test _agree(restored.state[1].current_layout == :c &&
+                     parent(get_coeff_data(restored.state[1])) == original)
+
+        # Model a filesystem/read failure visible to only one rank. The others
+        # must finish the metadata collective before entering load_field!'s
+        # transposes; an outer guard around both phases would hang here.
+        save_state(donor, path)
+        MPI.Barrier(COMM)
+        local_path = RANK == 1 ? joinpath(CHK_ROOT, "absent_metadata") : path
+        rejected = try
+            load_state!(restored, local_path)
+            false
+        catch err
+            err isa ErrorException
+        end
+        @test _agree(rejected)
+        @test _agree(restored.state[1].current_layout == :c &&
+                     parent(get_coeff_data(restored.state[1])) == original)
+
+        load_state!(restored, path)
+        @test _agree(restored.sim_time == donor.sim_time && restored.iteration == donor.iteration)
+    end
+
     @testset "Distributed checkpoint round-trips at the same rank count (rank=$RANK)" begin
         path = joinpath(CHK_ROOT, "same")
         solver, _ = _build(RK222(), 0.02)

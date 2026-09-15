@@ -4,6 +4,15 @@ Tarang enforces boundary conditions using the **tau method**, a spectral techniq
 
 The formulation uses explicit tau variables: tau fields are added to the state vector, and `lift()` operators inject them into the equations as extra degrees of freedom to match boundary conditions.
 
+## Tau constraints by problem type
+
+| Problem | How the constraints enter |
+|---|---|
+| [Initial value problem](../problems/initial_value.md) | Algebraic rows accompany the evolution equations and must hold during stepping. |
+| [Linear BVP](../problems/linear_boundary_value.md) | Solve the augmented linear system for fields and taus together. |
+| [Nonlinear BVP](../problems/nonlinear_boundary_value.md) | Include the constraints and taus in the nonlinear residual and Newton corrections. |
+| [Eigenvalue problem](../problems/eigenvalue.md) | Homogeneous perturbation constraints have zero mass rows in the generalized eigenproblem. |
+
 ## Why Do We Need the Tau Method?
 
 Consider the steady diffusion problem:
@@ -18,23 +27,44 @@ In a Chebyshev spectral method, `u` is expanded as
 u(z) = \sum_{n=0}^{N-1} a_n\, T_n(z),
 ```
 
-and the PDE is projected onto the basis to give an `N × N` linear system in the coefficients ``a_n``. The problem: **this system has no leftover degrees of freedom to enforce the boundary conditions**. All ``N`` unknowns are already determined by the interior equations, but we also need two boundary constraints.
-
-The tau method solves this by **adding extra unknowns** (the *tau fields*) that act as corrections designed to make the boundary conditions hold. The classical formulation, due to Lanczos (1938), replaces the highest-order rows of the spectral system with BC rows — but that makes the interior equation different at those rows, which is awkward for nonlinear and time-dependent problems.
-
-Modern spectral codes, including Tarang, use a cleaner variant: instead of *replacing* rows, they *add* a tau term to the equation itself:
+The second derivative has a two-dimensional nullspace (constant and linear
+polynomials), so the interior equations alone do not determine all coefficients.
+They also cannot represent an arbitrary degree-``N-1`` forcing: ``u_N''`` has
+degree at most ``N-3``. A tau formulation adds two unknown residual amplitudes:
 
 ```math
-\mathcal{L}[u] \;+\; \tau_1\,\phi_1(z) \;+\; \tau_2\,\phi_2(z) \;=\; f(z),
+\mathcal{L}[u_N] + \tau_1\phi_1(z) + \tau_2\phi_2(z) = f_N(z),
+\qquad B u_N = g.
 ```
 
-where ``\phi_1, \phi_2`` are chosen basis functions that live in a "lift basis". The tau scalars ``\tau_1, \tau_2`` become new unknowns in the system, and the boundary conditions become new equation rows that link them to the state. The interior of the PDE is untouched; the tau corrections only perturb the equation at a small number of high spectral modes, and for smooth solutions the required ``\tau_k`` are spectrally small.
+Here ``f_N`` is the discrete forcing, ``B`` evaluates the boundary constraints,
+and the chosen polynomials ``\phi_k`` supply the extra columns. In coefficient
+form the augmented system is
 
-That is exactly how Tarang implements BCs.
+```math
+\begin{pmatrix} L & P \\ B & 0 \end{pmatrix}
+\begin{pmatrix} a \\ \tau \end{pmatrix}
+= \begin{pmatrix} f \\ g \end{pmatrix}.
+```
+
+There are ``N+2`` equations and unknowns. The boundary rows constrain ``u_N``;
+the solve determines its coefficients and both taus together. A square system
+still requires independent constraints and suitable tau columns to be invertible.
+
+**Tau terms modify the interior PDE residual:**
+``\mathcal{L}[u_N]-f_N=-\sum_k\tau_k\phi_k``. High-degree polynomials extend
+throughout the domain; they are not corrections localized at the walls. For a
+convergent, well-resolved discretization the residual should decrease under
+refinement, but choosing a high mode alone does not guarantee a small error.
+
+When ``P`` selects particular coefficient rows, eliminating the tau unknowns
+is equivalent to omitting those PDE rows and imposing the BCs instead. Explicit
+tau variables and row replacement are two algebraic representations of that
+formulation. See the [generalized tau-method reference](https://dedalus-project.readthedocs.io/en/latest/pages/tau_method.html).
 
 ## Quick-Start Example
 
-Here's the smallest complete *verified* example — a 2D Poisson problem `Δu = -2`
+This 2D Poisson example solves `Δu = -2`
 with homogeneous Dirichlet BCs on the two `z` walls, whose exact solution is
 `u = z(Lz - z)`. The domain has one separable (Fourier) `x` direction and one
 bounded (Chebyshev) `z` direction; the Chebyshev direction is the coupled one
@@ -76,17 +106,20 @@ add_bc!(problem, "u(z=1.0) = 0")
 
 solver = BoundaryValueSolver(problem)
 solve!(solver)
-ensure_layout!(u, :g)            # scatter writes coefficients; switch to grid
+ensure_layout!(u, :g)
+x, z = local_grids(dist, xb, zb)
+@assert maximum(abs.(get_grid_data(u) .- z' .* (1 .- z'))) < 1e-12
+@assert maximum(abs, get_grid_data(u)[:, [1, end]]) < 1e-12
 ```
 
-This reproduces the exact solution `u = z(1 - z)` to `1.4e-16`, with both wall
-residuals at `0.0`.
+The assertions check the analytic solution and both wall values. Roundoff-level
+residuals depend on the numerical environment.
 
 Notice that:
 
 1. Tau fields (`tau1`, `tau2`) are **added to the state vector**, not computed from the state afterwards.
 2. The lift terms are registered as named parameters via `add_parameters!` and then referenced by name (`l1`, `l2`) in the equation. Each lift uses the 3-arg form `lift(tau, lift_basis, -k)`.
-3. The BCs are declared with `add_bc!` (`u(z=0) = 0`) — Tarang converts each into an algebraic row that constrains the tau fields.
+3. The BCs are declared with `add_bc!` (`u(z=0) = 0`) — Tarang converts each into an algebraic row that constrains the boundary value of `u`.
 
 The solver builds **one square tau subproblem per separable Fourier mode** and
 determines `u`, `tau1`, and `tau2` **simultaneously** in a single linear solve.
@@ -110,68 +143,56 @@ lift(tau, derivative_basis(basis, order), -k)   # explicit lift basis
 - **`derivative_basis(basis, order)`** is the *lift basis*. A direct second-order
   equation (`Δ(u)`) uses `order = 2`; the first-order `grad_u`/`grad_T`
   formulation used by the flow examples uses `order = 1`. Bind the result once
-  and reuse it. See [Why still pass the derivative basis?](#why-still-pass-the-derivative-basis)
+  and reuse it. See [Why still pass the derivative basis?](#Why-still-pass-the-derivative-basis?)
   below for what this argument does — and does not — control today.
 - **`-k`** is an integer mode index with wraparound semantics: `-1` is the last coefficient slot of the coupled direction (`lift_mode = N-1` → Julia index `N`), `-2` is the second-to-last, `0` is the first, and so on. For a ChebyshevT state of size `N`, `-1` places the tau value at coefficient `N-1`. A second-order problem uses two taus with lift orders `-1` and `-2`.
 
 ### The 2-argument short form does not work
 
-`lift(tau, n)` — the basis-less short form that appears in the `lift` docstring — is
-**broken in the current release**. It tries to auto-detect the lift basis by scanning
-`tau.dist.layouts`, but that dictionary is keyed by `(bases, dtype)` pairs rather than
-by bases alone, so the scan hands a *tuple* to `is_fourier_basis` and dies:
+Use `lift(tau, basis, n)` explicitly. Automatic basis detection in
+`lift(tau, n)` is unreliable with the distributor's cached layout keys and can
+raise an error even after the full state field has been constructed. The parser
+propagates this failure for equation strings; it does not replace a failed lift
+with its bare operand.
 
-```
-MethodError: no method matching is_fourier_basis(::Tuple{RealFourier, ChebyshevT})
-```
-
-It fails this way regardless of the order in which you create your fields — creating the
-full state field first, so the distributor has already cached the complete layout, does
-**not** rescue it. Pass the lift basis explicitly instead — bind it once and reuse it:
-
-```julia
-lb1    = derivative_basis(zbasis, 1)
-tau_u1 = ScalarField(dist, "tau_u1", (xbasis,), Float64)
-grad_u = grad(u) + ez * lift(tau_u1, lb1, -1)
-```
-
-All of Tarang's shipped examples use this explicit form.
-
-!!! warning "The short form inside an equation *string* fails silently"
-    Writing `lift(tau1, -1)` inside an `add_equation!` string does not raise: the parser
-    catches the auto-detection failure and falls back to the bare operand, dropping the
-    `Lift` wrapper. On the quick-start problem the solution `u` still comes out
-    bit-identical, but the tau fields scatter back as `0.0` instead of their true values,
-    so you silently lose the tau diagnostic — and you are leaning on an untracked fallback
-    path. Build the lift explicitly, name it with `add_parameters!`, and reference it by
-    name.
+Build the lift with an explicit basis, register it with `add_parameters!`, and
+reference the parameter in the equation, as in the quick-start example.
 
 ### What `lift(tau, basis, n)` actually computes (solver view)
 
-At the solver level, `lift(tau, basis, n)` resolves to a **single-column sparse matrix** with a `1` at row `lift_mode` (where `lift_mode = n` is wraparound-resolved: `-1` → last, `-2` → second-to-last, etc.). This column is a discrete delta in the coupled direction's coefficient space.
+For a scalar tau, `subproblem_matrix(op::Lift, sp)` builds an ``N\times1``
+sparse column with a unit entry at the selected coefficient row. Vector taus
+produce one such column per component. A direct lift adds to one row per
+component; composing it with a derivative, as in `div(grad_u)`, also differentiates
+the lift column and can couple it to additional rows.
 
 ```math
-\text{lift}(\tau, \cdot, n) \;\longrightarrow\; \tau \cdot e_{\text{lift\_mode}}
+\operatorname{Lift}(\tau,\cdot,n) \longrightarrow e_j\tau,
+\qquad j=N+n+1\quad(n<0)
 ```
 
-where ``e_{\text{lift\_mode}}`` is the unit vector with a `1` at the `lift_mode`-th Chebyshev-coefficient slot. When this is added to an equation's LHS, it contributes the unknown ``\tau`` to exactly one coefficient row, leaving every other interior row untouched. The linear solver then chooses ``\tau`` so that the BC rows hold — and because the perturbation is confined to one high-order coefficient, the interior PDE residual stays spectrally small for smooth solutions.
+Here ``j`` is a Julia index: `-1` gives row `N`. This is a coefficient-space
+injection, not a physical-space boundary impulse.
 
-> **Implementation detail worth knowing**: In Tarang's current solver, `subproblem_matrix(op::Lift, sp)` reads the dimension `N` from `_subproblem_cheb_basis(sp)` — the problem's own Chebyshev basis — and does **not** use `op.basis` to compute the matrix. That means `lift(tau, zb, -1)`, `lift(tau, derivative_basis(zb, 1), -1)` and `lift(tau, derivative_basis(zb, 2), -1)` produce **identical** delta columns at row `N-1`. (Measured: all three spellings give bit-identical solutions *and* bit-identical tau values on the quick-start problem.) The `basis` argument is a semantic hint for basis tracking; it's retained so that future refinements — e.g. explicit basis tracking through expression trees — can hook in without breaking user code.
+!!! note "Current matrix representation"
+    `src/core/operators/matrices/matrices_subproblem_operators.jl` takes `N`
+    from the subproblem's coupled basis and does not use `op.basis` to convert
+    the lift column. At a fixed mode, passing the state basis or its first or
+    second derivative basis therefore gives the same subproblem lift matrix.
+    This implementation detail is not a mathematical equivalence between those
+    polynomial bases. The standalone `evaluate_lift` path does use `op.basis`
+    to construct its output field, so the basis argument is not universally ignored.
 
 ### Why still pass the derivative basis?
 
-Even though the explicit basis choices produce identical lift columns in the current
-solver, passing the intended derivative basis is worth doing:
-
-1. **Forward-compatibility**: if Tarang later tracks the lift output basis in the matrix representation, your expression already identifies the intended space. Code that passed the state basis `zb` would silently start producing different matrices.
-2. **Semantic clarity**: in first-order formulations like `grad_u = grad(u) + ez * lift(tau_u1, lb1, -1)`, the lift lives alongside `grad(u)`, which maps a ChebyshevT field into the first-derivative (ChebyshevU) space. Passing the derivative basis tells the reader what the lift is conceptually contributing, even if the linear algebra doesn't currently care.
-3. **Consistency with examples and tutorials**: all of Tarang's shipped examples build the lift basis with `derivative_basis`, so sticking with it makes your code pattern-match familiar code.
-
-**Rule of thumb**: bind the lift basis once at the top of your setup block and reuse it —
-`derivative_basis(zb, 1)` for a lift added to a first-order gradient substitution (which is
-what `examples/ivp/rayleigh_benard_2d.jl` does), and `derivative_basis(zb, 2)` for lifts
-added directly to a second-order equation (`Δ(u)`, two lifts at `-1` and `-2`). Don't
-invent your own lift basis.
+The examples use `derivative_basis(zb, 1)` for gradient substitutions and
+`derivative_basis(zb, 2)` for direct second-order equations. This states the
+intended output space and keeps basis-dependent operations explicit.
+Mathematically, a Chebyshev-T derivative can be represented in Chebyshev-U;
+changing the tau polynomial family generally changes the discretization.
+Tarang's current subproblem columns do not implement that basis conversion,
+so the syntax alone does not establish an ultraspherical representation or
+its conditioning properties.
 
 ## Boundary Conditions as Algebraic Constraint Rows
 
@@ -189,28 +210,39 @@ Tarang produces a new equation row that looks like
 
 i.e. a linear combination of `u`'s coefficients that equals the boundary value. **This row is added to the system, not substituted in.** It's an *algebraic* equation — there is no time derivative, so it contributes nothing to the `M` matrix in the `M·dX/dt + L·X = F` formulation. In the linear-algebra picture:
 
-- `u` contributes `Nz` rows (PDE interior) + BC rows
+- The PDE contributes `Nz` rows; the boundary conditions add constraint rows
 - `tau_u1`, `tau_u2` contribute columns (one each, at the lift modes)
 - BC rows are zero in `M` (no time derivative) → they're pure algebraic constraints
 - The combined LHS matrix is square because `(PDE rows + BC rows) = (state cols + tau cols)`
 
-This square-system condition is enforced automatically when you declare the right number of tau fields to match the number of BCs. If you miss a BC you'll get a singular / non-square system at solver-build time.
+Match scalar tau DOFs to the added scalar constraints, including vector components
+and gauge conditions. This balances the dimensions; it does not guarantee full
+rank. Missing BCs or unused tau columns can leave a non-square or singular system.
 
 ### DAE-style handling in InitialValueProblem steppers
 
-For **initial-value problems**, BC rows have `M_row = 0`, which makes the full system a **differential-algebraic equation** (DAE) rather than a pure ODE. Tarang's subproblem stepper handles this correctly via a **per-stage row override** on what it classifies as "BC rows".
+Boundary constraints have zero rows in the mass matrix ``M``, making the
+semidiscrete system a differential-algebraic equation. For an implicit RK stage
+with nonzero diagonal coefficient ``a_{ii}``, the boundary part of
+``(M+\Delta t\,a_{ii}L)X_i=R_i`` must use
+``R_{i,BC}=\Delta t\,a_{ii}F_{BC}(t_i)`` to impose ``B X_i=g(t_i)``.
+Tarang applies this through `apply_bc_override!`; multistep schemes use their
+corresponding solve coefficient. Final-state constraint handling depends on the
+scheme, including projection for weighted RK updates.
 
-A note on how this classification works: `sp.bc_rows` is not built by scanning `M` for zero rows directly. Instead, `build_matrices!` labels rows by **equation size** — any equation whose per-subproblem row count is smaller than the coupled-direction basis size `Nz` is classified as a BC row (pressure gauge `integ(p) = 0` → 1 row; wall BC `T(z=0) = 1` → 1 row; vector wall BC → 2 rows; etc.). Rows from equations with `eq_size ≥ Nz` — the PDE interior and any *Nz-sized algebraic* equation like the continuity equation — are classified as "bulk".
-
-At each IMEX-RK stage (or multistep update), the solver assembles the stage RHS from the accumulated `dt·Σ(AᴱF − Aⁱ·L·X)` formula for **every** row, then calls `apply_bc_override!` to **replace** the `sp.bc_rows` entries with `dt·a_ii·F_BC`. After the LHS solve, those rows yield exactly `L_row·X = F_BC`, which is the correct BC enforcement.
-
-**Why a size-based classifier is good enough**: the only algebraic rows that don't get overridden are Nz-sized, F-zero equations like continuity. For them, the accumulated-RHS formula naturally produces zero on the right-hand side (since their `F` is zero and `L*X = 0` is the target), so no override is needed. The override only matters for *small* algebraic rows whose `F` can be nonzero — i.e., BCs and gauge constraints — and those are exactly what `sp.bc_rows` captures.
-
-**Why the override is necessary**: without it, the raw accumulated-RHS formula produces a wrong `1/γ` scaling factor for inhomogeneous algebraic rows. For RK222 (γ = 1 - 1/√2, 1/γ = 2 + √2 ≈ 3.414), a BC like `T(z=0) = 1` would be enforced as `T(z=0) = 2+√2` instead of `1`. The override is built into `step_subproblem_rk!` and `step_subproblem_multistep!`, so you don't have to do anything to enable it — but it's worth knowing the mechanism exists if you're debugging a "BC value is off by a constant factor" symptom.
+`sp.bc_rows` is a structural classification, not a scan for all zero mass rows.
+For `Nz > 1`, `_is_bulk_eqn_size` classifies positive multiples of `Nz` as bulk;
+other equation blocks are constraints. A full-size algebraic equation such as
+continuity remains in the bulk. This is not a general detector for arbitrary
+DAE constraints, and the size rule alone does not prove correct treatment of
+inhomogeneous bulk algebraic equations.
 
 ## First-Order Formulation (Recommended)
 
-For time-dependent problems and anything involving the Navier–Stokes equations, the **first-order formulation** is the right default. Instead of writing a 2nd-order operator like `Δ(u)` directly, introduce an auxiliary gradient field with a tau correction. The lift basis here is the **first**-derivative basis, because the lift is added to `grad(u)`, which lives in the first-derivative space:
+The channel-flow examples use **first-order-style tau substitutions**: define an
+augmented gradient expression and apply divergence to it. This does not introduce
+a separately evolved gradient field. The derivative basis names the intended
+space, subject to the matrix-representation limitation above:
 
 ```julia
 lift_basis = derivative_basis(zbasis, 1)
@@ -219,7 +251,8 @@ lift_basis = derivative_basis(zbasis, 1)
 grad_u = grad(u) + ez * τ_lift(tau_u1)
 ```
 
-Now `grad_u` is an "augmented gradient" that lives in the derivative (ChebyshevU) space and carries its own tau. Second derivatives become `div(grad_u)` rather than `Δ(u)`. Register `grad_u` and `τ_lift` as parameters so the equation string can name them:
+`grad_u` includes the first tau correction; `div(grad_u)` applies its derivative
+along with the Laplacian of `u`. Register the expressions so equations can name them:
 
 ```julia
 add_parameters!(problem, nu=nu, grad_u=grad_u, τ_lift=τ_lift)
@@ -240,7 +273,9 @@ The convention we use throughout Tarang's examples is:
 - `tau_u1` — correction added inside `grad_u`, one-dimensional (xbasis only)
 - `tau_u2` — correction added to the evolution equation directly, one-dimensional (xbasis only)
 
-For a vector field `u`, both `tau_u1` and `tau_u2` are VectorFields too (one component per velocity component).
+For a vector field `u`, both taus are VectorFields (one component per velocity
+component). Their placement in different expressions does not assign them to
+individual walls: both are determined jointly by the coupled system and its BCs.
 
 ## Worked Example: 2D Rayleigh–Bénard Convection
 
@@ -268,8 +303,8 @@ p = ScalarField(domain, "p")
 T = ScalarField(domain, "T")
 u = VectorField(domain, "u")
 
-# Tau fields. Each lives on `(xbasis,)` only — the coupled direction (z)
-# is dropped because the tau correction lives at a single z mode.
+# Boundary tau fields retain `(xbasis,)` and drop the coupled z direction.
+# The pressure-gauge tau is spatially constant instead.
 #
 # tau_p:  scalar, no bases — gauge for the pressure constraint
 # tau_T1: gradient-substitution correction for T
@@ -319,42 +354,43 @@ solver = InitialValueSolver(problem, RK222(); dt=1e-3)
 **Pattern summary**:
 
 - The five `add_bc!` calls expand to **7 scalar constraint rows**: two temperature rows, four velocity rows (two vector components at each of two walls), and one pressure-gauge row. The tau variables supply the matching seven scalar tau DOFs: one each from `tau_T1` and `tau_T2`, four from the two-component `tau_u1`/`tau_u2`, and one from `tau_p`.
-- **Each tau field drops the coupled direction** (`xbasis` only, not `zbasis`).
+- **Boundary taus retain only the tangential basis** `(xbasis,)`; the gauge tau has no bases.
 - **`tau_p` is a 0-D scalar** (no bases). It contributes a one-DOF candidate column during each subproblem build, but valid-mode filtering removes it at non-DC modes, leaving the actual gauge correction only at DC.
 - **The pressure gauge `integ(p) = 0`** is an algebraic constraint on the mean; it lives alongside the other BCs.
 
 ## Pressure Gauge and Valid-Mode Filtering
 
-In incompressible flow the pressure is defined only up to one **global constant**, so the gauge ambiguity belongs to the all-zero (DC) Fourier mode. At non-DC modes the pressure fluctuation is determined, while the domain-integral gauge equation is identically `0 = 0`. Tarang handles the DC gauge and those trivial non-DC rows with two mechanisms that are sometimes confused:
+Pressure is defined up to a global constant. The condition `integ(p) = 0` fixes
+that constant at the all-zero (DC) Fourier mode. At other Fourier modes the
+integral vanishes identically and supplies no independent equation.
 
-**1. Pressure gauge (a user-visible tau)**. You add `tau_p` to continuity and provide a gauge-fixing BC like `integ(p) = 0`:
+The spatially constant `tau_p` enters continuity directly:
 
 ```julia
 add_equation!(problem, "trace(grad_u) + tau_p = 0")
 add_bc!(problem, "integ(p) = 0")
 ```
 
-`tau_p` is typically declared as a **0-D scalar** (`ScalarField(dist, "tau_p", (), Float64)`). In the raw, pre-filtered matrix this gives it 1 DOF per subproblem (because a 0-D field has `subproblem_field_size == 1` at every Fourier mode). After valid-mode filtering (see next section) `tau_p` is dropped from every non-DC subproblem — so in practice it's a **single gauge-fixing scalar at the DC Fourier mode only**. The non-DC subproblems don't carry it, and `scatter_inputs` on those modes is a no-op because the filter removed the column.
+The gauge equation fixes the mean pressure; `tau_p` supplies the extra unknown
+needed to accommodate the compatibility constraint in continuity. It is not a
+boundary lift. Declare it on `()`, while the wall taus retain the tangential
+Fourier bases. See the [gauge-condition reference](https://dedalus-project.readthedocs.io/en/latest/pages/gauge_conditions.html).
 
-That's the picture you should hold in your head: `tau_p` fixes the pressure gauge at the DC mode; at every other mode, pressure is well-defined by the `trace(grad_u) = 0` constraint together with the wall BCs, with no gauge ambiguity.
-
-**2. Valid-mode filtering (invisible, done by the solver)**. At the non-DC Fourier modes (and in some situations at the DC mode too), the integral constraint `integ(p) = 0` produces a **zero row** in the raw LHS matrix — the integral of a non-DC Fourier mode over the domain is identically zero, so the row just says `0 = 0`, which is trivially true and carries no information.
-
-The solver detects these zero rows during matrix assembly (`build_matrices!`, in `src/core/subsystems/subproblem_matrix_build.jl`) and pairs each with a **1-DOF tau column** — any variable whose per-subproblem size equals 1. That includes:
-
-- `tau_p` (a 0-D gauge scalar, always vsz=1)
-- `tau_T1`, `tau_T2` (declared with `(xbasis,)` — at each Fourier mode, the xbasis contribution reduces to a single coefficient, so vsz=1 per subproblem)
-- Components of `tau_u1`, `tau_u2` (same story, per component)
-
-The pairing uses a **smallest-column-norm heuristic**: for each zero row, the filter picks the unused 1-DOF tau column with the smallest total `|L| + |M|` norm — i.e., the tau that appears in the fewest or smallest-magnitude entries elsewhere. That's typically `tau_p` at non-DC subproblems because `tau_p` only contributes to continuity (one nonzero entry from `+tau_p`), while `tau_T1`/`tau_T2` contribute through the full gradient substitution and so carry more weight. After pairing, both the row and the column are dropped from the filtered system, yielding a smaller square matrix that the sparse LU factorizes cleanly.
-
-**You do not have to do anything to enable this.** Just declare `tau_p` and the `integ(p) = 0` BC, and the valid-mode filter takes care of the rest. The take-away is: if you ever see a `"singular pencils"` or `"Non-square filtered system"` warning, it usually means a BC is missing, a tau field is missing, or the number of small-eq-size algebraic rows doesn't match the number of 1-DOF tau columns.
+In the raw subproblem matrices, a bases-free scalar contributes one candidate
+column per Fourier mode. `build_matrices!` in
+`src/core/subsystems/subproblem_matrix_build.jl` removes rows that are zero in
+both `L` and `M`, pairing each with an unused one-DOF variable column selected by
+the smallest combined column norm. This numerical heuristic is not an explicit
+identification of a pressure-gauge variable. In the intended channel formulation,
+filtering removes the redundant non-DC gauge row and its tau column; it does not
+replace the need to specify independent BCs and a pressure gauge at DC.
 
 ## Number of Tau Terms
 
-The number of scalar tau DOFs must match the number of scalar constraint rows (including gauge conditions). A vector-valued `add_bc!` call contributes one scalar row per component, and a vector tau field contributes the corresponding component-wise tau DOFs:
+For the interval/channel formulations here, balance scalar tau DOFs with the
+added scalar constraint rows (including gauge conditions). A vector-valued `add_bc!` call contributes one scalar row per component, and a vector tau field contributes the corresponding component-wise tau DOFs:
 
-| PDE order in coupled direction | BCs needed | Tau terms per equation |
+| Scalar differential order on an interval | Independent BCs | Tau DOFs |
 |---|---|---|
 | 1st (∂u/∂z) | 1 | 1 |
 | 2nd (∂²u/∂z², via first-order form) | 2 | 2 (one in grad, one in evolution) |
@@ -368,7 +404,9 @@ The number of scalar tau DOFs must match the number of scalar constraint rows (i
 
 Tarang supports boundary conditions whose value varies in time, space, or both. They are refreshed by the stepper:
 
-- **Time-dependent BCs** (e.g. `T(z=0) = sin(t)`): the RK stepper re-evaluates the BC value at each stage time `t + c[i]*dt`, so multi-stage methods retain their full formal order of accuracy for rapidly-varying BCs.
+- **Time-dependent BCs** (e.g. `T(z=0) = sin(t)`): the RK stepper re-evaluates the BC value at each stage time `t + c[i]*dt` to supply stage-consistent boundary data. This alone does not guarantee the
+  method's formal convergence order for a constrained or stiff PDE; check timestep
+  convergence for the problem being solved.
 - **Space-dependent BCs** (e.g. `T(z=0) = sin(2*pi*x/4.0)`): at solver-build time the BC expression is evaluated on the **global** coordinate grid, and the resulting array is projected onto the Fourier modes via an unnormalized `FFTW.rfft`. Each subproblem picks its own mode from the cached coefficient array.
 - **Space+time BCs** (e.g. `T(z=0) = sin(2*pi*x/4.0) * cos(2*pi*t)`): combined — re-projected on every stage.
 
@@ -419,27 +457,40 @@ u_data = get_grid_data(u)
 
 For a vector field, index a component: `get_grid_data(u.components[2])[:, 1]`.
 
-After a **BVP** `solve!`, the tau fields are scattered back with the corrections the
-solver chose, so you can read them to see how hard the tau method had to work. For
-smooth, well-resolved solutions they are spectrally small:
+Tau fields with coefficient storage can expose the corrections chosen by a
+BVP solve or an IVP step. For example, the Fourier-dependent taus in the RK222
+example below are scattered back to their fields. This is not a guarantee that
+every timestepper exposes every internal stage tau: bases-free scalars can use
+solver-owned storage, and final updates differ between schemes.
+
+Continuing from the quick-start setup, this forced diffusion step demonstrates
+nonzero IVP tau values while retaining homogeneous wall conditions:
 
 ```julia
-tau_data = get_coeff_data(tau2)          # ScalarField tau; for a VectorField use
-@info "tau2 magnitude: $(maximum(abs.(tau_data)))"   # tau2.components[i]
+forcing = ScalarField(dom, "forcing")
+ensure_layout!(forcing, :g)
+get_grid_data(forcing) .= sin.(7 .* z')
+ensure_layout!(u, :g)
+get_grid_data(u) .= 0
+
+ivp = InitialValueProblem([u, tau1, tau2])
+add_parameters!(ivp; forcing,
+                l1=lift(tau1, lb2, -1), l2=lift(tau2, lb2, -2))
+add_equation!(ivp, "∂t(u) - Δ(u) + l1 + l2 = forcing")
+add_bc!(ivp, "u(z=0) = 0")
+add_bc!(ivp, "u(z=1) = 0")
+ivp_solver = InitialValueSolver(ivp, RK222(); dt=0.01)
+step!(ivp_solver)
+
+@info "Tau magnitudes" tau1=maximum(abs, get_coeff_data(tau1)) tau2=maximum(abs, get_coeff_data(tau2))
+ensure_layout!(u, :g)
+@assert maximum(abs, get_grid_data(u)[:, [1, end]]) < 1e-12
 ```
 
-In the quick-start problem the exact solution `z(1 - z)` is a quadratic that the
-Chebyshev basis represents *exactly*, so both taus come back as `0.0` — the tau
-correction has nothing to do. Swap the constant forcing for a non-polynomial one (a grid
-field holding `sin(7z)`, passed in with `add_parameters!`) at `Nz=16` and they become
-nonzero but tiny: `max|tau1| = 2.1e-8`, `max|tau2| = 6.5e-8`.
-
-!!! note "Tau values are not exposed after an InitialValueProblem step"
-    The InitialValueProblem steppers solve for the stage taus internally but leave the tau *state
-    fields* at exactly zero, so `get_coeff_data(tau_T2)` after `run!` reads `0.0` no
-    matter how large the corrections were. BC enforcement itself is unaffected —
-    measured `max|T(z=0) − 1| = 0.0` and `max|u_x(z=0)| < 1e-16` after 20 RK222 steps
-    of the RBC problem. To inspect tau magnitudes, use a BVP solve.
+Tau amplitudes depend on polynomial normalization, equation scaling, resolution,
+and (for IVPs) the time discretization. They are not standalone error estimates.
+Check the physical PDE residual, boundary residuals, and convergence under
+refinement. For vector taus, inspect the appropriate field component.
 
 For time-dependent problems, check BC satisfaction inside a callback:
 
@@ -457,7 +508,9 @@ run!(solver;
 
 ### 1. Wrong number of tau fields
 
-If you have two wall BCs on `u` but only declare one tau field in the equation, the matrix system is under-determined. You'll see `Warning: Matrix is not square: rows=70, cols=65` followed by `Warning: Non-square filtered system: group=(3, nothing), valid_eqn=14, valid_var=13` at solver-build time (the exact counts depend on your resolution), and the solve then dies with a `DimensionMismatch`.
+For a scalar second-order equation, two wall constraints and only one tau
+produce `N+2` rows but `N+1` columns: a non-square, overdetermined system. Extra
+unconstrained taus instead add columns and can make the system underdetermined.
 
 **Fix**: count the scalar constraint rows — including gauge conditions like `integ(p) = 0`, and counting one row *per component* for a vector BC — and declare one tau DOF per row.
 
@@ -465,22 +518,18 @@ If you have two wall BCs on `u` but only declare one tau field in the equation, 
 
 A tau field declared in `problem.variables` but never referenced in any equation contributes a zero column to the LHS matrix, making the system rank-deficient.
 
-**Fix**: every tau field must appear inside exactly one `lift()` (or `τ_lift()` substitution) on the implicit (left-hand) side of some equation.
+**Fix**: each tau must contribute to the intended implicit system. Boundary taus
+usually enter through lifts; the pressure-gauge tau enters continuity directly.
+An augmented-gradient substitution may carry the same tau into multiple
+equations. Count independent columns, not textual occurrences of `lift()`.
 
 ### 3. Wrong lift basis — and what it does *not* cause
 
-Writing `lift(tau, zb, -1)` (the state basis), or using the first-derivative basis where
-the second-derivative basis is meant, is a *style* problem, not a numerical one: as
-explained above, the current solver ignores `op.basis` and sizes the delta column from the
-problem's own Chebyshev basis, so these spellings build identical matrices and produce the
-same solution to the last bit. Nothing diverges at high `Nz` because of this choice — the
-lift basis is **not** a conditioning control.
-
-**Fix**: still pass the basis that names the space you are lifting into —
-`derivative_basis(zb, 1)` for a first-order gradient substitution,
-`derivative_basis(zb, 2)` for a direct second-order equation. It says what you mean,
-matches every shipped example, and stays correct if Tarang later makes the lift basis
-load-bearing.
+Use the explicit basis that describes the intended lift space. The current
+subproblem matrix path produces the same column for several basis choices,
+but standalone lift evaluation uses the selected basis. Do not generalize
+matrix-column equality into a claim that polynomial family never affects
+conditioning or accuracy. See the solver-view discussion above.
 
 ### 4. Tau field bases don't match
 
@@ -492,9 +541,12 @@ If you accidentally declare `tau_u1 = ScalarField(dist, "tau_u1", (xbasis, zbasi
 
 ### 5. Non-square system at DC mode
 
-Most non-square warnings at the DC Fourier mode come from a missing gauge BC like `integ(p) = 0`. The valid-mode filter can only drop a zero row if there's a paired 0-D tau column (like `tau_p`) to drop along with it.
+Most non-square warnings at the DC Fourier mode come from a missing gauge BC like `integ(p) = 0`. The valid-mode filter pairs zero rows with eligible one-DOF columns; it cannot
+replace a missing independent constraint.
 
-**Fix**: make sure every PDE with a gauge ambiguity has both a `tau_*` field and a corresponding `integ()` BC.
+**Fix**: for the incompressible formulation shown here, include `tau_p` in
+continuity and `integ(p) = 0`. Other gauge freedoms require constraints appropriate
+to their nullspaces.
 
 ### 6. BC F value not reaching the stepper
 

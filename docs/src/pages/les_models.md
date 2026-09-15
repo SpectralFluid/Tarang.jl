@@ -1,61 +1,18 @@
 # Large Eddy Simulation (LES) Models
 
-This page provides a comprehensive introduction to Large Eddy Simulation (LES) and the subgrid-scale (SGS) closure models available in Tarang.jl.
+Tarang.jl provides Smagorinsky and Anisotropic Minimum Dissipation (AMD)
+subgrid-scale closures.
 
-!!! note "Scope: these models are array-level utilities"
-    The SGS models are **array-level utilities**. They consume grid-space
-    velocity-gradient arrays and produce an eddy-viscosity array (and, for AMD, an
-    eddy-diffusivity array). They are **not** automatically coupled into an `InitialValueProblem`, and
-    no solver, RHS builder, timestepper or problem parser reads them: you evaluate the
-    gradients, call the model, and apply the resulting stress yourself. The examples
-    below therefore show the SGS update in isolation — the momentum and scalar updates
-    around it are code you write. In particular, there is no timestepper keyword that
-    takes an effective-viscosity array; a variable-viscosity term has to be assembled
-    and applied explicitly.
-
----
+!!! note "Array-level utilities"
+    Models consume grid-space gradients and return eddy-viscosity or diffusivity
+    arrays. Callers compute the gradients and apply the resulting stress to their
+    equations; solvers do not attach these models automatically. The examples
+    below demonstrate SGS updates, not complete momentum or scalar solvers.
 
 ## What is Large Eddy Simulation?
 
-### The Turbulence Challenge
-
-Turbulent flows contain a vast range of length scales, from the largest energy-containing eddies down to the smallest dissipative scales (Kolmogorov scales). In a Direct Numerical Simulation (DNS), we resolve **all** these scales, which requires:
-
-```math
-N \sim Re^{9/4}
-```
-
-grid points in 3D, where $Re$ is the Reynolds number. For atmospheric or oceanic flows with $Re \sim 10^9$, this is computationally impossible.
-
-### The LES Approach
-
-Large Eddy Simulation offers a practical alternative:
-
-1. **Resolve** the large, energy-containing eddies directly
-2. **Model** the effect of small, unresolved eddies
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    Energy Spectrum E(k)                      │
-│                                                              │
-│    E(k)                                                      │
-│     │                                                        │
-│     │   ╭──╮                                                 │
-│     │  ╱    ╲          k^(-5/3)                              │
-│     │ ╱      ╲___                                            │
-│     │╱            ╲___                                       │
-│     │                  ╲___                                  │
-│     │                       ╲___                             │
-│     └──────────────────────────────────────────────► k       │
-│         │                    │                               │
-│         │◄── Resolved ──────►│◄── Modeled (SGS) ──►│        │
-│         │   (large eddies)   │   (small eddies)    │        │
-│                              │                               │
-│                          filter cutoff (Δ)                   │
-└─────────────────────────────────────────────────────────────┘
-```
-
-The **filter width** $\Delta$ (typically the grid spacing) separates resolved from unresolved scales.
+LES resolves large eddies and models the effect of unresolved motions. The
+filter width $\Delta$, typically set from grid spacing, separates these scales.
 
 ### Filtering the Navier-Stokes Equations
 
@@ -83,10 +40,6 @@ This tensor represents the effect of unresolved turbulent motions on the resolve
 
 ## The Closure Problem
 
-### Why We Need Models
-
-The SGS stress $\tau_{ij}$ contains information about scales we don't resolve. This creates the **closure problem**: our filtered equations have more unknowns than equations.
-
 ### The Eddy Viscosity Hypothesis
 
 Most SGS models use the **Boussinesq hypothesis**, which assumes the SGS stress is proportional to the resolved strain rate:
@@ -106,27 +59,23 @@ where:
 This transforms the filtered momentum equation into:
 
 ```math
-\frac{\partial \bar{u}_i}{\partial t} + \bar{u}_j \frac{\partial \bar{u}_i}{\partial x_j} = -\frac{1}{\rho}\frac{\partial \bar{p}^*}{\partial x_i} + (\nu + \nu_e) \nabla^2 \bar{u}_i
+\frac{\partial \bar{u}_i}{\partial t} + \bar{u}_j \frac{\partial \bar{u}_i}{\partial x_j} = -\frac{1}{\rho}\frac{\partial \bar{p}^*}{\partial x_i} + \frac{\partial}{\partial x_j}\left[2(\nu + \nu_e)\bar{S}_{ij}\right]
 ```
 
 where we've absorbed the isotropic part into a modified pressure $\bar{p}^*$.
 
-**Key insight**: The SGS model effectively adds a spatially-varying viscosity $\nu_e(x,t)$ to the molecular viscosity $\nu$.
+For constant molecular viscosity and incompressible velocity, the viscous term
+expands to $(\nu + \nu_e)\nabla^2\bar{u}_i +
+2(\partial_j\nu_e)\bar{S}_{ij}$. Keep the full symmetric stress inside the
+divergence when $\nu_e$ varies in space; multiplying the Laplacian by the local
+viscosity, or taking the divergence of an unsymmetrized velocity gradient,
+omits part of the SGS force. `compute_sgs_stress` returns
+$\tau_{ij}=-2\nu_e\bar{S}_{ij}$; its contribution to momentum is
+$-\partial_j\tau_{ij}$.
 
 ---
 
 ## Energy Cascade and Dissipation
-
-### Forward Energy Cascade
-
-In 3D turbulence, energy flows from large scales to small scales (forward cascade):
-
-```
-Large eddies ──► Medium eddies ──► Small eddies ──► Dissipation
-  (production)                                        (ε = 2νSᵢⱼSᵢⱼ)
-```
-
-The SGS model must drain energy from resolved scales at the correct rate to maintain physical behavior.
 
 ### SGS Dissipation
 
@@ -142,8 +91,6 @@ There is **no** extra factor of 2 in the final expression: the $\sqrt{2}$ in the
 definition of $|\bar{S}|$ already carries it. This is what
 [`sgs_dissipation`](../api/les_models.md) returns — writing $2\nu_e|\bar{S}|^2$ would
 double-count the dissipation.
-
-A good SGS model ensures $\varepsilon_{sgs}$ matches the actual energy transfer rate.
 
 ---
 
@@ -198,7 +145,6 @@ N = 16                      # Grid points per direction
 L = 2π                      # Domain size
 Δ = L / N                   # Grid spacing
 
-# Create the Smagorinsky model
 sgs_model = SmagorinskyModel(
     C_s = 0.17,                    # Smagorinsky constant
     filter_width = (Δ, Δ, Δ),      # Grid spacing in each direction
@@ -210,7 +156,6 @@ sgs_model = SmagorinskyModel(
 gradients = ntuple(i -> fill(i == 1 ? 1.0 : 0.0, N, N, N), 9)
 compute_eddy_viscosity!(sgs_model, gradients...)
 
-# Retrieve the computed eddy viscosity field
 νₑ = get_eddy_viscosity(sgs_model)
 ```
 
@@ -285,7 +230,6 @@ The numerator is positive (giving $\nu_e = 0$) when:
 ### Usage in Tarang.jl
 
 ```julia
-# Create the AMD model
 sgs_model = AMDModel(
     C = 1/12,                      # Poincaré constant (for spectral methods)
     filter_width = (Δx, Δy, Δz),   # Can be different in each direction
@@ -293,7 +237,6 @@ sgs_model = AMDModel(
     clip_negative = true           # Ensure νₑ ≥ 0 (recommended)
 )
 
-# Compute eddy viscosity (same interface as Smagorinsky)
 compute_eddy_viscosity!(sgs_model,
     ∂u∂x, ∂u∂y, ∂u∂z,
     ∂v∂x, ∂v∂y, ∂v∂z,
@@ -302,6 +245,16 @@ compute_eddy_viscosity!(sgs_model,
 
 νₑ = get_eddy_viscosity(sgs_model)
 ```
+
+### Numerical Evaluation
+
+The CPU and GPU implementations use the same scalar kernels. Before evaluating
+the contractions, AMD normalizes velocity gradients and, for diffusivity,
+scalar gradients independently. It restores the velocity scale afterward;
+the scalar-gradient scale cancels. This preserves the expected scaling across
+very small and large gradient magnitudes without an absolute epsilon cutoff.
+Zero gradients give zero closure coefficients, while nonfinite gradients remain
+visible as NaN. Clipping negative predictions still follows `clip_negative`.
 
 ### Choosing the AMD Constant
 
@@ -341,61 +294,29 @@ compute_eddy_diffusivity!(sgs_model,
 
 ## Choosing Between Models
 
-### Decision Flowchart
-
-```
-Start
-  │
-  ▼
-Is your grid anisotropic (Δx ≠ Δy ≠ Δz)?
-  │
-  ├── Yes ──► Use AMD (handles anisotropy naturally)
-  │
-  └── No
-       │
-       ▼
-Does your flow have laminar or transitional regions?
-       │
-       ├── Yes ──► Use AMD (automatically switches off)
-       │
-       └── No
-            │
-            ▼
-Is computational cost a primary concern?
-            │
-            ├── Yes ──► Use Smagorinsky (slightly cheaper)
-            │
-            └── No ──► Either works; AMD is generally more accurate
-```
-
 ### Summary Comparison
 
 | Aspect | Smagorinsky | AMD |
 |--------|-------------|-----|
 | **Complexity** | Simple | Moderate |
 | **Cost per timestep** | Low | Slightly higher |
-| **Laminar regions** | Over-dissipates | Correctly gives νₑ = 0 |
+| **Clipping** | Nonnegative viscosity | Negative predictions clipped by default |
 | **Anisotropic grids** | Needs modification | Native support |
 | **Near walls** | Needs damping | Better behavior |
-| **Tuning required** | Often yes | Usually not |
 | **Scalar transport** | Use Pr_t | Built-in κₑ |
 
 ---
 
 ## Complete Example: LES of Decaying Turbulence
 
-This example demonstrates the SGS side of an LES of decaying homogeneous isotropic
-turbulence: building the model, evaluating the velocity gradients, and refreshing νₑ
-each step. Advancing the momentum equation is not shown, because Tarang does not do it
-for you — see the scope note at the top of this page.
+This example builds a model, evaluates gradients, and refreshes νₑ for a
+Taylor–Green velocity field. Insert the momentum update in the indicated location.
 
 ```julia
 using Tarang
 using Statistics
 
-# ============================================================
 # 1. Physical and Numerical Parameters
-# ============================================================
 
 N = 16                      # Smoke-test resolution; use 128+ for production
 L = 2π                      # Domain size [m]
@@ -404,11 +325,8 @@ L = 2π                      # Domain size [m]
 dt = 0.001                  # Time step [s]
 nsteps = 3                  # Smoke run; increase for a production simulation
 
-# ============================================================
 # 2. Create the SGS Model
-# ============================================================
 
-# Option A: Smagorinsky (simple, robust)
 sgs = SmagorinskyModel(
     C_s = 0.17,
     filter_width = (Δ, Δ, Δ),
@@ -416,36 +334,22 @@ sgs = SmagorinskyModel(
     architecture = CPU()       # GPU() keeps νₑ on the device
 )
 
-# Option B: AMD (recommended for most applications)
-# sgs = AMDModel(
-#     C = 1/12,
-#     filter_width = (Δ, Δ, Δ),
-#     field_size = (N, N, N)
-# )
-
-# ============================================================
 # 3. Setup Computational Domain
-# ============================================================
 
 coords = CartesianCoordinates("x", "y", "z")
 dist = Distributor(coords; mesh=(1, 1, 1))  # Single processor
 
-# Fourier bases for periodic domain
 xbasis = RealFourier(coords["x"]; size=N, bounds=(0.0, L))
 ybasis = RealFourier(coords["y"]; size=N, bounds=(0.0, L))
 zbasis = RealFourier(coords["z"]; size=N, bounds=(0.0, L))
 
 domain = Domain(dist, (xbasis, ybasis, zbasis))
 
-# Create velocity field
 u = VectorField(dist, coords, "u", (xbasis, ybasis, zbasis))
 
-# ============================================================
 # 4. Initialize with a Turbulent Velocity Field
-# ============================================================
 
-# A Taylor-Green vortex keeps this example self-contained; substitute your
-# own IC (e.g. random phases with a prescribed energy spectrum).
+# Taylor–Green initial condition
 x, y, z = local_grids(dist, xbasis, ybasis, zbasis)
 ensure_layout!(u, :g)
 get_grid_data(u.components[1]) .=  sin.(x) .* cos.(y') .* cos.(reshape(z, 1, 1, :))
@@ -453,45 +357,31 @@ get_grid_data(u.components[2]) .= .-cos.(x) .* sin.(y') .* cos.(reshape(z, 1, 1,
 get_grid_data(u.components[3]) .= 0.0
 ensure_layout!(u, :c)
 
-# ============================================================
 # 5. Helper Function: Compute All Velocity Gradients
-# ============================================================
 
 function compute_velocity_gradients(u)
-    # grad(u) is a lazy Gradient — it is not itself iterable, so it cannot be
-    # destructured directly. evaluate() turns it into a TensorField whose
-    # components are already in the component-major order the models expect:
+    # evaluate(grad(u)) returns a TensorField in component-major order:
     # (∂u∂x, ∂u∂y, ∂u∂z, ∂v∂x, ∂v∂y, ∂v∂z, ∂w∂x, ∂w∂y, ∂w∂z).
     G = evaluate(grad(u))
     return Tuple(get_grid_data(g) for g in G.components)
 end
 
-# ============================================================
 # 6. Per-Step SGS Update
-# ============================================================
-#
-# Nothing in the solver stack calls the SGS model for you. What follows is the
-# SGS half of a timestep; advancing ū is code you supply.
 
 for step in 1:nsteps
-    # --- Step 1: Compute velocity gradients ---
     grads = compute_velocity_gradients(u)
 
-    # --- Step 2: Update SGS eddy viscosity ---
     compute_eddy_viscosity!(sgs, grads...)
 
-    # --- Step 3: Get effective viscosity ---
     νₑ = get_eddy_viscosity(sgs)
     ν_eff = ν .+ νₑ  # Total viscosity = molecular + SGS, one value per grid point
 
-    # --- Step 4: Advance the momentum equation (your code) ---
-    # The filtered Navier-Stokes with SGS model:
-    #   ∂ū/∂t + (ū·∇)ū = -∇p̄/ρ + ∇·((ν + νₑ)∇ū)
+    # Apply your momentum update here using the full symmetric stress:
+    #   ∂ū/∂t + (ū·∇)ū = -∇p*/ρ + ∇·[2(ν + νₑ)S̄]
+    #   S̄ = (∇ū + transpose(∇ū))/2
     #
-    # ν_eff is a plain array and no timestepper keyword accepts it, so the
-    # variable-viscosity term must be assembled and applied explicitly.
+    # Assemble the variable-viscosity term explicitly from ν_eff and S̄.
 
-    # --- Step 5: Diagnostics ---
     if step == nsteps
         mean_νₑ = mean_eddy_viscosity(sgs)
         max_νₑ = max_eddy_viscosity(sgs)
@@ -514,9 +404,7 @@ the SGS update is shown — the momentum and temperature updates are yours to wr
 ```julia
 using Tarang
 
-# ============================================================
 # Physical Parameters
-# ============================================================
 
 Nx, Nz = 256, 128           # Grid resolution
 Lx, Lz = 4.0, 1.0           # Domain size
@@ -527,9 +415,7 @@ Pr = 1.0                    # Prandtl number
 κ = ν / Pr                  # Thermal diffusivity
 nsteps = 1000               # Number of time steps
 
-# ============================================================
 # Domain and Fields
-# ============================================================
 
 coords = CartesianCoordinates("x", "z")
 dist   = Distributor(coords; dtype=Float64, device=CPU())
@@ -543,9 +429,7 @@ T = Field(dist; name="T", bases=(xbasis, zbasis))   # temperature
 
 # (Initialise u, w and T with your own IC and boundary conditions.)
 
-# ============================================================
 # Create AMD Model (recommended for RBC)
-# ============================================================
 
 # One filter width per axis. `grid_spacing` reports the *smallest* spacing on
 # each axis, which is the conservative choice on the Chebyshev-clustered z axis.
@@ -557,9 +441,7 @@ sgs = AMDModel(
     field_size = (Nx, Nz)
 )
 
-# ============================================================
 # Per-Step SGS Update
-# ============================================================
 
 for step in 1:nsteps
     # Velocity gradients. grad() is lazy and not iterable; evaluate() realises
@@ -631,31 +513,9 @@ println("Fraction with νₑ = 0: $(fraction_zero)")
 
 ## Tips for Successful LES
 
-### Resolution Requirements
-
-LES still requires adequate resolution:
-
-```
-┌────────────────────────────────────────────────────────────┐
-│  Resolution Quality for LES                                 │
-├────────────────────────────────────────────────────────────┤
-│  80% of TKE resolved      →  Minimum acceptable LES        │
-│  90% of TKE resolved      →  Good quality LES              │
-│  95%+ of TKE resolved     →  Nearly DNS quality            │
-└────────────────────────────────────────────────────────────┘
-```
-
-Rule of thumb: Grid spacing should resolve the inertial range, typically $\Delta \lesssim L_{integral}/10$.
-
-### Common Pitfalls
-
-| Symptom | Likely Cause | Solution |
-|---------|--------------|----------|
-| Simulation blows up | νₑ too small | Increase $C_s$ or $C$ |
-| Flow looks too smooth | Over-dissipation | Reduce $C_s$, or use AMD |
-| Checkerboard patterns | Aliasing errors | Enable dealiasing (2/3 rule) |
-| νₑ unrealistically large | Poor resolution | Refine grid |
-| AMD gives νₑ = 0 everywhere | Flow is laminar | This is correct! |
+Check grid and timestep convergence, monitor SGS dissipation, and use the actual
+axis spacings for filter widths. See [Troubleshooting](#Troubleshooting) for
+common symptoms; viscosity alone does not establish whether a run is resolved.
 
 ### When LES May Not Be Appropriate
 
@@ -671,7 +531,6 @@ Rule of thumb: Grid spacing should resolve the inertial range, typically $\Delta
 Both models support 2D simulations:
 
 ```julia
-# 2D Smagorinsky
 sgs_2d = SmagorinskyModel(
     C_s = 0.17,
     filter_width = (Δx, Δy),
@@ -725,66 +584,18 @@ sgs_gpu = SmagorinskyModel(
 )
 ```
 
-`compute_eddy_viscosity!` and `compute_eddy_diffusivity!` dispatch on the model's
-architecture: broadcast kernels on the GPU, SIMD loops on the CPU. Gradient arrays that
-are not already on the model's architecture are copied there on every call, so a CPU
-array handed to a `GPU()` model works but pays a host-to-device transfer each step —
-keep the gradients on the same device as the model. `get_eddy_viscosity` returns an
-array of the model's own kind (`Array` on `CPU()`, `CuArray` on `GPU()`).
+`compute_eddy_viscosity!` and `compute_eddy_diffusivity!` broadcast the same scalar
+kernels on CPU and GPU arrays. GPU models upload CPU gradients on each call;
+keep gradients on the device to avoid repeated transfers. CPU models reject GPU
+gradients. `get_eddy_viscosity` returns the model's array type (`Array` on CPU,
+`CuArray` on CUDA).
 
 ---
 
 ## API Reference
 
-### Constructors
-
-```julia
-SmagorinskyModel(;
-    C_s = 0.17,                    # Smagorinsky constant
-    filter_width::NTuple{N, Real}, # (Δx, Δy) or (Δx, Δy, Δz)
-    field_size::NTuple{N, Int},    # (Nx, Ny) or (Nx, Ny, Nz)
-    dtype = Float64,               # Precision
-    architecture = CPU()           # CPU() or GPU()
-)
-
-AMDModel(;
-    C = 1/12,                      # Poincaré constant
-    filter_width::NTuple{N, Real}, # Can be anisotropic
-    field_size::NTuple{N, Int},
-    clip_negative = true,          # Ensure νₑ ≥ 0
-    dtype = Float64,               # Precision
-    architecture = CPU()           # CPU() or GPU()
-)
-```
-
-### Core Functions
-
-| Function | Description |
-|----------|-------------|
-| `compute_eddy_viscosity!(model, grads...)` | Compute νₑ from velocity gradients |
-| `compute_eddy_diffusivity!(model, grads...)` | Compute κₑ for scalars (AMD only) |
-| `get_eddy_viscosity(model)` | Return the νₑ field |
-| `get_eddy_diffusivity(model)` | Return the κₑ field (AMD) |
-
-### Analysis Functions
-
-| Function | Description |
-|----------|-------------|
-| `mean_eddy_viscosity(model)` | Domain-averaged νₑ |
-| `max_eddy_viscosity(model)` | Maximum νₑ |
-| `sgs_dissipation(model, S_mag)` | SGS dissipation field |
-| `mean_sgs_dissipation(model, S_mag)` | Domain-averaged dissipation |
-
-### Utility Functions
-
-| Function | Description |
-|----------|-------------|
-| `set_constant!(model, C)` | Update model constant |
-| `reset!(model)` | Reset νₑ (and κₑ) to zero |
-| `get_filter_width(model)` | Return filter width tuple |
-| `compute_sgs_stress(model, S...)` | Compute the deviatoric SGS stress tensor τᵢⱼ = -2 νₑ S̄ᵢⱼ |
-
----
+See [LES Models API](../api/les_models.md) for constructor keywords, gradient
+ordering, MPI array requirements, diagnostics, and utility functions.
 
 ## Troubleshooting
 
@@ -793,7 +604,7 @@ AMDModel(;
 | Simulation becomes unstable | νₑ too small | Increase $C_s$ or $C$; check CFL condition |
 | Flow appears over-damped | νₑ too large | Reduce $C_s$; consider AMD model |
 | Spurious oscillations | Aliasing | Enable 2/3 dealiasing rule |
-| AMD gives νₑ = 0 everywhere | Flow is laminar | Correct behavior; model switches off |
+| AMD gives νₑ = 0 everywhere | Zero gradients or a nonpositive predictor | Inspect gradients and clipping before interpreting the result |
 | Unphysical behavior near walls | Poor wall resolution | Refine near-wall grid; use wall functions |
 
 ---

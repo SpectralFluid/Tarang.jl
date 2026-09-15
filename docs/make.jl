@@ -26,7 +26,7 @@ end
 # HTML format configuration
 format = Documenter.HTML(
     prettyurls = get(ENV, "CI", "false") == "true",
-    canonical = "https://subhk.github.io/Tarang.jl/stable",
+    canonical = "https://spectralfluid.github.io/Tarang.jl/stable",
     assets = [
         "assets/custom.css",
     ],
@@ -34,7 +34,7 @@ format = Documenter.HTML(
     collapselevel = 2,
     sidebar_sitename = true,
     edit_link = "main",
-    repolink = "https://github.com/subhk/Tarang.jl",
+    repolink = "https://github.com/SpectralFluid/Tarang.jl",
     size_threshold = 200 * 1024^2,  # 200 MiB
     size_threshold_warn = 10 * 1024^2   # 10 MiB warning
 )
@@ -48,15 +48,29 @@ pages = Any[
         "Running with MPI" => "getting_started/running_with_mpi.md",
         "Configuration" => "pages/configuration.md",
     ],
-    "Tutorials & Examples" => Any[
-        "Overview" => "tutorials/overview.md",
-        "2D Rayleigh-Benard" => "tutorials/ivp_2d_rbc.md",
-        "3D Turbulence" => "tutorials/ivp_3d_turbulence.md",
-        "Boundary Conditions" => "tutorials/boundary_conditions.md",
+    "Solving PDEs" => Any[
+        "Choosing a Problem" => "pages/problems.md",
+        "Initial Value Problems" => Any[
+            "Setup & Time Evolution" => "problems/initial_value.md",
+            "2D Rayleigh-Benard" => "tutorials/ivp_2d_rbc.md",
+            "3D Turbulence" => "tutorials/ivp_3d_turbulence.md",
+            "Surface Dynamics" => "tutorials/surface_dynamics.md",
+            "Rotating Shallow Water" => "tutorials/rotating_shallow_water.md",
+        ],
+        "Linear Boundary Value Problems" => Any[
+            "Setup & Linear Solve" => "problems/linear_boundary_value.md",
+        ],
+        "Nonlinear Boundary Value Problems" => Any[
+            "Setup & Newton Iteration" => "problems/nonlinear_boundary_value.md",
+        ],
+        "Eigenvalue Problems" => Any[
+            "Setup & Spectrum" => "problems/eigenvalue.md",
+            "Stability Analysis" => "tutorials/eigenvalue_problems.md",
+        ],
+    ],
+    "Examples & Output" => Any[
+        "Tutorial Directory" => "tutorials/overview.md",
         "Analysis & Output" => "tutorials/analysis_and_output.md",
-        "Eigenvalue Problems" => "tutorials/eigenvalue_problems.md",
-        "Surface Dynamics" => "tutorials/surface_dynamics.md",
-        "Rotating Shallow Water" => "tutorials/rotating_shallow_water.md",
         "Examples Gallery" => "examples/gallery.md",
     ],
     "User Guide" => Any[
@@ -65,7 +79,6 @@ pages = Any[
         "Domains" => "pages/domains.md",
         "Fields" => "pages/fields.md",
         "Operators" => "pages/operators.md",
-        "Problems" => "pages/problems.md",
         "Solvers" => "pages/solvers.md",
         "Time Steppers" => "pages/timesteppers.md",
         "GPU Computing" => "pages/gpu_computing.md",
@@ -74,6 +87,7 @@ pages = Any[
         "LES Models" => "pages/les_models.md",
         "GQL Approximation" => "pages/gql_approximation.md",
         "Tau Method" => "pages/tau_method.md",
+        "Boundary Conditions" => "tutorials/boundary_conditions.md",
     ],
     "Developer Guide" => Any[
         "Architecture & Codebase" => "pages/architecture.md",
@@ -108,7 +122,7 @@ println("Generating documentation with Documenter.jl...")
 makedocs(;
     modules = tarang_loaded ? [Tarang] : Module[],
     authors = "Subhajit Kar",
-    repo = "https://github.com/subhk/Tarang.jl/blob/{commit}{path}#{line}",
+    repo = "https://github.com/SpectralFluid/Tarang.jl/blob/{commit}{path}#{line}",
     sitename = "Tarang.jl",
     format = format,
     pages = pages,
@@ -138,7 +152,7 @@ if get(ENV, "CI", "false") == "true"
     println("Deploying documentation...")
 
     deploydocs(;
-        repo = "github.com/subhk/Tarang.jl.git",
+        repo = "github.com/SpectralFluid/Tarang.jl.git",
         devbranch = "main",
         target = "build",
         deps = nothing,

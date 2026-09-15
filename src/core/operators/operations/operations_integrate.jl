@@ -91,9 +91,6 @@ function integrate_along_coord(field::ScalarField, coord::Coordinate)
     # Work in grid space for integration
     ensure_layout!(field, :g)
 
-    # Get quadrature weights for this basis
-    weights = get_integration_weights(basis)
-
     # Apply weighted sum along the axis. Distributed fields are gathered to a
     # replicated global array first (analysis-sized; cold path), so the serial
     # reduction below applies and the reduced result is identical on all ranks
@@ -107,7 +104,9 @@ function integrate_along_coord(field::ScalarField, coord::Coordinate)
         result_dist = _serial_replica_distributor(field.dist, field.dtype)
     end
 
-    # Sum along the specified axis with weights
+    # Scales change the collocation grid, but not basis.meta.size. Construct
+    # quadrature for the actual global grid (after any MPI gather).
+    weights = get_integration_weights(basis, size(data, basis_index))
     result_data = integrate_weighted_sum(data, weights, basis_index)
 
     # Create result field with reduced dimensionality
@@ -122,6 +121,8 @@ function integrate_along_coord(field::ScalarField, coord::Coordinate)
         end
 
         result = ScalarField(result_dist, "int_$(field.name)", new_bases, field.dtype)
+        result.scales = field.scales === nothing ? nothing :
+            Tuple(field.scales[i] for i in 1:nb if i != basis_index)
         set_grid_data!(result, result_data)
         result.current_layout = :g
         return result
@@ -197,12 +198,11 @@ function _integrate_full_distributed(field::ScalarField, pdata::PencilArrays.Pen
 end
 
 """
-    get_integration_weights(basis)
+    get_integration_weights(basis, N=basis.meta.size)
 
-Get quadrature weights for integration over a basis.
+Get quadrature weights on a basis's collocation grid with `N` points.
 """
-function get_integration_weights(basis::Basis)
-    N = basis.meta.size
+function get_integration_weights(basis::Basis, N::Int=basis.meta.size)
     a, b = basis.meta.bounds
     L = b - a
 
@@ -225,7 +225,8 @@ function get_integration_weights(basis::Basis)
         # nodes (see _native_grid), so uniform L/N weights do NOT integrate them.
         # Derive plain-integral weights from the basis's own reference nodes —
         # exact for polynomials up to degree N-1, the span of the basis.
-        return _nodal_integration_weights(_native_grid(basis, 1.0), L)
+        # An exact rational scale keeps ceil(size * scale) equal to N.
+        return _nodal_integration_weights(_native_grid(basis, N // basis.meta.size), L)
 
     else
         # Default: uniform weights (only valid for a uniform grid; kept as a

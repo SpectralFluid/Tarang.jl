@@ -10,18 +10,8 @@ const GLOBAL_MATRIX_IMPLICIT_DOF_LIMIT = 1_000_000
 # ============================================================================
 # Per-scheme capability declarations
 #
-# Which implicit paths a scheme can actually take used to be implicit in whether
-# somebody had pasted the corresponding branch into that scheme's `step_*!`. It
-# was not written down anywhere, so it drifted: `step_sbdf2!` gained the
-# distributed diagonal-IMEX branch and its five multistep siblings did not, which
-# means SBDF2 solves an MPI pure-Fourier problem with a stiff implicit operator
-# while SBDF1/3/4 and CNAB1/2 refuse the identical configuration. Nothing could
-# detect that, because there was no single list to compare against.
-#
-# Declaring it as a trait makes the table explicit and testable — see
-# `test/test_execution_plan.jl`, which enumerates every `TimeStepper` subtype and
-# pins the answer. Adding the missing implementations is a numerical change and
-# deliberately NOT done here; this only stops the gap from being invisible.
+# Keep traits aligned with each scheme's distributed Fourier-diagonal solve.
+# `test/test_execution_plan.jl` checks the capability of every timestepper type.
 # ============================================================================
 
 """
@@ -30,8 +20,7 @@ const GLOBAL_MATRIX_IMPLICIT_DOF_LIMIT = 1_000_000
 Does this scheme have an implementation that treats a Fourier-diagonal implicit
 operator per mode under MPI decomposition?
 
-`false` is the safe default: a scheme that lacks the path refuses the
-configuration loudly rather than dropping the implicit operator.
+Defaults to `false`; schemes without this path reject the configuration.
 """
 supports_distributed_diagonal_imex(::TimeStepper) = false
 

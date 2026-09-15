@@ -51,7 +51,7 @@ If forcing were evaluated independently at every RK stage, its discrete covarian
 ## Maintained Example: Forced 2D Turbulence
 
 The runnable CPU/GPU example is
-[`examples/ivp/forced_2d_turbulence.jl`](https://github.com/subhk/Tarang.jl/blob/main/examples/ivp/forced_2d_turbulence.jl).
+[`examples/ivp/forced_2d_turbulence.jl`](https://github.com/SpectralFluid/Tarang.jl/blob/main/examples/ivp/forced_2d_turbulence.jl).
 It evolves vorticity, solves for streamfunction, derives velocity, and registers ring
 forcing on vorticity. Its essential forcing setup is:
 
@@ -138,6 +138,21 @@ the model's inverse elliptic operator.
 On GPU, forcing arrays and phase generation remain device-resident. Coupled
 solver selection and distributed-layout constraints are covered in
 [GPU Computing](gpu_computing.md).
+
+## Checkpoint and restart
+
+Solver checkpoints preserve registered standard and separable stochastic
+forcing: the private RNG state, cached forcing draw, timestep, and last update
+time. Recreate the problem with matching forcing configuration before calling
+`load_state!`; the initial seed may differ because the saved RNG is restored.
+Device arrays are staged through host memory for NetCDF persistence and
+restored onto the destination architecture.
+
+Stochastic restart requires the same Julia major/minor version. Older
+checkpoints without forcing state cannot resume a stochastically forced solver.
+Diagnostic `prevsol` scratch is cleared on restore; call `store_prevsol!` before
+the next forcing-work diagnostic. See [Solver checkpoint/restart](../api/io.md)
+for the complete restart contract and supported timesteppers.
 
 ---
 
