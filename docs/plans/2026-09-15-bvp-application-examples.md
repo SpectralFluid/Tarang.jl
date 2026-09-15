@@ -17,7 +17,8 @@ Documenter, and existing web-documentation checks.
   inspect both PNGs and provide SVG/PNG/CSV downloads.
 - [x] Add tutorials and navigation links under the two BVP sections.
 - [x] Run the examples, documentation checks, full site build, and local asset/link checks.
-- [ ] Commit and push to PR #137; verify the published preview.
+- [x] Commit the solver corrections and illustrated tutorials.
+- [ ] Open a follow-up PR after #137; verify the published preview.
 
 Poisson uses a periodic strip, mixed wall data, and filtered random forcing.
 Lane–Emden uses
