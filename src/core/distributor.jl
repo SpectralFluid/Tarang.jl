@@ -8,9 +8,7 @@ Key parallelization features:
 - Layout caching for performance
 """
 
-using MPI
-using PencilArrays
-using LinearAlgebra
+# MPI, PencilArrays, LinearAlgebra already in Tarang.jl
 
 struct Layout
     dist::Any
@@ -417,8 +415,8 @@ function initialize_mpi_topology!(dist::Distributor)
     end
 end
 
+"""Setup PencilArrays configuration for given global shape"""
 function setup_pencil_arrays(dist::Distributor, global_shape::Tuple{Vararg{Int}})
-    """Setup PencilArrays configuration for given global shape"""
 
     ndims_global = length(global_shape)
     ndims_mesh = length(dist.mesh)
@@ -433,7 +431,8 @@ function setup_pencil_arrays(dist::Distributor, global_shape::Tuple{Vararg{Int}}
     end
 
     # Create standard PencilArrays configuration
-    decomp_flags = ntuple(i -> i in decomp_dims, ndims_global)
+    # decomp_dims for PencilConfig is NTuple{M, Bool} matching the mesh dimensions
+    decomp_flags = ntuple(_ -> true, ndims_mesh)
 
     dist.pencil_config = PencilConfig(
         global_shape,
@@ -854,8 +853,8 @@ function get_process_coordinate_in_mesh(dist::Distributor, dim::Int)
     return div(dist.rank, stride) % dist.mesh[dim]
 end
 
+"""Get layout for given bases"""
 function get_layout(dist::Distributor, bases::Tuple{Vararg{Basis}}, dtype::Type=dist.dtype)
-    """Get layout for given bases"""
 
     start_time = time()
 
@@ -906,12 +905,12 @@ function get_layout(dist::Distributor, bases::Tuple{Vararg{Basis}}, dtype::Type=
     return layout
 end
 
-function local_indices(dist::Distributor, axis::Int)
-    """
+"""
     Get local indices for the given axis (1-indexed).
     For serial execution, returns all indices.
     For parallel execution, returns the indices owned by this process.
     """
+function local_indices(dist::Distributor, axis::Int)
     if dist.size == 1 || dist.mesh === nothing
         # Serial case: return all indices
         # We need to know the global size for this axis, but without a basis
@@ -936,8 +935,7 @@ function local_indices(dist::Distributor, axis::Int)
     return Colon()
 end
 
-function local_indices(dist::Distributor, axis::Int, global_size::Int)
-    """
+"""
     Get local indices for the given axis with known global size.
 
     Respects dist.use_pencil_arrays for decomposition convention:
@@ -948,6 +946,7 @@ function local_indices(dist::Distributor, axis::Int, global_size::Int)
     which uses full mesh decomposition (not pencil decomposition with a local dim).
     For pencil-specific operations, use explicit decomp_dims.
     """
+function local_indices(dist::Distributor, axis::Int, global_size::Int)
     if dist.size == 1 || dist.mesh === nothing
         return 1:global_size
     end
@@ -1024,8 +1023,8 @@ function local_indices(dist::Distributor, axis::Int, global_size::Int)
     return start_idx:(start_idx + local_size - 1)
 end
 
+"""Create a scalar field"""
 function Field(dist::Distributor; name::String="field", bases::Tuple{Vararg{Basis}}=(), dtype::Type=dist.dtype)
-    """Create a scalar field"""
     field = ScalarField(dist, name, bases, dtype)
     return field
 end
@@ -1033,8 +1032,7 @@ end
 # Note: VectorField and TensorField convenience constructors are defined in field.jl
 # to avoid conflict with the struct definitions (functions and structs cannot share names in Julia)
 
-function local_grids(dist::Distributor, bases::Vararg{Basis}; scales=nothing, move_to_arch::Bool=true)
-    """
+"""
     Return local coordinate grids for the given bases.
 
     GPU-aware: By default, grids are moved to the distributor's architecture.
@@ -1050,6 +1048,7 @@ function local_grids(dist::Distributor, bases::Vararg{Basis}; scales=nothing, mo
 
     Following implementation in distributor:294
     """
+function local_grids(dist::Distributor, bases::Vararg{Basis}; scales=nothing, move_to_arch::Bool=true)
     scales = remedy_scales(dist, scales)
     grids = []
 
@@ -1067,8 +1066,8 @@ function local_grids(dist::Distributor, bases::Vararg{Basis}; scales=nothing, mo
     return grids
 end
 
+"""Process and validate scales parameter."""
 function remedy_scales(dist::Distributor, scales, num_bases)
-    """Process and validate scales parameter."""
     if scales === nothing
         return ones(Float64, num_bases)
     elseif isa(scales, Number)
@@ -1080,11 +1079,11 @@ function remedy_scales(dist::Distributor, scales, num_bases)
     end
 end
 
-function remedy_scales(dist::Distributor, scales)
-    """
+"""
     Remedy different scale inputs.
     Following implementation in distributor:188-197
     """
+function remedy_scales(dist::Distributor, scales)
     if scales === nothing
         scales = 1.0
     end
@@ -1102,8 +1101,8 @@ function remedy_scales(dist::Distributor, scales)
     return scales
 end
 
+"""Get axis index for a coordinate."""
 function get_axis(dist::Distributor, coord::Coordinate)
-    """Get axis index for a coordinate."""
     for (i, c) in enumerate(dist.coords)
         if c.coordsys == coord.coordsys && c.name == coord.name
             return i - 1  # 0-indexed
@@ -1112,13 +1111,13 @@ function get_axis(dist::Distributor, coord::Coordinate)
     throw(ArgumentError("Coordinate $(coord.name) not found in distributor"))
 end
 
+"""Get axis for coordinate system (uses first coordinate)."""
 function get_axis(dist::Distributor, coordsys::CoordinateSystem)
-    """Get axis for coordinate system (uses first coordinate)."""
     return get_axis(dist, coords(coordsys)[1])
 end
 
+"""Get axis index for a basis."""
 function get_basis_axis(dist::Distributor, basis::Basis)
-    """Get axis index for a basis."""
     # Find the coordinate that matches this basis's element_label
     coord_name = basis.meta.element_label
     for (i, c) in enumerate(dist.coords)
@@ -1131,25 +1130,25 @@ function get_basis_axis(dist::Distributor, basis::Basis)
     return get_axis(dist, basis_coords[1])
 end
 
-function first_axis(dist::Distributor, basis::Basis)
-    """
+"""
     Get first axis index for a basis.
     Following implementation in distributor:210
     """
+function first_axis(dist::Distributor, basis::Basis)
     return get_basis_axis(dist, basis)
 end
 
-function last_axis(dist::Distributor, basis::Basis)
-    """
+"""
     Get last axis index for a basis.
     Following implementation in distributor:213
     """
+function last_axis(dist::Distributor, basis::Basis)
     return first_axis(dist, basis) + basis.meta.dim - 1
 end
 
 # MPI communication helpers
+"""Gather array from all processes (PencilArrays-aware)"""
 function gather_array(dist::Distributor, local_array::PencilArrays.PencilArray)
-    """Gather array from all processes (PencilArrays-aware)"""
 
     start_time = time()
 
@@ -1168,8 +1167,7 @@ function gather_array(dist::Distributor, local_array::PencilArrays.PencilArray)
     return result
 end
 
-function gather_array(dist::Distributor, local_array::AbstractArray)
-    """
+"""
     Gather array from all processes (fallback for non-PencilArray types).
     Note: MPI.Allgather flattens arrays - use the PencilArray version for
     shape-preserving gather of multi-dimensional distributed arrays.
@@ -1177,6 +1175,7 @@ function gather_array(dist::Distributor, local_array::AbstractArray)
     GPU-aware: Automatically transfers GPU arrays to CPU before MPI operations,
     since MPI requires CPU memory.
     """
+function gather_array(dist::Distributor, local_array::AbstractArray)
 
     start_time = time()
 
@@ -1265,8 +1264,7 @@ function _get_underlying_pencil_array(array::AbstractArray)
     return nothing
 end
 
-function scatter_array(dist::Distributor, global_array::AbstractArray)
-    """
+"""
     Scatter array to all processes.
 
     IMPORTANT: Uses different decomposition conventions based on dist.use_pencil_arrays:
@@ -1286,6 +1284,7 @@ function scatter_array(dist::Distributor, global_array::AbstractArray)
     For very large arrays that exceed MPI buffer limits, consider using non-blocking
     Isend/Irecv with Waitall for better overlap.
     """
+function scatter_array(dist::Distributor, global_array::AbstractArray)
 
     start_time = time()
 
@@ -1465,8 +1464,8 @@ function scatter_array(dist::Distributor, global_array::AbstractArray)
     return _maybe_to_architecture(dist.architecture, local_array)
 end
 
+"""All-reduce operation on array"""
 function allreduce_array(dist::Distributor, local_array::AbstractArray, op=MPI.SUM)
-    """All-reduce operation on array"""
 
     start_time = time()
 
@@ -1492,8 +1491,8 @@ end
 const MAX_LAYOUT_CACHE_SIZE = 100
 const MAX_PENCIL_CACHE_SIZE = 50
 
+"""Clear caches for distributor"""
 function clear_distributor_cache!(dist::Distributor)
-    """Clear caches for distributor"""
 
     # Clear layout cache
     empty!(dist.layouts)
@@ -1553,8 +1552,8 @@ function maybe_cleanup_caches!(dist::Distributor)
     end
 end
 
+"""Get memory usage information for distributor"""
 function get_distributor_memory_info(dist::Distributor)
-    """Get memory usage information for distributor"""
 
     return (
         cached_layouts = length(dist.layouts),
@@ -1562,8 +1561,8 @@ function get_distributor_memory_info(dist::Distributor)
     )
 end
 
+"""Log distributor performance statistics"""
 function log_distributor_performance(dist::Distributor)
-    """Log distributor performance statistics"""
 
     stats = dist.performance_stats
 
@@ -1583,8 +1582,8 @@ function log_distributor_performance(dist::Distributor)
 end
 
 # MPI communication functions
+"""All-to-all communication"""
 function mpi_alltoall(dist::Distributor, send_data::AbstractArray, recv_data::AbstractArray)
-    """All-to-all communication"""
 
     start_time = time()
 
@@ -1627,8 +1626,8 @@ function mpi_alltoall(dist::Distributor, send_data::AbstractArray, recv_data::Ab
     return recv_data
 end
 
+"""Create optimal 2D process mesh for given number of processes"""
 function create_2d_process_mesh(nproc::Int)
-    """Create optimal 2D process mesh for given number of processes"""
     # Find factors closest to square
     factors = []
     for i in 1:floor(Int, sqrt(nproc))
@@ -1646,8 +1645,8 @@ function create_2d_process_mesh(nproc::Int)
     return best_factor
 end
 
+"""Create optimal 3D process mesh for given number of processes"""
 function create_3d_process_mesh(nproc::Int)
-    """Create optimal 3D process mesh for given number of processes"""
     # Simple heuristic for 3D decomposition
     if nproc <= 8
         # Small cases

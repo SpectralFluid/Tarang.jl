@@ -9,11 +9,7 @@ for spectral PDE solvers, with particular focus on:
 - SIMD and threading implementations
 """
 
-using LinearAlgebra
-using LinearAlgebra: BLAS
-using SparseArrays
-using LoopVectorization
-using StaticArrays
+# LinearAlgebra, SparseArrays, LoopVectorization, StaticArrays already in Tarang.jl
 
 # Import BLAS symbols for direct calls
 import LinearAlgebra.BLAS: gemm!, gemv!, axpy!, scal!
@@ -43,25 +39,34 @@ struct BlockSparseMatVec{T, Ti} <: MatVecOp
     blocks::Vector{Union{SparseMatrixCSC{T, Ti}, Nothing}}
     block_structure::Matrix{Int}  # Maps to block indices
     workspace::Vector{Vector{T}}
+
+    function BlockSparseMatVec{T, Ti}(blocks, block_structure, workspace) where {T, Ti}
+        new{T, Ti}(blocks, block_structure, workspace)
+    end
 end
 
-function BlockSparseMatVec(blocks::Vector{Union{SparseMatrixCSC{T, Ti}, Nothing}},
-                            block_structure::Matrix{Int}) where {T, Ti}
-    workspace = Vector{Vector{T}}(undef, length(blocks))
-    for i in eachindex(blocks)
-        block = blocks[i]
-        workspace[i] = block === nothing ? Vector{T}(undef, 0) : Vector{T}(undef, size(block, 1))
-    end
+function _build_block_sparse(::Type{T}, ::Type{Ti},
+                             blocks::Vector{Union{SparseMatrixCSC{T, Ti}, Nothing}},
+                             block_structure::Matrix{Int}) where {T, Ti}
+    workspace = [b === nothing ? Vector{T}(undef, 0) : Vector{T}(undef, size(b, 1)) for b in blocks]
     return BlockSparseMatVec{T, Ti}(blocks, block_structure, workspace)
+end
+
+function BlockSparseMatVec(blocks::Vector{<:Union{SparseMatrixCSC, Nothing}},
+                            block_structure::Matrix{Int})
+    idx = findfirst(!isnothing, blocks)
+    idx === nothing && throw(ArgumentError("At least one block must be non-nothing"))
+    b = blocks[idx]::SparseMatrixCSC
+    T = eltype(b)
+    Ti = valtype(SparseArrays.getcolptr(b))
+    typed = convert(Vector{Union{SparseMatrixCSC{T, Ti}, Nothing}}, blocks)
+    return _build_block_sparse(T, Ti, typed, block_structure)
 end
 
 function BlockSparseMatVec(blocks::Vector{SparseMatrixCSC{T, Ti}},
                             block_structure::Matrix{Int}) where {T, Ti}
-    blocks_union = Vector{Union{SparseMatrixCSC{T, Ti}, Nothing}}(undef, length(blocks))
-    for i in eachindex(blocks)
-        blocks_union[i] = blocks[i]
-    end
-    return BlockSparseMatVec(blocks_union, block_structure)
+    blocks_union = Vector{Union{SparseMatrixCSC{T, Ti}, Nothing}}(blocks)
+    return _build_block_sparse(T, Ti, blocks_union, block_structure)
 end
 
 # Matrix-matrix multiplication types
@@ -166,8 +171,8 @@ end
 end
 
 # Matrix-vector operations
+"""Sparse matrix-vector multiplication: y = α*A*x + β*y"""
 function fast_matvec!(y::AbstractVector, op::SparseMatVec, x::AbstractVector, α::Real=1.0, β::Real=0.0)
-    """Sparse matrix-vector multiplication: y = α*A*x + β*y"""
 
     # Sparse matrices are CPU-only in Julia - check for GPU arrays
     if is_gpu_array(x) || is_gpu_array(y)
@@ -202,8 +207,8 @@ function fast_matvec!(y::AbstractVector, op::SparseMatVec, x::AbstractVector, α
     return y
 end
 
+"""Dense matrix-vector multiplication using BLAS"""
 function fast_matvec!(y::AbstractVector, op::DenseMatVec, x::AbstractVector, α::Real=1.0, β::Real=0.0)
-    """Dense matrix-vector multiplication using BLAS"""
 
     start_time = time()
 
@@ -274,8 +279,8 @@ function fast_matvec!(y::AbstractVector, op::DenseMatVec, x::AbstractVector, α:
     return y
 end
 
+"""Block sparse matrix-vector multiplication for structured problems"""
 function fast_matvec!(y::AbstractVector, op::BlockSparseMatVec, x::AbstractVector, α::Real=1.0, β::Real=0.0)
-    """Block sparse matrix-vector multiplication for structured problems"""
 
     # Sparse matrices are CPU-only in Julia - check for GPU arrays
     if is_gpu_array(x) || is_gpu_array(y)
@@ -339,8 +344,8 @@ function fast_matvec!(y::AbstractVector, op::BlockSparseMatVec, x::AbstractVecto
 end
 
 # Matrix-matrix operations
+"""Sparse-dense matrix multiplication"""
 function fast_matmat!(C::AbstractMatrix, op::SparseDenseMatMat, A_is_sparse::Bool, A::AbstractMatrix, B::AbstractMatrix, α::Real=1.0, β::Real=0.0)
-    """Sparse-dense matrix multiplication"""
 
     # Sparse matrices are CPU-only in Julia - check for GPU arrays
     if is_gpu_array(A) || is_gpu_array(B) || is_gpu_array(C)
@@ -382,8 +387,8 @@ function fast_matmat!(C::AbstractMatrix, op::SparseDenseMatMat, A_is_sparse::Boo
     return C
 end
 
+"""Dense matrix multiplication with BLAS"""
 function fast_matmat!(C::AbstractMatrix, op::DenseDenseMatMat, A::AbstractMatrix, B::AbstractMatrix, α::Real=1.0, β::Real=0.0)
-    """Dense matrix multiplication with BLAS"""
 
     start_time = time()
 
@@ -443,8 +448,8 @@ function fast_matmat!(C::AbstractMatrix, op::DenseDenseMatMat, A::AbstractMatrix
     return C
 end
 
+"""Kronecker product matrix multiplication: C = α*(A₁⊗A₂⊗...)*vec(C) + β*C"""
 function fast_matmat!(C::AbstractMatrix, op::TensorMatMat, vec_C::AbstractVector, α::Real=1.0, β::Real=0.0)
-    """Kronecker product matrix multiplication: C = α*(A₁⊗A₂⊗...)*vec(C) + β*C"""
 
     start_time = time()
 
@@ -515,8 +520,8 @@ function fast_matmat!(C::AbstractMatrix, op::TensorMatMat, vec_C::AbstractVector
 end
 
 # Specialized optimizations
-@inline function vectorized_matmat!(C, A, B, α, β)
-    """SIMD small matrix multiplication - CPU only, uses generic fallback for GPU"""
+@inline """SIMD small matrix multiplication - CPU only, uses generic fallback for GPU"""
+function vectorized_matmat!(C, A, B, α, β)
 
     # GPU arrays don't support @turbo SIMD - use generic mul! instead
     if is_gpu_array(A) || is_gpu_array(B) || is_gpu_array(C)
@@ -554,8 +559,8 @@ end
     end
 end
 
+"""Threaded block matrix multiplication - CPU only, uses BLAS"""
 function threaded_block_matmat!(C, A, B, α, β, block_size)
-    """Threaded block matrix multiplication - CPU only, uses BLAS"""
 
     # This function uses CPU BLAS - check for GPU arrays
     if is_gpu_array(A) || is_gpu_array(B) || is_gpu_array(C)
@@ -585,8 +590,8 @@ function threaded_block_matmat!(C, A, B, α, β, block_size)
 end
 
 # Memory-efficient operations for large systems
+"""Memory-efficient matrix-vector multiplication for very large matrices"""
 function streaming_matvec!(y::AbstractVector, A::AbstractMatrix, x::AbstractVector, chunk_size::Int=1024)
-    """Memory-efficient matrix-vector multiplication for very large matrices"""
 
     # GPU arrays don't benefit from CPU-style chunking - use direct mul!
     # GPU memory management and kernel launch overhead make chunking counterproductive
@@ -612,8 +617,8 @@ function streaming_matvec!(y::AbstractVector, A::AbstractMatrix, x::AbstractVect
     return y
 end
 
+"""Cache-efficient matrix multiplication using blocking"""
 function cache_efficient_matmat!(C::AbstractMatrix, A::AbstractMatrix, B::AbstractMatrix, cache_size::Int=32768)
-    """Cache-efficient matrix multiplication using blocking"""
 
     # GPU arrays don't benefit from CPU cache blocking - use direct mul!
     if is_gpu_array(A) || is_gpu_array(B) || is_gpu_array(C)
@@ -655,8 +660,8 @@ function cache_efficient_matmat!(C::AbstractMatrix, A::AbstractMatrix, B::Abstra
 end
 
 # Integration with spectral operators
+"""Create operator for spectral method matrices"""
 function create_operator(matrix::AbstractMatrix, operation_type::Symbol)
-    """Create operator for spectral method matrices"""
 
     if operation_type != :matvec && operation_type != :matmat
         throw(ArgumentError("Invalid operation_type: $operation_type. Must be :matvec or :matmat"))
@@ -678,8 +683,8 @@ function create_operator(matrix::AbstractMatrix, operation_type::Symbol)
     end
 end
 
+"""Create Kronecker product operator"""
 function create_kronecker_operator(factors::Vector{<:AbstractMatrix})
-    """Create Kronecker product operator"""
 
     if isempty(factors)
         throw(ArgumentError("Cannot create Kronecker operator with empty factors vector"))
@@ -860,11 +865,11 @@ function get_total_matrix_size(block_structure::Matrix{Int};
     return (sum(row_sizes), sum(col_sizes))
 end
 
-function get_block_ranges(blocks::Vector{<:Union{SparseMatrixCSC, Nothing}}, block_structure::Matrix{Int}, block_idx::Int)
-    """
+"""
     Enhanced version that uses actual block sizes from the sparse matrices.
     This is more accurate than the size estimation approach above.
     """
+function get_block_ranges(blocks::Vector{<:Union{SparseMatrixCSC, Nothing}}, block_structure::Matrix{Int}, block_idx::Int)
 
     # Find the position of the requested block in the block structure
     block_pos = findfirst(x -> x == block_idx, block_structure)
@@ -920,8 +925,8 @@ function get_block_ranges(blocks::Vector{<:Union{SparseMatrixCSC, Nothing}}, blo
     return (i_range, j_range)
 end
 
+"""Benchmark various linear algebra operations"""
 function benchmark_linalg_operations(sizes::Vector{Int}=[100, 500, 1000, 2000])
-    """Benchmark various linear algebra operations"""
     
     println("Benchmarking linear algebra operations...")
     println("=" ^ 60)
@@ -944,14 +949,14 @@ function benchmark_linalg_operations(sizes::Vector{Int}=[100, 500, 1000, 2000])
         y_dense = similar(x)
         y_sparse = similar(x)
         
-        t_dense_mv = @belapsed fast_matvec!($y_dense, $dense_matvec_op, $x)
-        t_sparse_mv = @belapsed fast_matvec!($y_sparse, $sparse_matvec_op, $x)
-        t_stdlib_mv = @belapsed mul!($y_dense, $A_dense, $x)
-        
+        t_dense_mv = @elapsed fast_matvec!(y_dense, dense_matvec_op, x)
+        t_sparse_mv = @elapsed fast_matvec!(y_sparse, sparse_matvec_op, x)
+        t_stdlib_mv = @elapsed mul!(y_dense, A_dense, x)
+
         # Benchmark matrix-matrix
         C = Matrix{Float64}(undef, n, size(B, 2))
-        t_fast_mm = @belapsed fast_matmat!($C, $dense_matmat_op, $A_dense, $B)
-        t_stdlib_mm = @belapsed mul!($C, $A_dense, $B)
+        t_fast_mm = @elapsed fast_matmat!(C, dense_matmat_op, A_dense, B)
+        t_stdlib_mm = @elapsed mul!(C, A_dense, B)
 
         speedup_mv = t_dense_mv > 0 ? round(t_stdlib_mv/t_dense_mv, digits=2) : NaN
         speedup_mm = t_fast_mm > 0 ? round(t_stdlib_mm/t_fast_mm, digits=2) : NaN
@@ -963,8 +968,8 @@ function benchmark_linalg_operations(sizes::Vector{Int}=[100, 500, 1000, 2000])
 end
 
 # Performance monitoring and statistics
+"""Reset global linear algebra statistics"""
 function reset_linalg_stats!()
-    """Reset global linear algebra statistics"""
     global GLOBAL_LINALG_STATS
     GLOBAL_LINALG_STATS.matvec_calls = 0
     GLOBAL_LINALG_STATS.matvec_time = 0.0
@@ -975,8 +980,8 @@ function reset_linalg_stats!()
     GLOBAL_LINALG_STATS.blas_ops = 0
 end
 
+"""Print linear algebra performance statistics"""
 function print_linalg_stats()
-    """Print linear algebra performance statistics"""
     stats = GLOBAL_LINALG_STATS
     
     println("Linear Algebra Performance Statistics:")

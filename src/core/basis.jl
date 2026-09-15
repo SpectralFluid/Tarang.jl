@@ -32,9 +32,7 @@ convert them to CPU for evaluation, with a warning message. For GPU-native
 operations, use transform-based methods instead of direct basis evaluation.
 """
 
-using LinearAlgebra
-using SparseArrays
-using FFTW
+# LinearAlgebra, SparseArrays, FFTW already in Tarang.jl
 using SpecialFunctions: gamma, lgamma
 
 export Basis, IntervalBasis, JacobiBasis, FourierBasis,
@@ -730,6 +728,35 @@ function wavenumbers_rfft(basis::RealFourier)
     # RFFT output: [0, 1, 2, ..., N/2] (N/2+1 values)
     kmax = N ÷ 2
     return k0 .* collect(0:kmax)
+end
+
+"""
+    wavenumbers_fft(basis::RealFourier)
+
+Get wavenumbers for RealFourier basis in standard FFT layout.
+
+In multi-dimensional transforms, `rfft` is applied to the first axis (producing
+N/2+1 complex values), while subsequent RealFourier axes use `fft` (because their
+input is already complex). The `fft` output uses standard FFT ordering:
+
+    [k=0, k=1, ..., k=N/2-1, k=-N/2, k=-N/2+1, ..., k=-1]
+
+This function returns wavenumbers matching that layout.
+"""
+function wavenumbers_fft(basis::RealFourier)
+    N = basis.meta.size
+    L = basis.meta.bounds[2] - basis.meta.bounds[1]
+    if abs(L) < 1e-14
+        throw(ArgumentError("wavenumbers_fft: domain length is zero"))
+    end
+    k0 = 2π / L
+    if iseven(N)
+        k_fft = Float64.([0:(N ÷ 2 - 1); -(N ÷ 2):-1])
+    else
+        kmax = (N - 1) ÷ 2
+        k_fft = Float64.([0:kmax; -kmax:-1])
+    end
+    return k0 .* k_fft
 end
 
 """
@@ -2215,14 +2242,14 @@ function local_grids(basis::JacobiBasis, dist, scales; move_to_arch::Bool=true)
     return (local_grid(basis, dist, scales[1]; move_to_arch=move_to_arch),)
 end
 
-function local_grid(basis::Basis, dist, scale; move_to_arch::Bool=true)
-    """
+"""
     Local grid for a basis.
 
     GPU-aware: By default, the grid is moved to the distributor's architecture.
     This enables efficient broadcasting with field data on GPU.
     Set `move_to_arch=false` to always return CPU arrays (e.g., for file I/O).
     """
+function local_grid(basis::Basis, dist, scale; move_to_arch::Bool=true)
     axis = get_basis_axis(dist, basis)
     native_grid = _native_grid(basis, scale)
     global_size = length(native_grid)
@@ -2558,6 +2585,6 @@ function evaluate_basis(basis::JacobiBasis, coords, modes)
     return result
 end
 
+"""No-op for CPU-only mode."""
 function synchronize_basis!(basis::Basis)
-    """No-op for CPU-only mode."""
 end

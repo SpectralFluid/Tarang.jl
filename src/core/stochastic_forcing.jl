@@ -68,7 +68,7 @@ The spectrum is normalized to inject energy at rate ε.
 """
 
 using Random
-using LinearAlgebra
+# LinearAlgebra already in Tarang.jl
 
 # ============================================================================
 # Abstract forcing types

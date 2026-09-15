@@ -2,6 +2,38 @@
 # NCCL-based Transpose for Pencil Decomposition
 # ============================================================================
 
+# Binary search helpers for GPU kernels (shared with transpose_kernels.jl)
+# Find which rank owns index `idx` given cumulative prefix sums.
+@inline function _gpu_find_rank(idx::Int, prefix_sums, nranks::Int)
+    lo = 1
+    hi = nranks
+    @inbounds while lo < hi
+        mid = (lo + hi) >>> 1
+        if idx <= prefix_sums[mid]
+            hi = mid
+        else
+            lo = mid + 1
+        end
+    end
+    @inbounds offset = lo > 1 ? prefix_sums[lo - 1] : 0
+    return lo - 1, offset  # 0-based rank
+end
+
+@inline function _gpu_find_rank_1based(idx::Int, prefix_sums, nranks::Int)
+    lo = 1
+    hi = nranks
+    @inbounds while lo < hi
+        mid = (lo + hi) >>> 1
+        if idx <= prefix_sums[mid]
+            hi = mid
+        else
+            lo = mid + 1
+        end
+    end
+    @inbounds offset = lo > 1 ? prefix_sums[lo - 1] : 0
+    return lo, offset  # 1-based rank
+end
+
 """
     NCCLTransposeBuffer{T}
 
@@ -94,7 +126,8 @@ Reorganizes data from Z-pencil layout to prepare for all-to-all communication.
 Each element is placed contiguously for its destination rank.
 """
 @kernel function pack_z_to_y_kernel!(packed, @Const(data), Nx, Ny, Nz,
-                                      @Const(chunk_sizes), @Const(displs), nranks)
+                                      @Const(chunk_sizes), @Const(displs), nranks,
+                                      @Const(prefix_sums))
     idx = @index(Global)
 
     total = Nx * Ny * Nz
@@ -102,23 +135,11 @@ Each element is placed contiguously for its destination rank.
         return
     end
 
-    # Calculate 3D indices from linear index (column-major)
     i = ((idx - 1) % Nx) + 1
     j = (((idx - 1) ÷ Nx) % Ny) + 1
     k = ((idx - 1) ÷ (Nx * Ny)) + 1
 
-    # Determine which rank this Z-slice goes to (split Z, the fully-local dimension)
-    rank = 1
-    z_offset = 0
-    for r in 1:nranks
-        if k <= z_offset + chunk_sizes[r]
-            rank = r
-            break
-        end
-        z_offset += chunk_sizes[r]
-    end
-
-    # Compute position within this rank's chunk
+    rank, z_offset = _gpu_find_rank_1based(k, prefix_sums, nranks)
     local_k = k - z_offset
     local_idx = (local_k - 1) * Nx * Ny + (j - 1) * Nx + i
     buf_idx = displs[rank] + local_idx
@@ -131,7 +152,8 @@ Unpack kernel for Z->Y transpose.
 Reorganizes received data into Y-pencil layout after all-to-all communication.
 """
 @kernel function unpack_z_to_y_kernel!(data, @Const(packed), Nx, Ny, Nz,
-                                        @Const(chunk_sizes), @Const(displs), nranks)
+                                        @Const(chunk_sizes), @Const(displs), nranks,
+                                        @Const(prefix_sums))
     idx = @index(Global)
 
     total = Nx * Ny * Nz
@@ -139,23 +161,11 @@ Reorganizes received data into Y-pencil layout after all-to-all communication.
         return
     end
 
-    # Calculate 3D indices for Y-pencil layout (Nx, Ny_global, Nz_local)
     i = ((idx - 1) % Nx) + 1
     j = (((idx - 1) ÷ Nx) % Ny) + 1
     k = ((idx - 1) ÷ (Nx * Ny)) + 1
 
-    # Determine which rank contributed this Y-slice (each peer sent its Ny_local chunk)
-    rank = 1
-    y_offset = 0
-    for r in 1:nranks
-        if j <= y_offset + chunk_sizes[r]
-            rank = r
-            break
-        end
-        y_offset += chunk_sizes[r]
-    end
-
-    # Compute position within this rank's received chunk: (Nx, Ny_r, Nz_local)
+    rank, y_offset = _gpu_find_rank_1based(j, prefix_sums, nranks)
     local_j = j - y_offset
     local_idx = (k - 1) * Nx * chunk_sizes[rank] + (local_j - 1) * Nx + i
     buf_idx = displs[rank] + local_idx
@@ -172,7 +182,8 @@ In Y-pencil: (Nx_local, Ny, Nz_local) where Ny is full, Nz is partitioned
 We send Y-chunks to each rank, keeping our Nz_local portion.
 """
 @kernel function pack_y_to_z_kernel!(packed, @Const(data), Nx, Ny, Nz_local,
-                                      @Const(chunk_sizes), @Const(displs), nranks)
+                                      @Const(chunk_sizes), @Const(displs), nranks,
+                                      @Const(prefix_sums))
     idx = @index(Global)
 
     total = Nx * Ny * Nz_local
@@ -180,24 +191,11 @@ We send Y-chunks to each rank, keeping our Nz_local portion.
         return
     end
 
-    # Calculate 3D indices from linear index (column-major)
     i = ((idx - 1) % Nx) + 1
     j = (((idx - 1) ÷ Nx) % Ny) + 1
     k = ((idx - 1) ÷ (Nx * Ny)) + 1
 
-    # Determine which rank this Y-slice goes to (partition by Y)
-    rank = 1
-    y_offset = 0
-    for r in 1:nranks
-        if j <= y_offset + chunk_sizes[r]
-            rank = r
-            break
-        end
-        y_offset += chunk_sizes[r]
-    end
-
-    # Compute position within this rank's chunk
-    # Layout within chunk: (Nx, chunk_size_y, Nz_local)
+    rank, y_offset = _gpu_find_rank_1based(j, prefix_sums, nranks)
     local_j = j - y_offset
     local_idx = (k - 1) * Nx * chunk_sizes[rank] + (local_j - 1) * Nx + i
     buf_idx = displs[rank] + local_idx
@@ -213,7 +211,8 @@ After communication, we receive Nz_chunk from each rank.
 Output is Z-pencil: (Nx_local, Ny_local, Nz) where Nz is now full.
 """
 @kernel function unpack_y_to_z_kernel!(data, @Const(packed), Nx, Ny_local, Nz,
-                                        @Const(chunk_sizes), @Const(displs), nranks)
+                                        @Const(chunk_sizes), @Const(displs), nranks,
+                                        @Const(prefix_sums))
     idx = @index(Global)
 
     total = Nx * Ny_local * Nz
@@ -221,24 +220,11 @@ Output is Z-pencil: (Nx_local, Ny_local, Nz) where Nz is now full.
         return
     end
 
-    # Calculate 3D indices for Z-pencil layout
     i = ((idx - 1) % Nx) + 1
     j = (((idx - 1) ÷ Nx) % Ny_local) + 1
     k = ((idx - 1) ÷ (Nx * Ny_local)) + 1
 
-    # Determine which rank contributed this Z-slice
-    rank = 1
-    z_offset = 0
-    for r in 1:nranks
-        if k <= z_offset + chunk_sizes[r]
-            rank = r
-            break
-        end
-        z_offset += chunk_sizes[r]
-    end
-
-    # Compute position within this rank's received chunk
-    # Received layout: (Nx, Ny_local, chunk_size_z)
+    rank, z_offset = _gpu_find_rank_1based(k, prefix_sums, nranks)
     local_k = k - z_offset
     local_idx = (local_k - 1) * Nx * Ny_local + (j - 1) * Nx + i
     buf_idx = displs[rank] + local_idx
@@ -251,7 +237,8 @@ Pack kernel for Y->X transpose.
 Reorganizes data from Y-pencil layout for column communicator all-to-all.
 """
 @kernel function pack_y_to_x_kernel!(packed, @Const(data), Nx, Ny, Nz,
-                                      @Const(chunk_sizes), @Const(displs), nranks)
+                                      @Const(chunk_sizes), @Const(displs), nranks,
+                                      @Const(prefix_sums))
     idx = @index(Global)
 
     total = Nx * Ny * Nz
@@ -259,23 +246,11 @@ Reorganizes data from Y-pencil layout for column communicator all-to-all.
         return
     end
 
-    # Calculate 3D indices from linear index
     i = ((idx - 1) % Nx) + 1
     j = (((idx - 1) ÷ Nx) % Ny) + 1
     k = ((idx - 1) ÷ (Nx * Ny)) + 1
 
-    # Determine which rank this Y-slice goes to (split Y, the fully-local dimension)
-    rank = 1
-    y_offset = 0
-    for r in 1:nranks
-        if j <= y_offset + chunk_sizes[r]
-            rank = r
-            break
-        end
-        y_offset += chunk_sizes[r]
-    end
-
-    # Compute position within this rank's chunk: (Nx, Ny_r, Nz)
+    rank, y_offset = _gpu_find_rank_1based(j, prefix_sums, nranks)
     local_j = j - y_offset
     local_idx = (k - 1) * Nx * chunk_sizes[rank] + (local_j - 1) * Nx + i
     buf_idx = displs[rank] + local_idx
@@ -288,7 +263,8 @@ Unpack kernel for Y->X transpose.
 Reorganizes received data into X-pencil layout.
 """
 @kernel function unpack_y_to_x_kernel!(data, @Const(packed), Nx, Ny, Nz,
-                                        @Const(chunk_sizes), @Const(displs), nranks)
+                                        @Const(chunk_sizes), @Const(displs), nranks,
+                                        @Const(prefix_sums))
     idx = @index(Global)
 
     total = Nx * Ny * Nz
@@ -296,23 +272,11 @@ Reorganizes received data into X-pencil layout.
         return
     end
 
-    # Calculate 3D indices for X-pencil layout (Nx_global, Ny_local, Nz_local)
     i = ((idx - 1) % Nx) + 1
     j = (((idx - 1) ÷ Nx) % Ny) + 1
     k = ((idx - 1) ÷ (Nx * Ny)) + 1
 
-    # Determine which rank contributed this X-slice (each peer sent its Nx_local chunk)
-    rank = 1
-    x_offset = 0
-    for r in 1:nranks
-        if i <= x_offset + chunk_sizes[r]
-            rank = r
-            break
-        end
-        x_offset += chunk_sizes[r]
-    end
-
-    # Compute position within this rank's received chunk: (Nx_r, Ny, Nz)
+    rank, x_offset = _gpu_find_rank_1based(i, prefix_sums, nranks)
     local_i = i - x_offset
     local_idx = (k - 1) * chunk_sizes[rank] * Ny + (j - 1) * chunk_sizes[rank] + local_i
     buf_idx = displs[rank] + local_idx
@@ -326,7 +290,8 @@ Reorganizes data from X-pencil layout for column communicator all-to-all.
 Splits the X dimension among ranks (the reverse of the Y->X unpack).
 """
 @kernel function pack_x_to_y_kernel!(packed, @Const(data), Nx, Ny, Nz,
-                                      @Const(chunk_sizes), @Const(displs), nranks)
+                                      @Const(chunk_sizes), @Const(displs), nranks,
+                                      @Const(prefix_sums))
     idx = @index(Global)
 
     total = Nx * Ny * Nz
@@ -334,23 +299,11 @@ Splits the X dimension among ranks (the reverse of the Y->X unpack).
         return
     end
 
-    # Calculate 3D indices from linear index (X-pencil: Nx, Ny_local, Nz_local)
     i = ((idx - 1) % Nx) + 1
     j = (((idx - 1) ÷ Nx) % Ny) + 1
     k = ((idx - 1) ÷ (Nx * Ny)) + 1
 
-    # Determine which rank this X-slice goes to (split X among ranks)
-    rank = 1
-    x_offset = 0
-    for r in 1:nranks
-        if i <= x_offset + chunk_sizes[r]
-            rank = r
-            break
-        end
-        x_offset += chunk_sizes[r]
-    end
-
-    # Compute position within this rank's chunk: (Nx_r, Ny, Nz)
+    rank, x_offset = _gpu_find_rank_1based(i, prefix_sums, nranks)
     local_i = i - x_offset
     local_idx = (k - 1) * chunk_sizes[rank] * Ny + (j - 1) * chunk_sizes[rank] + local_i
     buf_idx = displs[rank] + local_idx
@@ -364,7 +317,8 @@ Reorganizes received data into Y-pencil layout.
 Gathers Y-slices from each rank (the reverse of the Y->X pack).
 """
 @kernel function unpack_x_to_y_kernel!(data, @Const(packed), Nx, Ny, Nz,
-                                        @Const(chunk_sizes), @Const(displs), nranks)
+                                        @Const(chunk_sizes), @Const(displs), nranks,
+                                        @Const(prefix_sums))
     idx = @index(Global)
 
     total = Nx * Ny * Nz
@@ -372,23 +326,11 @@ Gathers Y-slices from each rank (the reverse of the Y->X pack).
         return
     end
 
-    # Calculate 3D indices for Y-pencil layout (Nx_local, Ny_global, Nz_local)
     i = ((idx - 1) % Nx) + 1
     j = (((idx - 1) ÷ Nx) % Ny) + 1
     k = ((idx - 1) ÷ (Nx * Ny)) + 1
 
-    # Determine which rank contributed this Y-slice
-    rank = 1
-    y_offset = 0
-    for r in 1:nranks
-        if j <= y_offset + chunk_sizes[r]
-            rank = r
-            break
-        end
-        y_offset += chunk_sizes[r]
-    end
-
-    # Compute position within this rank's received chunk: (Nx, Ny_r, Nz)
+    rank, y_offset = _gpu_find_rank_1based(j, prefix_sums, nranks)
     local_j = j - y_offset
     local_idx = (k - 1) * Nx * chunk_sizes[rank] + (local_j - 1) * Nx + i
     buf_idx = displs[rank] + local_idx
@@ -414,10 +356,10 @@ full transpose_z_to_y!, transpose_y_to_x!, etc. functions.
 - `dim`: Dimension along which to prepare for transpose (1=X, 2=Y, 3=Z)
 """
 function nccl_pack_for_transpose!(packed::CuArray{T}, data::CuArray{T,3}, dim::Int) where T
+    @warn "nccl_pack_for_transpose! is a testing stub (simple copy). For actual transposes, use transpose_z_to_y! etc." maxlog=1
     Nx, Ny, Nz = size(data)
     total = Nx * Ny * Nz
 
-    # For testing: simple copy (actual pack logic is in transpose functions)
     if dim == 3 || dim == 2 || dim == 1
         copyto!(view(packed, 1:total), reshape(data, :))
     end
@@ -439,10 +381,10 @@ full transpose_z_to_y!, transpose_y_to_x!, etc. functions.
 - `dim`: Dimension along which transpose was performed (1=X, 2=Y, 3=Z)
 """
 function nccl_unpack_from_transpose!(data::CuArray{T,3}, packed::CuArray{T}, dim::Int) where T
+    @warn "nccl_unpack_from_transpose! is a testing stub (simple copy). For actual transposes, use transpose_z_to_y! etc." maxlog=1
     Nx, Ny, Nz = size(data)
     total = Nx * Ny * Nz
 
-    # For testing: simple copy (actual unpack logic is in transpose functions)
     if dim == 3 || dim == 2 || dim == 1
         copyto!(reshape(data, :), view(packed, 1:total))
     end
@@ -612,9 +554,10 @@ function transpose_z_to_y!(buffer::NCCLTransposeBuffer{T},
     chunk_sizes_gpu = CuArray(Int[div(Nz, row_size) + ((i-1) < mod(Nz, row_size) ? 1 : 0) for i in 1:row_size])
     displs_gpu = CuArray(buffer.send_displs[1:row_size])
 
+    prefix_sums_gpu = cumsum(chunk_sizes_gpu)
     kernel = pack_z_to_y_kernel!(CUDABackend())
     kernel(buffer.send_buffer, data, Nx_local, Ny_local, Nz,
-           chunk_sizes_gpu, displs_gpu, row_size; ndrange=total)
+           chunk_sizes_gpu, displs_gpu, row_size, prefix_sums_gpu; ndrange=total)
     CUDA.synchronize()
 
     # Perform NCCL all-to-all (pass my_rank to avoid self-send deadlock)
@@ -634,9 +577,10 @@ function transpose_z_to_y!(buffer::NCCLTransposeBuffer{T},
     recv_chunk_sizes_gpu = CuArray(Int[div(Ny_global, row_size) + ((i-1) < mod(Ny_global, row_size) ? 1 : 0) for i in 1:row_size])
     recv_displs_gpu = CuArray(buffer.recv_displs[1:row_size])
 
+    recv_prefix_sums_gpu = cumsum(recv_chunk_sizes_gpu)
     kernel_unpack = unpack_z_to_y_kernel!(CUDABackend())
     kernel_unpack(output, buffer.recv_buffer, Nx_y, Ny_y, Nz_y,
-                  recv_chunk_sizes_gpu, recv_displs_gpu, row_size; ndrange=prod(pencil.y_pencil_shape))
+                  recv_chunk_sizes_gpu, recv_displs_gpu, row_size, recv_prefix_sums_gpu; ndrange=prod(pencil.y_pencil_shape))
     CUDA.synchronize()
 
     set_orientation!(pencil, :y_pencil)
@@ -710,9 +654,10 @@ function transpose_y_to_z!(buffer::NCCLTransposeBuffer{T},
     chunk_sizes_gpu = CuArray(Int[div(Ny, row_size) + ((i-1) < mod(Ny, row_size) ? 1 : 0) for i in 1:row_size])
     displs_gpu = CuArray(buffer.send_displs[1:row_size])
 
+    prefix_sums_gpu = cumsum(chunk_sizes_gpu)
     kernel = pack_y_to_z_kernel!(CUDABackend())
     kernel(buffer.send_buffer, data, Nx_local, Ny, Nz_local,
-           chunk_sizes_gpu, displs_gpu, row_size; ndrange=total)
+           chunk_sizes_gpu, displs_gpu, row_size, prefix_sums_gpu; ndrange=total)
     CUDA.synchronize()
 
     row_rank = MPI.Comm_rank(pencil.row_comm)
@@ -723,17 +668,16 @@ function transpose_y_to_z!(buffer::NCCLTransposeBuffer{T},
         buffer.nccl_subcomms.row_comm; my_rank=row_rank
     )
 
-    # CRITICAL FIX: Use proper unpack kernel
-    # Reassemble Z-chunks from each rank into contiguous Z dimension
     output = CUDA.zeros(T, pencil.z_pencil_shape...)
     Nx_z, Ny_z, Nz_z = pencil.z_pencil_shape
 
     recv_chunk_sizes_gpu = CuArray(Int[div(Nz_global, row_size) + ((i-1) < mod(Nz_global, row_size) ? 1 : 0) for i in 1:row_size])
     recv_displs_gpu = CuArray(buffer.recv_displs[1:row_size])
+    recv_prefix_sums_gpu = cumsum(recv_chunk_sizes_gpu)
 
     kernel_unpack = unpack_y_to_z_kernel!(CUDABackend())
     kernel_unpack(output, buffer.recv_buffer, Nx_z, Ny_z, Nz_z,
-                  recv_chunk_sizes_gpu, recv_displs_gpu, row_size; ndrange=prod(pencil.z_pencil_shape))
+                  recv_chunk_sizes_gpu, recv_displs_gpu, row_size, recv_prefix_sums_gpu; ndrange=prod(pencil.z_pencil_shape))
     CUDA.synchronize()
 
     set_orientation!(pencil, :z_pencil)
@@ -805,12 +749,12 @@ function transpose_y_to_x!(buffer::NCCLTransposeBuffer{T},
     chunk_sizes_gpu = CuArray(Int[div(Ny, col_size) + ((i-1) < mod(Ny, col_size) ? 1 : 0) for i in 1:col_size])
     displs_gpu = CuArray(buffer.send_displs[1:col_size])
 
+    prefix_sums_gpu = cumsum(chunk_sizes_gpu)
     kernel = pack_y_to_x_kernel!(CUDABackend())
     kernel(buffer.send_buffer, data, Nx_local, Ny, Nz_local,
-           chunk_sizes_gpu, displs_gpu, col_size; ndrange=total)
+           chunk_sizes_gpu, displs_gpu, col_size, prefix_sums_gpu; ndrange=total)
     CUDA.synchronize()
 
-    # Perform NCCL all-to-all on column communicator (pass my_rank to avoid self-send deadlock)
     col_rank = MPI.Comm_rank(pencil.col_comm)
     nccl_alltoall!(
         buffer.send_buffer, buffer.recv_buffer,
@@ -819,17 +763,16 @@ function transpose_y_to_x!(buffer::NCCLTransposeBuffer{T},
         buffer.nccl_subcomms.col_comm; my_rank=col_rank
     )
 
-    # Create output in X-pencil shape and unpack
     output = CUDA.zeros(T, pencil.x_pencil_shape...)
     Nx_x, Ny_x, Nz_x = pencil.x_pencil_shape
 
-    # Unpack: each peer contributed its Nx_local chunk (X-chunks)
     recv_chunk_sizes_gpu = CuArray(Int[div(Nx_global, col_size) + ((i-1) < mod(Nx_global, col_size) ? 1 : 0) for i in 1:col_size])
     recv_displs_gpu = CuArray(buffer.recv_displs[1:col_size])
+    recv_prefix_sums_gpu = cumsum(recv_chunk_sizes_gpu)
 
     kernel_unpack = unpack_y_to_x_kernel!(CUDABackend())
     kernel_unpack(output, buffer.recv_buffer, Nx_x, Ny_x, Nz_x,
-                  recv_chunk_sizes_gpu, recv_displs_gpu, col_size; ndrange=prod(pencil.x_pencil_shape))
+                  recv_chunk_sizes_gpu, recv_displs_gpu, col_size, recv_prefix_sums_gpu; ndrange=prod(pencil.x_pencil_shape))
     CUDA.synchronize()
 
     set_orientation!(pencil, :x_pencil)
@@ -900,9 +843,10 @@ function transpose_x_to_y!(buffer::NCCLTransposeBuffer{T},
     chunk_sizes_gpu = CuArray(Int[div(Nx_global, col_size) + ((i-1) < mod(Nx_global, col_size) ? 1 : 0) for i in 1:col_size])
     displs_gpu = CuArray(buffer.send_displs[1:col_size])
 
+    prefix_sums_gpu = cumsum(chunk_sizes_gpu)
     kernel = pack_x_to_y_kernel!(CUDABackend())
     kernel(buffer.send_buffer, data, Nx, Ny_local, Nz_local,
-           chunk_sizes_gpu, displs_gpu, col_size; ndrange=total)
+           chunk_sizes_gpu, displs_gpu, col_size, prefix_sums_gpu; ndrange=total)
     CUDA.synchronize()
 
     nccl_alltoall!(
@@ -912,16 +856,16 @@ function transpose_x_to_y!(buffer::NCCLTransposeBuffer{T},
         buffer.nccl_subcomms.col_comm; my_rank=col_rank
     )
 
-    # Unpack into Y-pencil layout using GPU kernel
     output = CUDA.zeros(T, pencil.y_pencil_shape...)
     Nx_y, Ny_y, Nz_y = pencil.y_pencil_shape
 
     recv_chunk_sizes_gpu = CuArray(Int[div(Ny_global, col_size) + ((i-1) < mod(Ny_global, col_size) ? 1 : 0) for i in 1:col_size])
     recv_displs_gpu = CuArray(buffer.recv_displs[1:col_size])
+    recv_prefix_sums_gpu = cumsum(recv_chunk_sizes_gpu)
 
     kernel_unpack = unpack_x_to_y_kernel!(CUDABackend())
     kernel_unpack(output, buffer.recv_buffer, Nx_y, Ny_y, Nz_y,
-                  recv_chunk_sizes_gpu, recv_displs_gpu, col_size; ndrange=prod(pencil.y_pencil_shape))
+                  recv_chunk_sizes_gpu, recv_displs_gpu, col_size, recv_prefix_sums_gpu; ndrange=prod(pencil.y_pencil_shape))
     CUDA.synchronize()
 
     set_orientation!(pencil, :y_pencil)

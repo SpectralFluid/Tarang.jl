@@ -18,8 +18,7 @@
 #
 # ============================================================================
 
-using LinearAlgebra
-using SparseArrays
+# LinearAlgebra, SparseArrays already in Tarang.jl
 
 """
     PencilLinearOperator{T}

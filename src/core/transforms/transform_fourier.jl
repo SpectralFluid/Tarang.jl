@@ -30,13 +30,13 @@ function _fourier_forward(data::AbstractArray, transform::FourierTransform)
     end
 end
 
+"""Apply forward Fourier transform"""
 function apply_fourier_forward!(field::ScalarField, transform::FourierTransform)
-    """Apply forward Fourier transform"""
     set_coeff_data!(field, _fourier_forward(get_grid_data(field), transform))
 end
 
+"""Apply backward transform to field """
 function backward_transform!(field::ScalarField, target_layout::Symbol=:g)
-    """Apply backward transform to field """
 
     if field.domain === nothing
         return
@@ -127,8 +127,8 @@ function _fourier_backward(data::AbstractArray, transform::FourierTransform)
     end
 end
 
+"""Apply backward Fourier transform"""
 function apply_fourier_backward!(field::ScalarField, transform::FourierTransform)
-    """Apply backward Fourier transform"""
     set_grid_data!(field, _fourier_backward(get_coeff_data(field), transform))
 end
 

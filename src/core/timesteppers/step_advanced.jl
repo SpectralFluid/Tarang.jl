@@ -2,8 +2,7 @@
 # Additional Timestepper Step Functions
 # ============================================================================
 
-function step_mcnab2!(state::TimestepperState, solver::InitialValueSolver)
-    """
+"""
     Modified Crank-Nicolson Adams-Bashforth 2nd order step.
 
     Uses modified θ parameter for the implicit Crank-Nicolson treatment.
@@ -16,6 +15,7 @@ function step_mcnab2!(state::TimestepperState, solver::InitialValueSolver)
 
     where c₁ = 1.5, c₂ = -0.5 are Adams-Bashforth 2 coefficients.
     """
+function step_mcnab2!(state::TimestepperState, solver::InitialValueSolver)
 
     current_state = state.history[end]
     dt = state.dt
@@ -116,8 +116,7 @@ function step_mcnab2!(state::TimestepperState, solver::InitialValueSolver)
     end
 end
 
-function step_cnlf2!(state::TimestepperState, solver::InitialValueSolver)
-    """
+"""
     Crank-Nicolson Leapfrog 2nd order step with variable-timestep coefficients.
 
     Uses the Dedalus CNLF2 formulation (Wang 2008, Eqn 2.11) which correctly
@@ -135,6 +134,7 @@ function step_cnlf2!(state::TimestepperState, solver::InitialValueSolver)
 
     For constant dt (w1=1): reduces to standard CNLF with θ=0.5.
     """
+function step_cnlf2!(state::TimestepperState, solver::InitialValueSolver)
 
     current_state = state.history[end]
     dt_current = state.dt
@@ -235,8 +235,7 @@ function step_cnlf2!(state::TimestepperState, solver::InitialValueSolver)
 
 end
 
-function step_rksmr!(state::TimestepperState, solver::InitialValueSolver)
-    """
+"""
     Strong Stability Preserving Runge-Kutta 3rd order step (SSP-RK3).
 
     This is the Shu-Osher form of SSP-RK3, optimal for hyperbolic PDEs.
@@ -251,6 +250,7 @@ function step_rksmr!(state::TimestepperState, solver::InitialValueSolver)
     - SSP with CFL coefficient C = 1
     - TVD (Total Variation Diminishing) for scalar conservation laws
     """
+function step_rksmr!(state::TimestepperState, solver::InitialValueSolver)
 
     current_state = state.history[end]
     dt = state.dt

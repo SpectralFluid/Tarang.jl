@@ -349,7 +349,7 @@ end
 MPI sub-communicators for transpose operations.
 Wrapper around Topology2D for backward compatibility.
 """
-struct TransposeComms <: AbstractTransposeComms
+mutable struct TransposeComms <: AbstractTransposeComms
     # Z↔Y transpose communicator (row communicator)
     zy_comm::Union{Nothing, MPI.Comm}
     zy_rank::Int
@@ -389,6 +389,7 @@ function free_comms!(comms::TransposeComms)
         catch e
             @warn "Failed to free zy_comm: $e" maxlog=1
         end
+        comms.zy_comm = nothing
     end
 
     # Free Y↔X communicator if it exists
@@ -398,6 +399,7 @@ function free_comms!(comms::TransposeComms)
         catch e
             @warn "Failed to free yx_comm: $e" maxlog=1
         end
+        comms.yx_comm = nothing
     end
 end
 

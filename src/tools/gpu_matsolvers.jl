@@ -94,18 +94,30 @@ Initialize GPU matrix solvers if CUDA is available.
 Called from the main module __init__ function.
 """
 function _init_gpu_solvers!()
+    # Check if CUDA extension is already loaded (preferred path)
+    cuda_loaded = false
     try
-        @eval using CUDA
-        if CUDA.functional()
-            CUDA_AVAILABLE[] = true
-            @info "GPU matrix solvers enabled (CUDA available)"
-            _register_gpu_helpers()
-            _register_gpu_solvers()
-        else
-            @debug "CUDA found but not functional - GPU solvers disabled"
+        cuda_mod = Base.get_extension(@__MODULE__, :TarangCUDAExt)
+        if cuda_mod !== nothing
+            cuda_loaded = true
         end
-    catch e
-        @debug "CUDA not available - GPU solvers disabled: $e"
+    catch
+    end
+
+    if !cuda_loaded
+        try
+            @eval using CUDA
+            if CUDA.functional()
+                CUDA_AVAILABLE[] = true
+                @info "GPU matrix solvers enabled (CUDA available)"
+                _register_gpu_helpers()
+                _register_gpu_solvers()
+            else
+                @debug "CUDA found but not functional - GPU solvers disabled"
+            end
+        catch e
+            @debug "CUDA not available - GPU solvers disabled: $e"
+        end
     end
 end
 

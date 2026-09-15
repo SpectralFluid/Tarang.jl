@@ -15,8 +15,8 @@ struct PlotData
     title::String
 end
 
+"""Extract data for plotting from scalar field"""
 function extract_plot_data(field::ScalarField; layout::Symbol=:g)
-    """Extract data for plotting from scalar field"""
     
     ensure_layout!(field, layout)
     
@@ -68,15 +68,15 @@ function extract_plot_data(field::ScalarField; layout::Symbol=:g)
     end
 end
 
+"""Extract data for plotting from vector field component"""
 function extract_plot_data(field::VectorField; component::Int=1, layout::Symbol=:g)
-    """Extract data for plotting from vector field component"""
     return extract_plot_data(field.components[component], layout=layout)
 end
 
 # Plotting functions - return PlotData for integration with plotting backends (Plots.jl, Makie.jl, etc.)
 
+"""Create 1D line plot"""
 function plot_1d(field::ScalarField; layout::Symbol=:g, kwargs...)
-    """Create 1D line plot"""
     
     plot_data = extract_plot_data(field, layout=layout)
     
@@ -92,8 +92,8 @@ function plot_1d(field::ScalarField; layout::Symbol=:g, kwargs...)
     return plot_data
 end
 
+"""Create 2D contour or heatmap plot"""
 function plot_2d(field::ScalarField; layout::Symbol=:g, contour::Bool=false, kwargs...)
-    """Create 2D contour or heatmap plot"""
     
     plot_data = extract_plot_data(field, layout=layout)
     
@@ -110,8 +110,8 @@ function plot_2d(field::ScalarField; layout::Symbol=:g, contour::Bool=false, kwa
     return plot_data
 end
 
+"""Create vector field plot (quiver plot)"""
 function plot_vector_field(field::VectorField; layout::Symbol=:g, subsample::Int=1, kwargs...)
-    """Create vector field plot (quiver plot)"""
     
     if field.coordsys.dim != 2
         throw(ArgumentError("Vector field plotting only implemented for 2D"))
@@ -130,8 +130,8 @@ function plot_vector_field(field::VectorField; layout::Symbol=:g, subsample::Int
     return (u=u_data, v=v_data)
 end
 
+"""Create streamline plot for 2D vector field"""
 function plot_streamlines(field::VectorField; layout::Symbol=:g, n_lines::Int=10, kwargs...)
-    """Create streamline plot for 2D vector field"""
     
     if field.coordsys.dim != 2
         throw(ArgumentError("Streamlines only implemented for 2D vector fields"))
@@ -160,8 +160,8 @@ mutable struct Animation
     end
 end
 
+"""Add frame to animation"""
 function add_frame!(anim::Animation, field::Union{ScalarField, VectorField}; kwargs...)
-    """Add frame to animation"""
     
     if isa(field, ScalarField)
         plot_data = extract_plot_data(field; kwargs...)
@@ -176,8 +176,8 @@ function add_frame!(anim::Animation, field::Union{ScalarField, VectorField}; kwa
     @info "Added frame $(length(anim.frames)) to animation"
 end
 
+"""Save animation to file"""
 function save_animation(anim::Animation)
-    """Save animation to file"""
     
     if isempty(anim.frames)
         throw(ArgumentError("No frames in animation"))
@@ -192,8 +192,8 @@ function save_animation(anim::Animation)
 end
 
 # Utility functions
+"""Calculate magnitude of vector field"""
 function vector_magnitude(field::VectorField; layout::Symbol=:g)
-    """Calculate magnitude of vector field"""
 
     mag_field = ScalarField(field.dist, "$(field.name)_magnitude", field.bases, field.dtype)
     ensure_layout!(mag_field, layout)
@@ -213,8 +213,8 @@ function vector_magnitude(field::VectorField; layout::Symbol=:g)
     return mag_field
 end
 
+"""Save field data to file for external plotting"""
 function save_field_data(field::Union{ScalarField, VectorField}, filename::String; format::String="nc")
-    """Save field data to file for external plotting"""
 
     if format in ("nc", "netcdf")
         save_field_netcdf(field, filename)
@@ -225,8 +225,8 @@ function save_field_data(field::Union{ScalarField, VectorField}, filename::Strin
     end
 end
 
+"""Save field to NetCDF format"""
 function save_field_netcdf(field::Union{ScalarField, VectorField}, filename::String)
-    """Save field to NetCDF format"""
 
     if isa(field, ScalarField)
         save_field(field, filename)
@@ -241,8 +241,8 @@ function save_field_netcdf(field::Union{ScalarField, VectorField}, filename::Str
     @info "Saved field data to NetCDF file: $filename"
 end
 
+"""Save scalar field to CSV format"""
 function save_field_csv(field::ScalarField, filename::String)
-    """Save scalar field to CSV format"""
     
     ensure_layout!(field, :g)
     
@@ -291,13 +291,13 @@ end
 # Global plot style (mutable Ref to allow updates)
 const DEFAULT_STYLE = Ref{PlotStyle}(PlotStyle())
 
+"""Get current global plotting style"""
 function get_plot_style()
-    """Get current global plotting style"""
     return DEFAULT_STYLE[]
 end
 
+"""Set global plotting style"""
 function set_plot_style!(style::PlotStyle)
-    """Set global plotting style"""
     DEFAULT_STYLE[] = style
     @info "Updated plotting style"
 end

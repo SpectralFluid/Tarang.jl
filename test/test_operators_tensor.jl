@@ -128,3 +128,227 @@ using Tarang
         @test isapprox(Tarang.get_grid_data(d2u), expected; rtol=1e-8, atol=1e-10)
     end
 end
+
+# ============================================================================
+# Fractional Laplacian Operators
+# ============================================================================
+
+@testset "Fractional Laplacian Operators" begin
+
+    # ------------------------------------------------------------------
+    # Construction tests
+    # ------------------------------------------------------------------
+
+    @testset "FractionalLaplacian construction with various alpha" begin
+        N = 16
+        coords = CartesianCoordinates("x", "y")
+        dist = Distributor(coords; mesh=(1, 1), dtype=Float64)
+        xb = RealFourier(coords["x"]; size=N, bounds=(0.0, 2π))
+        yb = RealFourier(coords["y"]; size=N, bounds=(0.0, 2π))
+
+        u = ScalarField(dist, "u", (xb, yb), Float64)
+
+        for α in [0.5, 1.0, 1.5, 2.0, -0.5, -1.0, 3.0]
+            op = FractionalLaplacian(u, α)
+            @test op isa FractionalLaplacian
+            @test op.α == Float64(α)
+            @test op.operand === u
+        end
+    end
+
+    @testset "fraclap convenience constructor" begin
+        N = 16
+        coords = CartesianCoordinates("x", "y")
+        dist = Distributor(coords; mesh=(1, 1), dtype=Float64)
+        xb = RealFourier(coords["x"]; size=N, bounds=(0.0, 2π))
+        yb = RealFourier(coords["y"]; size=N, bounds=(0.0, 2π))
+
+        u = ScalarField(dist, "u", (xb, yb), Float64)
+
+        op = fraclap(u, 0.5)
+        @test op isa FractionalLaplacian
+        @test op.α == 0.5
+
+        # Unicode alias
+        op2 = Δᵅ(u, 0.5)
+        @test op2 isa FractionalLaplacian
+        @test op2.α == 0.5
+    end
+
+    @testset "sqrtlap and invsqrtlap constructors" begin
+        N = 16
+        coords = CartesianCoordinates("x", "y")
+        dist = Distributor(coords; mesh=(1, 1), dtype=Float64)
+        xb = RealFourier(coords["x"]; size=N, bounds=(0.0, 2π))
+        yb = RealFourier(coords["y"]; size=N, bounds=(0.0, 2π))
+
+        u = ScalarField(dist, "u", (xb, yb), Float64)
+
+        sq = sqrtlap(u)
+        @test sq isa FractionalLaplacian
+        @test sq.α == 0.5
+
+        isq = invsqrtlap(u)
+        @test isq isa FractionalLaplacian
+        @test isq.α == -0.5
+    end
+
+    @testset "hyperlap and Δ² Δ⁴ Δ⁶ Δ⁸ constructors" begin
+        N = 16
+        coords = CartesianCoordinates("x", "y")
+        dist = Distributor(coords; mesh=(1, 1), dtype=Float64)
+        xb = RealFourier(coords["x"]; size=N, bounds=(0.0, 2π))
+        yb = RealFourier(coords["y"]; size=N, bounds=(0.0, 2π))
+
+        u = ScalarField(dist, "u", (xb, yb), Float64)
+
+        # hyperlap with explicit order
+        for n in [1, 2, 3, 4]
+            op = hyperlap(u, n)
+            @test op isa FractionalLaplacian
+            @test op.α == Float64(n)
+        end
+
+        # hyperlap rejects n < 1
+        @test_throws ArgumentError hyperlap(u, 0)
+
+        # Unicode aliases
+        @test Δ²(u) isa FractionalLaplacian
+        @test Δ²(u).α == 2.0
+
+        @test Δ⁴(u) isa FractionalLaplacian
+        @test Δ⁴(u).α == 4.0
+
+        @test Δ⁶(u) isa FractionalLaplacian
+        @test Δ⁶(u).α == 6.0
+
+        @test Δ⁸(u) isa FractionalLaplacian
+        @test Δ⁸(u).α == 8.0
+    end
+
+    # ------------------------------------------------------------------
+    # Numerical evaluation tests
+    # ------------------------------------------------------------------
+
+    @testset "Fractional Laplacian alpha=1 matches standard Laplacian" begin
+        # (-Δ)^1 sin(kx)*sin(ly) = (k²+l²) sin(kx)*sin(ly)
+        # Note: FractionalLaplacian computes (-Δ)^α, which has opposite sign from Laplacian().
+        N = 32
+        coords = CartesianCoordinates("x", "y")
+        dist = Distributor(coords; mesh=(1, 1), dtype=Float64)
+        xb = RealFourier(coords["x"]; size=N, bounds=(0.0, 2π))
+        yb = RealFourier(coords["y"]; size=N, bounds=(0.0, 2π))
+
+        u = ScalarField(dist, "u", (xb, yb), Float64)
+        mesh = Tarang.create_meshgrid(u.domain)
+        x, y = mesh["x"], mesh["y"]
+
+        k, l = 2, 3
+        Tarang.get_grid_data(u) .= @. sin(k * x) * sin(l * y)
+
+        # Evaluate (-Δ)^1 via fractional Laplacian
+        frac_result = evaluate(FractionalLaplacian(u, 1.0))
+        ensure_layout!(frac_result, :g)
+
+        # (-Δ)^1 f = (k²+l²) f  =>  sign is positive
+        expected = @. (k^2 + l^2) * sin(k * x) * sin(l * y)
+        @test isapprox(Tarang.get_grid_data(frac_result), expected; rtol=1e-8, atol=1e-10)
+
+        # Compare with standard Laplacian (which gives -k² f):
+        # (-Δ)^1 f should equal -Laplacian(f)
+        lap_result = evaluate(Laplacian(u))
+        ensure_layout!(lap_result, :g)
+        @test isapprox(Tarang.get_grid_data(frac_result), .-Tarang.get_grid_data(lap_result); rtol=1e-8, atol=1e-10)
+    end
+
+    @testset "Fractional Laplacian alpha=0.5 (sqrtlap) on single mode" begin
+        # (-Δ)^(1/2) sin(kx) = |k| sin(kx) = k sin(kx)   for k > 0
+        N = 32
+        coords = CartesianCoordinates("x")
+        dist = Distributor(coords; mesh=(1,), dtype=Float64)
+        xb = RealFourier(coords["x"]; size=N, bounds=(0.0, 2π))
+
+        u = ScalarField(dist, "u", (xb,), Float64)
+        mesh = Tarang.create_meshgrid(u.domain)
+        x = mesh["x"]
+
+        k = 3
+        Tarang.get_grid_data(u) .= @. sin(k * x)
+
+        result = evaluate(sqrtlap(u))
+        ensure_layout!(result, :g)
+
+        expected = @. k * sin(k * x)
+        @test isapprox(Tarang.get_grid_data(result), expected; rtol=1e-8, atol=1e-10)
+    end
+
+    @testset "Fractional Laplacian alpha=2 (Δ²) on single mode" begin
+        # (-Δ)^2 sin(kx)*sin(ly) = (k²+l²)² sin(kx)*sin(ly)
+        N = 32
+        coords = CartesianCoordinates("x", "y")
+        dist = Distributor(coords; mesh=(1, 1), dtype=Float64)
+        xb = RealFourier(coords["x"]; size=N, bounds=(0.0, 2π))
+        yb = RealFourier(coords["y"]; size=N, bounds=(0.0, 2π))
+
+        u = ScalarField(dist, "u", (xb, yb), Float64)
+        mesh = Tarang.create_meshgrid(u.domain)
+        x, y = mesh["x"], mesh["y"]
+
+        k, l = 1, 2
+        Tarang.get_grid_data(u) .= @. sin(k * x) * sin(l * y)
+
+        result = evaluate(Δ²(u))
+        ensure_layout!(result, :g)
+
+        expected = @. (k^2 + l^2)^2 * sin(k * x) * sin(l * y)
+        @test isapprox(Tarang.get_grid_data(result), expected; rtol=1e-8, atol=1e-10)
+    end
+
+    @testset "invsqrtlap inverts sqrtlap for nonzero modes" begin
+        # (-Δ)^(-1/2) * (-Δ)^(1/2) f = f  for modes with k != 0
+        N = 32
+        coords = CartesianCoordinates("x")
+        dist = Distributor(coords; mesh=(1,), dtype=Float64)
+        xb = RealFourier(coords["x"]; size=N, bounds=(0.0, 2π))
+
+        u = ScalarField(dist, "u", (xb,), Float64)
+        mesh = Tarang.create_meshgrid(u.domain)
+        x = mesh["x"]
+
+        # Use a mode with k > 0 so the inverse is well-defined
+        k = 4
+        Tarang.get_grid_data(u) .= @. cos(k * x)
+
+        # Apply sqrtlap then invsqrtlap
+        forward = evaluate(sqrtlap(u))
+        roundtrip = evaluate(invsqrtlap(forward))
+        ensure_layout!(roundtrip, :g)
+
+        expected = @. cos(k * x)
+        @test isapprox(Tarang.get_grid_data(roundtrip), expected; rtol=1e-8, atol=1e-10)
+    end
+
+    @testset "operator_order returns 2*alpha" begin
+        N = 8
+        coords = CartesianCoordinates("x")
+        dist = Distributor(coords; mesh=(1,), dtype=Float64)
+        xb = RealFourier(coords["x"]; size=N, bounds=(0.0, 2π))
+        u = ScalarField(dist, "u", (xb,), Float64)
+
+        @test Tarang.operator_order(FractionalLaplacian(u, 0.5)) == 1.0
+        @test Tarang.operator_order(FractionalLaplacian(u, 1.0)) == 2.0
+        @test Tarang.operator_order(FractionalLaplacian(u, 2.0)) == 4.0
+        @test Tarang.operator_order(FractionalLaplacian(u, -0.5)) == -1.0
+    end
+
+    @testset "is_linear returns true" begin
+        N = 8
+        coords = CartesianCoordinates("x")
+        dist = Distributor(coords; mesh=(1,), dtype=Float64)
+        xb = RealFourier(coords["x"]; size=N, bounds=(0.0, 2π))
+        u = ScalarField(dist, "u", (xb,), Float64)
+
+        @test Tarang.is_linear(FractionalLaplacian(u, 0.5)) == true
+        @test Tarang.is_linear(FractionalLaplacian(u, 2.0)) == true
+    end
+end

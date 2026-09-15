@@ -9,13 +9,13 @@ for domains with various bases (Fourier, Chebyshev, Legendre).
 const _transform_setup_logged = Ref(false)
 
 # Transform planning and execution
-function plan_transforms!(dist::Distributor, domain::Domain)
-    """
+"""
     Plan all transforms for a domain.
 
     MPI parallelization is ONLY supported for pure Fourier domains.
     Mixed-basis or non-Fourier domains require serial execution.
     """
+function plan_transforms!(dist::Distributor, domain::Domain)
 
     gshape = global_shape(domain)
     ndim = length(domain.bases)
@@ -272,8 +272,8 @@ function setup_pencil_fft_transforms_2d!(dist::Distributor, domain::Domain,
     end
 end
 
+"""Setup FFTW transforms for 1D case (CPU only)."""
 function setup_fftw_transform!(dist::Distributor, basis::Union{RealFourier, ComplexFourier}, axis::Int)
-    """Setup FFTW transforms for 1D case (CPU only)."""
     transform = FourierTransform(basis, axis)
     setup_cpu_fft_transform!(transform, basis, dist.dtype)
     push!(dist.transforms, transform)
@@ -302,8 +302,7 @@ function setup_cpu_fft_transform!(transform::FourierTransform, basis::Union{Real
 end
 
 
-function setup_chebyshev_transform!(dist::Distributor, basis::ChebyshevT, axis::Int)
-    """
+"""
     Setup Chebyshev transform following Tarang FastChebyshevTransform implementation.
 
     Based on Tarang transforms:
@@ -312,6 +311,7 @@ function setup_chebyshev_transform!(dist::Distributor, basis::ChebyshevT, axis::
     - Proper scaling factors for unit-amplitude normalization
     - Supports padding/truncation for different grid/coefficient sizes
     """
+function setup_chebyshev_transform!(dist::Distributor, basis::ChebyshevT, axis::Int)
     
     transform = ChebyshevTransform(basis)
     
@@ -325,8 +325,8 @@ function setup_chebyshev_transform!(dist::Distributor, basis::ChebyshevT, axis::
     @debug "Chebyshev transform setup: grid_size=$grid_size, coeff_size=$coeff_size, Kmax=$(transform.Kmax)"
 end
 
+"""Setup CPU Chebyshev transform using FFTW DCT"""
 function setup_chebyshev_cpu_transform!(transform::ChebyshevTransform, grid_size::Int, coeff_size::Int, axis::Int)
-    """Setup CPU Chebyshev transform using FFTW DCT"""
     
     try
         # Use DCT-I (REDFT00) to match the Gauss-Lobatto grid: x_k = -cos(πk/(N-1))
@@ -362,8 +362,8 @@ function setup_chebyshev_cpu_transform!(transform::ChebyshevTransform, grid_size
     transform.axis = axis
 end
 
+"""Setup CPU matrix-based Chebyshev transform for Gauss-Lobatto (DCT-I) grid."""
 function setup_chebyshev_matrix_transform!(transform::ChebyshevTransform, grid_size::Int, coeff_size::Int, axis::Int)
-    """Setup CPU matrix-based Chebyshev transform for Gauss-Lobatto (DCT-I) grid."""
 
     N = grid_size
     Nm1 = max(N - 1, 1)
@@ -406,8 +406,7 @@ function setup_chebyshev_matrix_transform!(transform::ChebyshevTransform, grid_s
     @info "Setup CPU matrix-based Chebyshev transform (Gauss-Lobatto) for axis $axis, N=$grid_size"
 end
 
-function setup_legendre_transform!(dist::Distributor, basis::Legendre, axis::Int)
-    """
+"""
     Setup Legendre transform using JacobiMMT implementation.
 
     - Uses Gauss-Legendre quadrature (Jacobi with a=0, b=0)
@@ -415,6 +414,7 @@ function setup_legendre_transform!(dist::Distributor, basis::Legendre, axis::Int
     - Backward transform: polynomial evaluation at quadrature points
     - Proper normalization for orthogonal Legendre polynomials
     """
+function setup_legendre_transform!(dist::Distributor, basis::Legendre, axis::Int)
     
     transform = LegendreTransform(basis)
 
@@ -484,11 +484,11 @@ end
 
 
 # Helper functions for Legendre transform
-function compute_legendre_quadrature(N::Int)
-    """
+"""
     Compute Gauss-Legendre quadrature points and weights manually.
     Based on standard algorithms for Legendre polynomial roots.
     """
+function compute_legendre_quadrature(N::Int)
     
     if N == 1
         return [0.0], [2.0]
@@ -527,10 +527,10 @@ function compute_legendre_quadrature(N::Int)
     return x, weights
 end
 
-function evaluate_legendre_and_derivative(x::Vector{Float64}, N::Int)
-    """
+"""
     Evaluate Legendre polynomial P_N(x) and its derivative P'_N(x) using recurrence relations.
     """
+function evaluate_legendre_and_derivative(x::Vector{Float64}, N::Int)
     
     if N == 0
         return ones(length(x)), zeros(length(x))
@@ -562,10 +562,10 @@ function evaluate_legendre_and_derivative(x::Vector{Float64}, N::Int)
     return P_curr, Pprime_curr
 end
 
-function build_legendre_polynomials(M::Int, grid_points::Vector{Float64})
-    """
+"""
     Build matrix of Legendre polynomial values P_n(x_i) for n=0,...,M-1 and grid points x_i.
     """
+function build_legendre_polynomials(M::Int, grid_points::Vector{Float64})
     
     N_grid = length(grid_points)
     poly_matrix = zeros(M, N_grid)

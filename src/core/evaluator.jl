@@ -20,7 +20,7 @@ All file I/O operations (NetCDF) receive CPU arrays, regardless of whether
 the underlying field data is on CPU or GPU.
 """
 
-using MPI
+# MPI already in Tarang.jl
 using NetCDF
 using Dates: now
 
@@ -88,15 +88,15 @@ mutable struct Evaluator
 end
 
 # File handler management
+"""Add file handler for output"""
 function add_file_handler(evaluator::Evaluator, filename::String; kwargs...)
-    """Add file handler for output"""
     handler = FileHandler(filename; kwargs...)
     push!(evaluator.handlers, handler)
     return handler
 end
 
+"""Add field or operator to file handler"""
 function add_task!(handler::FileHandler, field::Union{ScalarField, VectorField, TensorField, Operator}; name::String="")
-    """Add field or operator to file handler"""
     if isempty(name)
         if hasfield(typeof(field), :name)
             name = field.name
@@ -108,14 +108,14 @@ function add_task!(handler::FileHandler, field::Union{ScalarField, VectorField, 
     handler.datasets[name] = field
 end
 
+"""Add field or operator to file handler with explicit name"""
 function add_task!(handler::FileHandler, field, name::String)
-    """Add field or operator to file handler with explicit name"""
     handler.datasets[name] = field
 end
 
 # Evaluation and output
+"""Evaluate all handlers and write output if conditions are met"""
 function evaluate_handlers!(evaluator::Evaluator, wall_time::Float64, sim_time::Float64, iteration::Int)
-    """Evaluate all handlers and write output if conditions are met"""
 
     for handler in evaluator.handlers
         # Determine write decision on rank 0 and broadcast to all ranks,
@@ -134,13 +134,13 @@ function evaluate_handlers!(evaluator::Evaluator, wall_time::Float64, sim_time::
     end
 end
 
-function should_write(handler::FileHandler, wall_time::Float64, sim_time::Float64, iteration::Int)
-    """Check if handler should write output.
+"""Check if handler should write output.
 
     Uses OR semantics: a write is triggered if ANY specified cadence condition
     is met. This ensures output is never silently skipped when multiple cadences
     are configured (e.g., cadence=10 OR sim_dt=0.1 — whichever fires first).
     """
+function should_write(handler::FileHandler, wall_time::Float64, sim_time::Float64, iteration::Int)
 
     # Check max writes
     if handler.max_writes !== nothing && handler.write_count >= handler.max_writes
@@ -179,8 +179,8 @@ function should_write(handler::FileHandler, wall_time::Float64, sim_time::Float6
     return !has_any_cadence || triggered
 end
 
+"""Write handler output to file"""
 function write_handler!(handler::FileHandler, solver::InitialValueSolver, wall_time::Float64, sim_time::Float64, iteration::Int)
-    """Write handler output to file"""
 
     # Create filename with iteration number
     base_name = splitext(handler.filename)[1]
@@ -220,12 +220,12 @@ function write_handler!(handler::FileHandler, solver::InitialValueSolver, wall_t
     end
 end
 
-function evaluate_task(task, solver::InitialValueSolver)
-    """
+"""
     Evaluate a task (field or operator) and return data.
 
     GPU-aware: All results are returned on CPU for file I/O compatibility.
     """
+function evaluate_task(task, solver::InitialValueSolver)
 
     if isa(task, ScalarField)
         # gather_array handles GPU→CPU conversion
@@ -298,8 +298,8 @@ function _stack_tensor_components(components::AbstractMatrix{<:ScalarField})
 
     return result
 end
+"""Evaluate operator and return result field."""
 function evaluate_operator(op::Operator, layout::Symbol=:g)
-    """Evaluate operator and return result field."""
     return evaluate(op, layout)
 end
 
@@ -307,8 +307,8 @@ end
 # Note: evaluate_curl and evaluate_laplacian are defined in operators.jl
 # Do not redefine here to avoid method overwrite warnings
 
+"""Write data to NetCDF file (simple per-snapshot output)"""
 function write_netcdf_simple_output(filename::String, data::Dict{String, Any}, sim_time::Float64, iteration::Int, rank::Int)
-    """Write data to NetCDF file (simple per-snapshot output)"""
 
     # Only rank 0 writes to file
     if rank == 0
@@ -360,8 +360,8 @@ mutable struct GlobalFlowProperty
     end
 end
 
+"""Compute global reduction of a scalar from each process."""
 function reduce_scalar(reducer::GlobalArrayReducer, local_scalar::Real, mpi_op)
-    """Compute global reduction of a scalar from each process."""
     reducer.scalar_buffer[1] = Float64(local_scalar)
     if MPI.Initialized() && !MPI.Finalized()
         MPI.Allreduce!(reducer.scalar_buffer, mpi_op, reducer.comm)
@@ -369,14 +369,14 @@ function reduce_scalar(reducer::GlobalArrayReducer, local_scalar::Real, mpi_op)
     return reducer.scalar_buffer[1]
 end
 
-function global_min(reducer::GlobalArrayReducer, data::AbstractArray; empty::Float64=Inf)
-    """
+"""
     Compute global min of all array data.
 
     GPU-compatible: Works with both CPU arrays and GPU arrays (CuArray).
     For GPU arrays, the local reduction is performed on GPU, then the scalar
     is transferred to CPU for MPI reduction across ranks.
     """
+function global_min(reducer::GlobalArrayReducer, data::AbstractArray; empty::Float64=Inf)
     if isempty(data)
         local_min = empty
     else
@@ -387,14 +387,14 @@ function global_min(reducer::GlobalArrayReducer, data::AbstractArray; empty::Flo
     return reduce_scalar(reducer, local_min, MPI.MIN)
 end
 
-function global_max(reducer::GlobalArrayReducer, data::AbstractArray; empty::Float64=-Inf)
-    """
+"""
     Compute global max of all array data.
 
     GPU-compatible: Works with both CPU arrays and GPU arrays (CuArray).
     For GPU arrays, the local reduction is performed on GPU, then the scalar
     is transferred to CPU for MPI reduction across ranks.
     """
+function global_max(reducer::GlobalArrayReducer, data::AbstractArray; empty::Float64=-Inf)
     if isempty(data)
         local_max = empty
     else
@@ -409,14 +409,14 @@ end
 global_min(reducer::GlobalArrayReducer, value::Real) = reduce_scalar(reducer, Float64(value), MPI.MIN)
 global_max(reducer::GlobalArrayReducer, value::Real) = reduce_scalar(reducer, Float64(value), MPI.MAX)
 
-function global_mean(reducer::GlobalArrayReducer, data::AbstractArray)
-    """
+"""
     Compute global mean of all array data.
 
     GPU-compatible: Works with both CPU arrays and GPU arrays (CuArray).
     For GPU arrays, the local sum is computed on GPU, then the scalar
     is transferred to CPU for MPI reduction across ranks.
     """
+function global_mean(reducer::GlobalArrayReducer, data::AbstractArray)
     # sum() and length() work on both CPU and GPU arrays
     local_sum = Float64(real(sum(data)))
     local_size = Float64(length(data))
@@ -432,24 +432,24 @@ function global_mean(reducer::GlobalArrayReducer, data::AbstractArray)
     return global_size > 0 ? global_sum / global_size : 0.0
 end
 
-function add_property!(flow::GlobalFlowProperty, field::Union{ScalarField, VectorField}, name::String)
-    """
+"""
     Add property to track.
     Following pattern: properties.add_task(property, layout='g', name=name)
     """
+function add_property!(flow::GlobalFlowProperty, field::Union{ScalarField, VectorField}, name::String)
     # Store field reference for evaluation
     # In Tarang, this gets added to the dictionary handler as a task
     flow.properties[name] = field
 end
 
-function evaluate_property(flow::GlobalFlowProperty, name::String)
-    """
+"""
     Get grid data for property evaluation.
     Following pattern: gdata = self.properties[name]['g']
     Returns the grid data array for the named property.
 
     GPU-aware: Returns CPU arrays (GPU arrays are converted via on_architecture).
     """
+function evaluate_property(flow::GlobalFlowProperty, name::String)
     if !haskey(flow.properties, name)
         throw(KeyError("Property '$name' not found"))
     end
@@ -478,35 +478,34 @@ function evaluate_property(flow::GlobalFlowProperty, name::String)
     return result
 end
 
-function property_max(flow::GlobalFlowProperty, name::String)
-    """
+"""
     Compute global max of a property on the grid.
     Following implementation in flow_tools:107-110
     """
+function property_max(flow::GlobalFlowProperty, name::String)
     gdata = evaluate_property(flow, name)
     return global_max(flow.reducer, gdata)
 end
 
-function property_min(flow::GlobalFlowProperty, name::String)
-    """
+"""
     Compute global min of a property on the grid.
     Following implementation in flow_tools:102-105
     """
+function property_min(flow::GlobalFlowProperty, name::String)
     gdata = evaluate_property(flow, name)
     return global_min(flow.reducer, gdata)
 end
 
-function grid_average(flow::GlobalFlowProperty, name::String)
-    """
+"""
     Compute global mean of a property on the grid.
     Following implementation in flow_tools:112-115
     """
+function grid_average(flow::GlobalFlowProperty, name::String)
     gdata = evaluate_property(flow, name)
     return global_mean(flow.reducer, gdata)
 end
 
-function volume_integral(flow::GlobalFlowProperty, name::String)
-    """
+"""
     Compute volume integral of a property.
     Following implementation in flow_tools:117-130
 
@@ -521,6 +520,7 @@ function volume_integral(flow::GlobalFlowProperty, name::String)
     For multi-dimensional domains, the weights are the outer product
     of 1D weights along each axis.
     """
+function volume_integral(flow::GlobalFlowProperty, name::String)
     # Check for precomputed integral
     integral_name = "_$(name)_integral"
     if haskey(flow.properties, integral_name)
@@ -572,14 +572,14 @@ function volume_integral(flow::GlobalFlowProperty, name::String)
     return global_sum(flow.reducer, [local_integral])
 end
 
-function compute_weighted_integral(data::AbstractArray, weights::Vector)
-    """
+"""
     Compute weighted integral of multi-dimensional data.
 
     For N-dimensional data with weights w₁, w₂, ..., wₙ along each axis,
     the integral is:
     ∫∫...∫ f(x₁,x₂,...,xₙ) dx₁dx₂...dxₙ ≈ Σᵢ₁Σᵢ₂...Σᵢₙ w₁[i₁]w₂[i₂]...wₙ[iₙ] f[i₁,i₂,...,iₙ]
     """
+function compute_weighted_integral(data::AbstractArray, weights::Vector)
     ndims_data = ndims(data)
     nweights = length(weights)
 
@@ -637,14 +637,14 @@ function compute_weighted_integral(data::AbstractArray, weights::Vector)
     return sum(result)
 end
 
-function global_sum(reducer::GlobalArrayReducer, data::AbstractArray)
-    """
+"""
     Compute global sum of all array data across MPI processes.
 
     GPU-compatible: Works with both CPU arrays and GPU arrays (CuArray).
     For GPU arrays, the local sum is computed on GPU, then the scalar
     is transferred to CPU for MPI reduction across ranks.
     """
+function global_sum(reducer::GlobalArrayReducer, data::AbstractArray)
     # sum() works on both CPU and GPU arrays
     local_val = sum(data)
     if local_val isa Complex
@@ -655,8 +655,8 @@ function global_sum(reducer::GlobalArrayReducer, data::AbstractArray)
     return reduce_scalar(reducer, Float64(local_val), MPI.SUM)
 end
 
+"""Get domain from solver, handling various solver configurations."""
 function get_solver_domain(solver::InitialValueSolver)
-    """Get domain from solver, handling various solver configurations."""
     # Try direct domain access
     if hasfield(typeof(solver), :domain) && solver.domain !== nothing
         return solver.domain
@@ -688,13 +688,13 @@ function get_solver_domain(solver::InitialValueSolver)
     return nothing
 end
 
-function volume_average(flow::GlobalFlowProperty, name::String)
-    """
+"""
     Compute volume average of a property.
     Following implementation in flow_tools:132-137
 
     Volume average = (∫ f dV) / (∫ dV) = volume_integral(f) / hypervolume
     """
+function volume_average(flow::GlobalFlowProperty, name::String)
     # Get domain to compute hypervolume
     domain = get_solver_domain(flow.solver)
 
@@ -717,14 +717,14 @@ function volume_average(flow::GlobalFlowProperty, name::String)
     return integral_value / hypervolume
 end
 
-function compute_hypervolume(domain::Domain)
-    """
+"""
     Compute the total volume (hypervolume) of a domain.
 
     For a domain with bases along coordinates x₁, x₂, ..., xₙ,
     the hypervolume is the product of the interval lengths:
     V = (b₁ - a₁) × (b₂ - a₂) × ... × (bₙ - aₙ)
     """
+function compute_hypervolume(domain::Domain)
     hypervolume = 1.0
 
     for basis in domain.bases
@@ -791,8 +791,8 @@ Base.getindex(dh::DictionaryHandler, key::String) = dh.fields[key]
 Base.haskey(dh::DictionaryHandler, key::String) = haskey(dh.fields, key)
 Base.keys(dh::DictionaryHandler) = keys(dh.fields)
 
+"""Add a field/operator task to the dictionary handler."""
 function add_task!(handler::DictionaryHandler, field, name::String)
-    """Add a field/operator task to the dictionary handler."""
     handler.datasets[name] = field
 end
 
@@ -1105,8 +1105,8 @@ end
 # Alias for backward compatibility
 const NetCDFEvaluator = UnifiedEvaluator
 
+"""Add a VirtualFileHandler to the UnifiedEvaluator."""
 function add_virtual_file_handler(evaluator::UnifiedEvaluator, base_path::String, name::String; kwargs...)
-    """Add a VirtualFileHandler to the UnifiedEvaluator."""
     dist = get_solver_dist(evaluator.solver)
     handler = VirtualFileHandler(base_path, name; comm=dist.comm, kwargs...)
     # Store in workspace since UnifiedEvaluator doesn't have a dedicated field
@@ -1119,28 +1119,28 @@ function add_virtual_file_handler(evaluator::UnifiedEvaluator, base_path::String
 end
 
 # Enhanced evaluator functions with NetCDF support
+"""Create evaluator for solver"""
 function create_evaluator(solver::InitialValueSolver)
-    """Create evaluator for solver"""
     return Evaluator(solver)
 end
 
+"""Create NetCDF evaluator for solver"""
 function create_netcdf_evaluator(solver::InitialValueSolver)
-    """Create NetCDF evaluator for solver"""
     return UnifiedEvaluator(solver)
 end
 
+"""Create unified evaluator for NetCDF output"""
 function create_unified_evaluator(solver::InitialValueSolver)
-    """Create unified evaluator for NetCDF output"""
     return UnifiedEvaluator(solver)
 end
 
-function add_file_handler(evaluator::UnifiedEvaluator, filename::String, format::Symbol=:auto; kwargs...)
-    """Add file handler with automatic format detection
+"""Add file handler with automatic format detection
 
     Supported formats:
     - :netcdf or :nc - NetCDF format
     - :auto - Auto-detect from file extension (defaults to NetCDF)
     """
+function add_file_handler(evaluator::UnifiedEvaluator, filename::String, format::Symbol=:auto; kwargs...)
 
     # Ensure NetCDF extension
     _, ext = splitext(filename)
@@ -1163,30 +1163,30 @@ function add_file_handler(evaluator::UnifiedEvaluator, filename::String, format:
 end
 
 # Wrapper functions for NetCDFFileHandler compatibility
+"""Check if NetCDF handler should write - delegates to check_schedule"""
 function should_write(handler::NetCDFFileHandler, wall_time::Float64, sim_time::Float64, iteration::Int)
-    """Check if NetCDF handler should write - delegates to check_schedule"""
     return check_schedule(handler; iteration=iteration, wall_time=wall_time, sim_time=sim_time)
 end
 
+"""Write NetCDF data - delegates to process!"""
 function write_netcdf_data!(handler::NetCDFFileHandler, sim_time::Float64, iteration::Int)
-    """Write NetCDF data - delegates to process!"""
     return process!(handler; iteration=iteration, sim_time=sim_time)
 end
 
+"""Close NetCDF handler - delegates to close!"""
 function close_netcdf_handler!(handler::NetCDFFileHandler)
-    """Close NetCDF handler - delegates to close!"""
     return close!(handler)
 end
 
+"""Add a DictionaryHandler to the UnifiedEvaluator."""
 function add_dictionary_handler(evaluator::UnifiedEvaluator; kwargs...)
-    """Add a DictionaryHandler to the UnifiedEvaluator."""
     handler = DictionaryHandler(; kwargs...)
     push!(evaluator.dictionary_handlers, handler)
     return handler
 end
 
+"""Evaluate NetCDF and dictionary handlers"""
 function evaluate_unified_handlers!(evaluator::UnifiedEvaluator, wall_time::Float64, sim_time::Float64, iteration::Int)
-    """Evaluate NetCDF and dictionary handlers"""
 
     # Evaluate NetCDF handlers
     for handler in evaluator.netcdf_handlers
@@ -1231,13 +1231,12 @@ function add_netcdf_handler(evaluator::UnifiedEvaluator, filename::String;
     return handler
 end
 
-function set_coordinates!(evaluator::UnifiedEvaluator, coords::Dict{String, Any})
-    """Set coordinate information for all NetCDF handlers
+"""Set coordinate information for all NetCDF handlers
 
     Note: NetCDFFileHandler stores coordinate information in its vars field
     and handles coordinate writing internally during process!() calls.
-    This function updates the vars dictionary for all handlers.
-    """
+    This """
+function set_coordinates!(evaluator::UnifiedEvaluator, coords::Dict{String, Any})
 
     for handler in evaluator.netcdf_handlers
         # Update the vars dictionary with coordinate information
@@ -1247,8 +1246,8 @@ function set_coordinates!(evaluator::UnifiedEvaluator, coords::Dict{String, Any}
     return evaluator
 end
 
+"""Finalize and close all file handlers."""
 function finalize_evaluator!(evaluator::UnifiedEvaluator)
-    """Finalize and close all file handlers"""
 
     # Close NetCDF handlers
     for handler in evaluator.netcdf_handlers
@@ -1259,13 +1258,13 @@ function finalize_evaluator!(evaluator::UnifiedEvaluator)
 end
 
 
-function get_task_data_array(task_data::Any)
-    """
+"""
     Extract array data from task data.
     Handles different field types (ScalarField, VectorField, etc.)
 
     GPU-aware: Automatically converts GPU arrays to CPU for file I/O.
     """
+function get_task_data_array(task_data::Any)
 
     if isa(task_data, ScalarField)
         # Get grid-space data (gather_array handles GPU→CPU conversion)
@@ -1286,13 +1285,13 @@ end
 
 # Utility function to add tasks to file handler
 # Note: Parameter order (handler, field, name) matches earlier definitions at lines 67-83
+"""Add a field/array to be written by this file handler."""
 function add_task!(handler::FileHandler, field::Union{ScalarField, VectorField, AbstractArray}, name::String)
-    """Add a field/array to be written by this file handler."""
     handler.datasets[name] = field
 end
 
+"""Log evaluator performance statistics"""
 function log_evaluator_performance(evaluator::Union{Evaluator, UnifiedEvaluator, GlobalFlowProperty})
-    """Log evaluator performance statistics"""
 
     stats = evaluator.performance_stats
 

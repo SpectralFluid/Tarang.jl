@@ -390,8 +390,9 @@ function safe_divide(a, b; default=0.0)
     return b == 0 ? default : a / b
 end
 
-"""Clamp value to range."""
+"""Clamp value to range. Deprecated: use `clamp(x, min_val, max_val)` directly."""
 function clamp_to_range(x, min_val, max_val)
+    Base.depwarn("`clamp_to_range` is deprecated, use `clamp` directly", :clamp_to_range)
     return clamp(x, min_val, max_val)
 end
 

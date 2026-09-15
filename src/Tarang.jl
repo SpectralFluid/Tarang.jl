@@ -5,8 +5,6 @@ Tarang.jl - Spectral PDE framework for Julia
 
 module Tarang
 
-const __version__ = "1.0.0"
-
 using MPI
 using PencilArrays
 using PencilFFTs
@@ -48,18 +46,18 @@ abstract type TimeStepper end                   # Solvers → Timesteppers bridg
 abstract type AbstractTimestepperState end       # Solvers → Timesteppers bridge
 
 # Custom PencilConfig struct for pencil array configuration
-struct PencilConfig
-    global_shape::Tuple{Vararg{Int}}
-    mesh::Tuple{Vararg{Int}}
+struct PencilConfig{N, M}
+    global_shape::NTuple{N, Int}
+    mesh::NTuple{M, Int}
     comm::MPI.Comm
-    decomp_dims::Tuple{Vararg{Bool}}
+    decomp_dims::NTuple{M, Bool}
     dtype::Type  # Data type for the pencil arrays
 
-    function PencilConfig(global_shape::Tuple{Vararg{Int}}, mesh::Tuple{Vararg{Int}};
+    function PencilConfig(global_shape::NTuple{N, Int}, mesh::NTuple{M, Int};
                          comm::MPI.Comm=MPI.COMM_WORLD,
-                         decomp_dims::Tuple{Vararg{Bool}}=ntuple(i -> true, length(mesh)),
-                         dtype::Type=Float64)
-        new(global_shape, mesh, comm, decomp_dims, dtype)
+                         decomp_dims::NTuple{M, Bool}=ntuple(i -> true, M),
+                         dtype::Type=Float64) where {N, M}
+        new{N, M}(global_shape, mesh, comm, decomp_dims, dtype)
     end
 end
 
@@ -88,6 +86,7 @@ include("core/boundary_conditions.jl")
 include("core/problems.jl")
 include("core/subsystems.jl")
 include("core/system.jl")
+include("core/linalg.jl")
 include("tools/matsolvers.jl")
 include("tools/gpu_matsolvers.jl")
 include("core/solvers.jl")
@@ -215,7 +214,7 @@ export
     DotProduct, CrossProduct,
     outer, advective_cfl, cfl,
     Copy, HilbertTransform, copy_field, hilbert,
-    sym_diff, simplify, UFUNC_DERIVATIVES,
+    sym_diff, simplify,
     frechet_differential, build_symbolic_jacobian,
 
     # ═══════════════════════════════════════════════════════════════
@@ -224,16 +223,14 @@ export
     CartesianComponent, CartesianGradient, CartesianDivergence, CartesianCurl,
     CartesianLaplacian, CartesianTrace, CartesianSkew,
     DirectProductGradient, DirectProductDivergence, DirectProductLaplacian,
-    cartesian_component, dispatch_cartesian_operator,
-    matrix_dependence, matrix_coupling, subproblem_matrix,
-    check_conditions, enforce_conditions, is_linear, operator_order,
+    cartesian_component,
+    is_linear, operator_order,
 
     # ═══════════════════════════════════════════════════════════════
     # Nonlinear operators
     # ═══════════════════════════════════════════════════════════════
     advection, nonlinear_momentum, convection,
     AdvectionOperator, NonlinearAdvectionOperator, ConvectiveOperator,
-    NonlinearEvaluator, evaluate_nonlinear_term, evaluate_transform_multiply,
 
     # ═══════════════════════════════════════════════════════════════
     # Time steppers
@@ -248,9 +245,7 @@ export
     DiagonalIMEX_RK222, DiagonalIMEX_RK443, DiagonalIMEX_SBDF2,
     SpectralLinearOperator, set_spectral_linear_operator!,
     # Pencil IMEX (Chebyshev-Fourier MPI)
-    PencilLinearOperator, set_pencil_linear_operator!, PencilLHSCache,
-    pencil_implicit_solve!, pencil_implicit_solve_inplace!,
-    build_pencil_lhs_matrix, get_pencil_lhs_factor!,
+    PencilLinearOperator, set_pencil_linear_operator!,
     is_pencil_imex_compatible, has_chebyshev_basis,
 
     # ═══════════════════════════════════════════════════════════════
@@ -327,10 +322,15 @@ export
     bad_step!, bad_compute_velocity!, bad_compute_rhs!, bad_add_source!,
     bad_energy, bad_enstrophy, bad_max_velocity, bad_cfl_dt
 
-# Initialize MPI, configuration, and logging at runtime
+# Initialize configuration, logging, and optionally MPI at runtime
 function __init__()
-    if !MPI.Initialized()
-        MPI.Init()
+    # Only initialize MPI if explicitly requested or running under MPI launcher
+    if !MPI.Initialized() && get(ENV, "TARANG_USE_MPI", "") != "0"
+        try
+            MPI.Init()
+        catch e
+            @warn "MPI initialization failed (set TARANG_USE_MPI=0 to disable): $e"
+        end
     end
 
     # Initialize configuration system (load config files, apply env overrides)

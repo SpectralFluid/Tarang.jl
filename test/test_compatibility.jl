@@ -67,7 +67,7 @@ end
         @test isfile(file)
         @test NetCDF.ncgetatt(file, "NC_GLOBAL", "title") == "Tarang.jl simulation output"
         @test NetCDF.ncgetatt(file, "NC_GLOBAL", "handler_name") == handler.name
-        @test NetCDF.ncgetatt(file, "NC_GLOBAL", "tarang_version") == Tarang.__version__
+        @test NetCDF.ncgetatt(file, "NC_GLOBAL", "tarang_version") == string(pkgversion(Tarang))
         @test NetCDF.ncgetatt(file, "NC_GLOBAL", "software") == "Tarang"
 
         data = NetCDF.ncread(file, "u")

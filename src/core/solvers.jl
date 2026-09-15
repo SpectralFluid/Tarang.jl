@@ -66,9 +66,7 @@ For large problems (N > 100K modes):
 - Memory bandwidth often the bottleneck
 """
 
-using LinearAlgebra
-using SparseArrays
-using MPI
+# LinearAlgebra, SparseArrays, MPI already in Tarang.jl
 using Arpack
 using .MatSolvers
 
@@ -359,8 +357,8 @@ function _build_initial_value_solver(problem::IVP, timestepper; dt::Real=1e-3, d
     return solver
 end
 
+"""Merge boundary_conditions strings into equations and track indices."""
 function _merge_boundary_conditions!(problem::Problem)
-    """Merge boundary_conditions strings into equations and track indices."""
     if isempty(problem.boundary_conditions)
         return
     end
@@ -395,8 +393,8 @@ function _merge_boundary_conditions!(problem::Problem)
     @debug "Merged $(length(problem.boundary_conditions)) BCs into equations (total: $(length(problem.equations)))"
 end
 
+"""Inject cached BC values into equation_data F expressions."""
 function _apply_bc_values_to_equations!(solver::InitialValueSolver, current_time)
-    """Inject cached BC values into equation_data F expressions."""
     bc_manager = solver.problem.bc_manager
     equation_data = solver.problem.equation_data
 
@@ -637,8 +635,8 @@ function invoke_constructor(::Type{EigenvalueSolver}, args::Tuple, kwargs::Named
 end
 
 # Solver building functions
+"""Build matrices for initial value solver"""
 function build_solver_matrices!(solver::InitialValueSolver)
-    """Build matrices for initial value solver"""
     L, M, F = build_matrices(solver.problem)
     cutoff = solver.base.entry_cutoff
     
@@ -671,8 +669,8 @@ function apply_entry_cutoff!(v::AbstractVector, cutoff::Real)
 end
 
 # Time stepping for IVP
+"""Advance solution by one time step using existing timestepper infrastructure"""
 function step!(solver::InitialValueSolver, dt::Float64=solver.dt)
-    """Advance solution by one time step using existing timestepper infrastructure"""
 
     # NOTE: FieldPool is disabled until the checkout_or_alloc lifetime/aliasing
     # issues are resolved. Multiple arithmetic operations (dot product, cross product,
@@ -738,8 +736,8 @@ function step!(solver::InitialValueSolver, dt::Float64=solver.dt)
 end
 
 # Solver execution control
+"""Check if solver should continue"""
 function proceed(solver::InitialValueSolver)
-    """Check if solver should continue"""
     if solver.sim_time >= solver.stop_sim_time
         return false
     end
@@ -851,8 +849,8 @@ function run!(solver::InitialValueSolver;
 end
 
 # Boundary value solver
+"""Solve boundary value problem"""
 function solve!(solver::BoundaryValueSolver)
-    """Solve boundary value problem"""
 
     start_time = time()
 
@@ -876,8 +874,8 @@ function solve!(solver::BoundaryValueSolver)
     return solver
 end
 
+"""Solve linear boundary value problem"""
 function solve_linear!(solver::BoundaryValueSolver)
-    """Solve linear boundary value problem"""
     # Direct solve: L * x = F
     if solver.global_solver !== nothing
         return MatSolvers.solve(solver.global_solver, solver.F_vector)
@@ -885,8 +883,8 @@ function solve_linear!(solver::BoundaryValueSolver)
     return solver.L_matrix \ solver.F_vector
 end
 
+"""Solve nonlinear boundary value problem using Newton iteration"""
 function solve_nonlinear!(solver::BoundaryValueSolver)
-    """Solve nonlinear boundary value problem using Newton iteration"""
 
     # Initial guess (current state)
     x = fields_to_vector(solver.state)
@@ -951,12 +949,9 @@ function solve!(solver::EigenvalueSolver; nev::Int=solver.nev,
     return λ, v
 end
 
-# Workspace cache for fields_to_vector (avoids re-allocation per call)
-const _fields_to_vector_cache = Dict{Int, Vector{ComplexF64}}()
 
 # Utility functions
-function fields_to_vector(fields::Vector{<:ScalarField})
-    """
+"""
     Convert field array to solution vector following gather pattern.
 
     GPU-aware: For GPU fields, data is synchronized and transferred to CPU.
@@ -966,6 +961,7 @@ function fields_to_vector(fields::Vector{<:ScalarField})
     This function always returns a CPU Vector{ComplexF64} since that's what
     sparse linear solvers expect.
     """
+function fields_to_vector(fields::Vector{<:ScalarField})
 
     if isempty(fields)
         return Vector{ComplexF64}()
@@ -988,13 +984,8 @@ function fields_to_vector(fields::Vector{<:ScalarField})
     # Calculate total vector size
     total_size = sum(compute_field_vector_size(field) for field in fields)
 
-    # Reuse cached vector if size matches, otherwise allocate
-    vector = get!(() -> Vector{ComplexF64}(undef, total_size),
-                  _fields_to_vector_cache, total_size)
-    if length(vector) != total_size
-        vector = resize!(vector, total_size)
-        _fields_to_vector_cache[total_size] = vector
-    end
+    # Allocate fresh vector each call to avoid shared-buffer aliasing bugs
+    vector = Vector{ComplexF64}(undef, total_size)
 
     # Gather field data into vector (following Tarang gather pattern)
     offset = 1
@@ -1062,8 +1053,7 @@ function _gather_to_global_vector(local_vector::Vector{ComplexF64}, dist::Distri
     return global_vector
 end
 
-function copy_solution_to_fields!(fields::Vector{<:ScalarField}, solution::AbstractVector{<:Number})
-    """
+"""
     Copy solution vector back to fields following scatter pattern.
 
     GPU-aware: The solution vector is on CPU (from linear solver).
@@ -1073,6 +1063,7 @@ function copy_solution_to_fields!(fields::Vector{<:ScalarField}, solution::Abstr
     global vector (from _gather_to_global_vector), each rank extracts only
     its local portion based on the rank offset.
     """
+function copy_solution_to_fields!(fields::Vector{<:ScalarField}, solution::AbstractVector{<:Number})
 
     if isempty(fields)
         return
@@ -1121,14 +1112,14 @@ function copy_solution_to_fields!(fields::Vector{<:ScalarField}, solution::Abstr
     @debug "Vector to fields completed: solution_size=$(length(solution)), fields=$(length(fields))"
 end
 
-function vector_to_fields(vector::AbstractVector{<:Number}, template::Vector{<:ScalarField})
-    """
+"""
     Convert solution vector to a new state vector matching a template.
 
     GPU-aware: New fields are allocated on the same architecture as the
     template fields. The vector (typically on CPU from linear solve) is
     transferred to GPU via set_field_data_from_vector! if needed.
     """
+function vector_to_fields(vector::AbstractVector{<:Number}, template::Vector{<:ScalarField})
 
     new_state = ScalarField[]
     offset = 1
@@ -1178,11 +1169,11 @@ function vector_to_fields!(output::Vector{<:ScalarField}, vector::AbstractVector
     return output
 end
 
-function compute_field_vector_size(field::ScalarField)
-    """
+"""
     Compute the number of degrees of freedom for a field in vector form.
     Following field size computation patterns.
     """
+function compute_field_vector_size(field::ScalarField)
     
     if get_coeff_data(field) !== nothing
         # Use coefficient space data size
@@ -1204,8 +1195,7 @@ function compute_field_vector_size(field::ScalarField)
     end
 end
 
-function extract_field_data_for_vector(field::ScalarField)
-    """
+"""
     Extract field data for vector conversion with proper layout handling.
     Following field data extraction patterns.
 
@@ -1213,6 +1203,7 @@ function extract_field_data_for_vector(field::ScalarField)
     This is necessary because linear solvers typically work on CPU.
     Synchronization is handled by the caller (fields_to_vector).
     """
+function extract_field_data_for_vector(field::ScalarField)
 
     # Ensure coefficient space layout
     ensure_layout!(field, :c)
@@ -1235,8 +1226,7 @@ function extract_field_data_for_vector(field::ScalarField)
     end
 end
 
-function set_field_data_from_vector!(field::ScalarField, data::AbstractVector{<:Number})
-    """
+"""
     Set field data from vector with proper shape and layout handling.
     Following field data setting patterns.
 
@@ -1246,6 +1236,7 @@ function set_field_data_from_vector!(field::ScalarField, data::AbstractVector{<:
 
     Note: Synchronization is handled by the caller (copy_solution_to_fields!).
     """
+function set_field_data_from_vector!(field::ScalarField, data::AbstractVector{<:Number})
 
     if get_coeff_data(field) !== nothing
         # Reshape data to match field coefficient data shape
@@ -1330,8 +1321,8 @@ function set_field_data_from_vector!(field::ScalarField, data::AbstractVector{<:
     end
 end
 
+"""Get the size (number of modes) for a basis following Tarang patterns"""
 function get_basis_size(basis)
-    """Get the size (number of modes) for a basis following Tarang patterns"""
     
     # Following basis structure, bases store size information in different ways:
     # 1. Most common: meta.size field (for Julia BasisMeta structure)
@@ -1363,8 +1354,7 @@ function get_basis_size(basis)
     end
 end
 
-function evaluate_residual_and_jacobian(problem::NLBVP, x::Vector{ComplexF64})
-    """
+"""
     Evaluate residual and Jacobian for nonlinear problem following Tarang patterns.
     
     In Tarang, this corresponds to:
@@ -1372,6 +1362,7 @@ function evaluate_residual_and_jacobian(problem::NLBVP, x::Vector{ComplexF64})
     2. Building dF matrices (Jacobian/Frechet differential) 
     3. Gathering results into numerical arrays for Newton solver
     """
+function evaluate_residual_and_jacobian(problem::NLBVP, x::Vector{ComplexF64})
     
     # Step 1: Copy solution vector back to problem fields
     state_fields = collect_state_fields(problem.variables)
@@ -1433,13 +1424,13 @@ function evaluate_residual_and_jacobian(problem::NLBVP, x::Vector{ComplexF64})
     return residual, jacobian
 end
 
-function _constant_field_from_template(template::ScalarField, value::Number; layout::Symbol=:g)
-    """
+"""
     Create a constant field from a template.
 
     GPU-aware: The field inherits the architecture from the template.
     Uses fill!() which works on both CPU and GPU arrays.
     """
+function _constant_field_from_template(template::ScalarField, value::Number; layout::Symbol=:g)
     field = ScalarField(template.dist, "const_$(template.name)", template.bases, template.dtype)
     ensure_layout!(field, layout)
     if layout == :g && get_grid_data(field) !== nothing
@@ -1500,11 +1491,11 @@ function _binary_template(left, right, template::Union{Nothing, ScalarField})
     end
 end
 
-function evaluate_solver_expression(expr, variables; layout::Symbol=:g, template::Union{Nothing, ScalarField}=nothing)
-    """
+"""
     Evaluate a parsed solver expression with current field values.
     Returns a field (preferred) or a numeric scalar for constant expressions.
     """
+function evaluate_solver_expression(expr, variables; layout::Symbol=:g, template::Union{Nothing, ScalarField}=nothing)
 
     if expr === nothing
         throw(ArgumentError("Cannot evaluate null expression"))
@@ -1643,8 +1634,7 @@ function evaluate_solver_expression(expr, variables; layout::Symbol=:g, template
           "Value: $(repr(expr)). This may indicate a parsing error or missing operator handler.")
 end
 
-function build_jacobian_block(expr, variables, perturbations)
-    """
+"""
     Build Jacobian matrix block from Frechet differential expression following Tarang patterns.
     
     In Tarang, this corresponds to:
@@ -1652,6 +1642,7 @@ function build_jacobian_block(expr, variables, perturbations)
     2. Returns dict {var: matrix} for each variable
     3. Recursively builds matrices for expression tree
     """
+function build_jacobian_block(expr, variables, perturbations)
     
     if expr === nothing
         @warn "Cannot build Jacobian from null expression"
@@ -1687,8 +1678,8 @@ function build_jacobian_block(expr, variables, perturbations)
     return sparse(I, jacobian_size, jacobian_size)
 end
 
+"""Build identity matrix block for variable (Tarang pattern)"""
 function build_variable_jacobian_block(expr, variables)
-    """Build identity matrix block for variable (Tarang pattern)"""
 
     # Check for field_ref using struct field access (consistent with build_jacobian_block)
     if !hasfield(typeof(expr), :field_ref)
@@ -1710,8 +1701,8 @@ function build_variable_jacobian_block(expr, variables)
     return sparse(I, 1, 1)
 end
 
+"""Build Jacobian block for operator expression (following Tarang recursive patterns)"""
 function build_operator_jacobian_block(expr, variables, perturbations)
-    """Build Jacobian block for operator expression (following Tarang recursive patterns)"""
 
     # Check for operator and operands using struct field access (consistent with build_jacobian_block)
     if !hasfield(typeof(expr), :operator) || !hasfield(typeof(expr), :operands)
@@ -1806,13 +1797,13 @@ function create_zero_field(variables::Vector)
     end
 end
 
-function create_constant_field(expr, variables)
-    """
+"""
     Create field with constant value.
 
     GPU-aware: The field is allocated on the same architecture as the first variable.
     Uses fill!() which works on both CPU and GPU arrays.
     """
+function create_constant_field(expr, variables)
     if length(variables) == 0
         throw(ArgumentError("No variables available"))
     end
@@ -1829,12 +1820,12 @@ function create_constant_field(expr, variables)
     return result
 end
 
-function apply_add_operator(operands)
-    """
+"""
     Apply addition operator following Tarang patterns.
 
     GPU-aware: Uses broadcasting (.+=) which works on both CPU and GPU arrays.
     """
+function apply_add_operator(operands)
     if length(operands) == 0
         throw(ArgumentError("Addition requires operands"))
     end
@@ -1857,12 +1848,12 @@ function apply_add_operator(operands)
     return result
 end
 
-function apply_multiply_operator(operands)
-    """
+"""
     Apply multiplication operator following Tarang patterns.
 
     GPU-aware: Uses broadcasting (.*=) which works on both CPU and GPU arrays.
     """
+function apply_multiply_operator(operands)
     if length(operands) < 2
         return length(operands) == 1 ? operands[1] : throw(ArgumentError("Multiplication requires 2+ operands"))
     end
@@ -1893,8 +1884,7 @@ function apply_multiply_operator(operands)
     return result
 end
 
-function apply_differentiate_operator(operands, expr)
-    """
+"""
     Apply differentiation operator using existing operators.jl infrastructure.
     
     This leverages the complete implementation in operators.jl which includes:
@@ -1902,6 +1892,7 @@ function apply_differentiate_operator(operands, expr)
     - Proper spectral differentiation matrices
     - Layout management and efficient operations
     """
+function apply_differentiate_operator(operands, expr)
     
     if length(operands) == 0
         throw(ArgumentError("Differentiation requires operand"))
@@ -1935,8 +1926,8 @@ function apply_differentiate_operator(operands, expr)
     end
 end
 
+"""Extract coordinate for differentiation from expression"""
 function get_diff_coordinate(expr)
-    """Extract coordinate for differentiation from expression"""
     # Direct coordinate object (struct field access)
     if hasfield(typeof(expr), :coordinate) && expr.coordinate !== nothing
         return expr.coordinate
@@ -1991,8 +1982,8 @@ function get_diff_coordinate(expr)
     return nothing
 end
 
+"""Extract differentiation order from expression"""
 function get_diff_order(expr)
-    """Extract differentiation order from expression"""
     if hasfield(typeof(expr), :order)
         return max(1, Int(expr.order))
     else
@@ -2001,8 +1992,8 @@ function get_diff_order(expr)
 end
 
 # Performance and logging
+"""Log solver performance statistics"""
 function log_stats(solver::Solver)
-    """Log solver performance statistics"""
     
     if isa(solver, InitialValueSolver)
         elapsed = time() - solver.wall_time_start
@@ -2025,8 +2016,8 @@ end
 
 # Analysis and output - create_evaluator is defined in evaluator.jl
 
+"""Log solver performance statistics"""
 function log_solver_performance(solver::Union{InitialValueSolver, BoundaryValueSolver})
-    """Log solver performance statistics"""
 
     stats = solver.performance_stats
 

@@ -19,10 +19,7 @@ This module is split into multiple files for maintainability:
 - transform_grouped.jl: Grouped transform operations
 """
 
-using PencilFFTs
-using FFTW
-using LinearAlgebra
-using SparseArrays
+# PencilFFTs, FFTW, LinearAlgebra, SparseArrays already in Tarang.jl
 
 # Include all the split files
 include("transforms/transform_types.jl")

@@ -263,8 +263,7 @@ that will be immediately overwritten with zeros.
     return z
 end
 
-function create_rhs_zero_field(template_field::ScalarField)
-    """Create a zero RHS field matching the template field properties.
+"""Create a zero RHS field matching the template field properties.
 
     Uses the global FieldPool (via checkout_or_alloc) when available to avoid
     per-RHS-evaluation allocations.  Falls back to direct ScalarField allocation
@@ -274,6 +273,7 @@ function create_rhs_zero_field(template_field::ScalarField)
     it already carries the correct PencilArray decomposition structure — no
     need for similar()-based copying.
     """
+function create_rhs_zero_field(template_field::ScalarField)
 
     # Skip 0D fields (tau variables) which have no spatial data
     if isempty(template_field.bases)

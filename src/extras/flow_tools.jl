@@ -44,13 +44,13 @@ mutable struct CFL
     end
 end
 
+"""Add velocity field for CFL calculation"""
 function add_velocity!(cfl::CFL, velocity::VectorField)
-    """Add velocity field for CFL calculation"""
     push!(cfl.velocities, velocity)
 end
 
+"""Compute adaptive timestep based on CFL condition"""
 function compute_timestep(cfl::CFL)
-    """Compute adaptive timestep based on CFL condition"""
 
     cfl.iteration_count += 1
 
@@ -109,8 +109,8 @@ function compute_timestep(cfl::CFL)
 end
 
 # Reynolds number calculation
+"""Calculate Reynolds number Re = |u| * L / ν"""
 function reynolds_number(velocity::VectorField, viscosity::Float64, length_scale::Float64=1.0)
-    """Calculate Reynolds number Re = |u| * L / ν"""
     
     # Calculate velocity magnitude (GPU-compatible allocation)
     ensure_layout!(velocity.components[1], :g)
@@ -131,8 +131,8 @@ function reynolds_number(velocity::VectorField, viscosity::Float64, length_scale
 end
 
 # Kinetic energy calculation
+"""Calculate kinetic energy KE = (1/2) * ρ * |u|²"""
 function kinetic_energy(velocity::VectorField, density::Float64=1.0)
-    """Calculate kinetic energy KE = (1/2) * ρ * |u|²"""
     
     # Calculate |u|² (GPU-compatible allocation)
     ensure_layout!(velocity.components[1], :g)
@@ -150,16 +150,16 @@ function kinetic_energy(velocity::VectorField, density::Float64=1.0)
     return ke_field
 end
 
+"""Calculate total kinetic energy integrated over domain"""
 function total_kinetic_energy(velocity::VectorField, density::Float64=1.0)
-    """Calculate total kinetic energy integrated over domain"""
     
     ke_field = kinetic_energy(velocity, density)
     return integrate(ke_field)
 end
 
 # Enstrophy calculation (for 2D flows)
+"""Calculate enstrophy (vorticity squared) for 2D flow"""
 function enstrophy(velocity::VectorField)
-    """Calculate enstrophy (vorticity squared) for 2D flow"""
     
     if velocity.coordsys.dim != 2
         throw(ArgumentError("Enstrophy calculation requires 2D velocity field"))
@@ -179,16 +179,16 @@ function enstrophy(velocity::VectorField)
     return enstrophy_field
 end
 
+"""Calculate total enstrophy integrated over domain"""
 function total_enstrophy(velocity::VectorField)
-    """Calculate total enstrophy integrated over domain"""
     
     enstrophy_field = enstrophy(velocity)
     return integrate(enstrophy_field)
 end
 
 # Energy dissipation rate
+"""Calculate energy dissipation rate ε = ν * |∇u|²"""
 function energy_dissipation_rate(velocity::VectorField, viscosity::Float64)
-    """Calculate energy dissipation rate ε = ν * |∇u|²"""
     
     # Calculate strain rate tensor components (GPU-compatible allocation)
     ensure_layout!(velocity.components[1], :g)
@@ -216,8 +216,8 @@ function energy_dissipation_rate(velocity::VectorField, viscosity::Float64)
 end
 
 # Vorticity dynamics
+"""Calculate vorticity transport equation terms for 2D flow"""
 function vorticity_transport(velocity::VectorField, vorticity::ScalarField, viscosity::Float64)
-    """Calculate vorticity transport equation terms for 2D flow"""
     
     if velocity.coordsys.dim != 2
         throw(ArgumentError("Vorticity transport requires 2D velocity field"))
@@ -403,8 +403,8 @@ function energy_spectrum(velocity::VectorField;
     end
 end
 
+"""Validate and extract Fourier basis information"""
 function validate_fourier_bases(velocity::VectorField)
-    """Validate and extract Fourier basis information"""
     fourier_axes = Int[]
     fourier_bases = []
     
@@ -428,14 +428,14 @@ struct WavenumberInfo
     fourier_shape::Tuple{Vararg{Int}}
 end
 
-function get_wavenumber_info(velocity::VectorField, fourier_axes::Vector{Int}, fourier_bases::Vector)
-    """
+"""
     Extract wavenumber grid information from velocity field and bases.
     Handles both 2D and 3D cases with proper PencilArrays integration.
 
     IMPORTANT: For MPI mode with PencilArrays, this function computes GLOBAL
     wavenumber values for each local grid point using the PencilArray offsets.
     """
+function get_wavenumber_info(velocity::VectorField, fourier_axes::Vector{Int}, fourier_bases::Vector)
 
     # Get domain information
     domain = velocity.domain
@@ -553,11 +553,11 @@ function calculate_kmax_global(global_shape::Tuple, fourier_bases=nothing)
     end
 end
 
-function calculate_wavenumber_grids(fourier_bases::Vector, fourier_shape::Tuple{Vararg{Int}}, domain_size::Tuple{Vararg{Float64}})
-    """
+"""
     Calculate wavenumber grids for each Fourier dimension (serial version).
     DEPRECATED: Use calculate_wavenumber_grids_global for MPI compatibility.
     """
+function calculate_wavenumber_grids(fourier_bases::Vector, fourier_shape::Tuple{Vararg{Int}}, domain_size::Tuple{Vararg{Float64}})
     # Call global version with zero offsets for backward compatibility
     offsets = Tuple(zeros(Int, length(fourier_shape)))
     return calculate_wavenumber_grids_global(fourier_bases, fourier_shape, domain_size, offsets, fourier_shape)
@@ -699,8 +699,8 @@ function _fft_index_to_wavenumber(idx::Int, N::Int)
     end
 end
 
+"""Calculate wavenumber magnitudes |k| = √(kx² + ky² + kz²)"""
 function calculate_k_magnitudes(kx_grid::Array{Float64}, ky_grid::Array{Float64}, kz_grid::Union{Array{Float64}, Nothing})
-    """Calculate wavenumber magnitudes |k| = √(kx² + ky² + kz²)"""
     
     if kz_grid !== nothing
         # 3D case
@@ -713,8 +713,8 @@ function calculate_k_magnitudes(kx_grid::Array{Float64}, ky_grid::Array{Float64}
     return k_magnitudes
 end
 
+"""Calculate maximum wavenumber (Nyquist limit)"""
 function calculate_kmax(fourier_shape::Tuple{Vararg{Int}})
-    """Calculate maximum wavenumber (Nyquist limit)"""
     return min(fourier_shape[1]÷2, fourier_shape[2]÷2)
 end
 
@@ -784,8 +784,7 @@ function calculate_radial_energy_spectrum(velocity::VectorField, wavenumber_info
     return (k=bin_centers, power=spectrum, bin_counts=bin_counts, bin_edges=bin_edges)
 end
 
-function calculate_spectral_kinetic_energy(velocity::VectorField; apply_conjugate_symmetry::Bool=true)
-    """
+"""
     Calculate kinetic energy density in spectral space.
     Returns |û|² + |v̂|² + |ŵ|² with proper normalization.
 
@@ -798,6 +797,7 @@ function calculate_spectral_kinetic_energy(velocity::VectorField; apply_conjugat
     - k=1 to k=N/2-1 (interior modes): count twice
     - k=N/2 (Nyquist, only if N even): count once
     """
+function calculate_spectral_kinetic_energy(velocity::VectorField; apply_conjugate_symmetry::Bool=true)
 
     # Get first component to determine array size (GPU-compatible allocation)
     first_component = velocity.components[1]
@@ -877,8 +877,7 @@ function calculate_spectral_kinetic_energy(velocity::VectorField; apply_conjugat
     return ke_spectral
 end
 
-function calculate_full_energy_spectrum(velocity::VectorField, wavenumber_info::WavenumberInfo, max_wavenumber::Int)
-    """
+"""
     Calculate full energy spectrum without radial averaging.
     Returns E(kx, ky) or E(kx, ky, kz) for detailed analysis.
 
@@ -889,6 +888,7 @@ function calculate_full_energy_spectrum(velocity::VectorField, wavenumber_info::
     To combine across ranks, use MPI gather operations (not reduce, since each rank
     has different wavenumbers). The keys are globally unique across ranks.
     """
+function calculate_full_energy_spectrum(velocity::VectorField, wavenumber_info::WavenumberInfo, max_wavenumber::Int)
 
     ke_spectral = calculate_spectral_kinetic_energy(velocity)
 
@@ -1783,16 +1783,16 @@ function get_domain_bounds(domain)
     return bounds_list
 end
 
+"""Extract local Fourier shape from velocity field"""
 function get_fourier_shape(velocity::VectorField, fourier_axes::Vector{Int})
-    """Extract local Fourier shape from velocity field"""
     first_component = velocity.components[1] 
     ensure_layout!(first_component, :c)
     return size(get_coeff_data(first_component))
 end
 
 # Turbulence statistics
+"""Calculate basic turbulence statistics"""
 function turbulence_statistics(velocity::VectorField)
-    """Calculate basic turbulence statistics"""
 
     stats = Dict{String, Float64}()
     use_mpi = MPI.Initialized() && velocity.dist.size > 1
@@ -1861,8 +1861,7 @@ function turbulence_statistics(velocity::VectorField)
 end
 
 # Flow visualization helpers  
-function streamfunction(velocity::VectorField; boundary_condition::Symbol=:periodic, gauge_condition::Bool=true)
-    """
+"""
     Calculate streamfunction for 2D incompressible flow.
     
     Solves the Poisson equation ∇²ψ = ω to obtain streamfunction from vorticity.
@@ -1877,8 +1876,8 @@ function streamfunction(velocity::VectorField; boundary_condition::Symbol=:perio
         gauge_condition: Apply ∫ψ dA = 0 constraint
     
     Returns:
-        ScalarField containing streamfunction ψ
-    """
+        ScalarField containing stream"""
+function streamfunction(velocity::VectorField; boundary_condition::Symbol=:periodic, gauge_condition::Bool=true)
     
     if velocity.coordsys.dim != 2
         throw(ArgumentError("Streamfunction calculation requires 2D velocity field"))
@@ -1899,8 +1898,8 @@ function streamfunction(velocity::VectorField; boundary_condition::Symbol=:perio
     end
 end
 
+"""Extract information about Fourier vs non-Fourier bases"""
 function get_fourier_basis_info(bases::Vector)
-    """Extract information about Fourier vs non-Fourier bases"""
     fourier_info = []
     
     for (i, basis) in enumerate(bases)
@@ -1911,16 +1910,16 @@ function get_fourier_basis_info(bases::Vector)
     return fourier_info
 end
 
+"""Check if all bases are periodic Fourier"""
 function all_periodic_fourier(fourier_info::Vector)
-    """Check if all bases are periodic Fourier"""
     return all(info.is_fourier for info in fourier_info)
 end
 
-function streamfunction_spectral_invert(vorticity::ScalarField, apply_gauge::Bool=true)
-    """
+"""
     Direct spectral inversion for periodic domains: ψ̂(k) = -ω̂(k)/|k|²
     Based on Tarang spectral Poisson inversion patterns.
     """
+function streamfunction_spectral_invert(vorticity::ScalarField, apply_gauge::Bool=true)
     
     # Ensure vorticity is in spectral space
     ensure_layout!(vorticity, :c)
@@ -1966,14 +1965,14 @@ function streamfunction_spectral_invert(vorticity::ScalarField, apply_gauge::Boo
     return streamfunction_field
 end
 
-function get_2d_wavenumber_grids(field::ScalarField)
-    """
+"""
     Get 2D wavenumber grids for spectral operations.
     Returns properly scaled kx, ky grids.
 
     CRITICAL: For MPI/PencilArrays, uses global wavenumber indices with proper offsets.
     Each rank generates wavenumbers corresponding to its local portion of global spectrum.
     """
+function get_2d_wavenumber_grids(field::ScalarField)
 
     # Extract domain size from field bases
     if field.domain !== nothing && length(field.domain.bases) >= 2
@@ -2093,13 +2092,13 @@ function _get_pencil_array_offsets_internal(field::ScalarField)
     return Tuple(zeros(Int, ndims(coeff_data)))
 end
 
-function streamfunction_bvp_solve(vorticity::ScalarField, bc_type::Symbol, apply_gauge::Bool=true)
-    """
+"""
     Solve streamfunction BVP for bounded/mixed domains.
 
     Solves ∇²ψ = ω with appropriate boundary conditions using Jacobi iteration.
     This is an iterative solver suitable for domains with physical boundaries.
     """
+function streamfunction_bvp_solve(vorticity::ScalarField, bc_type::Symbol, apply_gauge::Bool=true)
 
     streamfunction_field = ScalarField(vorticity.dist, "streamfunction", vorticity.bases, vorticity.dtype)
     ensure_layout!(streamfunction_field, :g)
@@ -2183,8 +2182,8 @@ function streamfunction_jacobi_solve(vorticity::ScalarField, bc_type::Symbol, ap
     return psi
 end
 
+"""Apply boundary conditions to streamfunction"""
 function apply_streamfunction_bc!(psi::Array{Float64,2}, bc_type::Symbol)
-    """Apply boundary conditions to streamfunction"""
     
     nx, ny = size(psi)
     
@@ -2211,12 +2210,12 @@ function apply_streamfunction_bc!(psi::Array{Float64,2}, bc_type::Symbol)
     end
 end
 
-function validate_streamfunction(velocity::VectorField, streamfunction::ScalarField; tolerance::Float64=1e-6)
-    """
+"""
     Validate streamfunction by checking if it generates the correct velocity field.
     
     For 2D incompressible flow: u = ∂ψ/∂y, v = -∂ψ/∂x
     """
+function validate_streamfunction(velocity::VectorField, streamfunction::ScalarField; tolerance::Float64=1e-6)
     
     if velocity.coordsys.dim != 2
         return false
@@ -2249,8 +2248,8 @@ function validate_streamfunction(velocity::VectorField, streamfunction::ScalarFi
     return (valid=is_valid, u_error=u_error, v_error=v_error, max_error=max_error)
 end
 
+"""Calculate velocity divergence ∇·u"""
 function velocity_divergence(velocity::VectorField)
-    """Calculate velocity divergence ∇·u"""
 
     divergence_op = divergence(velocity)
     return evaluate_operator(divergence_op)
@@ -3531,8 +3530,8 @@ function bad_step_rk4!(bad::BoundaryAdvectionDiffusion, dt::Real)
     end
 end
 
+"""Strong Stability Preserving RK3 (Shu-Osher form)"""
 function bad_step_ssprk3!(bad::BoundaryAdvectionDiffusion, dt::Real)
-    """Strong Stability Preserving RK3 (Shu-Osher form)"""
 
     # Save initial state
     saved_states = Dict{String, Array}()

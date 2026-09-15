@@ -39,7 +39,7 @@ on the GPU and computations use GPU-optimized broadcasting.
 3. Abkar, M., Bae, H.J., Moin, P. (2016). "Minimum-dissipation scalar transport model"
 """
 
-using LinearAlgebra
+# LinearAlgebra already in Tarang.jl
 
 # ============================================================================
 # Abstract Types

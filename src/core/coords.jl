@@ -11,9 +11,7 @@ This module implements coordinate systems:
 - SphericalCoordinates: Full spherical coordinates (azimuth, colatitude, radius)
 """
 
-using StaticArrays
-using LinearAlgebra
-using SparseArrays
+# StaticArrays, LinearAlgebra, SparseArrays already in Tarang.jl
 
 # ============================================================================
 # Abstract types

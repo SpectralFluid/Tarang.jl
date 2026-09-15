@@ -5,11 +5,11 @@
 """
     step_diagonal_imex_rk222!(state::TimestepperState, solver::InitialValueSolver)
 
-2nd-order diagonal IMEX RK step with GPU-native implicit treatment.
+Diagonal IMEX RK step with GPU-native implicit treatment.
 
-Uses the standard IMEX-RK formulation where:
+Uses a simplified IMEX-RK formulation where:
 - Explicit tableau handles nonlinear terms F(u)
-- Implicit diagonal operator L handles linear terms (viscosity/hyperviscosity)
+- Implicit diagonal operator L̂ handles linear terms (viscosity/hyperviscosity)
 
 For each stage s, we solve:
     (1 + dt*γ*L̂) * Ŷ_s = X̂_n + dt * Σ_{j<s} a_j * F̂_j
@@ -17,6 +17,12 @@ For each stage s, we solve:
 where L̂ is the diagonal spectral operator.
 
 This avoids sparse matrix solves and stays 100% on GPU.
+
+!!! warning "Order reduction in stiff limit"
+    This implementation omits the off-diagonal implicit contributions
+    (- dt * Σ_{j<s} A_imp[s,j] * L̂ * Ŷ_j) from the stage RHS. This means
+    the method is only **first-order accurate in the stiff limit** (dt*|λ| >> 1).
+    For full 2nd-order IMEX-RK accuracy, use the dense IMEX methods in `step_rk.jl`.
 """
 function step_diagonal_imex_rk222!(state::TimestepperState, solver::InitialValueSolver)
     ts = state.timestepper
@@ -118,10 +124,15 @@ end
 """
     step_diagonal_imex_rk443!(state::TimestepperState, solver::InitialValueSolver)
 
-3rd-order diagonal IMEX RK step with GPU-native implicit treatment.
+Diagonal IMEX RK step with GPU-native implicit treatment (4 stages).
 
 Uses classical RK4 explicit tableau for nonlinear terms, with implicit
 treatment of linear operator at each stage and final update.
+
+!!! warning "Order reduction in stiff limit"
+    Like `step_diagonal_imex_rk222!`, this omits off-diagonal implicit
+    contributions, reducing to first-order accuracy in the stiff limit.
+    For full 3rd-order IMEX accuracy, use the dense IMEX methods in `step_rk.jl`.
 """
 function step_diagonal_imex_rk443!(state::TimestepperState, solver::InitialValueSolver)
     ts = state.timestepper

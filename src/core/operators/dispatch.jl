@@ -18,20 +18,27 @@ Fields (ScalarField, VectorField) have `dist.coordsys`.
 Operators with `coordsys` field use it directly.
 Other operators recurse into their `operand` field.
 """
+# Dispatched methods for common types
+_extract_coordsys(f::ScalarField) = f.dist.coordsys
+_extract_coordsys(f::VectorField) = f.coordsys
+_extract_coordsys(op::NegateOperator) = _extract_coordsys(op.operand)
+_extract_coordsys(op::AddOperator) = _extract_coordsys(op.left)
+_extract_coordsys(op::SubtractOperator) = _extract_coordsys(op.left)
+_extract_coordsys(op::MultiplyOperator) = _extract_coordsys(op.left)
+_extract_coordsys(op::DivideOperator) = _extract_coordsys(op.left)
+_extract_coordsys(op::PowerOperator) = _extract_coordsys(op.left)
+
+# Fallback using reflection for other types
 function _extract_coordsys(op)
-    # Fields have dist.coordsys
     if hasfield(typeof(op), :dist) && op.dist !== nothing
         return op.dist.coordsys
     end
-    # Some operators store coordsys directly
     if hasfield(typeof(op), :coordsys) && getfield(op, :coordsys) !== nothing
         return getfield(op, :coordsys)
     end
-    # Recurse into operator's operand
     if hasfield(typeof(op), :operand)
         return _extract_coordsys(getfield(op, :operand))
     end
-    # Binary operators: try left operand
     if hasfield(typeof(op), :left)
         return _extract_coordsys(getfield(op, :left))
     end

@@ -13,8 +13,7 @@
 #
 # ============================================================================
 
-using SparseArrays: sparse
-using LinearAlgebra: I, lu
+# SparseArrays, LinearAlgebra already in Tarang.jl
 
 """
     _get_or_factorize!(cache, key, build_fn)
@@ -245,6 +244,9 @@ function _pencil_sbdf1_field!(
     Nz = L.Nz
     ν = L.parameters[:ν]
 
+    # Pre-allocate RHS buffer to avoid per-wavenumber allocation
+    rhs_buf = Vector{T}(undef, Nz)
+
     if ndims == 1
         # 2D: (Nkx, Nz)
         nkx = size(data_n, 1)
@@ -258,13 +260,13 @@ function _pencil_sbdf1_field!(
                     lu(LHS)
                 end
 
-                # Build RHS: X̂^n + dt*F̂^n
+                # Build RHS in-place: rhs = X̂^n + dt*F̂^n
                 pencil_n = @view data_n[ikx, :]
                 pencil_F = @view data_F_n[ikx, :]
-                rhs = Vector(pencil_n) + dt * Vector(pencil_F)
+                @. rhs_buf = pencil_n + dt * pencil_F
 
                 # Solve and store
-                data_new[ikx, :] .= factor \ rhs
+                data_new[ikx, :] .= factor \ rhs_buf
             end
         end
 
@@ -285,9 +287,9 @@ function _pencil_sbdf1_field!(
 
                     pencil_n = @view data_n[ikx, iky, :]
                     pencil_F = @view data_F_n[ikx, iky, :]
-                    rhs = Vector(pencil_n) + dt * Vector(pencil_F)
+                    @. rhs_buf = pencil_n + dt * pencil_F
 
-                    data_new[ikx, iky, :] .= factor \ rhs
+                    data_new[ikx, iky, :] .= factor \ rhs_buf
                 end
             end
         end
@@ -322,6 +324,9 @@ function _pencil_sbdf2_field!(
     Nz = L.Nz
     ν = L.parameters[:ν]
 
+    # Pre-allocate RHS buffer to avoid per-wavenumber allocation
+    rhs_buf = Vector{T}(undef, Nz)
+
     if ndims == 1
         # 2D: (Nkx, Nz)
         nkx = size(data_n, 1)
@@ -341,13 +346,13 @@ function _pencil_sbdf2_field!(
                 pencil_nm1 = @view data_nm1[ikx, :]
                 pencil_F_n = @view data_F_n[ikx, :]
 
-                rhs = -a1 * Vector(pencil_n) - a2 * Vector(pencil_nm1) + dt * ext_c1 * Vector(pencil_F_n)
+                @. rhs_buf = -a1 * pencil_n - a2 * pencil_nm1 + dt * ext_c1 * pencil_F_n
                 if data_F_nm1 !== nothing
                     pencil_F_nm1 = @view data_F_nm1[ikx, :]
-                    rhs .-= dt * ext_c2 * Vector(pencil_F_nm1)
+                    @. rhs_buf -= dt * ext_c2 * pencil_F_nm1
                 end
 
-                data_new[ikx, :] .= factor \ rhs
+                data_new[ikx, :] .= factor \ rhs_buf
             end
         end
 
@@ -370,13 +375,13 @@ function _pencil_sbdf2_field!(
                     pencil_nm1 = @view data_nm1[ikx, iky, :]
                     pencil_F_n = @view data_F_n[ikx, iky, :]
 
-                    rhs = -a1 * Vector(pencil_n) - a2 * Vector(pencil_nm1) + dt * ext_c1 * Vector(pencil_F_n)
+                    @. rhs_buf = -a1 * pencil_n - a2 * pencil_nm1 + dt * ext_c1 * pencil_F_n
                     if data_F_nm1 !== nothing
                         pencil_F_nm1 = @view data_F_nm1[ikx, iky, :]
-                        rhs .-= dt * ext_c2 * Vector(pencil_F_nm1)
+                        @. rhs_buf -= dt * ext_c2 * pencil_F_nm1
                     end
 
-                    data_new[ikx, iky, :] .= factor \ rhs
+                    data_new[ikx, iky, :] .= factor \ rhs_buf
                 end
             end
         end
@@ -544,6 +549,9 @@ function _pencil_cnab1_field!(
     ν = L.parameters[:ν]
     θ = 0.5  # Crank-Nicolson parameter
 
+    # Pre-allocate RHS buffer
+    rhs_buf = Vector{T}(undef, Nz)
+
     if ndims == 1
         # 2D: (Nkx, Nz)
         nkx = size(data_n, 1)
@@ -563,9 +571,10 @@ function _pencil_cnab1_field!(
 
                 pencil_n = @view data_n[ikx, :]
                 pencil_F = @view data_F_n[ikx, :]
-                rhs = RHS_mat * Vector(pencil_n) + dt * Vector(pencil_F)
+                mul!(rhs_buf, RHS_mat, pencil_n)
+                @. rhs_buf += dt * pencil_F
 
-                data_new[ikx, :] .= factor \ rhs
+                data_new[ikx, :] .= factor \ rhs_buf
             end
         end
 
@@ -587,9 +596,10 @@ function _pencil_cnab1_field!(
 
                     pencil_n = @view data_n[ikx, iky, :]
                     pencil_F = @view data_F_n[ikx, iky, :]
-                    rhs = RHS_mat * Vector(pencil_n) + dt * Vector(pencil_F)
+                    mul!(rhs_buf, RHS_mat, pencil_n)
+                    @. rhs_buf += dt * pencil_F
 
-                    data_new[ikx, iky, :] .= factor \ rhs
+                    data_new[ikx, iky, :] .= factor \ rhs_buf
                 end
             end
         end
@@ -625,6 +635,9 @@ function _pencil_cnab2_field!(
     ab2_c1 = 1 + w / 2
     ab2_c2 = w / 2
 
+    # Pre-allocate RHS buffer
+    rhs_buf = Vector{T}(undef, Nz)
+
     if ndims == 1
         # 2D: (Nkx, Nz)
         nkx = size(data_n, 1)
@@ -643,13 +656,14 @@ function _pencil_cnab2_field!(
                 pencil_F_n = @view data_F_n[ikx, :]
 
                 # Adams-Bashforth 2 extrapolation with variable-timestep coefficients
-                rhs = RHS_mat * Vector(pencil_n) + dt * ab2_c1 * Vector(pencil_F_n)
+                mul!(rhs_buf, RHS_mat, pencil_n)
+                @. rhs_buf += dt * ab2_c1 * pencil_F_n
                 if data_F_nm1 !== nothing
                     pencil_F_nm1 = @view data_F_nm1[ikx, :]
-                    rhs .-= dt * ab2_c2 * Vector(pencil_F_nm1)
+                    @. rhs_buf -= dt * ab2_c2 * pencil_F_nm1
                 end
 
-                data_new[ikx, :] .= factor \ rhs
+                data_new[ikx, :] .= factor \ rhs_buf
             end
         end
 
@@ -672,13 +686,14 @@ function _pencil_cnab2_field!(
                     pencil_n = @view data_n[ikx, iky, :]
                     pencil_F_n = @view data_F_n[ikx, iky, :]
 
-                    rhs = RHS_mat * Vector(pencil_n) + dt * ab2_c1 * Vector(pencil_F_n)
+                    mul!(rhs_buf, RHS_mat, pencil_n)
+                    @. rhs_buf += dt * ab2_c1 * pencil_F_n
                     if data_F_nm1 !== nothing
                         pencil_F_nm1 = @view data_F_nm1[ikx, iky, :]
-                        rhs .-= dt * ab2_c2 * Vector(pencil_F_nm1)
+                        @. rhs_buf -= dt * ab2_c2 * pencil_F_nm1
                     end
 
-                    data_new[ikx, iky, :] .= factor \ rhs
+                    data_new[ikx, iky, :] .= factor \ rhs_buf
                 end
             end
         end

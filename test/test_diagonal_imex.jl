@@ -101,7 +101,8 @@ import Tarang: SpectralLinearOperator
         err2 = abs(u2 - exact)
 
         # 2nd order: error ratio should be ~4 when dt halved
-        if err2 > 1e-14  # avoid division by zero
+        @test err2 > 0  # Sanity: error should not be zero or negative
+        if err2 > 1e-14  # avoid division by zero near machine precision
             rate = log2(err1 / err2)
             @test rate > 1.5  # Should be ~2 for 2nd order
         end
@@ -141,6 +142,7 @@ import Tarang: SpectralLinearOperator
         err1 = abs(u1 - exact)
         err2 = abs(u2 - exact)
 
+        @test err2 > 0  # Sanity: error should not be zero or negative
         if err2 > 1e-14
             rate = log2(err1 / err2)
             @test rate > 0.8  # Should be ~1 for 1st order
@@ -152,5 +154,14 @@ import Tarang: SpectralLinearOperator
         @test RK222() isa Tarang.TimeStepper
         @test RK443() isa Tarang.TimeStepper
         @test DiagonalIMEX_RK222() isa Tarang.TimeStepper
+    end
+
+    @testset "Multistep timestepper types exist" begin
+        @test CNAB1() isa Tarang.TimeStepper
+        @test CNAB2() isa Tarang.TimeStepper
+        @test SBDF1() isa Tarang.TimeStepper
+        @test SBDF2() isa Tarang.TimeStepper
+        @test SBDF3() isa Tarang.TimeStepper
+        @test SBDF4() isa Tarang.TimeStepper
     end
 end

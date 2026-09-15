@@ -11,8 +11,7 @@ the tau method approach, with support for:
 - Custom boundary condition expressions
 """
 
-using LinearAlgebra
-using SparseArrays
+# LinearAlgebra, SparseArrays already in Tarang.jl
 
 # GPU support: This module works with both CPU and GPU arrays.
 # - Expression evaluation uses broadcast() which handles GPU arrays automatically
@@ -170,8 +169,8 @@ Get the architecture (CPU or GPU) of the boundary condition manager.
 architecture(manager::BoundaryConditionManager) = manager.architecture
 
 # Utility functions for time/space dependency detection
+"""Check if value depends on time"""
 function is_time_dependent(value)
-    """Check if value depends on time"""
     if isa(value, String)
         return occursin(r"\bt\b", value) || occursin("∂t(", value) || occursin("dt(", value)
     elseif isa(value, TimeDependentValue) || isa(value, TimeSpaceDependentValue)
@@ -182,8 +181,8 @@ function is_time_dependent(value)
     return false
 end
 
+"""Check if value depends on spatial coordinates"""
 function is_space_dependent(value)
-    """Check if value depends on spatial coordinates"""
     if isa(value, String)
         # Check for common spatial coordinate patterns
         spatial_patterns = [r"\bx\b", r"\by\b", r"\bz\b", r"\br\b", r"\btheta\b", r"\bphi\b"]
@@ -253,8 +252,8 @@ function robin_bc(field::String, coordinate::String, position, alpha, beta, valu
     return RobinBC(field, coordinate, position, alpha, beta, value, tau_field, is_time_dep, is_space_dep)
 end
 
+"""Create periodic boundary condition"""
 function periodic_bc(field::String, coordinate::String)
-    """Create periodic boundary condition"""
     return PeriodicBC(field, coordinate)
 end
 
@@ -264,14 +263,14 @@ function stress_free_bc(velocity_field::String, coordinate::String, position;
     return StressFreeBC(velocity_field, coordinate, position, tau_fields)
 end
 
+"""Create custom boundary condition from expression"""
 function custom_bc(expression::String; tau_fields::Vector{String}=String[])
-    """Create custom boundary condition from expression"""
     return CustomBC(expression, tau_fields)
 end
 
 # Enhanced BC Management Functions with time/space dependency tracking
+"""Add boundary condition to manager with dependency tracking"""
 function add_bc!(manager::BoundaryConditionManager, bc::AbstractBoundaryCondition)
-    """Add boundary condition to manager with dependency tracking"""
     push!(manager.conditions, bc)
     
     # Track time and space dependencies
@@ -313,8 +312,8 @@ function add_robin!(manager::BoundaryConditionManager, field::String,
     return bc
 end
 
+"""Convenient function to add periodic BC"""
 function add_periodic!(manager::BoundaryConditionManager, field::String, coordinate::String)
-    """Convenient function to add periodic BC"""
     bc = periodic_bc(field, coordinate)
     add_bc!(manager, bc)
     return bc
@@ -328,22 +327,22 @@ function add_stress_free!(manager::BoundaryConditionManager, velocity_field::Str
     return bc
 end
 
+"""Convenient function to add custom BC"""
 function add_custom!(manager::BoundaryConditionManager, expression::String; kwargs...)
-    """Convenient function to add custom BC"""
     bc = custom_bc(expression; kwargs...)
     add_bc!(manager, bc)
     return bc
 end
 
 # Tau field management
+"""Register tau field for boundary condition enforcement"""
 function register_tau_field!(manager::BoundaryConditionManager, name::String, field)
-    """Register tau field for boundary condition enforcement"""
     manager.tau_fields[name] = field
     return manager
 end
 
+"""Get registered tau field"""
 function get_tau_field(manager::BoundaryConditionManager, name::String)
-    """Get registered tau field"""
     return get(manager.tau_fields, name, nothing)
 end
 
@@ -419,8 +418,7 @@ function auto_generate_tau_fields!(manager::BoundaryConditionManager, problem, d
     return manager
 end
 
-function get_boundary_basis(manager::BoundaryConditionManager, coordinate::String)
-    """
+"""
     Get basis for boundary along specified coordinate.
 
     For a boundary condition along a given coordinate, the tau field lives on
@@ -438,6 +436,7 @@ function get_boundary_basis(manager::BoundaryConditionManager, coordinate::Strin
     Returns:
     - Basis or tuple of bases for the boundary, or nothing if not found
     """
+function get_boundary_basis(manager::BoundaryConditionManager, coordinate::String)
 
     # Check if coordinate info has been registered
     if !haskey(manager.coordinate_info, "bases") || !haskey(manager.coordinate_info, "coordinates")
@@ -511,12 +510,12 @@ function register_coordinate_info!(manager::BoundaryConditionManager,
     return manager
 end
 
-function register_domain_info!(manager::BoundaryConditionManager, domain::Domain)
-    """
+"""
     Register domain information for boundary basis lookup.
 
     Extracts coordinate and basis information from a Domain object.
     """
+function register_domain_info!(manager::BoundaryConditionManager, domain::Domain)
     if !hasfield(typeof(domain), :bases) || domain.bases === nothing
         @warn "Domain has no bases information"
         return manager
@@ -611,8 +610,8 @@ function _bc_derivative_str(field::String, coordinate::String, order::Int)
     return "d($field, $coordinate, $order)"
 end
 
+"""Convert Dirichlet BC to equation string"""
 function bc_to_equation(manager::BoundaryConditionManager, bc::DirichletBC)
-    """Convert Dirichlet BC to equation string"""
     pos_str = isa(bc.position, String) ? bc.position : string(bc.position)
     val_str = _bc_value_to_string(bc.value)
     
@@ -626,8 +625,8 @@ function bc_to_equation(manager::BoundaryConditionManager, bc::DirichletBC)
     return equation
 end
 
+"""Convert Neumann BC to equation string"""
 function bc_to_equation(manager::BoundaryConditionManager, bc::NeumannBC)
-    """Convert Neumann BC to equation string"""
     pos_str = isa(bc.position, String) ? bc.position : string(bc.position)
     val_str = _bc_value_to_string(bc.value)
     
@@ -643,8 +642,8 @@ function bc_to_equation(manager::BoundaryConditionManager, bc::NeumannBC)
     return equation
 end
 
+"""Convert Robin BC to equation string"""
 function bc_to_equation(manager::BoundaryConditionManager, bc::RobinBC)
-    """Convert Robin BC to equation string"""
     pos_str = isa(bc.position, String) ? bc.position : string(bc.position)
     alpha_str = _bc_value_to_string(bc.alpha)
     beta_str = _bc_value_to_string(bc.beta)
@@ -661,8 +660,8 @@ function bc_to_equation(manager::BoundaryConditionManager, bc::RobinBC)
     return equation
 end
 
+"""Convert stress-free BC to equations"""
 function bc_to_equation(manager::BoundaryConditionManager, bc::StressFreeBC)
-    """Convert stress-free BC to equations"""
     pos_str = isa(bc.position, String) ? bc.position : string(bc.position)
     
     # Stress-free: u = 0 and du/dz = 0 at boundary (vanishing tangential stress)
@@ -674,14 +673,14 @@ function bc_to_equation(manager::BoundaryConditionManager, bc::StressFreeBC)
     return equations
 end
 
+"""Convert custom BC to equation string"""
 function bc_to_equation(manager::BoundaryConditionManager, bc::CustomBC)
-    """Convert custom BC to equation string"""
     return bc.expression
 end
 
 # Problem integration
+"""Apply all boundary conditions to problem"""
 function apply_boundary_conditions!(manager::BoundaryConditionManager, problem)
-    """Apply all boundary conditions to problem"""
     
     equations_added = String[]
     
@@ -708,8 +707,8 @@ function apply_boundary_conditions!(manager::BoundaryConditionManager, problem)
     return equations_added
 end
 
+"""Validate boundary conditions for consistency and completeness"""
 function validate_boundary_conditions(manager::BoundaryConditionManager, problem)
-    """Validate boundary conditions for consistency and completeness"""
     
     warnings = String[]
     errors = String[]
@@ -779,8 +778,8 @@ function validate_boundary_conditions(manager::BoundaryConditionManager, problem
 end
 
 # Utility functions
+"""Get count of boundary conditions by type"""
 function get_bc_count_by_type(manager::BoundaryConditionManager)
-    """Get count of boundary conditions by type"""
     counts = Dict{String, Int}()
     
     for bc in manager.conditions
@@ -791,8 +790,8 @@ function get_bc_count_by_type(manager::BoundaryConditionManager)
     return counts
 end
 
+"""Get list of required tau field names"""
 function get_required_tau_fields(manager::BoundaryConditionManager)
-    """Get list of required tau field names"""
     tau_fields = String[]
     
     for bc in manager.conditions
@@ -813,8 +812,8 @@ function get_required_tau_fields(manager::BoundaryConditionManager)
 end
 
 # Time and space dependency management
+"""Set the time variable for time-dependent boundary conditions"""
 function set_time_variable!(manager::BoundaryConditionManager, time_var::String, time_field=nothing)
-    """Set the time variable for time-dependent boundary conditions"""
     manager.time_variable = time_var
     if time_field !== nothing
         manager.coordinate_fields[time_var] = time_field
@@ -822,14 +821,14 @@ function set_time_variable!(manager::BoundaryConditionManager, time_var::String,
     return manager
 end
 
+"""Add spatial coordinate field for space-dependent boundary conditions"""
 function add_coordinate_field!(manager::BoundaryConditionManager, coord_name::String, field)
-    """Add spatial coordinate field for space-dependent boundary conditions"""
     manager.coordinate_fields[coord_name] = field
     return manager
 end
 
+"""Evaluate boundary condition value at current time and spatial coordinates"""
 function evaluate_bc_value(manager::BoundaryConditionManager, bc, current_time=0.0, coords=Dict())
-    """Evaluate boundary condition value at current time and spatial coordinates"""
 
     if isa(bc, DirichletBC)
         value = bc.value
@@ -1187,8 +1186,8 @@ function _evaluate_space_function_expression(func::Function, coords)
     end
 end
 
+"""Update all time-dependent boundary conditions for current time"""
 function update_time_dependent_bcs!(manager::BoundaryConditionManager, current_time)
-    """Update all time-dependent boundary conditions for current time"""
     
     if isempty(manager.time_dependent_bcs)
         return manager
@@ -1248,8 +1247,8 @@ function update_time_dependent_bcs!(manager::BoundaryConditionManager, current_t
     return manager
 end
 
+"""Retrieve the most recently cached value for a time-dependent BC."""
 function get_current_bc_value(manager::BoundaryConditionManager, bc_index::Int, current_time)
-    """Retrieve the most recently cached value for a time-dependent BC."""
     bc = manager.conditions[bc_index]
 
     if isa(bc, RobinBC)
@@ -1262,23 +1261,23 @@ function get_current_bc_value(manager::BoundaryConditionManager, bc_index::Int, 
     end
 end
 
+"""Check if boundary conditions need updating"""
 function requires_bc_update(manager::BoundaryConditionManager)
-    """Check if boundary conditions need updating"""
     return manager.bc_update_required || !isempty(manager.time_dependent_bcs)
 end
 
+"""Check if manager has any time-dependent boundary conditions"""
 function has_time_dependent_bcs(manager::BoundaryConditionManager)
-    """Check if manager has any time-dependent boundary conditions"""
     return !isempty(manager.time_dependent_bcs)
 end
 
+"""Check if manager has any space-dependent boundary conditions"""
 function has_space_dependent_bcs(manager::BoundaryConditionManager)
-    """Check if manager has any space-dependent boundary conditions"""
     return !isempty(manager.space_dependent_bcs)
 end
 
+"""Clear all boundary conditions and associated caches"""
 function clear_boundary_conditions!(manager::BoundaryConditionManager)
-    """Clear all boundary conditions and associated caches"""
     empty!(manager.conditions)
     empty!(manager.tau_fields)
     empty!(manager.lift_operators)
@@ -1291,8 +1290,8 @@ function clear_boundary_conditions!(manager::BoundaryConditionManager)
     return manager
 end
 
+"""Log boundary condition performance statistics"""
 function log_bc_performance(manager::BoundaryConditionManager)
-    """Log boundary condition performance statistics"""
 
     stats = manager.performance_stats
 
@@ -1353,8 +1352,8 @@ function evaluate_space_dependent_bcs!(manager::BoundaryConditionManager, coordi
     return manager
 end
 
+"""Clear cache for boundary conditions"""
 function clear_bc_cache!(manager::BoundaryConditionManager)
-    """Clear cache for boundary conditions"""
     empty!(manager.bc_cache)
     return manager
 end

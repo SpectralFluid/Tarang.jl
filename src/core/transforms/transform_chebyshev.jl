@@ -120,8 +120,7 @@ _apply_forward(current, t::ChebyshevTransform) = _chebyshev_forward(current, t)
 _apply_backward(current, t::ChebyshevTransform) = _chebyshev_backward(current, t)
 
 # Chebyshev transform application functions following Tarang patterns
-function apply_chebyshev_forward!(field::ScalarField, transform::ChebyshevTransform)
-    """
+"""
     Apply forward Chebyshev transform (grid to coefficients) with in-place operations.
 
     Based on Tarang ScipyDCT.forward and FFTWDCT.forward methods:
@@ -130,6 +129,7 @@ function apply_chebyshev_forward!(field::ScalarField, transform::ChebyshevTransf
     - Follows resize_rescale_forward pattern
     - OPTIMIZED: Uses workspace buffers to minimize allocations
     """
+function apply_chebyshev_forward!(field::ScalarField, transform::ChebyshevTransform)
 
     if ndims(get_grid_data(field)) != 1 || eltype(get_grid_data(field)) <: Complex || is_gpu_array(get_grid_data(field))
         set_coeff_data!(field, _chebyshev_forward(get_grid_data(field), transform))
@@ -186,15 +186,20 @@ function apply_chebyshev_forward!(field::ScalarField, transform::ChebyshevTransf
     end
 end
 
-function apply_chebyshev_backward!(field::ScalarField, transform::ChebyshevTransform)
-    """
+"""
     Apply backward Chebyshev transform (coefficients to grid) with in-place operations.
 
     Based on Tarang ScipyDCT.backward and FFTWDCT.backward methods:
     - Uses DCT-III with proper scaling for unit-amplitude normalization
     - Handles padding/truncation for different coefficient/grid sizes
     - OPTIMIZED: Uses workspace buffers and in-place operations
+
+    Note: This per-field path and the generic _chebyshev_backward() path use
+    identical normalization logic. The per-field path is optimized for 1D real
+    CPU data with workspace reuse; the generic path handles multi-dimensional,
+    complex, and GPU data.
     """
+function apply_chebyshev_backward!(field::ScalarField, transform::ChebyshevTransform)
 
     if ndims(get_coeff_data(field)) != 1 || eltype(get_coeff_data(field)) <: Complex || is_gpu_array(get_coeff_data(field))
         set_grid_data!(field, _chebyshev_backward(get_coeff_data(field), transform))
@@ -250,8 +255,8 @@ function apply_chebyshev_backward!(field::ScalarField, transform::ChebyshevTrans
     end
 end
 
+"""Apply forward Chebyshev transform using in-place matrix multiplication"""
 function apply_chebyshev_matrix_forward!(field::ScalarField, transform::ChebyshevTransform)
-    """Apply forward Chebyshev transform using in-place matrix multiplication"""
 
     if transform.forward_matrix !== nothing
         mat = transform.forward_matrix
@@ -277,8 +282,8 @@ function apply_chebyshev_matrix_forward!(field::ScalarField, transform::Chebyshe
     end
 end
 
+"""Apply backward Chebyshev transform using in-place matrix multiplication"""
 function apply_chebyshev_matrix_backward!(field::ScalarField, transform::ChebyshevTransform)
-    """Apply backward Chebyshev transform using in-place matrix multiplication"""
 
     if transform.backward_matrix !== nothing
         mat = transform.backward_matrix

@@ -7,15 +7,14 @@ This file contains utility functions used by operators, including:
 - require_linearity() methods for linearity checking
 """
 
-using LinearAlgebra
-using SparseArrays
+# LinearAlgebra, SparseArrays already in Tarang.jl
 
 # ============================================================================
 # FFT Frequency Utility
 # ============================================================================
 
 """
-    fftfreq(n, d=1.0)
+    _fftfreq(n, d=1.0)
 
 Return the Discrete Fourier Transform sample frequencies.
 
@@ -23,9 +22,10 @@ The returned array contains the frequency bin centers in cycles per unit of the 
 For n even: [0, 1, ..., n/2-1, -n/2, ..., -1] / (d*n)
 For n odd:  [0, 1, ..., (n-1)/2, -(n-1)/2, ..., -1] / (d*n)
 
-This is equivalent to numpy.fft.fftfreq.
+Equivalent to numpy.fft.fftfreq / AbstractFFTs.fftfreq.
+Named with underscore prefix to avoid shadowing AbstractFFTs.fftfreq.
 """
-function fftfreq(n::Int, d::Real=1.0)
+function _fftfreq(n::Int, d::Real=1.0)
     results = zeros(Float64, n)
     N = (n - 1) ÷ 2 + 1
     for i in 0:(N-1)

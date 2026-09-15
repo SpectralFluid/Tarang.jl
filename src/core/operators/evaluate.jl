@@ -222,11 +222,26 @@ end
 
 _add_result(left::Number, right::Number, ::Symbol) = left + right
 
+function _add_result(left::VectorField, right::VectorField, layout::Symbol)
+    result = VectorField(left.dist, left.coordsys, "_add", left.bases, left.dtype)
+    for (i, (lcomp, rcomp)) in enumerate(zip(left.components, right.components))
+        ensure_layout!(lcomp, layout)
+        ensure_layout!(rcomp, layout)
+        ensure_layout!(result.components[i], layout)
+        l_data = layout == :g ? get_grid_data(lcomp) : get_coeff_data(lcomp)
+        r_data = layout == :g ? get_grid_data(rcomp) : get_coeff_data(rcomp)
+        res_data = layout == :g ? get_grid_data(result.components[i]) : get_coeff_data(result.components[i])
+        if l_data !== nothing && r_data !== nothing && res_data !== nothing
+            @. res_data = l_data + r_data
+        end
+    end
+    return result
+end
+
 function _add_result(left, right, ::Symbol)
     throw(ArgumentError(
         "Cannot add $(typeof(left)) and $(typeof(right)). " *
-        "Supported: ScalarField+ScalarField, Number+Number. " *
-        "VectorField addition: use `add_vector_fields(a, b)`."))
+        "Supported: ScalarField+ScalarField, VectorField+VectorField, Number+Number."))
 end
 
 """
@@ -256,10 +271,26 @@ end
 
 _subtract_result(left::Number, right::Number, ::Symbol) = left - right
 
+function _subtract_result(left::VectorField, right::VectorField, layout::Symbol)
+    result = VectorField(left.dist, left.coordsys, "_sub", left.bases, left.dtype)
+    for (i, (lcomp, rcomp)) in enumerate(zip(left.components, right.components))
+        ensure_layout!(lcomp, layout)
+        ensure_layout!(rcomp, layout)
+        ensure_layout!(result.components[i], layout)
+        l_data = layout == :g ? get_grid_data(lcomp) : get_coeff_data(lcomp)
+        r_data = layout == :g ? get_grid_data(rcomp) : get_coeff_data(rcomp)
+        res_data = layout == :g ? get_grid_data(result.components[i]) : get_coeff_data(result.components[i])
+        if l_data !== nothing && r_data !== nothing && res_data !== nothing
+            @. res_data = l_data - r_data
+        end
+    end
+    return result
+end
+
 function _subtract_result(left, right, ::Symbol)
     throw(ArgumentError(
         "Cannot subtract $(typeof(left)) and $(typeof(right)). " *
-        "Supported: ScalarField-ScalarField, Number-Number."))
+        "Supported: ScalarField-ScalarField, VectorField-VectorField, Number-Number."))
 end
 
 """

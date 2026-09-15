@@ -364,7 +364,7 @@ async_copy_to_gpu!(gpu_array, pinned_src)
 release_pinned_buffer!(pinned_src, size(cpu_array))
 ```
 """
-function async_copy_to_gpu!(dst::CuArray{T}, src::Array{T}; stream=nothing) where T
+function async_copy_to_gpu!(dst::CuArray{T}, src::Array{T}; stream=nothing, synchronize::Bool=true) where T
     # Use the device of the destination array for stream selection
     dst_device = CUDA.device(dst)
     device_id = CUDA.deviceid(dst_device)
@@ -377,8 +377,11 @@ function async_copy_to_gpu!(dst::CuArray{T}, src::Array{T}; stream=nothing) wher
             CUDA.stream!(s) do
                 copyto!(dst, src)
             end
-            # Always synchronize for safety - prevents race conditions
-            CUDA.synchronize(s)
+            # Synchronize by default for safety — set synchronize=false
+            # when caller manages synchronization for true async overlap
+            if synchronize
+                CUDA.synchronize(s)
+            end
         finally
             CUDA.device!(prev_device)
         end
@@ -416,7 +419,7 @@ copyto!(cpu_array, pinned_dst)
 release_pinned_buffer!(pinned_dst, size(gpu_array))
 ```
 """
-function async_copy_to_cpu!(dst::Array{T}, src::CuArray{T}; stream=nothing) where T
+function async_copy_to_cpu!(dst::Array{T}, src::CuArray{T}; stream=nothing, synchronize::Bool=true) where T
     # Use the device of the source array for stream selection
     src_device = CUDA.device(src)
     device_id = CUDA.deviceid(src_device)
@@ -429,8 +432,9 @@ function async_copy_to_cpu!(dst::Array{T}, src::CuArray{T}; stream=nothing) wher
             CUDA.stream!(s) do
                 copyto!(dst, src)
             end
-            # Always synchronize for safety - prevents race conditions
-            CUDA.synchronize(s)
+            if synchronize
+                CUDA.synchronize(s)
+            end
         finally
             CUDA.device!(prev_device)
         end

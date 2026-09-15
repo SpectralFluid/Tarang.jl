@@ -107,14 +107,16 @@ end
     f = make_periodic_field("u")
     prob = IVP([f])
 
-    # add_substitution! uses Base.depwarn internally, so it may emit a
-    # deprecation warning depending on --depwarn flag.  We only verify that
-    # the function still works correctly (sets the namespace value).
-    Tarang.add_substitution!(prob, "nu", 1e-3)
+    # add_substitution! uses Base.depwarn internally; suppress the expected warnings.
+    @test_nowarn begin
+        Tarang.add_substitution!(prob, "nu", 1e-3; _internal=true)
+    end
     @test prob.namespace["nu"] == 1e-3
 
     # Calling it again overwrites
-    Tarang.add_substitution!(prob, "nu", 2e-3)
+    @test_nowarn begin
+        Tarang.add_substitution!(prob, "nu", 2e-3; _internal=true)
+    end
     @test prob.namespace["nu"] == 2e-3
 
     # add_parameters! calls add_substitution! with _internal=true (no depwarn)

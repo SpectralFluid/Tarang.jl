@@ -6,8 +6,7 @@ sparse matrices for implicit solvers, along with helper functions
 for differentiation matrices and lift matrices.
 """
 
-using LinearAlgebra
-using SparseArrays
+# LinearAlgebra, SparseArrays already in Tarang.jl
 
 # ============================================================================
 # Expression Matrices for Matrix Assembly

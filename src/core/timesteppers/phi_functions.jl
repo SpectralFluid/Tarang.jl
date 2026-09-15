@@ -28,15 +28,18 @@ end
 
 # Cached workspace for phi_functions_matrix to avoid repeated identity matrix allocation
 const _phi_identity_cache = Dict{Tuple{Int, DataType}, Matrix}()
+const _phi_identity_lock = ReentrantLock()
 
 @inline function _get_identity_matrix(n::Int, T::Type)
-    get!(_phi_identity_cache, (n, T)) do
-        Matrix{T}(LinearAlgebra.I, n, n)
+    lock(_phi_identity_lock) do
+        get!(_phi_identity_cache, (n, T)) do
+            Matrix{T}(LinearAlgebra.I, n, n)
+        end
     end
 end
 
+"""Compute matrix φ functions for exponential integrators"""
 function phi_functions_matrix(A::AbstractMatrix, dt::Float64)
-    """Compute matrix φ functions for exponential integrators"""
 
     z = dt * A
 
@@ -85,8 +88,8 @@ function phi_functions_matrix(A::AbstractMatrix, dt::Float64)
     end
 end
 
+"""Stable computation of φ₁"""
 function _compute_phi1_stable(z, exp_z, I)
-    """Stable computation of φ₁"""
     z_norm = norm(z)
     if z_norm < 1e-2
         # Use series expansion for better accuracy (reuse z powers)
@@ -99,12 +102,12 @@ function _compute_phi1_stable(z, exp_z, I)
     end
 end
 
-function _compute_phi2_stable(z, exp_z, I, φ₁)
-    """
+"""
     Stable computation of φ₂(z) = (exp(z) - 1 - z) / z² = (φ₁(z) - I) / z
 
     Reference: Cox & Matthews (2002), Hochbruck & Ostermann (2010)
     """
+function _compute_phi2_stable(z, exp_z, I, φ₁)
     z_norm = norm(z)
     if z_norm < 1e-2
         # Use series expansion for better accuracy near z=0 (reuse z powers)
@@ -116,10 +119,10 @@ function _compute_phi2_stable(z, exp_z, I, φ₁)
     end
 end
 
-function _phi_functions_pade(z)
-    """Padé approximation fallback for φ functions.
+"""Padé approximation fallback for φ functions.
     Uses scaling-and-squaring with Padé [3/3] for better accuracy than [1/1].
     """
+function _phi_functions_pade(z)
     n = size(z, 1)
     I_mat = _get_identity_matrix(n, eltype(z))
 
@@ -153,8 +156,7 @@ function _phi_functions_pade(z)
     return exp_z, φ₁, φ₂
 end
 
-function _phi_functions_krylov(A::AbstractMatrix, krylov_dim::Int=30)
-    """
+"""
     Krylov subspace approximation for φ functions using ExponentialUtilities.jl.
 
     Uses the phiv function which computes [φ₀(A)b, φ₁(A)b, ..., φₖ(A)b] efficiently
@@ -162,6 +164,7 @@ function _phi_functions_krylov(A::AbstractMatrix, krylov_dim::Int=30)
 
     For matrix φ functions, we compute φₖ(A) by applying to identity vectors.
     """
+function _phi_functions_krylov(A::AbstractMatrix, krylov_dim::Int=30)
     n = size(A, 1)
     T = eltype(A)
 
@@ -196,9 +199,10 @@ function _phi_functions_krylov(A::AbstractMatrix, krylov_dim::Int=30)
         @warn "Krylov φ computation failed: $e, falling back to direct method"
         # Fallback to direct computation
         try
+            I_n = Matrix{T}(LinearAlgebra.I, n, n)
             exp_A = exp(A)
-            φ₁ = (exp_A - I_mat) * inv(A)
-            φ₂ = (exp_A - I_mat - A) * inv(A^2)
+            φ₁ = (exp_A - I_n) * inv(A)
+            φ₂ = (exp_A - I_n - A) * inv(A^2)
             return exp_A, φ₁, φ₂
         catch e2
             error("All φ function computation methods failed for matrix of size $(size(A)) " *
@@ -208,8 +212,7 @@ function _phi_functions_krylov(A::AbstractMatrix, krylov_dim::Int=30)
     end
 end
 
-function phiv_vector(t::Real, A::AbstractMatrix, b::AbstractVector, k::Int; m::Int=30)
-    """
+"""
     Compute [φ₀(tA)b, φ₁(tA)b, ..., φₖ(tA)b] using Krylov subspace methods.
 
     This is a convenience wrapper around ExponentialUtilities.phiv for
@@ -225,11 +228,11 @@ function phiv_vector(t::Real, A::AbstractMatrix, b::AbstractVector, k::Int; m::I
     Returns:
     - Matrix of size (n, k+1) where column j+1 contains φⱼ(tA)b
     """
+function phiv_vector(t::Real, A::AbstractMatrix, b::AbstractVector, k::Int; m::Int=30)
     return phiv(t, A, b, k; m=min(m, length(b)))
 end
 
-function expv_krylov(t::Real, A::AbstractMatrix, b::AbstractVector; m::Int=30)
-    """
+"""
     Compute exp(tA)b using Krylov subspace methods.
 
     More efficient than computing exp(tA) and then multiplying by b,
@@ -244,5 +247,6 @@ function expv_krylov(t::Real, A::AbstractMatrix, b::AbstractVector; m::Int=30)
     Returns:
     - Vector exp(tA)b
     """
+function expv_krylov(t::Real, A::AbstractMatrix, b::AbstractVector; m::Int=30)
     return expv(t, A, b; m=min(m, length(b)))
 end

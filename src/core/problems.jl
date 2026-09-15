@@ -2,8 +2,7 @@
 Problem formulation classes
 """
 
-using LinearAlgebra
-using SparseArrays
+# LinearAlgebra, SparseArrays already in Tarang.jl
 
 abstract type Problem end
 
@@ -404,8 +403,8 @@ end
 # Problem building and manipulation
 # ============================================================================
 
+"""Add equation to problem"""
 function add_equation!(problem::Problem, equation::String)
-    """Add equation to problem"""
     push!(problem.equations, equation)
 end
 
@@ -647,8 +646,8 @@ end
 #   add_equation!(problem, "u(z=0) = 0")  # Dirichlet BC
 #   add_equation!(problem, "dz(u)(z=1) = 0")  # Neumann BC
 
+"""Register tau field for boundary condition enforcement"""
 function register_tau_field!(problem::Problem, name::String, field)
-    """Register tau field for boundary condition enforcement"""
     register_tau_field!(problem.bc_manager, name, field)
     
     # Add to problem variables if not already present
@@ -659,19 +658,18 @@ function register_tau_field!(problem::Problem, name::String, field)
     return problem
 end
 
+"""Set parameter value"""
 function set_parameter!(problem::Problem, name::String, value)
-    """Set parameter value"""
     problem.parameters[name] = value
 end
 
+"""Get parameter value"""
 function get_parameter(problem::Problem, name::String, default=nothing)
-    """Get parameter value"""
     return get(problem.parameters, name, default)
 end
 
 # Equation parsing following structure
-function parse_equation(equation::String, namespace::Dict{String, Any})
-    """
+"""
     Parse equation string into operator expressions following formulation requirements.
     
     Requires:
@@ -681,6 +679,7 @@ function parse_equation(equation::String, namespace::Dict{String, Any})
     
     Following problems:add_equation pattern (problems:65-80).
     """
+function parse_equation(equation::String, namespace::Dict{String, Any})
     
     try
         # Split equation into LHS and RHS expressions
@@ -709,8 +708,7 @@ function parse_equation(equation::String, namespace::Dict{String, Any})
     end
 end
 
-function parse_linear_expression(expr_str::AbstractString, namespace::Dict{String, Any})
-    """
+"""
     Parse LHS expression ensuring it contains only linear terms.
     
     Linear terms allowed on LHS:
@@ -721,6 +719,7 @@ function parse_linear_expression(expr_str::AbstractString, namespace::Dict{Strin
     
     Non-constant coefficients should be moved to RHS.
     """
+function parse_linear_expression(expr_str::AbstractString, namespace::Dict{String, Any})
     
     expr = parse_expression(expr_str, namespace)
     
@@ -768,8 +767,8 @@ function is_linear_expression(expr, namespace::Dict{String, Any})
     end
 end
 
+"""Collect all problem variables (fields) from namespace."""
 function collect_problem_variables(namespace::Dict{String, Any})
-    """Collect all problem variables (fields) from namespace."""
     variables = []
     for (name, val) in namespace
         if isa(val, ScalarField) || isa(val, VectorField) || isa(val, TensorField)
@@ -779,8 +778,8 @@ function collect_problem_variables(namespace::Dict{String, Any})
     return variables
 end
 
+"""Check if expression is a direct reference to a problem variable."""
 function is_variable_reference(expr, namespace::Dict{String, Any})
-    """Check if expression is a direct reference to a problem variable."""
     if hasfield(typeof(expr), :name) && isa(getfield(expr, :name), String)
         var_name = getfield(expr, :name)
         if haskey(namespace, var_name)
@@ -795,11 +794,11 @@ function is_variable_reference(expr, namespace::Dict{String, Any})
     return false
 end
 
-function is_constant_coefficient(expr, namespace::Dict{String, Any})
-    """
+"""
     Check if expression represents a constant coefficient.
     Non-constant coefficients should be moved to RHS per requirements.
     """
+function is_constant_coefficient(expr, namespace::Dict{String, Any})
     
     if isa(expr, ConstantOperator)
         return true
@@ -816,8 +815,7 @@ function is_constant_coefficient(expr, namespace::Dict{String, Any})
     return false
 end
 
-function validate_equation_structure(LHS, RHS, original_equation::String)
-    """
+"""
     Validate that equation follows structure requirements.
     
     Requirements:
@@ -826,6 +824,7 @@ function validate_equation_structure(LHS, RHS, original_equation::String)
     3. RHS can contain nonlinear terms
     4. Non-constant coefficients should be on RHS
     """
+function validate_equation_structure(LHS, RHS, original_equation::String)
     
     # Check for temporal derivatives on RHS (not allowed)
     if contains_time_derivatives(RHS)
@@ -846,8 +845,8 @@ function validate_equation_structure(LHS, RHS, original_equation::String)
     return true
 end
 
+"""Check if expression tree contains any time derivatives."""
 function contains_time_derivatives(expr)
-    """Check if expression tree contains any time derivatives."""
     if expr === nothing
         return false
     elseif isa(expr, TimeDerivative)
@@ -870,8 +869,7 @@ function contains_time_derivatives(expr)
     end
 end
 
-function is_proper_lhs_structure(expr)
-    """
+"""
     Check if LHS has proper structure for matrix formulation.
     Should be of the form: M·∂tX + L·X where M and L are linear operators.
 
@@ -888,6 +886,7 @@ function is_proper_lhs_structure(expr)
     - :is_linear => whether all terms are linear
     - :error_message => description of any structural issues
     """
+function is_proper_lhs_structure(expr)
 
     info = Dict{Symbol, Any}(
         :has_time_derivative => false,
@@ -904,10 +903,10 @@ function is_proper_lhs_structure(expr)
     return (is_valid, info)
 end
 
-function _analyze_lhs_structure!(expr, info::Dict{Symbol, Any}, namespace::Dict{String, Any})
-    """
+"""
     Recursively analyze expression structure for LHS validity.
     """
+function _analyze_lhs_structure!(expr, info::Dict{Symbol, Any}, namespace::Dict{String, Any})
 
     # Handle nothing/empty case
     if expr === nothing
@@ -1080,10 +1079,10 @@ function _analyze_lhs_structure!(expr, info::Dict{Symbol, Any}, namespace::Dict{
     return is_linear_expression(expr, namespace)
 end
 
-function _analyze_lhs_operand!(operand, info::Dict{Symbol, Any}, namespace::Dict{String, Any})
-    """
+"""
     Analyze the operand of a differential operator.
     """
+function _analyze_lhs_operand!(operand, info::Dict{Symbol, Any}, namespace::Dict{String, Any})
     if isa(operand, ScalarField)
         push!(info[:dependent_variables], operand.name)
         return true
@@ -1095,11 +1094,11 @@ function _analyze_lhs_operand!(operand, info::Dict{Symbol, Any}, namespace::Dict
     end
 end
 
-function _is_constant_coefficient_strict(expr, namespace::Dict{String, Any})
-    """
+"""
     Strictly check if expression is a constant coefficient.
     Constants are: numbers, ConstantOperator, or namespace entries that are constant.
     """
+function _is_constant_coefficient_strict(expr, namespace::Dict{String, Any})
     if isa(expr, Number)
         return true
     end
@@ -1158,11 +1157,11 @@ function _is_constant_coefficient_strict(expr, namespace::Dict{String, Any})
     return false
 end
 
-function _get_constant_value(expr)
-    """
+"""
     Extract numeric value from a constant expression.
     Returns nothing if not a simple constant.
     """
+function _get_constant_value(expr)
     if isa(expr, Number)
         return expr
     end
@@ -1174,11 +1173,11 @@ function _get_constant_value(expr)
     return nothing
 end
 
-function validate_lhs_structure(expr)
-    """
+"""
     Validate LHS structure and return a detailed report.
     Throws an error if the structure is invalid.
     """
+function validate_lhs_structure(expr)
     is_valid, info = is_proper_lhs_structure(expr)
 
     if !is_valid
@@ -1192,14 +1191,14 @@ function validate_lhs_structure(expr)
     return info
 end
 
-function parse_expression(expr_str::AbstractString, namespace::Dict{String, Any})
-    """
+"""
     Parse expression string into operator tree following patterns.
     Uses Julia's Meta.parse for proper AST parsing and operator precedence handling.
     
     This function evaluates mathematical expressions similar to how one would use
     eval(string, namespace) in problems:73-74.
     """
+function parse_expression(expr_str::AbstractString, namespace::Dict{String, Any})
     
     expr_str = strip(expr_str)
     
@@ -1234,11 +1233,11 @@ function parse_expression(expr_str::AbstractString, namespace::Dict{String, Any}
     end
 end
 
-function evaluate_parsed_expression(expr, namespace::Dict{String, Any})
-    """
+"""
     Recursively evaluate parsed expression with namespace substitution.
     Similar to eval(string, namespace) but with proper Julia AST handling.
     """
+function evaluate_parsed_expression(expr, namespace::Dict{String, Any})
     
     if isa(expr, Symbol)
         # Variable/function lookup
@@ -1482,11 +1481,11 @@ function evaluate_parsed_expression(expr, namespace::Dict{String, Any})
     end
 end
 
-function fallback_parse_expression(expr_str::AbstractString, namespace::Dict{String, Any})
-    """
+"""
     Fallback parsing for expressions that fail Meta.parse evaluation.
     Uses simple string pattern matching as backup.
     """
+function fallback_parse_expression(expr_str::AbstractString, namespace::Dict{String, Any})
     
     # Handle simple field references
     if haskey(namespace, expr_str)
@@ -1616,12 +1615,12 @@ function _find_coordinate_for_field(field::Operand, coord_name::String, namespac
     return nothing
 end
 
-function build_matrices(problem::Problem)
-    """
+"""
     Build system matrices for problem following structure.
     Following subsystems:build_subproblem_matrices (subsystems:72-81) and
     Subproblem.build_matrices (subsystems:497-576).
     """
+function build_matrices(problem::Problem)
     
     if length(problem.equations) == 0
         throw(ArgumentError("No equations specified"))
@@ -1712,11 +1711,11 @@ function build_matrices(problem::Problem)
     return L_matrix, M_matrix, F_vector
 end
 
-function build_matrix_expressions!(problem::Problem)
-    """
+"""
     Build matrix expressions from parsed equations.
     Following problems:_build_matrix_expressions patterns.
     """
+function build_matrix_expressions!(problem::Problem)
     
     problem.equation_data = Dict{String, Any}[]
     
@@ -1758,11 +1757,11 @@ function build_matrix_expressions!(problem::Problem)
     end
 end
 
-function build_equation_expressions(lhs, rhs, variables::Vector)
-    """
+"""
     Build matrix expressions from LHS and RHS operators.
     Following _build_matrix_expressions patterns.
     """
+function build_equation_expressions(lhs, rhs, variables::Vector)
     
     eq_data = Dict{String, Any}()
     
@@ -1880,11 +1879,11 @@ end
     return hasfield(typeof(var), :name) ? getfield(var, :name) : nothing
 end
 
-function split_time_spatial_operators(operator)
-    """
+"""
     Split operator into time derivative (mass matrix) and spatial (stiffness) terms.
     Following operators split pattern.
     """
+function split_time_spatial_operators(operator)
     
     M_terms = []  # Time derivative terms
     L_terms = []  # Spatial terms
@@ -1985,8 +1984,8 @@ function split_time_spatial_operators(operator)
     return M_terms, L_terms
 end
 
+"""Combine operator terms into single expression"""
 function combine_operators(terms::Vector)
-    """Combine operator terms into single expression"""
     if isempty(terms)
         return ZeroOperator()
     elseif length(terms) == 1
@@ -2022,8 +2021,8 @@ end
 field_dofs(field::VectorField) = sum(field_dofs(comp) for comp in field.components)
 field_dofs(field::TensorField) = sum(field_dofs(comp) for comp in vec(field.components))
 
+"""Compute size (degrees of freedom) of field or equation data"""
 function compute_field_size(field_or_data)
-    """Compute size (degrees of freedom) of field or equation data"""
     if isa(field_or_data, Dict)
         if haskey(field_or_data, "equation_size")
             return field_or_data["equation_size"]
@@ -2052,8 +2051,7 @@ function compute_field_size(field_or_data)
     end
 end
 
-function check_equation_condition(eq_data::Dict)
-    """
+"""
     Check if equation should be included in matrix assembly.
 
     An equation is included if:
@@ -2066,6 +2064,7 @@ function check_equation_condition(eq_data::Dict)
     Following patterns where equations can be conditionally
     included/excluded based on wavenumber, problem parameters, etc.
     """
+function check_equation_condition(eq_data::Dict)
 
     # Check if equation is explicitly disabled
     if haskey(eq_data, "enabled") && !eq_data["enabled"]
@@ -2171,11 +2170,11 @@ function check_equation_condition(eq_data::Dict)
     return true
 end
 
-function is_equation_valid(eq_data::Dict)
-    """
+"""
     Check if equation data is structurally valid.
     Returns (is_valid::Bool, error_message::Union{String,Nothing})
     """
+function is_equation_valid(eq_data::Dict)
 
     # Must have equation string
     if !haskey(eq_data, "equation_string")
@@ -2204,46 +2203,46 @@ function is_equation_valid(eq_data::Dict)
     return (true, nothing)
 end
 
-function set_equation_condition!(eq_data::Dict, condition::Union{Bool, Function})
-    """
+"""
     Set a condition for equation inclusion in matrix assembly.
     """
+function set_equation_condition!(eq_data::Dict, condition::Union{Bool, Function})
     eq_data["condition"] = condition
 end
 
+"""Enable an equation for matrix assembly."""
 function enable_equation!(eq_data::Dict)
-    """Enable an equation for matrix assembly."""
     eq_data["enabled"] = true
 end
 
+"""Disable an equation from matrix assembly."""
 function disable_equation!(eq_data::Dict)
-    """Disable an equation from matrix assembly."""
     eq_data["enabled"] = false
 end
 
-function set_valid_modes!(eq_data::Dict, modes::Union{Vector, Set, AbstractRange})
-    """
+"""
     Set the valid wavenumber modes for this equation.
     The equation will only be included for these modes.
     """
+function set_valid_modes!(eq_data::Dict, modes::Union{Vector, Set, AbstractRange})
     eq_data["valid_modes"] = Set(modes)
 end
 
-function exclude_k_zero!(eq_data::Dict, exclude::Bool=true)
-    """
+"""
     Exclude this equation from k=0 (homogeneous) mode.
     Useful for gauge conditions in incompressible flow problems.
     """
+function exclude_k_zero!(eq_data::Dict, exclude::Bool=true)
     eq_data["exclude_k_zero"] = exclude
 end
 
+"""Get matrix expression from equation data"""
 function get_matrix_expression(eq_data::Dict, matrix_name::String)
-    """Get matrix expression from equation data"""
     return get(eq_data, matrix_name, nothing)
 end
 
+"""Check if expression is effectively zero"""
 function is_zero_expression(expr)
-    """Check if expression is effectively zero"""
     return isa(expr, ZeroOperator) || expr === nothing
 end
 
@@ -2258,11 +2257,11 @@ function _identity_block(eqn_size::Int, var_size::Int; scale::Number=1.0)
     return spdiagm(eqn_size, var_size, 0 => vals)
 end
 
-function build_expression_matrix_block(expr, var, eqn_size::Int, var_size::Int)
-    """
+"""
     Build matrix block for expression acting on variable.
     Following expression_matrices pattern.
     """
+function build_expression_matrix_block(expr, var, eqn_size::Int, var_size::Int)
     
     if isa(expr, TimeDerivative) && _operand_matches_variable(expr.operand, var)
         # Time derivative of this variable -> identity block
@@ -2350,8 +2349,8 @@ function build_expression_matrix_block(expr, var, eqn_size::Int, var_size::Int)
     end
 end
 
+"""Build forcing vector from RHS terms"""
 function build_forcing_vector(problem::Problem, eqn_sizes::Vector{Int}, total_size::Int)
-    """Build forcing vector from RHS terms"""
     
     F_vector = zeros(ComplexF64, total_size)
     
@@ -2380,12 +2379,12 @@ end
 
 # Legacy functions (kept for compatibility)
 
-function process_lhs_operator!(L_matrix::Matrix, M_matrix::Matrix, lhs_op, eq_idx::Int, variables::Vector)
-    """
+"""
     Process LHS operator and extract contributions to system matrices.
     Following pattern where time derivatives go to M_matrix,
     spatial operators go to L_matrix.
     """
+function process_lhs_operator!(L_matrix::Matrix, M_matrix::Matrix, lhs_op, eq_idx::Int, variables::Vector)
     
     if isa(lhs_op, TimeDerivative)
         # Time derivative terms go to mass matrix
@@ -2455,14 +2454,14 @@ function process_lhs_operator!(L_matrix::Matrix, M_matrix::Matrix, lhs_op, eq_id
     end
 end
 
-function process_rhs_operator!(F_vector::Vector, rhs_op, eq_idx::Int, variables::Vector)
-    """
+"""
     Process RHS operator and extract contributions to forcing vector.
     Following pattern where RHS represents known terms/forcing.
 
     Recursively evaluates composite operators (Add, Subtract, Multiply) to
     compute the scalar forcing value for each equation.
     """
+function process_rhs_operator!(F_vector::Vector, rhs_op, eq_idx::Int, variables::Vector)
 
     if isa(rhs_op, ConstantOperator)
         # Constant forcing term
@@ -2581,8 +2580,8 @@ function evaluate_rhs_scalar(op, variables::Vector)
     end
 end
 
+"""Find index of variable in problem variable list"""
 function find_variable_index(operand, variables::Vector)
-    """Find index of variable in problem variable list"""
     
     # Handle direct variable reference
     for (i, var) in enumerate(variables)
@@ -2604,8 +2603,8 @@ function find_variable_index(operand, variables::Vector)
 end
 
 # Domain setup
+"""Setup domain for problem based on variables"""
 function setup_domain!(problem::Problem)
-    """Setup domain for problem based on variables"""
     
     if length(problem.variables) == 0
         throw(ArgumentError("No variables specified"))
@@ -2641,8 +2640,8 @@ function setup_domain!(problem::Problem)
 end
 
 # Problem validation
+"""Validate problem formulation"""
 function validate_problem(problem::Problem)
-    """Validate problem formulation"""
 
     errors = String[]
 
@@ -2718,11 +2717,11 @@ function add_substitution!(problem::Problem, name::String, expression;
     problem.namespace[name] = expression
 end
 
-function expand_substitutions!(problem::Problem)
-    """
+"""
     Expand substitutions in equations following pattern.
     Following expand(*vars) methods (arithmetic:319-329, operators:704-739).
     """
+function expand_substitutions!(problem::Problem)
     
     # Get all variables for expansion
     variables = problem.variables
@@ -2782,11 +2781,11 @@ function expand_substitutions!(problem::Problem)
     return problem
 end
 
-function expand_expression(expr, variables::Vector)
-    """
+"""
     Expand expression over specified variables following pattern.
     Following operators:expand and arithmetic:expand methods.
     """
+function expand_expression(expr, variables::Vector)
     
     if expr === nothing || isa(expr, String)
         return expr
@@ -2854,13 +2853,13 @@ function expand_expression(expr, variables::Vector)
     end
 end
 
-function has_variables(expr, variables::Vector)
-    """
+"""
     Check if expression contains any of the specified variables.
 
     Wrapper around the proper has() method from field.jl/operators.jl following
     the Dedalus pattern (dedalus/core/field.py:has and arithmetic.py:has).
     """
+function has_variables(expr, variables::Vector)
 
     if expr === nothing || isa(expr, String)
         return false
@@ -2870,8 +2869,8 @@ function has_variables(expr, variables::Vector)
     return has(expr, variables...)
 end
 
+"""Combine two expressions with addition, flattening nested additions"""
 function combine_add_expressions(left, right)
-    """Combine two expressions with addition, flattening nested additions"""
     
     if isa(left, ZeroOperator)
         return right
@@ -2882,11 +2881,11 @@ function combine_add_expressions(left, right)
     end
 end
 
-function expand_multiply_expressions(left, right, variables::Vector)
-    """
+"""
     Expand multiplication with distribution over addition.
     Following arithmetic:expand multiplication pattern.
     """
+function expand_multiply_expressions(left, right, variables::Vector)
     
     # If either operand is addition involving variables, distribute
     if isa(left, AddOperator) && has_variables(left, variables)
@@ -2907,11 +2906,11 @@ function expand_multiply_expressions(left, right, variables::Vector)
     end
 end
 
-function distribute_operator_over_operand(operator, expanded_operand, variables::Vector)
-    """
+"""
     Distribute operator over expanded operand.
     Following operators:_expand_add pattern.
     """
+function distribute_operator_over_operand(operator, expanded_operand, variables::Vector)
     
     if isa(expanded_operand, AddOperator) && has_variables(expanded_operand, variables)
         # Op(a + b) = Op(a) + Op(b) for linear operators
@@ -2925,8 +2924,8 @@ function distribute_operator_over_operand(operator, expanded_operand, variables:
     end
 end
 
+"""Create new operator of same type with different operand"""
 function create_similar_operator(operator, new_operand)
-    """Create new operator of same type with different operand"""
     
     if isa(operator, TimeDerivative)
         return TimeDerivative(new_operand, operator.order)
@@ -2944,8 +2943,8 @@ function create_similar_operator(operator, new_operand)
     end
 end
 
+"""Reconstruct equation string from expanded expressions"""
 function reconstruct_equation_string(lhs, rhs)
-    """Reconstruct equation string from expanded expressions"""
     
     lhs_str = expression_to_string(lhs)
     rhs_str = expression_to_string(rhs)
@@ -2953,8 +2952,8 @@ function reconstruct_equation_string(lhs, rhs)
     return "$lhs_str = $rhs_str"
 end
 
+"""Convert expression back to string representation"""
 function expression_to_string(expr)
-    """Convert expression back to string representation"""
 
     if isa(expr, String)
         return expr
@@ -3207,8 +3206,8 @@ function apply_substitution_recursive(expr, substitutions::Dict)
 end
 
 # Problem metadata
+"""Get names of all variables"""
 function get_variable_names(problem::Problem)
-    """Get names of all variables"""
     names = String[]
     for var in problem.variables
         if isa(var, ScalarField)
@@ -3226,13 +3225,13 @@ function get_variable_names(problem::Problem)
     return names
 end
 
+"""Get total number of equations including boundary conditions"""
 function get_equation_count(problem::Problem)
-    """Get total number of equations including boundary conditions"""
     return length(problem.equations) + length(problem.boundary_conditions)
 end
 
+"""Get total number of scalar variables"""
 function get_variable_count(problem::Problem)
-    """Get total number of scalar variables"""
     count = 0
     for var in problem.variables
         if isa(var, ScalarField)

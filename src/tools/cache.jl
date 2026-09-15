@@ -8,9 +8,10 @@ Caching utilities
 struct CachedMethod{F}
     func::F
     cache::Dict{Any, Any}
-    
-    function CachedMethod(func::F) where F
-        new{F}(func, Dict{Any, Any}())
+    maxsize::Int
+
+    function CachedMethod(func::F; maxsize::Int=1024) where F
+        new{F}(func, Dict{Any, Any}(), maxsize)
     end
 end
 
@@ -19,6 +20,10 @@ function (cm::CachedMethod)(args...)
         return cm.cache[args]
     else
         result = cm.func(args...)
+        # Evict oldest entry if at capacity (simple FIFO via iterate)
+        if length(cm.cache) >= cm.maxsize
+            delete!(cm.cache, first(keys(cm.cache)))
+        end
         cm.cache[args] = result
         return result
     end
@@ -164,7 +169,20 @@ function _evict_lru!(lru::LRUCache)
     end
 end
 
+function _renumber_timestamps!(lru::LRUCache)
+    # Sort entries by current timestamp and reassign 1..N
+    entries = sort!(collect(lru.cache), by = p -> p.second.timestamp)
+    for (i, (_, entry)) in enumerate(entries)
+        entry.timestamp = i
+    end
+    lru.counter = length(entries)
+end
+
 function Base.get!(lru::LRUCache{K, V}, key::K, default_func::Function) where {K, V}
+    # Prevent counter overflow by renumbering when approaching typemax
+    if lru.counter >= typemax(Int) - lru.capacity - 1
+        _renumber_timestamps!(lru)
+    end
     if haskey(lru.cache, key)
         lru.counter += 1
         lru.cache[key].timestamp = lru.counter
@@ -287,10 +305,11 @@ mutable struct MemoizedFunction{F, C}
     cache::C
     hits::Int
     misses::Int
-    
-    function MemoizedFunction(func::F, cache_type=Dict) where F
+    maxsize::Int
+
+    function MemoizedFunction(func::F, cache_type=Dict; maxsize::Int=1024) where F
         cache = cache_type{Any, Any}()
-        new{F, typeof(cache)}(func, cache, 0, 0)
+        new{F, typeof(cache)}(func, cache, 0, 0, maxsize)
     end
 end
 
@@ -301,6 +320,9 @@ function (mf::MemoizedFunction)(args...)
     else
         mf.misses += 1
         result = mf.func(args...)
+        if length(mf.cache) >= mf.maxsize
+            delete!(mf.cache, first(keys(mf.cache)))
+        end
         mf.cache[args] = result
         return result
     end

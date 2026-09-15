@@ -91,8 +91,11 @@ function distributed_forward_transform!(tf::TransposableField{F,T,N};
 
         tf.total_fft_time += time() - fft_start
 
-        # Step 6: Transpose back to ZLocal layout to match field["c"] allocation
+        # Step 6: Transpose back to ZLocal layout to match field["c"] allocation.
         # (field["c"] is allocated with ZLocal decomposition via get_local_array_size)
+        # PERF NOTE: These two extra all-to-all transposes double the communication cost.
+        # A future optimization could store spectral data in XLocal layout to eliminate
+        # this round-trip, at the cost of changing field["c"] storage conventions.
         transpose_x_to_y!(tf)
         transpose_y_to_z!(tf)
 

@@ -18,8 +18,7 @@ Key features:
 - CartesianSkew: Skew operation for 2D vectors
 """
 
-using LinearAlgebra
-using SparseArrays
+# LinearAlgebra, SparseArrays already in Tarang.jl
 
 # ============================================================================
 # Abstract operator infrastructure for multiclass dispatch
@@ -578,8 +577,8 @@ function matrix_coupling(op::CartesianGradient, vars...)
     return result
 end
 
+"""Build operator matrix for a specific subproblem."""
 function subproblem_matrix(op::CartesianGradient, subproblem)
-    """Build operator matrix for a specific subproblem."""
     operand = op.operand
     coordsys = op.coordsys
 
@@ -631,8 +630,8 @@ function subproblem_matrix(op::CartesianGradient, subproblem)
     end
 end
 
+"""Check that operands are in a proper layout."""
 function check_conditions(op::CartesianGradient)
-    """Check that operands are in a proper layout."""
     operand = op.operand
 
     if isa(operand, VectorField)
@@ -652,8 +651,8 @@ function check_conditions(op::CartesianGradient)
     end
 end
 
+"""Require operands to be in coefficient layout."""
 function enforce_conditions(op::CartesianGradient)
-    """Require operands to be in coefficient layout."""
     operand = op.operand
 
     if isa(operand, VectorField)
@@ -744,8 +743,8 @@ function matrix_coupling(op::CartesianDivergence, vars...)
     return matrix_coupling(op.arg, vars...)
 end
 
+"""Build operator matrix for a specific subproblem."""
 function subproblem_matrix(op::CartesianDivergence, subproblem)
-    """Build operator matrix for a specific subproblem."""
     operand = op.operand
     if !isa(operand, VectorField)
         return spzeros(Float64, 0, 0)
@@ -765,8 +764,8 @@ function subproblem_matrix(op::CartesianDivergence, subproblem)
     return isempty(blocks) ? spzeros(Float64, 0, 0) : hcat(blocks...)
 end
 
+"""Check that operands are in a proper layout for divergence computation."""
 function check_conditions(op::CartesianDivergence)
-    """Check that operands are in a proper layout for divergence computation."""
     operand = op.operand
 
     # For VectorField, check that all components are in a consistent layout
@@ -794,8 +793,8 @@ function check_conditions(op::CartesianDivergence)
     return true
 end
 
+"""Ensure operands are in coefficient layout for differentiation."""
 function enforce_conditions(op::CartesianDivergence)
-    """Ensure operands are in coefficient layout for differentiation."""
     operand = op.operand
 
     # For VectorField, ensure all components are in coefficient layout
@@ -890,13 +889,13 @@ struct CartesianCurl <: AbstractLinearOperator
     end
 end
 
+"""Determine which variables the curl operator matrix depends on."""
 function matrix_dependence(op::CartesianCurl, vars...)
-    """Determine which variables the curl operator matrix depends on."""
     return matrix_dependence(op.operand, vars...)
 end
 
+"""Determine which variables couple through the curl operator."""
 function matrix_coupling(op::CartesianCurl, vars...)
-    """Determine which variables couple through the curl operator."""
     result = falses(length(vars))
 
     # Check coupling from all derivative operators
@@ -913,8 +912,8 @@ function matrix_coupling(op::CartesianCurl, vars...)
     return result
 end
 
+"""Build operator matrix for curl in a specific subproblem."""
 function subproblem_matrix(op::CartesianCurl, subproblem)
-    """Build operator matrix for curl in a specific subproblem."""
     operand = op.operand
     if !isa(operand, VectorField) || op.coordsys.dim != 3
         return spzeros(Float64, 0, 0)
@@ -943,8 +942,8 @@ function subproblem_matrix(op::CartesianCurl, subproblem)
     return result
 end
 
+"""Check that operands are in a proper layout for curl computation."""
 function check_conditions(op::CartesianCurl)
-    """Check that operands are in a proper layout for curl computation."""
     operand = op.operand
 
     # For VectorField, check that all components are in a consistent layout
@@ -962,8 +961,8 @@ function check_conditions(op::CartesianCurl)
     return true
 end
 
+"""Ensure operands are in coefficient layout for differentiation."""
 function enforce_conditions(op::CartesianCurl)
-    """Ensure operands are in coefficient layout for differentiation."""
     operand = op.operand
 
     # For VectorField, ensure all components are in coefficient layout
@@ -1034,8 +1033,8 @@ function matrix_coupling(op::CartesianLaplacian, vars...)
     return result
 end
 
+"""Build operator matrix for a specific subproblem."""
 function subproblem_matrix(op::CartesianLaplacian, subproblem)
-    """Build operator matrix for a specific subproblem."""
     # Sum of second derivative matrices
     result = nothing
     for part in op.arg
@@ -1052,8 +1051,8 @@ function subproblem_matrix(op::CartesianLaplacian, subproblem)
     return result === nothing ? spzeros(Float64, 0, 0) : result
 end
 
+"""Check that operands are in a proper layout for Laplacian computation."""
 function check_conditions(op::CartesianLaplacian)
-    """Check that operands are in a proper layout for Laplacian computation."""
     operand = op.operand
 
     # For VectorField, check that all components are in a consistent layout
@@ -1080,8 +1079,8 @@ function check_conditions(op::CartesianLaplacian)
     return true
 end
 
+"""Ensure operands are in coefficient layout for differentiation."""
 function enforce_conditions(op::CartesianLaplacian)
-    """Ensure operands are in coefficient layout for differentiation."""
     operand = op.operand
 
     # For VectorField, ensure all components are in coefficient layout
@@ -1129,8 +1128,8 @@ function matrix_coupling(op::CartesianTrace, vars...)
     return matrix_coupling(op.operand, vars...)
 end
 
+"""Build trace matrix."""
 function subproblem_matrix(op::CartesianTrace, subproblem)
-    """Build trace matrix."""
     # Get tensor dimension
     tensorsig = get_tensorsig(op.operand)
     if length(tensorsig) < 2
@@ -1214,8 +1213,8 @@ function matrix_coupling(op::CartesianSkew, vars...)
     return matrix_coupling(op.operand, vars...)
 end
 
+"""Build skew matrix."""
 function subproblem_matrix(op::CartesianSkew, subproblem)
-    """Build skew matrix."""
     # For 2D: skew(u) = [-u_y, u_x]
     # Matrix: [0 -1; 1 0]
 

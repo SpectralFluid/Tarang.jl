@@ -312,19 +312,24 @@ function _step_rk_imex_explicit_fallback!(state::TimestepperState, solver::Initi
     _step_explicit_rk!(state, solver, ts.A_explicit, ts.b_explicit, ts.c_explicit)
 end
 
+# Singleton instances for explicit RK fallbacks (avoid allocation per call)
+const _RK111_SINGLETON = RK111()
+const _RK222_SINGLETON = RK222()
+const _RK443_SINGLETON = RK443()
+
 # Explicit RK fallbacks used by other timesteppers
 function step_rk111!(state::TimestepperState, solver::InitialValueSolver)
-    ts = RK111()
+    ts = _RK111_SINGLETON
     _step_explicit_rk!(state, solver, ts.A_explicit, ts.b_explicit, ts.c_explicit)
 end
 
 function step_rk222!(state::TimestepperState, solver::InitialValueSolver)
-    ts = RK222()
+    ts = _RK222_SINGLETON
     _step_explicit_rk!(state, solver, ts.A_explicit, ts.b_explicit, ts.c_explicit)
 end
 
 function step_rk443!(state::TimestepperState, solver::InitialValueSolver)
-    ts = RK443()
+    ts = _RK443_SINGLETON
     _step_explicit_rk!(state, solver, ts.A_explicit, ts.b_explicit, ts.c_explicit)
 end
 

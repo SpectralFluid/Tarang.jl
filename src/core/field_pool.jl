@@ -4,6 +4,9 @@
 # keyed dictionary of available (returned) ScalarField objects that can
 # be checked out and reused instead of allocating new ones.
 
+export FieldPool, checkout!, return!, with_pool_field, prewarm!,
+       get_field_pool, set_field_pool!, checkout_or_alloc, maybe_return!
+
 # ---------------------------------------------------------------------------
 # PoolKey — identifies a "shape class" of ScalarField
 # ---------------------------------------------------------------------------
@@ -84,7 +87,17 @@ function checkout!(pool::FieldPool,
         # Allocate a fresh field — _from_pool starts false, _pool_generation=0
         ScalarField(pool.dist, "pool_field", bases, dtype)
     else
-        pop!(stack)
+        f = pop!(stack)
+        # Zero-fill recycled field to prevent stale data from previous use
+        grid_data = get_grid_data(f)
+        if grid_data !== nothing
+            fill!(grid_data, zero(eltype(grid_data)))
+        end
+        coeff_data = get_coeff_data(f)
+        if coeff_data !== nothing
+            fill!(coeff_data, zero(eltype(coeff_data)))
+        end
+        f
     end
 
     field._from_pool = true

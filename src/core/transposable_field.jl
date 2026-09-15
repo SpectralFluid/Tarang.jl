@@ -61,8 +61,7 @@ This module is split into multiple files for maintainability:
 - transpose_grouped.jl: Grouped transpose operations
 """
 
-using MPI
-using FFTW
+# MPI, FFTW already in Tarang.jl
 
 # Include all the split files
 include("transpose/transpose_types.jl")

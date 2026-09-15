@@ -119,8 +119,8 @@ function _execute_on_cpu(f, data::AbstractArray)
 end
 
 # Transform execution functions
+"""Apply forward transform to field"""
 function forward_transform!(field::ScalarField, target_layout::Symbol=:c)
-    """Apply forward transform to field"""
 
     if field.domain === nothing
         return

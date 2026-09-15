@@ -89,7 +89,8 @@ using Tarang
         err2 = abs(u2 - exact)
 
         # 3rd order: error ratio should be ~8 when dt halved
-        if err2 > 1e-14  # avoid division by zero
+        @test err2 > 0  # Sanity: error should not be zero or negative
+        if err2 > 1e-14  # avoid division by zero near machine precision
             rate = log2(err1 / err2)
             @test rate > 2.5  # Should be ~3 for 3rd order
         end
@@ -141,6 +142,7 @@ using Tarang
         err2 = abs(ssp_rk3_solve(dt2) - exact)
 
         # 3rd order: error ratio should be ~8 when dt halved
+        @test err2 > 0  # Sanity: error should not be zero or negative
         if err2 > 1e-14
             rate = log2(err1 / err2)
             @test rate > 2.5  # Should be ~3 for 3rd order
@@ -170,6 +172,7 @@ using Tarang
         err1_wrong = abs(ssp_rk3_solve_wrong(dt1) - exact)
         err2_wrong = abs(ssp_rk3_solve_wrong(dt2) - exact)
 
+        @test err2_wrong > 0  # Sanity: error should not be zero or negative
         if err2_wrong > 1e-14
             rate_wrong = log2(err1_wrong / err2_wrong)
             @test rate_wrong < 2.5  # Should be ~2, NOT 3rd order

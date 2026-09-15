@@ -14,6 +14,7 @@ We test two variants:
 2. Richardson ETDRK2: u_{n+1} = exp(hL)u_n + h*φ₁(hL)*[2*N(c) - N(u_n)]
 """
 
+using Test
 using LinearAlgebra
 using Printf
 
@@ -260,5 +261,42 @@ function run_convergence_test()
     println("\n" * "="^70)
 end
 
-# Run the test
-run_convergence_test()
+# Run the test and verify convergence
+@testset "ETDRK2 Convergence" begin
+    run_convergence_test()
+
+    # Reproduce the convergence computation for assertions
+    λ = -10.0; T = 1.0; u0 = 0.1
+    h_ref = 1e-5
+    u_ref = u0; t = 0.0
+    while t < T
+        u_ref = etdrk2_standard_nonlinear(u_ref, λ, h_ref, t)
+        t += h_ref
+    end
+
+    timesteps = [0.1, 0.05, 0.025, 0.0125, 0.00625]
+
+    for (label, step_fn) in [("Standard", etdrk2_standard_nonlinear),
+                              ("Richardson", etdrk2_richardson_nonlinear)]
+        errors = Float64[]
+        for h in timesteps
+            u = u0; t = 0.0
+            nsteps = Int(ceil(T / h)); h_actual = T / nsteps
+            for _ in 1:nsteps
+                u = step_fn(u, λ, h_actual, t); t += h_actual
+            end
+            push!(errors, abs(u - u_ref))
+        end
+
+        @testset "$label ETDRK2" begin
+            # Errors should be positive and decrease
+            @test all(errors .> 0)
+            @test issorted(errors, rev=true)
+
+            # Convergence rates should be approximately 2nd order
+            rates = [log(errors[i] / errors[i+1]) / log(2.0) for i in 1:length(errors)-1]
+            avg_rate = sum(rates) / length(rates)
+            @test avg_rate > 1.8  # Should be ~2.0 for 2nd order
+        end
+    end
+end

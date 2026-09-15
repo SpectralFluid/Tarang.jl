@@ -14,8 +14,7 @@ The key concepts are:
 - Preconditioners handle permutation and valid mode filtering
 """
 
-using SparseArrays
-using LinearAlgebra
+# SparseArrays, LinearAlgebra already in Tarang.jl
 
 # ---------------------------------------------------------------------------
 # Constants and configuration

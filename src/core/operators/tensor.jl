@@ -10,8 +10,7 @@ This file contains evaluation functions for:
 - AdvectiveCFL
 """
 
-using LinearAlgebra
-using SparseArrays
+# LinearAlgebra, SparseArrays already in Tarang.jl
 
 # ============================================================================
 # Trace Evaluation
@@ -452,7 +451,7 @@ function compute_wavenumber_squared_grid(field::ScalarField)
     # Add contribution from each basis
     for (axis, basis) in enumerate(bases)
         if isa(basis, RealFourier)
-            # For RealFourier, check if we're in RFFT layout (N/2+1) or native layout (N)
+            # For RealFourier, check if we're in RFFT layout (N/2+1) or full FFT layout (N)
             N = basis.meta.size
             actual_size = data_shape[axis]
             rfft_size = N ÷ 2 + 1
@@ -461,9 +460,11 @@ function compute_wavenumber_squared_grid(field::ScalarField)
                 # RFFT layout: [k=0, k=1, ..., k=N/2]
                 k_axis_cpu = wavenumbers_rfft(basis)
             else
-                # Native cos/sin layout: [cos0, cos1, msin1, cos2, msin2, ...]
-                # Both cos(k) and msin(k) have the same wavenumber k
-                k_axis_cpu = wavenumbers(basis)
+                # Full FFT layout: [k=0, k=1, ..., k=N/2-1, k=-N/2, ..., k=-1]
+                # This occurs on non-first axes in multi-dim transforms where
+                # rfft on the first axis produces complex data, so subsequent
+                # RealFourier axes use fft (standard FFT ordering).
+                k_axis_cpu = wavenumbers_fft(basis)
             end
 
             add_wavenumber_squared_contribution!(k_squared, k_axis_cpu, axis, length(bases))

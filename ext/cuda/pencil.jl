@@ -15,7 +15,7 @@ For a domain (Nx, Ny, Nz) on a P1 x P2 process grid:
 This struct is used for multi-GPU DCT (Discrete Cosine Transform) with NCCL
 communication for all-to-all transpose operations between pencil orientations.
 """
-struct PencilDecomposition
+mutable struct PencilDecomposition
     # Global domain shape
     global_shape::NTuple{3, Int}
 
@@ -26,10 +26,10 @@ struct PencilDecomposition
     rank::Int
     grid_coords::NTuple{2, Int}  # (row, col) in process grid
 
-    # MPI communicators
+    # MPI communicators (Union with Nothing for safe cleanup)
     world_comm::MPI.Comm
-    row_comm::MPI.Comm   # Ranks in same row (for Y<->Z transpose)
-    col_comm::MPI.Comm   # Ranks in same column (for X<->Y transpose)
+    row_comm::Union{Nothing, MPI.Comm}   # Ranks in same row (for Y<->Z transpose)
+    col_comm::Union{Nothing, MPI.Comm}   # Ranks in same column (for X<->Y transpose)
 
     # Local shapes for each pencil orientation
     x_pencil_shape::NTuple{3, Int}
@@ -129,7 +129,7 @@ function PencilDecomposition(global_shape::NTuple{3, Int},
     # Compute local shapes
     x_shape, y_shape, z_shape = compute_pencil_shapes(global_shape, proc_grid, grid_coords)
 
-    return PencilDecomposition(
+    pd = PencilDecomposition(
         global_shape,
         proc_grid,
         rank,
@@ -142,6 +142,37 @@ function PencilDecomposition(global_shape::NTuple{3, Int},
         z_shape,
         Ref(:z_pencil)  # Start in Z-pencil orientation
     )
+    finalizer(free_pencil_decomposition!, pd)
+    return pd
+end
+
+"""
+    free_pencil_decomposition!(pd::PencilDecomposition)
+
+Free MPI sub-communicators to prevent communicator leaks.
+Safe to call multiple times.
+"""
+function free_pencil_decomposition!(pd::PencilDecomposition)
+    # Guard against GC running after MPI.Finalize() (e.g., during Julia shutdown)
+    if !MPI.Initialized() || MPI.Finalized()
+        return
+    end
+    if pd.row_comm !== nothing && pd.row_comm != MPI.COMM_NULL
+        try
+            MPI.free(pd.row_comm)
+        catch e
+            @warn "Failed to free PencilDecomposition row communicator: $e" maxlog=1
+        end
+        pd.row_comm = nothing
+    end
+    if pd.col_comm !== nothing && pd.col_comm != MPI.COMM_NULL
+        try
+            MPI.free(pd.col_comm)
+        catch e
+            @warn "Failed to free PencilDecomposition col communicator: $e" maxlog=1
+        end
+        pd.col_comm = nothing
+    end
 end
 
 # ============================================================================
@@ -164,7 +195,7 @@ Set the current pencil orientation.
 - `orient::Symbol`: One of :x_pencil, :y_pencil, or :z_pencil
 """
 function set_orientation!(p::PencilDecomposition, orient::Symbol)
-    @assert orient in (:x_pencil, :y_pencil, :z_pencil) "Invalid orientation: $orient"
+    orient in (:x_pencil, :y_pencil, :z_pencil) || throw(ArgumentError("Invalid orientation: $orient. Must be :x_pencil, :y_pencil, or :z_pencil"))
     p.current_orientation[] = orient
 end
 

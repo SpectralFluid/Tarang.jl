@@ -45,11 +45,21 @@ const TEST_FILES = [
     "test_dealiasing_math.jl",
     "test_gpu_solver_cpu.jl",
     "test_type_stability.jl",
+    "test_field_pool.jl",
+    "test_linalg.jl",
+    "test_pretty_printing.jl",
+    "test_progress.jl",
+    "test_convenience_api.jl",
 ]
 
 # Tests that may require special setup or longer runtime
 const OPTIONAL_TEST_FILES = [
     "test_etdrk2_convergence.jl",  # Convergence test - may be slow
+    "test_end_to_end_pde.jl",      # Full PDE solve test
+    "test_pencil_imex.jl",
+    "test_dct_reorder.jl",
+    "test_optimized_dct.jl",
+    "test_ilu0_preconditioner.jl",
 ]
 
 # MPI tests that must be run separately with mpiexec

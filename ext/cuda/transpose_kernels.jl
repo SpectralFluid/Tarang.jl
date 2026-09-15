@@ -17,14 +17,18 @@ into the appropriate positions in the output array.
 using KernelAbstractions
 using KernelAbstractions: @kernel, @index, @Const
 
+# Binary search helpers (_gpu_find_rank, _gpu_find_rank_1based) are defined in
+# nccl_transpose.jl which is loaded before this file.
+
 # ============================================================================
 # Pack Kernels for Transpose
 # ============================================================================
 
 """
-    pack_for_transpose_kernel_3d!(buffer, data, Nx, Ny, Nz, nranks, dim, chunk_sizes)
+    pack_for_transpose_kernel_3d!(buffer, data, Nx, Ny, Nz, nranks, dim, chunk_sizes, displs)
 
 Pack 3D array data into contiguous buffer for MPI.Alltoallv.
+Uses binary search via _gpu_find_rank for O(log P) rank lookup per element.
 
 Arguments:
 - buffer: Output flat buffer
@@ -32,12 +36,15 @@ Arguments:
 - Nx, Ny, Nz: Array dimensions
 - nranks: Number of MPI ranks in the transpose communicator
 - dim: Dimension being redistributed (1=x, 2=y, 3=z)
-- chunk_sizes: Array of chunk sizes for each rank
+- chunk_sizes: Array of chunk sizes for each rank (for local index computation)
+- displs: Buffer displacements (prefix sums of element counts)
+- prefix_sums: Cumulative sum of chunk_sizes (for binary search rank lookup)
 """
 @kernel function pack_for_transpose_kernel_3d!(buffer, @Const(data),
                                                Nx::Int, Ny::Int, Nz::Int,
                                                nranks::Int, dim::Int,
-                                               @Const(chunk_sizes), @Const(displs))
+                                               @Const(chunk_sizes), @Const(displs),
+                                               @Const(prefix_sums))
     i = @index(Global)
 
     # Total elements
@@ -51,56 +58,23 @@ Arguments:
     iy = (((i - 1) ÷ Nx) % Ny) + 1
     iz = ((i - 1) ÷ (Nx * Ny)) + 1
 
-    # Determine which rank this element goes to based on redistributed dimension
+    # Determine which rank this element goes to using binary search
     if dim == 3  # Z→Y transpose: z-dimension being redistributed
-        # Find which rank owns this z-index after transpose
-        rank = 0
-        z_offset = 0
-        for r in 1:nranks
-            if iz <= z_offset + chunk_sizes[r]
-                rank = r - 1
-                break
-            end
-            z_offset += chunk_sizes[r]
-        end
-
-        # Compute position within rank's chunk
+        rank, z_offset = _gpu_find_rank(iz, prefix_sums, nranks)
         local_iz = iz - z_offset
         local_idx = (local_iz - 1) * Nx * Ny + (iy - 1) * Nx + ix
-
-        # Compute buffer position
         buf_idx = displs[rank + 1] + local_idx
 
     elseif dim == 2  # Y→X transpose: y-dimension being redistributed
-        rank = 0
-        y_offset = 0
-        for r in 1:nranks
-            if iy <= y_offset + chunk_sizes[r]
-                rank = r - 1
-                break
-            end
-            y_offset += chunk_sizes[r]
-        end
-
+        rank, y_offset = _gpu_find_rank(iy, prefix_sums, nranks)
         local_iy = iy - y_offset
         local_idx = (iz - 1) * Nx * chunk_sizes[rank + 1] + (local_iy - 1) * Nx + ix
-
         buf_idx = displs[rank + 1] + local_idx
 
     else  # dim == 1: X being redistributed
-        rank = 0
-        x_offset = 0
-        for r in 1:nranks
-            if ix <= x_offset + chunk_sizes[r]
-                rank = r - 1
-                break
-            end
-            x_offset += chunk_sizes[r]
-        end
-
+        rank, x_offset = _gpu_find_rank(ix, prefix_sums, nranks)
         local_ix = ix - x_offset
         local_idx = (iz - 1) * chunk_sizes[rank + 1] * Ny + (iy - 1) * chunk_sizes[rank + 1] + local_ix
-
         buf_idx = displs[rank + 1] + local_idx
     end
 
@@ -108,14 +82,16 @@ Arguments:
 end
 
 """
-    pack_for_transpose_kernel_2d!(buffer, data, Nx, Ny, nranks, dim, chunk_sizes, displs)
+    pack_for_transpose_kernel_2d!(buffer, data, Nx, Ny, nranks, dim, chunk_sizes, displs, prefix_sums)
 
 Pack 2D array data into contiguous buffer for MPI.Alltoallv.
+Uses binary search for O(log P) rank lookup.
 """
 @kernel function pack_for_transpose_kernel_2d!(buffer, @Const(data),
                                                Nx::Int, Ny::Int,
                                                nranks::Int, dim::Int,
-                                               @Const(chunk_sizes), @Const(displs))
+                                               @Const(chunk_sizes), @Const(displs),
+                                               @Const(prefix_sums))
     i = @index(Global)
 
     total = Nx * Ny
@@ -123,36 +99,16 @@ Pack 2D array data into contiguous buffer for MPI.Alltoallv.
         return
     end
 
-    # Convert linear index to 2D indices
     ix = ((i - 1) % Nx) + 1
     iy = ((i - 1) ÷ Nx) + 1
 
     if dim == 2  # Y being redistributed
-        rank = 0
-        y_offset = 0
-        for r in 1:nranks
-            if iy <= y_offset + chunk_sizes[r]
-                rank = r - 1
-                break
-            end
-            y_offset += chunk_sizes[r]
-        end
-
+        rank, y_offset = _gpu_find_rank(iy, prefix_sums, nranks)
         local_iy = iy - y_offset
         local_idx = (local_iy - 1) * Nx + ix
         buf_idx = displs[rank + 1] + local_idx
-
     else  # dim == 1: X being redistributed
-        rank = 0
-        x_offset = 0
-        for r in 1:nranks
-            if ix <= x_offset + chunk_sizes[r]
-                rank = r - 1
-                break
-            end
-            x_offset += chunk_sizes[r]
-        end
-
+        rank, x_offset = _gpu_find_rank(ix, prefix_sums, nranks)
         local_ix = ix - x_offset
         local_idx = (iy - 1) * chunk_sizes[rank + 1] + local_ix
         buf_idx = displs[rank + 1] + local_idx
@@ -166,14 +122,16 @@ end
 # ============================================================================
 
 """
-    unpack_from_transpose_kernel_3d!(data, buffer, Nx, Ny, Nz, nranks, dim, chunk_sizes, displs)
+    unpack_from_transpose_kernel_3d!(data, buffer, Nx, Ny, Nz, nranks, dim, chunk_sizes, displs, prefix_sums)
 
 Unpack data from flat buffer after MPI.Alltoallv into 3D array.
+Uses binary search for O(log P) rank lookup.
 """
 @kernel function unpack_from_transpose_kernel_3d!(data, @Const(buffer),
                                                   Nx::Int, Ny::Int, Nz::Int,
                                                   nranks::Int, dim::Int,
-                                                  @Const(chunk_sizes), @Const(displs))
+                                                  @Const(chunk_sizes), @Const(displs),
+                                                  @Const(prefix_sums))
     i = @index(Global)
 
     total = Nx * Ny * Nz
@@ -181,53 +139,22 @@ Unpack data from flat buffer after MPI.Alltoallv into 3D array.
         return
     end
 
-    # Convert linear index to 3D indices
     ix = ((i - 1) % Nx) + 1
     iy = (((i - 1) ÷ Nx) % Ny) + 1
     iz = ((i - 1) ÷ (Nx * Ny)) + 1
 
-    # Determine which rank this element came from
-    if dim == 2  # After Z→Y transpose: receiving y-chunks from different ranks
-        rank = 0
-        y_offset = 0
-        for r in 1:nranks
-            if iy <= y_offset + chunk_sizes[r]
-                rank = r - 1
-                break
-            end
-            y_offset += chunk_sizes[r]
-        end
-
+    if dim == 2  # After Z→Y transpose: receiving y-chunks
+        rank, y_offset = _gpu_find_rank(iy, prefix_sums, nranks)
         local_iy = iy - y_offset
         local_idx = (iz - 1) * Nx * chunk_sizes[rank + 1] + (local_iy - 1) * Nx + ix
         buf_idx = displs[rank + 1] + local_idx
-
     elseif dim == 1  # After Y→X transpose: receiving x-chunks
-        rank = 0
-        x_offset = 0
-        for r in 1:nranks
-            if ix <= x_offset + chunk_sizes[r]
-                rank = r - 1
-                break
-            end
-            x_offset += chunk_sizes[r]
-        end
-
+        rank, x_offset = _gpu_find_rank(ix, prefix_sums, nranks)
         local_ix = ix - x_offset
         local_idx = (iz - 1) * chunk_sizes[rank + 1] * Ny + (iy - 1) * chunk_sizes[rank + 1] + local_ix
         buf_idx = displs[rank + 1] + local_idx
-
     else  # dim == 3: receiving z-chunks
-        rank = 0
-        z_offset = 0
-        for r in 1:nranks
-            if iz <= z_offset + chunk_sizes[r]
-                rank = r - 1
-                break
-            end
-            z_offset += chunk_sizes[r]
-        end
-
+        rank, z_offset = _gpu_find_rank(iz, prefix_sums, nranks)
         local_iz = iz - z_offset
         local_idx = (local_iz - 1) * Nx * Ny + (iy - 1) * Nx + ix
         buf_idx = displs[rank + 1] + local_idx
@@ -237,14 +164,16 @@ Unpack data from flat buffer after MPI.Alltoallv into 3D array.
 end
 
 """
-    unpack_from_transpose_kernel_2d!(data, buffer, Nx, Ny, nranks, dim, chunk_sizes, displs)
+    unpack_from_transpose_kernel_2d!(data, buffer, Nx, Ny, nranks, dim, chunk_sizes, displs, prefix_sums)
 
 Unpack data from flat buffer after MPI.Alltoallv into 2D array.
+Uses binary search for O(log P) rank lookup.
 """
 @kernel function unpack_from_transpose_kernel_2d!(data, @Const(buffer),
                                                   Nx::Int, Ny::Int,
                                                   nranks::Int, dim::Int,
-                                                  @Const(chunk_sizes), @Const(displs))
+                                                  @Const(chunk_sizes), @Const(displs),
+                                                  @Const(prefix_sums))
     i = @index(Global)
 
     total = Nx * Ny
@@ -256,31 +185,12 @@ Unpack data from flat buffer after MPI.Alltoallv into 2D array.
     iy = ((i - 1) ÷ Nx) + 1
 
     if dim == 1  # Receiving x-chunks
-        rank = 0
-        x_offset = 0
-        for r in 1:nranks
-            if ix <= x_offset + chunk_sizes[r]
-                rank = r - 1
-                break
-            end
-            x_offset += chunk_sizes[r]
-        end
-
+        rank, x_offset = _gpu_find_rank(ix, prefix_sums, nranks)
         local_ix = ix - x_offset
         local_idx = (iy - 1) * chunk_sizes[rank + 1] + local_ix
         buf_idx = displs[rank + 1] + local_idx
-
     else  # dim == 2: receiving y-chunks
-        rank = 0
-        y_offset = 0
-        for r in 1:nranks
-            if iy <= y_offset + chunk_sizes[r]
-                rank = r - 1
-                break
-            end
-            y_offset += chunk_sizes[r]
-        end
-
+        rank, y_offset = _gpu_find_rank(iy, prefix_sums, nranks)
         local_iy = iy - y_offset
         local_idx = (local_iy - 1) * Nx + ix
         buf_idx = displs[rank + 1] + local_idx
@@ -338,19 +248,19 @@ end
 # ============================================================================
 
 # Constants for kernel operations
-const GPU_PACK_3D_OP = KernelOperation(pack_for_transpose_kernel_3d!) do buffer, data, Nx, Ny, Nz, _, _, _, _
+const GPU_PACK_3D_OP = KernelOperation(pack_for_transpose_kernel_3d!) do buffer, data, Nx, Ny, Nz, _, _, _, _, _
     Nx * Ny * Nz
 end
 
-const GPU_UNPACK_3D_OP = KernelOperation(unpack_from_transpose_kernel_3d!) do data, buffer, Nx, Ny, Nz, _, _, _, _
+const GPU_UNPACK_3D_OP = KernelOperation(unpack_from_transpose_kernel_3d!) do data, buffer, Nx, Ny, Nz, _, _, _, _, _
     Nx * Ny * Nz
 end
 
-const GPU_PACK_2D_OP = KernelOperation(pack_for_transpose_kernel_2d!) do buffer, data, Nx, Ny, _, _, _, _
+const GPU_PACK_2D_OP = KernelOperation(pack_for_transpose_kernel_2d!) do buffer, data, Nx, Ny, _, _, _, _, _
     Nx * Ny
 end
 
-const GPU_UNPACK_2D_OP = KernelOperation(unpack_from_transpose_kernel_2d!) do data, buffer, Nx, Ny, _, _, _, _
+const GPU_UNPACK_2D_OP = KernelOperation(unpack_from_transpose_kernel_2d!) do data, buffer, Nx, Ny, _, _, _, _, _
     Nx * Ny
 end
 
@@ -369,6 +279,27 @@ function _validate_chunk_divisibility(count::Int, divisor::Int, dim::Int, rank::
         throw(ArgumentError("GPU $operation: count=$count is not evenly divisible by divisor=$divisor " *
                            "for dim=$dim, rank=$rank. This indicates misaligned MPI counts/displs. " *
                            "Check that array dimensions are compatible with the MPI decomposition."))
+    end
+end
+
+# Cache for small GPU arrays (chunk_sizes, displs) used in pack/unpack kernels.
+# Keyed by (device_id, tag, length) to avoid per-call CuArray allocation.
+# Device ID is included for multi-GPU correctness.
+const _GPU_INT_CACHE = Dict{Tuple{Int, Int, Int}, CuArray{Int, 1}}()
+const _GPU_INT_CACHE_LOCK = ReentrantLock()
+
+function _to_gpu_cached(cpu_array::Vector{Int}, tag::Int)
+    n = length(cpu_array)
+    dev_id = CUDA.deviceid(CUDA.device())
+    key = (dev_id, tag, n)
+    lock(_GPU_INT_CACHE_LOCK) do
+        gpu_arr = get(_GPU_INT_CACHE, key, nothing)
+        if gpu_arr === nothing
+            gpu_arr = CuArray{Int}(undef, n)
+            _GPU_INT_CACHE[key] = gpu_arr
+        end
+        copyto!(gpu_arr, cpu_array)
+        return gpu_arr
     end
 end
 
@@ -414,11 +345,12 @@ function gpu_pack_for_transpose!(buffer::CuArray, data::CuArray,
             end
         end
 
-        chunk_sizes_gpu = CuArray(chunk_sizes)
-        displs_gpu = CuArray(displs)
+        chunk_sizes_gpu = _to_gpu_cached(chunk_sizes, 1)
+        displs_gpu = _to_gpu_cached(displs, 2)
+        prefix_sums_gpu = _to_gpu_cached(cumsum(chunk_sizes), 3)
 
         kernel = pack_for_transpose_kernel_3d!(CUDABackend())
-        kernel(buffer, data, Nx, Ny, Nz, nranks, dim, chunk_sizes_gpu, displs_gpu;
+        kernel(buffer, data, Nx, Ny, Nz, nranks, dim, chunk_sizes_gpu, displs_gpu, prefix_sums_gpu;
                ndrange=n_elements)
 
     elseif ndims_data == 2
@@ -440,11 +372,12 @@ function gpu_pack_for_transpose!(buffer::CuArray, data::CuArray,
             end
         end
 
-        chunk_sizes_gpu = CuArray(chunk_sizes)
-        displs_gpu = CuArray(displs)
+        chunk_sizes_gpu = _to_gpu_cached(chunk_sizes, 1)
+        displs_gpu = _to_gpu_cached(displs, 2)
+        prefix_sums_gpu = _to_gpu_cached(cumsum(chunk_sizes), 3)
 
         kernel = pack_for_transpose_kernel_2d!(CUDABackend())
-        kernel(buffer, data, Nx, Ny, nranks, dim, chunk_sizes_gpu, displs_gpu;
+        kernel(buffer, data, Nx, Ny, nranks, dim, chunk_sizes_gpu, displs_gpu, prefix_sums_gpu;
                ndrange=n_elements)
     else
         # Fallback: simple copy
@@ -498,11 +431,12 @@ function gpu_unpack_from_transpose!(data::CuArray, buffer::CuArray,
             end
         end
 
-        chunk_sizes_gpu = CuArray(chunk_sizes)
-        displs_gpu = CuArray(displs)
+        chunk_sizes_gpu = _to_gpu_cached(chunk_sizes, 4)  # tags 4-6 for unpack
+        displs_gpu = _to_gpu_cached(displs, 5)
+        prefix_sums_gpu = _to_gpu_cached(cumsum(chunk_sizes), 6)
 
         kernel = unpack_from_transpose_kernel_3d!(CUDABackend())
-        kernel(data, buffer, Nx, Ny, Nz, nranks, dim, chunk_sizes_gpu, displs_gpu;
+        kernel(data, buffer, Nx, Ny, Nz, nranks, dim, chunk_sizes_gpu, displs_gpu, prefix_sums_gpu;
                ndrange=n_elements)
 
     elseif ndims_data == 2
@@ -524,11 +458,12 @@ function gpu_unpack_from_transpose!(data::CuArray, buffer::CuArray,
             end
         end
 
-        chunk_sizes_gpu = CuArray(chunk_sizes)
-        displs_gpu = CuArray(displs)
+        chunk_sizes_gpu = _to_gpu_cached(chunk_sizes, 4)
+        displs_gpu = _to_gpu_cached(displs, 5)
+        prefix_sums_gpu = _to_gpu_cached(cumsum(chunk_sizes), 6)
 
         kernel = unpack_from_transpose_kernel_2d!(CUDABackend())
-        kernel(data, buffer, Nx, Ny, nranks, dim, chunk_sizes_gpu, displs_gpu;
+        kernel(data, buffer, Nx, Ny, nranks, dim, chunk_sizes_gpu, displs_gpu, prefix_sums_gpu;
                ndrange=n_elements)
     else
         copyto!(vec(data), view(buffer, 1:length(data)))
@@ -683,15 +618,9 @@ end
 Override fft_in_dim! for GPU arrays using CUFFT.
 """
 function Tarang.fft_in_dim!(data::CuArray, dim::Int, direction::Symbol, arch::Tarang.GPU)
-    if direction == :forward
-        # Use CUFFT for forward FFT along specified dimension
-        plan = CUFFT.plan_fft(data, (dim,))
-        data .= plan * data
-    else
-        # Use CUFFT for inverse FFT along specified dimension
-        plan = CUFFT.plan_ifft(data, (dim,))
-        data .= plan * data
-    end
+    # Use cached CUFFT plan to avoid expensive plan creation per call
+    plan = get_fft_1d_plan(size(data), dim, eltype(data); inverse=(direction != :forward))
+    data .= plan * data
     CUDA.synchronize()
     return data
 end

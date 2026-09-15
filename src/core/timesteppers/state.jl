@@ -188,20 +188,26 @@ See also: [`_get_linear_operator_lhs!`](@ref) for the non-negated version.
 function _get_linear_operator_eff!(state::TimestepperState, L_matrix::AbstractMatrix,
                                    M_matrix::Union{Nothing, AbstractMatrix})
     if M_matrix === nothing
-        # No mass matrix: L_rhs = -L_matrix  (negate for RHS form)
-        return -L_matrix, nothing
+        # No mass matrix: L_rhs = -L_matrix  (negate for RHS form, cached)
+        cache = state.timestepper_data
+        if !haskey(cache, :L_neg) || get(cache, :L_neg_source, nothing) !== L_matrix
+            cache[:L_neg] = -L_matrix
+            cache[:L_neg_source] = L_matrix
+        end
+        return cache[:L_neg]::AbstractMatrix, nothing
     end
 
     M_factor = _get_mass_factor!(state, M_matrix)
     cache = state.timestepper_data
     if !haskey(cache, :L_eff) || get(cache, :L_eff_source, nothing) !== L_matrix
         cache[:L_eff] = M_factor \ L_matrix   # M^{-1} * L (cached, positive)
+        cache[:L_eff_neg] = -cache[:L_eff]    # Negated version (cached)
         cache[:L_eff_source] = L_matrix
     end
 
     # Negate to convert from LHS form (M*dX/dt + L*X = F)
     # to RHS form (dX/dt = -M^{-1}*L*X + M^{-1}*F)
-    return -cache[:L_eff]::AbstractMatrix, M_factor
+    return cache[:L_eff_neg]::AbstractMatrix, M_factor
 end
 
 """

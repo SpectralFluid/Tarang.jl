@@ -39,9 +39,9 @@ const fftfreq = Tarang.fftfreq
         expected_7 = [0, 1, 2, 3, -3, -2, -1] ./ 7.0
         @test f7 ≈ expected_7
 
-        # With sample spacing
+        # With sample rate (AbstractFFTs convention: fftfreq(n, fs) = k * fs / n)
         f4 = fftfreq(4, 0.5)
-        expected_4 = [0, 1, -2, -1] ./ (4 * 0.5)
+        expected_4 = [0, 1, -2, -1] .* (0.5 / 4)
         @test f4 ≈ expected_4
     end
 

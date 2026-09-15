@@ -685,8 +685,7 @@ function _copy_padded_spectral_to_pencil!(orig_pencil, padded_pencil, orig_shape
     orig_local[copy_ranges...] .= pad_local[copy_ranges...]
 end
 
-function setup_nonlinear_transforms!(evaluator::NonlinearEvaluator)
-    """Setup PencilFFT transforms for nonlinear term evaluation.
+"""Setup PencilFFT transforms for nonlinear term evaluation.
 
     Transforms are created lazily on first use and cached for reuse.
     This avoids pre-computing transforms for shapes that may never be used
@@ -696,6 +695,7 @@ function setup_nonlinear_transforms!(evaluator::NonlinearEvaluator)
     The lazy creation path uses local FFTW plans (no MPI collectives), so it is
     safe to call from within the evaluation loop.
     """
+function setup_nonlinear_transforms!(evaluator::NonlinearEvaluator)
 
     dist = evaluator.dist
 
@@ -710,8 +710,8 @@ function setup_nonlinear_transforms!(evaluator::NonlinearEvaluator)
     end
 end
 
+"""Setup PencilFFT transforms for specific 2D shape"""
 function setup_pencil_transforms_for_shape!(evaluator::NonlinearEvaluator, shape::Tuple{Int, Int})
-    """Setup PencilFFT transforms for specific 2D shape"""
 
     dist = evaluator.dist
     shape_key = "$(shape[1])x$(shape[2])"
@@ -834,8 +834,7 @@ function setup_pencil_transforms_for_shape!(evaluator::NonlinearEvaluator, shape
     end
 end
 
-function setup_1d_nonlinear_transforms!(evaluator::NonlinearEvaluator)
-    """
+"""
     Setup 1D FFT transforms for nonlinear term evaluation.
 
     This is the fallback for when only 1D domain decomposition is used
@@ -852,6 +851,7 @@ function setup_1d_nonlinear_transforms!(evaluator::NonlinearEvaluator)
     - Scratch arrays for in-place transforms
     - Dealiased array configurations
     """
+function setup_1d_nonlinear_transforms!(evaluator::NonlinearEvaluator)
 
     dist = evaluator.dist
     @info "Setting up 1D nonlinear transforms"
@@ -885,8 +885,8 @@ function setup_1d_nonlinear_transforms!(evaluator::NonlinearEvaluator)
     @info "  Dealiasing factor: $(evaluator.dealiasing_factor)"
 end
 
+"""Setup FFTW plans for 1D transforms of size n."""
 function setup_1d_fftw_plans!(evaluator::NonlinearEvaluator, n::Int)
-    """Setup FFTW plans for 1D transforms of size n."""
 
     shape_key = "1d_$n"
 
@@ -926,8 +926,8 @@ function setup_1d_fftw_plans!(evaluator::NonlinearEvaluator, n::Int)
     end
 end
 
+"""Setup FFTW plans for 2D transforms."""
 function setup_2d_fftw_plans!(evaluator::NonlinearEvaluator, shape::Tuple{Int, Int})
-    """Setup FFTW plans for 2D transforms."""
 
     shape_key = "2d_$(shape[1])x$(shape[2])"
 
@@ -966,8 +966,8 @@ function setup_2d_fftw_plans!(evaluator::NonlinearEvaluator, shape::Tuple{Int, I
     end
 end
 
+"""Setup FFTW plans for 3D transforms."""
 function setup_3d_fftw_plans!(evaluator::NonlinearEvaluator, shape::Tuple{Int, Int, Int})
-    """Setup FFTW plans for 3D transforms."""
 
     shape_key = "3d_$(shape[1])x$(shape[2])x$(shape[3])"
 
@@ -1007,13 +1007,13 @@ function setup_3d_fftw_plans!(evaluator::NonlinearEvaluator, shape::Tuple{Int, I
     end
 end
 
-function get_nonlinear_transform(evaluator::NonlinearEvaluator, shape::Tuple)
-    """
+"""
     Get the appropriate transform configuration for a given shape.
 
     Automatically selects between PencilFFT (for multi-D parallelization)
     and FFTW (for 1D parallelization or serial) based on what's available.
     """
+function get_nonlinear_transform(evaluator::NonlinearEvaluator, shape::Tuple)
     ndims_shape = length(shape)
 
     # Try to find exact match first
@@ -1057,8 +1057,8 @@ function get_nonlinear_transform(evaluator::NonlinearEvaluator, shape::Tuple)
 end
 
 # Main nonlinear evaluation functions
+"""Evaluate u·∇φ nonlinear term using transform method"""
 function evaluate_nonlinear_term(op::AdvectionOperator, layout::Symbol=:g)
-    """Evaluate u·∇φ nonlinear term using transform method"""
     
     velocity = op.velocity
     scalar = op.scalar
@@ -1097,8 +1097,8 @@ function evaluate_nonlinear_term(op::AdvectionOperator, layout::Symbol=:g)
     return result
 end
 
+"""Evaluate (u·∇)u nonlinear momentum term"""
 function evaluate_nonlinear_term(op::NonlinearAdvectionOperator, layout::Symbol=:g)
-    """Evaluate (u·∇)u nonlinear momentum term"""
 
     velocity = op.velocity
     dist = velocity.dist
@@ -1138,8 +1138,7 @@ function evaluate_nonlinear_term(op::NonlinearAdvectionOperator, layout::Symbol=
     return result
 end
 
-function evaluate_transform_multiply(field1::ScalarField, field2::ScalarField, evaluator::NonlinearEvaluator)
-    """Efficiently multiply two fields using transform method and proper dealiasing.
+"""Efficiently multiply two fields using transform method and proper dealiasing.
 
     Uses proper 3/2-rule padded dealiasing (Orszag 1971) when possible:
     - CPU serial: full padded dealiasing on all Fourier dimensions
@@ -1149,6 +1148,7 @@ function evaluate_transform_multiply(field1::ScalarField, field2::ScalarField, e
 
     Falls back to truncation-after-multiply only when no Fourier bases exist.
     """
+function evaluate_transform_multiply(field1::ScalarField, field2::ScalarField, evaluator::NonlinearEvaluator)
 
     start_time = time()
 
@@ -1253,8 +1253,8 @@ function gpu_multiply_fields!(result_data::AbstractArray, data1::AbstractArray, 
     return result_data
 end
 
+"""2D transform-based multiplication using PencilFFTs"""
 function evaluate_2d_transform_multiply(field1::ScalarField, field2::ScalarField, evaluator::NonlinearEvaluator, shape::Tuple)
-    """2D transform-based multiplication using PencilFFTs"""
     
     # Create result field (static name avoids string allocation per call)
     result = ScalarField(field1.dist, "_nl_product", field1.bases, field1.dtype)
@@ -1297,8 +1297,8 @@ function evaluate_2d_transform_multiply(field1::ScalarField, field2::ScalarField
     return result
 end
 
+"""3D transform-based multiplication using 3D PencilFFTs"""
 function evaluate_3d_transform_multiply(field1::ScalarField, field2::ScalarField, evaluator::NonlinearEvaluator, shape::Tuple)
-    """3D transform-based multiplication using 3D PencilFFTs"""
     
     result = ScalarField(field1.dist, "_nl_product", field1.bases, field1.dtype)
     ensure_layout!(result, :g)
@@ -1331,8 +1331,8 @@ function evaluate_3d_transform_multiply(field1::ScalarField, field2::ScalarField
     return result
 end
 
+"""Fallback multiplication for unsupported dimensions"""
 function evaluate_fallback_multiply(field1::ScalarField, field2::ScalarField, evaluator::NonlinearEvaluator)
-    """Fallback multiplication for unsupported dimensions"""
 
     result = ScalarField(field1.dist, "_nl_product", field1.bases, field1.dtype)
     ensure_layout!(result, :g)
@@ -1349,8 +1349,8 @@ function evaluate_fallback_multiply(field1::ScalarField, field2::ScalarField, ev
 end
 
 # Dealiasing functions
+"""Apply 2D dealiasing using PencilFFT transforms"""
 function apply_2d_dealiasing(data::AbstractArray, transform_info::Dict, dealiasing_factor::Float64)
-    """Apply 2D dealiasing using PencilFFT transforms"""
 
     # Transform to spectral space
     fft_plan = transform_info["fft_plan_1"]
@@ -1646,8 +1646,7 @@ function apply_rfft_spectral_cutoff!(data::AbstractVector, cutoff::Int)
     end
 end
 
-function apply_1d_spectral_cutoff!(data::AbstractVector, axis::Int, cutoff::Int)
-    """
+"""
     Apply 1D spectral cutoff along a vector.
 
     For FFT layout with N points:
@@ -1657,6 +1656,7 @@ function apply_1d_spectral_cutoff!(data::AbstractVector, axis::Int, cutoff::Int)
 
     Modes with |k| > cutoff are set to zero.
     """
+function apply_1d_spectral_cutoff!(data::AbstractVector, axis::Int, cutoff::Int)
     n = length(data)
     if cutoff >= div(n, 2)
         return  # No cutoff needed
@@ -1680,10 +1680,10 @@ function apply_1d_spectral_cutoff!(data::AbstractVector, axis::Int, cutoff::Int)
     end
 end
 
-function apply_1d_spectral_cutoff!(data::AbstractArray, axis::Int, cutoff::Int)
-    """
+"""
     Apply 1D spectral cutoff along specified axis of multi-dimensional array.
     """
+function apply_1d_spectral_cutoff!(data::AbstractArray, axis::Int, cutoff::Int)
     shape = size(data)
     n = shape[axis]
 
@@ -1715,13 +1715,13 @@ function apply_1d_spectral_cutoff!(data::AbstractArray, axis::Int, cutoff::Int)
     end
 end
 
-function apply_2d_spectral_cutoff!(data::AbstractMatrix, cutoffs::Tuple, rfft_dims::Tuple=ntuple(i->false, 2))
-    """
+"""
     Apply 2D spectral cutoff for dealiasing.
 
     Zeros out modes where |kx| > cutoffs[1] or |ky| > cutoffs[2].
     For rfft dimensions, all indices are positive frequencies (k=i-1).
     """
+function apply_2d_spectral_cutoff!(data::AbstractMatrix, cutoffs::Tuple, rfft_dims::Tuple=ntuple(i->false, 2))
     nx, ny = size(data)
     kx_cut = cutoffs[1]
     ky_cut = length(cutoffs) >= 2 ? cutoffs[2] : div(ny, 2)
@@ -1760,13 +1760,13 @@ function apply_2d_spectral_cutoff!(data::AbstractMatrix, cutoffs::Tuple, rfft_di
     end
 end
 
-function apply_3d_spectral_cutoff!(data::AbstractArray{T, 3}, cutoffs::Tuple, rfft_dims::Tuple=ntuple(i->false, 3)) where T
-    """
+"""
     Apply 3D spectral cutoff for dealiasing.
 
     Zeros out modes where |kx| > cutoffs[1], |ky| > cutoffs[2], or |kz| > cutoffs[3].
     For rfft dimensions, all indices are positive frequencies (k=i-1).
     """
+function apply_3d_spectral_cutoff!(data::AbstractArray{T, 3}, cutoffs::Tuple, rfft_dims::Tuple=ntuple(i->false, 3)) where T
     nx, ny, nz = size(data)
     kx_cut = cutoffs[1]
     ky_cut = length(cutoffs) >= 2 ? cutoffs[2] : div(ny, 2)
@@ -1815,10 +1815,10 @@ function apply_3d_spectral_cutoff!(data::AbstractArray{T, 3}, cutoffs::Tuple, rf
     end
 end
 
-function apply_nd_spectral_cutoff!(data::AbstractArray, cutoffs::Tuple, rfft_dims::Tuple=ntuple(i->false, length(cutoffs)))
-    """
+"""
     Apply N-dimensional spectral cutoff (general case).
     """
+function apply_nd_spectral_cutoff!(data::AbstractArray, cutoffs::Tuple, rfft_dims::Tuple=ntuple(i->false, length(cutoffs)))
     shape = size(data)
     ndims_data = ndims(data)
 
@@ -1962,8 +1962,7 @@ function create_spherical_mask(shape::Tuple, k_max::Int, T::Type)
     end
 end
 
-function get_dealiasing_cutoffs(shape::Tuple, dealiasing_factor::Float64=1.5)
-    """
+"""
     Compute spectral cutoffs for dealiasing.
 
     For the 2/3 rule (dealiasing_factor=1.5):
@@ -1973,12 +1972,12 @@ function get_dealiasing_cutoffs(shape::Tuple, dealiasing_factor::Float64=1.5)
     (or used as a post-multiply filter), modes above this cutoff are zeroed
     to suppress aliasing from quadratic nonlinear interactions.
     """
+function get_dealiasing_cutoffs(shape::Tuple, dealiasing_factor::Float64=1.5)
     return tuple([floor(Int, n / (2 * dealiasing_factor)) for n in shape]...)
 end
 
 # Utility functions for PencilArray compatibility
-function get_pencil_compatible_data(field::ScalarField, config::PencilConfig)
-    """
+"""
     Convert field data to PencilArray format compatible with the given PencilConfig.
 
     This function ensures that the field's data is:
@@ -1989,6 +1988,7 @@ function get_pencil_compatible_data(field::ScalarField, config::PencilConfig)
 
     Returns the field's grid space data as a PencilArray or compatible array.
     """
+function get_pencil_compatible_data(field::ScalarField, config::PencilConfig)
 
     # Ensure field is in grid space layout for nonlinear operations
     ensure_layout!(field, :g)
@@ -2117,10 +2117,10 @@ function is_shape_compatible(local_shape::Tuple, global_shape::Tuple, mesh::Tupl
     return true
 end
 
-function get_pencil_config_from_field(field::ScalarField)
-    """
+"""
     Extract a PencilConfig from a ScalarField's distributor configuration.
     """
+function get_pencil_config_from_field(field::ScalarField)
     dist = field.dist
 
     if dist.pencil_config !== nothing
@@ -2142,13 +2142,13 @@ function get_pencil_config_from_field(field::ScalarField)
     )
 end
 
-function ensure_pencil_compatibility!(field::ScalarField, config::PencilConfig)
-    """
+"""
     Ensure field is compatible with the given PencilConfig, reallocating if necessary.
 
     This function modifies the field in-place to ensure compatibility with the config.
     Returns true if the field was modified, false otherwise.
     """
+function ensure_pencil_compatibility!(field::ScalarField, config::PencilConfig)
 
     # Ensure field is in grid space
     ensure_layout!(field, :g)
@@ -2450,11 +2450,11 @@ function compute_local_range(global_shape::Tuple, mesh::Tuple, comm::MPI.Comm)
     return ranges
 end
 
-function interpolate_field_data!(dest::AbstractArray, src::AbstractArray)
-    """
+"""
     Interpolate source data into destination array.
     Uses nearest-neighbor or linear interpolation depending on relative sizes.
     """
+function interpolate_field_data!(dest::AbstractArray, src::AbstractArray)
     src_shape = size(src)
     dest_shape = size(dest)
 
@@ -2476,12 +2476,12 @@ function interpolate_field_data!(dest::AbstractArray, src::AbstractArray)
     end
 end
 
-function set_pencil_compatible_data!(field::ScalarField, data, config::PencilConfig)
-    """
+"""
     Set field data from PencilArray format.
     Since ScalarField stores data as PencilArrays, this mainly ensures
     proper layout and copies the data.
     """
+function set_pencil_compatible_data!(field::ScalarField, data, config::PencilConfig)
     
     # Ensure field is in grid space layout
     ensure_layout!(field, :g)
@@ -2520,8 +2520,8 @@ function set_pencil_compatible_data!(field::ScalarField, data, config::PencilCon
 end
 
 # Memory management
+"""Get temporary field for intermediate calculations """
 function get_temp_field(evaluator::NonlinearEvaluator, template::ScalarField, name::String)
-    """Get temporary field for intermediate calculations """
     
     key = "$(name)_$(hash(template.bases))"
     
@@ -2537,8 +2537,8 @@ function get_temp_field(evaluator::NonlinearEvaluator, template::ScalarField, na
     return evaluator.temp_fields[key]
 end
 
+"""Clear temporary fields to free memory"""
 function clear_temp_fields!(evaluator::NonlinearEvaluator)
-    """Clear temporary fields to free memory"""
     empty!(evaluator.temp_fields)
     GC.gc()
 end
@@ -2576,8 +2576,8 @@ function return_temp_array!(evaluator::NonlinearEvaluator, arr::AbstractArray)
 end
 
 # Integration with existing operator evaluation
+"""Evaluate nonlinear operator"""
 function evaluate_operator(op::NonlinearOperator)
-    """Evaluate nonlinear operator"""
     
     if isa(op, AdvectionOperator)
         return evaluate_nonlinear_term(op)
@@ -2598,8 +2598,8 @@ function _get_evaluator(dist::Distributor)
     return dist.nonlinear_evaluator
 end
 
+"""Evaluate general convective operator"""
 function evaluate_convective_operator(op::ConvectiveOperator)
-    """Evaluate general convective operator"""
 
     field1, field2 = op.field1, op.field2
 
@@ -2633,8 +2633,8 @@ function evaluate_convective_operator(op::ConvectiveOperator)
     end
 end
 
+"""Evaluate v1·v2 dot product"""
 function evaluate_vector_dot_product(v1::VectorField, v2::VectorField)
-    """Evaluate v1·v2 dot product"""
     
     if length(v1.components) != length(v2.components)
         throw(ArgumentError("Vector fields must have same number of components"))
@@ -2653,8 +2653,8 @@ function evaluate_vector_dot_product(v1::VectorField, v2::VectorField)
     return result
 end
 
+"""Evaluate v1×v2 cross product (3D only)"""
 function evaluate_vector_cross_product(v1::VectorField, v2::VectorField)
-    """Evaluate v1×v2 cross product (3D only)"""
     
     if length(v1.components) != 3 || length(v2.components) != 3
         throw(ArgumentError("Cross product requires 3D vector fields"))
@@ -2706,8 +2706,8 @@ function _evaluate_any_operand(arg, layout::Symbol)
 end
 
 # Evaluate methods for DotProduct and CrossProduct from arithmetic.jl
+"""Evaluate DotProduct of two VectorFields"""
 function evaluate(op::DotProduct, layout::Symbol=:g)
-    """Evaluate DotProduct of two VectorFields"""
     args = future_args(op)
     if length(args) != 2
         throw(ArgumentError("DotProduct expects exactly two operands"))
@@ -2726,8 +2726,8 @@ function evaluate(op::DotProduct, layout::Symbol=:g)
     return result
 end
 
+"""Evaluate CrossProduct of two VectorFields"""
 function evaluate(op::CrossProduct, layout::Symbol=:g)
-    """Evaluate CrossProduct of two VectorFields"""
     args = future_args(op)
     if length(args) != 2
         throw(ArgumentError("CrossProduct expects exactly two operands"))
@@ -2749,23 +2749,23 @@ function evaluate(op::CrossProduct, layout::Symbol=:g)
 end
 
 # Convenience constructors
+"""Create advection operator u·∇φ"""
 function advection(u::VectorField, φ::ScalarField)
-    """Create advection operator u·∇φ"""
     return AdvectionOperator(u, φ)
 end
 
+"""Create nonlinear momentum operator (u·∇)u"""
 function nonlinear_momentum(u::VectorField)
-    """Create nonlinear momentum operator (u·∇)u"""
     return NonlinearAdvectionOperator(u)
 end
 
+"""Create convective operator"""
 function convection(f1, f2, op::Symbol)
-    """Create convective operator"""
     return ConvectiveOperator(f1, f2, op)
 end
 
+"""Log nonlinear evaluation performance statistics"""
 function log_nonlinear_performance(stats::NonlinearPerformanceStats)
-    """Log nonlinear evaluation performance statistics"""
 
     if MPI.Initialized()
         mpi_rank = MPI.Comm_rank(MPI.COMM_WORLD)

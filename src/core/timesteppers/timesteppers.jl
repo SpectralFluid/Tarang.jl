@@ -16,11 +16,8 @@ MPI-compatible IMEX support:
 - Chebyshev-Fourier domains: Use PencilLinearOperator (per-wavenumber 1D solves)
 """
 
-using LinearAlgebra
-using LinearAlgebra: BLAS
+# LinearAlgebra, SparseArrays, LoopVectorization, ExponentialUtilities already in Tarang.jl
 using SparseArrays: SparseMatrixCSC, nnz
-using LoopVectorization  # For SIMD loops
-using ExponentialUtilities  # For Krylov-based φ functions
 
 # TimeStepper abstract type is forward-declared in Tarang.jl
 

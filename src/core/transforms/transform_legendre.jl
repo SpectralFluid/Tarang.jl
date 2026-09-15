@@ -114,8 +114,7 @@ end
 _apply_forward(current, t::LegendreTransform) = _legendre_forward(current, t)
 _apply_backward(current, t::LegendreTransform) = _legendre_backward(current, t)
 
-function apply_legendre_forward!(field::ScalarField, transform::LegendreTransform)
-    """
+"""
     Apply forward Legendre transform (grid to coefficients) with in-place operations.
 
     Based on Tarang JacobiMMT.forward_matrix:
@@ -123,6 +122,7 @@ function apply_legendre_forward!(field::ScalarField, transform::LegendreTransfor
     - Proper normalization for orthonormal Legendre expansion
     - OPTIMIZED: In-place matrix-vector multiplication
     """
+function apply_legendre_forward!(field::ScalarField, transform::LegendreTransform)
 
     if transform.forward_matrix !== nothing
         set_coeff_data!(field, _legendre_forward(get_grid_data(field), transform))
@@ -134,14 +134,14 @@ function apply_legendre_forward!(field::ScalarField, transform::LegendreTransfor
     set_coeff_data!(field, copy(get_grid_data(field)))
 end
 
-function apply_legendre_backward!(field::ScalarField, transform::LegendreTransform)
-    """
+"""
     Apply backward Legendre transform (coefficients to grid) with in-place operations.
 
     Based on Tarang polynomial evaluation:
     - Evaluates f(x) = Σ c_n P_n(x) at Gauss-Legendre quadrature points
     - OPTIMIZED: Uses workspace buffer and in-place operations
     """
+function apply_legendre_backward!(field::ScalarField, transform::LegendreTransform)
 
     if transform.backward_matrix !== nothing
         set_grid_data!(field, _legendre_backward(get_coeff_data(field), transform))
@@ -154,8 +154,7 @@ function apply_legendre_backward!(field::ScalarField, transform::LegendreTransfo
 end
 
 # Dealiasing operations following Tarang patterns
-function dealias!(field::ScalarField, scales::Union{Real, Vector{Real}})
-    """
+"""
     Apply dealiasing to field following Tarang field.change_scales and low_pass_filter implementation.
     
     Based on Tarang field:
@@ -170,6 +169,7 @@ function dealias!(field::ScalarField, scales::Union{Real, Vector{Real}})
         Scale factors for each basis dimension (0 < scale <= 1)
         Values < 1 remove high-frequency modes for dealiasing
     """
+function dealias!(field::ScalarField, scales::Union{Real, Vector{Real}})
     
     # Ensure we're in coefficient space for dealiasing
     ensure_layout!(field, :c)
@@ -261,8 +261,8 @@ function _dealiasing_zero_range!(field::ScalarField, axis::Int, global_start::In
     end
 end
 
+"""Apply Fourier basis dealiasing following Tarang patterns"""
 function apply_basis_dealiasing!(field::ScalarField, basis::Union{RealFourier, ComplexFourier}, axis::Int, scale::Real)
-    """Apply Fourier basis dealiasing following Tarang patterns"""
 
     # Use GLOBAL axis size for cutoff computation (critical for MPI mode)
     axis_size = _dealiasing_axis_size(field, axis)
@@ -313,8 +313,8 @@ function apply_basis_dealiasing!(field::ScalarField, basis::Union{RealFourier, C
     end
 end
 
+"""Apply Chebyshev basis dealiasing following Tarang patterns"""
 function apply_basis_dealiasing!(field::ScalarField, basis::ChebyshevT, axis::Int, scale::Real)
-    """Apply Chebyshev basis dealiasing following Tarang patterns"""
 
     # Calculate cutoff mode for Chebyshev basis
     total_modes = basis.meta.size
@@ -333,8 +333,8 @@ function apply_basis_dealiasing!(field::ScalarField, basis::ChebyshevT, axis::In
     end
 end
 
+"""Apply Legendre basis dealiasing following Tarang patterns"""
 function apply_basis_dealiasing!(field::ScalarField, basis::Legendre, axis::Int, scale::Real)
-    """Apply Legendre basis dealiasing following Tarang patterns"""
 
     # Calculate cutoff mode for Legendre basis
     total_modes = basis.meta.size
@@ -354,8 +354,8 @@ function apply_basis_dealiasing!(field::ScalarField, basis::Legendre, axis::Int,
 end
 
 # Generic fallback for unknown basis types
+"""Generic dealiasing for unknown basis types"""
 function apply_basis_dealiasing!(field::ScalarField, basis, axis::Int, scale::Real)
-    """Generic dealiasing for unknown basis types"""
     
     @warn "Unknown basis type $(typeof(basis)) for axis $axis, using generic polynomial dealiasing"
     
@@ -379,8 +379,8 @@ function apply_basis_dealiasing!(field::ScalarField, basis, axis::Int, scale::Re
 end
 
 # Convenience function for domain-based dealiasing
+"""Apply default dealiasing using domain.dealias scales"""
 function dealias!(field::ScalarField)
-    """Apply default dealiasing using domain.dealias scales"""
     
     if field.domain !== nothing && hasfield(typeof(field.domain), :dealias)
         dealias!(field, field.domain.dealias)
@@ -391,8 +391,8 @@ function dealias!(field::ScalarField)
 end
 
 # Utility functions
+"""Find transform corresponding to a basis"""
 function get_transform_for_basis(transforms::Vector, basis::Basis)
-    """Find transform corresponding to a basis"""
     for transform in transforms
         if hasfield(typeof(transform), :basis) && transform.basis == basis
             return transform
@@ -523,8 +523,8 @@ function setup_pencil_fft_transforms_3d!(dist::Distributor, domain::Domain,
     end
 end
 
+"""Fallback FFTW transforms for high-dimensional problems"""
 function setup_fftw_transforms_nd!(dist::Distributor, domain::Domain, fourier_axes::Vector{Int})
-    """Fallback FFTW transforms for high-dimensional problems"""
     
     @info "Using FFTW fallback for $(length(domain.bases))D problem"
     
@@ -535,8 +535,8 @@ function setup_fftw_transforms_nd!(dist::Distributor, domain::Domain, fourier_ax
     end
 end
 
+"""Setup 3D PencilArrays configuration"""
 function setup_pencil_arrays_3d(dist::Distributor, global_shape::Tuple{Vararg{Int}})
-    """Setup 3D PencilArrays configuration"""
 
     if length(global_shape) != 3
         throw(ArgumentError("3D setup requires 3D global shape, got $(length(global_shape))D"))
@@ -553,9 +553,8 @@ function setup_pencil_arrays_3d(dist::Distributor, global_shape::Tuple{Vararg{In
     end
 
     # Create PencilArrays configuration
-    # For 2D mesh with 3D data (pencil decomposition), only decompose last 2 dimensions
-    # For 3D mesh with 3D data, decompose all 3 dimensions
-    decomp_dims = mesh_len == 3 ? (true, true, true) : (false, true, true)
+    # decomp_dims is NTuple{M, Bool} matching the mesh dimensions — all active
+    decomp_dims = ntuple(_ -> true, mesh_len)
 
     dist.pencil_config = PencilConfig(
         global_shape,
@@ -581,8 +580,8 @@ function create_pencil_3d(dist::Distributor, global_shape::Tuple{Vararg{Int}},
 end
 
 # Enhanced 3D transform execution
+"""Apply 3D forward transform to field"""
 function forward_transform_3d!(field::ScalarField, target_layout::Symbol=:c)
-    """Apply 3D forward transform to field"""
     
     if field.domain === nothing || length(field.domain.bases) != 3
         forward_transform!(field, target_layout)  # Fall back to general case
@@ -607,8 +606,8 @@ function forward_transform_3d!(field::ScalarField, target_layout::Symbol=:c)
     forward_transform!(field, target_layout)
 end
 
+"""Apply 3D backward transform to field"""
 function backward_transform_3d!(field::ScalarField, target_layout::Symbol=:g)
-    """Apply 3D backward transform to field"""
     
     if field.domain === nothing || length(field.domain.bases) != 3
         backward_transform!(field, target_layout)  # Fall back to general case
@@ -799,8 +798,8 @@ function synchronize_transforms!(transforms::Vector)
     return nothing
 end
 
+"""Check if bases are compatible with parallel transforms (PencilArrays)"""
 function is_pencil_compatible(bases::Tuple{Vararg{Basis}})
-    """Check if bases are compatible with parallel transforms (PencilArrays)"""
     ndim = length(bases)
 
     if ndim < 2
@@ -819,8 +818,8 @@ function is_pencil_compatible(bases::Tuple{Vararg{Basis}})
     return fourier_count >= 1 && ndim >= 2
 end
 
+"""Check if 3D PencilFFTs would be optimal for these bases"""
 function is_3d_pencil_optimal(bases::Tuple{Vararg{Basis}})
-    """Check if 3D PencilFFTs would be optimal for these bases"""
     if length(bases) != 3
         return false
     end

@@ -30,8 +30,7 @@ For a 3D domain (Nx, Ny, Nz) with P processes:
 - 2DECOMP&FFT library concepts
 """
 
-using MPI
-using FFTW
+# MPI, FFTW already in Tarang.jl
 
 # GPU synchronization helper — overridden by CUDA extension
 synchronize_device!(::CPU) = nothing

@@ -257,6 +257,20 @@ function BandedLUSolver(matrix::AbstractMatrix;
     return BandedLUSolver{T}(AB, n, kl, ku, ipiv)
 end
 
+function detect_bandwidth(A::SparseMatrixCSC)
+    lower = 0
+    upper = 0
+    rows = rowvals(A)
+    for j in 1:size(A, 2)
+        for idx in nzrange(A, j)
+            i = rows[idx]
+            lower = max(lower, i - j)
+            upper = max(upper, j - i)
+        end
+    end
+    return lower, upper
+end
+
 function detect_bandwidth(A::AbstractMatrix)
     n = size(A, 1)
     lower = 0

@@ -382,11 +382,11 @@ using Test
             @test Tarang.safe_divide(1, 0; default=-1.0) == -1.0
         end
 
-        @testset "clamp_to_range" begin
-            @test Tarang.clamp_to_range(5, 0, 10) == 5
-            @test Tarang.clamp_to_range(-5, 0, 10) == 0
-            @test Tarang.clamp_to_range(15, 0, 10) == 10
-            @test Tarang.clamp_to_range(0.5, 0.0, 1.0) == 0.5
+        @testset "clamp" begin
+            @test clamp(5, 0, 10) == 5
+            @test clamp(-5, 0, 10) == 0
+            @test clamp(15, 0, 10) == 10
+            @test clamp(0.5, 0.0, 1.0) == 0.5
         end
     end
 

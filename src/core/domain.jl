@@ -2,9 +2,8 @@
 Domain class definition
 """
 
-using LinearAlgebra
-using MPI
-using OrderedCollections: OrderedDict
+# LinearAlgebra and MPI already imported in Tarang.jl
+using OrderedCollections: OrderedDict, OrderedSet
 
 """
     gauss_legendre_weights(N)
@@ -172,8 +171,8 @@ is_gpu(domain::Domain) = is_gpu(domain.dist.architecture)
     end
 end
 
+"""Ordered mapping from global axis index to basis."""
 function bases_by_axis(domain::Domain)
-    """Ordered mapping from global axis index to basis."""
     _domain_cached_get!(domain, :bases_by_axis) do
         axes = OrderedDict{Int, Basis}()
         for basis in domain.bases
@@ -186,8 +185,8 @@ function bases_by_axis(domain::Domain)
     end
 end
 
+"""Tuple mapping each distributor axis to its active basis (or nothing)."""
 function full_bases(domain::Domain)
-    """Tuple mapping each distributor axis to its active basis (or nothing)."""
     _domain_cached_get!(domain, :full_bases) do
         full = Vector{Union{Basis, Nothing}}(undef, domain.dist.dim)
         fill!(full, nothing)
@@ -201,8 +200,8 @@ function full_bases(domain::Domain)
     end
 end
 
+"""Ordered mapping from coordinates/coordinate systems to bases."""
 function bases_by_coord(domain::Domain)
-    """Ordered mapping from coordinates/coordinate systems to bases."""
     _domain_cached_get!(domain, :bases_by_coord) do
         mapping = OrderedDict{Any, Union{Basis, Nothing}}()
         for coord in domain.dist.coords
@@ -222,8 +221,8 @@ function bases_by_coord(domain::Domain)
     end
 end
 
+"""Tuple of dealiasing factors per axis."""
 function dealias(domain::Domain)
-    """Tuple of dealiasing factors per axis."""
     _domain_cached_get!(domain, :dealias) do
         factors = ones(Float64, domain.dist.dim)
         for basis in domain.bases
@@ -240,8 +239,8 @@ function dealias(domain::Domain)
     end
 end
 
+"""Tuple indicating which axes are constant."""
 function constant(domain::Domain)
-    """Tuple indicating which axes are constant."""
     _domain_cached_get!(domain, :constant) do
         const_flags = falses(domain.dist.dim)
         for basis in domain.bases
@@ -259,15 +258,15 @@ function constant(domain::Domain)
     end
 end
 
+"""Tuple inverse of constant axes."""
 function nonconstant(domain::Domain)
-    """Tuple inverse of constant axes."""
     _domain_cached_get!(domain, :nonconstant) do
         map(!, constant(domain))
     end
 end
 
+"""Tuple of mode-dependence flags per axis."""
 function mode_dependence(domain::Domain)
-    """Tuple of mode-dependence flags per axis."""
     _domain_cached_get!(domain, :mode_dependence) do
         dep_flags = trues(domain.dist.dim)
         for basis in domain.bases
@@ -285,8 +284,8 @@ function mode_dependence(domain::Domain)
     end
 end
 
+"""Return new domain with one basis substituted."""
 function substitute_basis(domain::Domain, old_basis::Basis, new_basis::Basis)
-    """Return new domain with one basis substituted."""
     bases_vec = collect(domain.bases)
     idx = findfirst(==(old_basis), bases_vec)
     if idx !== nothing
@@ -296,8 +295,8 @@ function substitute_basis(domain::Domain, old_basis::Basis, new_basis::Basis)
     return Domain(domain.dist, tuple(bases_vec...))
 end
 
+"""Retrieve basis associated with coordinate or axis index."""
 function get_basis(domain::Domain, coords)
-    """Retrieve basis associated with coordinate or axis index."""
     axis = coords isa Int ? coords : get_axis(domain.dist, coords)
     full = full_bases(domain)
     idx = axis + 1
@@ -307,8 +306,8 @@ function get_basis(domain::Domain, coords)
     return full[idx]
 end
 
+"""Return subaxis index for coordinate within its basis."""
 function get_basis_subaxis(domain::Domain, coord::Coordinate)
-    """Return subaxis index for coordinate within its basis."""
     axis = get_axis(domain.dist, coord)
     for basis in domain.bases
         first_axis = get_basis_axis(domain.dist, basis)
@@ -319,8 +318,8 @@ function get_basis_subaxis(domain::Domain, coord::Coordinate)
     throw(ArgumentError("Coordinate $(coord.name) not found in any basis"))
 end
 
+"""Retrieve coordinate by name across all bases."""
 function get_coord(domain::Domain, name::AbstractString)
-    """Retrieve coordinate by name across all bases."""
     for basis in domain.bases
         for coord in coords(basis.meta.coordsys)
             if coord.name == name
@@ -331,8 +330,8 @@ function get_coord(domain::Domain, name::AbstractString)
     throw(ArgumentError("Coordinate name $name not found in domain"))
 end
 
+"""Iterator of (axis, basis) pairs with unique bases."""
 function enumerate_unique_bases(domain::Domain)
-    """Iterator of (axis, basis) pairs with unique bases."""
     _domain_cached_get!(domain, :enumerate_unique_bases) do
         seen = OrderedSet()
         pairs = Vector{Tuple{Int, Union{Basis, Nothing}}}()
@@ -349,8 +348,8 @@ function enumerate_unique_bases(domain::Domain)
     end
 end
 
+"""Effective dimension counting non-constant axes."""
 function dim(domain::Domain)
-    """Effective dimension counting non-constant axes."""
     _domain_cached_get!(domain, :dim_cached) do
         sum(flag ? 1 : 0 for flag in nonconstant(domain))
     end
@@ -363,25 +362,27 @@ function clear_domain_cache!(domain::Domain)
     return domain
 end
 
+"""Calculate domain volume as product of interval lengths for all bases."""
 function volume(domain::Domain)
-    """Calculate domain volume as product of interval lengths for all bases."""
     vol = 1.0
     for basis in domain.bases
         interval_length = basis.meta.bounds[2] - basis.meta.bounds[1]
-        if interval_length <= 0
-            @warn "Non-positive interval length $(interval_length) for basis $(basis.meta.element_label), using absolute value"
-            interval_length = abs(interval_length)
-            if interval_length == 0
-                interval_length = 1.0  # Fallback for degenerate case
-            end
+        if interval_length == 0
+            throw(ArgumentError(
+                "Zero-length interval for basis '$(basis.meta.element_label)': " *
+                "bounds = $(basis.meta.bounds). Cannot compute domain volume."))
+        elseif interval_length < 0
+            throw(ArgumentError(
+                "Reversed interval for basis '$(basis.meta.element_label)': " *
+                "bounds = $(basis.meta.bounds) (lower > upper). Check basis construction."))
         end
         vol *= interval_length
     end
     return vol
 end
 
+"""Get global shape for domain in specified layout"""
 function global_shape(domain::Domain, layout_name::Symbol=:g)
-    """Get global shape for domain in specified layout"""
     if layout_name == :g  # Grid layout
         return tuple([basis.meta.size for basis in domain.bases]...)
     elseif layout_name == :c  # Coefficient layout
@@ -393,8 +394,7 @@ function global_shape(domain::Domain, layout_name::Symbol=:g)
     end
 end
 
-function coefficient_shape(domain::Domain)
-    """
+"""
     Get coefficient space shape for domain (serial mode).
 
     For RealFourier bases, the coefficient array has size div(N, 2) + 1 (complex).
@@ -404,6 +404,7 @@ function coefficient_shape(domain::Domain)
     PencilFFTs can only apply RFFT to the FIRST Fourier axis. Subsequent RealFourier
     axes must use FFT (full size N, not N/2+1).
     """
+function coefficient_shape(domain::Domain)
     shape = Int[]
     for basis in domain.bases
         if isa(basis, RealFourier)
@@ -417,8 +418,7 @@ function coefficient_shape(domain::Domain)
     return tuple(shape...)
 end
 
-function coefficient_shape_mpi(domain::Domain)
-    """
+"""
     Get coefficient space shape for domain in MPI mode with PencilFFTs.
 
     CRITICAL: PencilFFTs can only apply RFFT to the FIRST Fourier axis.
@@ -430,6 +430,7 @@ function coefficient_shape_mpi(domain::Domain)
     - ComplexFourier axes: N (FFT output)
     - Non-Fourier axes: N (same as grid)
     """
+function coefficient_shape_mpi(domain::Domain)
     shape = Int[]
 
     # Find the first Fourier axis (RealFourier or ComplexFourier)
@@ -459,14 +460,14 @@ function coefficient_shape_mpi(domain::Domain)
     return tuple(shape...)
 end
 
-function get_coefficient_shape_for_context(domain::Domain, dist::Distributor)
-    """
+"""
     Get the appropriate coefficient shape based on execution context.
 
     - Serial mode (dist.size == 1): Use standard coefficient_shape (all RealFourier → N/2+1)
     - MPI mode with PencilFFTs: Use coefficient_shape_mpi (only first RealFourier → N/2+1)
     - MPI mode without PencilFFTs: Use standard coefficient_shape (local FFTs)
     """
+function get_coefficient_shape_for_context(domain::Domain, dist::Distributor)
     if dist.size > 1 && dist.use_pencil_arrays
         return coefficient_shape_mpi(domain)
     else
@@ -474,8 +475,8 @@ function get_coefficient_shape_for_context(domain::Domain, dist::Distributor)
     end
 end
 
+"""Get local shape for domain in specified layout"""
 function local_shape(domain::Domain, layout_name::Symbol=:g)
-    """Get local shape for domain in specified layout"""
     if layout_name == :g
         layout = get_layout(domain.dist, domain.bases)
         return layout.local_shape
@@ -493,15 +494,15 @@ function local_shape(domain::Domain, layout_name::Symbol=:g)
     end
 end
 
+"""Get pencil array for domain"""
 function get_pencil(domain::Domain, decomp_index::Int=1)
-    """Get pencil array for domain"""
     gshape = global_shape(domain)
     return create_pencil(domain.dist, gshape, decomp_index)
 end
 
 # Grid and coefficient utilities
+"""Calculate grid spacing for each dimension"""
 function grid_spacing(domain::Domain)
-    """Calculate grid spacing for each dimension"""
     spacings = Float64[]
     for basis in domain.bases
         size = basis.meta.size
@@ -533,8 +534,7 @@ function grid_spacing(domain::Domain)
     return spacings
 end
 
-function integration_weights(domain::Domain; on_device::Bool=true)
-    """
+"""
     Get integration weights for each basis.
 
     Arguments:
@@ -545,6 +545,7 @@ function integration_weights(domain::Domain; on_device::Bool=true)
     Returns:
     - Vector{AbstractArray} of integration weights for each basis
     """
+function integration_weights(domain::Domain; on_device::Bool=true)
 
     start_time = time()
     arch = architecture(domain)
@@ -585,23 +586,22 @@ function integration_weights(domain::Domain; on_device::Bool=true)
 end
 
 # Domain queries
+"""Check if domain is compound (multiple bases)"""
 function is_compound(domain::Domain)
-    """Check if domain is compound (multiple bases)"""
     return length(domain.bases) > 1
 end
 
+"""Check if domain contains a specific basis"""
 function has_basis(domain::Domain, basis::Basis)
-    """Check if domain contains a specific basis"""
     return basis in domain.bases
 end
 
+"""Get names of all bases in domain"""
 function basis_names(domain::Domain)
-    """Get names of all bases in domain"""
     return [basis.meta.element_label for basis in domain.bases]
 end
 
-function get_grid_coordinates(domain::Domain; on_device::Bool=true)
-    """
+"""
     Get grid coordinates for all bases.
 
     Arguments:
@@ -612,6 +612,7 @@ function get_grid_coordinates(domain::Domain; on_device::Bool=true)
     Returns:
     - Dict{String, AbstractArray} mapping coordinate names to coordinate arrays
     """
+function get_grid_coordinates(domain::Domain; on_device::Bool=true)
 
     start_time = time()
     arch = architecture(domain)
@@ -655,8 +656,7 @@ function get_grid_coordinates(domain::Domain; on_device::Bool=true)
     return coordinates
 end
 
-function create_meshgrid(domain::Domain; on_device::Bool=true)
-    """
+"""
     Create meshgrid arrays for multi-dimensional domains.
 
     Supports both CPU and GPU: when domain is on GPU, returns GPU arrays.
@@ -670,54 +670,37 @@ function create_meshgrid(domain::Domain; on_device::Bool=true)
     Returns:
     - Dict{String, AbstractArray} mapping coordinate names to meshgrid arrays
     """
+function create_meshgrid(domain::Domain; on_device::Bool=true)
 
     grid_coords = get_grid_coordinates(domain; on_device=on_device)
+    ndim = length(domain.bases)
 
-    if length(domain.bases) == 1
+    if ndim == 1
         coord_name = domain.bases[1].meta.element_label
         return Dict(coord_name => grid_coords[coord_name])
-    elseif length(domain.bases) == 2
-        x_name = domain.bases[1].meta.element_label
-        y_name = domain.bases[2].meta.element_label
-
-        x_coords = grid_coords[x_name]
-        y_coords = grid_coords[y_name]
-
-        nx, ny = length(x_coords), length(y_coords)
-
-        # Both arrays should have shape (nx, ny) for consistency
-        # reshape and repeat work on both CPU and GPU arrays
-        X = repeat(reshape(x_coords, nx, 1), 1, ny)
-        Y = repeat(reshape(y_coords, 1, ny), nx, 1)
-
-        return Dict(x_name => X, y_name => Y)
-    elseif length(domain.bases) == 3
-        x_name = domain.bases[1].meta.element_label
-        y_name = domain.bases[2].meta.element_label
-        z_name = domain.bases[3].meta.element_label
-
-        x_coords = grid_coords[x_name]
-        y_coords = grid_coords[y_name]
-        z_coords = grid_coords[z_name]
-
-        nx, ny, nz = length(x_coords), length(y_coords), length(z_coords)
-
-        # reshape and repeat work on both CPU and GPU arrays
-        X = repeat(reshape(x_coords, nx, 1, 1), 1, ny, nz)
-        Y = repeat(reshape(y_coords, 1, ny, 1), nx, 1, nz)
-        Z = repeat(reshape(z_coords, 1, 1, nz), nx, ny, 1)
-
-        return Dict(x_name => X, y_name => Y, z_name => Z)
-    else
-        throw(ArgumentError("Meshgrid not implemented for $(length(domain.bases))D domains"))
     end
+
+    # General N-dimensional meshgrid using reshape + repeat
+    names = [b.meta.element_label for b in domain.bases]
+    coords = [grid_coords[n] for n in names]
+    sizes = [length(c) for c in coords]
+
+    result = Dict{String, AbstractArray}()
+    for (d, name) in enumerate(names)
+        # Shape: 1 in all dims except d where it's sizes[d]
+        shape = ntuple(i -> i == d ? sizes[i] : 1, ndim)
+        # Repeat: sizes[i] in all dims except d where it's 1
+        reps = ntuple(i -> i == d ? 1 : sizes[i], ndim)
+        result[name] = repeat(reshape(coords[d], shape...), reps...)
+    end
+    return result
 end
 
 # Alias for backward compatibility
 domain_volume(domain::Domain) = volume(domain)
 
+"""Log domain performance statistics"""
 function log_domain_performance(domain::Domain)
-    """Log domain performance statistics"""
 
     # Only log on rank 0 to avoid spamming output
     rank = MPI.Initialized() ? MPI.Comm_rank(MPI.COMM_WORLD) : 0
@@ -734,8 +717,7 @@ function log_domain_performance(domain::Domain)
     return nothing
 end
 
-function get_domain_memory_info(domain::Domain)
-    """
+"""
     Return memory information for domains.
 
     For CPU domains, returns system memory info.
@@ -750,6 +732,7 @@ function get_domain_memory_info(domain::Domain)
     - domain_memory: Memory used by domain cached arrays
     - memory_utilization: Fraction of total memory in use
     """
+function get_domain_memory_info(domain::Domain)
     arch = architecture(domain)
 
     # Estimate domain memory usage from cached arrays

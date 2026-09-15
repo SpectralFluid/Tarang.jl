@@ -1519,7 +1519,7 @@ function create_current_file!(handler::NetCDFFileHandler)
         "source" => "Tarang.jl - Julia implementation of Tarang",
         "history" => "Created on $(Dates.format(now(), "yyyy-mm-dd HH:MM:SS"))",
         "Conventions" => "CF-1.8",
-        "tarang_version" => Tarang.__version__,
+        "tarang_version" => string(pkgversion(Tarang)),
         "software" => "Tarang",
         "software_repository" => "https://github.com/subhk/Tarang.jl",
         "restart_compatible" => 0  # 0 = false, 1 = true (NetCDF doesn't support Bool)

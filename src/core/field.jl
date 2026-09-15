@@ -2,12 +2,9 @@
 Field classes for data fields
 """
 
-using PencilArrays
-using LinearAlgebra
-using LinearAlgebra: BLAS, mul!, ldiv!
-using SparseArrays
+# PencilArrays, LinearAlgebra, SparseArrays, LoopVectorization already in Tarang.jl
+using LinearAlgebra: mul!, ldiv!
 using NetCDF
-using LoopVectorization  # For SIMD loops
 using Random
 
 abstract type Operand end
@@ -635,10 +632,10 @@ Get the underlying unlocked field.
 unlock(lf::LockedField) = lf.field
 
 # Copy methods for ScalarField
+"""Create a shallow copy of ScalarField with copied data arrays.
+Uses empty bases to construct a skeleton field without allocating data,
+then copies only the source field's arrays — avoids double allocation."""
 function Base.copy(field::ScalarField)
-    """Create a shallow copy of ScalarField with copied data arrays.
-    Uses empty bases to construct a skeleton field without allocating data,
-    then copies only the source field's arrays — avoids double allocation."""
     new_field = ScalarField(field.dist, field.name, (), field.dtype)
     # Restore metadata from source field
     new_field.bases = field.bases
@@ -658,14 +655,17 @@ function Base.copy(field::ScalarField)
     return new_field
 end
 
-function Base.deepcopy(field::ScalarField)
-    """Create a deep copy of ScalarField.
-    Uses empty bases to construct a skeleton field without allocating data,
-    then deep-copies the source field's arrays and mutable metadata."""
+function Base.deepcopy_internal(field::ScalarField, stackdict::IdDict)
+    # Return existing copy if already visited (cycle detection)
+    haskey(stackdict, field) && return stackdict[field]::ScalarField
+
+    # Construct skeleton field without data allocation
     new_field = ScalarField(field.dist, field.name, (), field.dtype)
-    # Deep-copy mutable metadata (Domain and Basis contain mutable caches)
-    new_field.bases = deepcopy(field.bases)
-    new_field.domain = field.domain === nothing ? nothing : deepcopy(field.domain)
+    stackdict[field] = new_field  # Register before recursing to break cycles
+
+    # Deep-copy mutable metadata with cycle tracking
+    new_field.bases = Base.deepcopy_internal(field.bases, stackdict)
+    new_field.domain = field.domain === nothing ? nothing : Base.deepcopy_internal(field.domain, stackdict)
     # Layout is a struct with immutable fields — shallow copy is fine
     new_field.layout = field.layout
     new_field.current_layout = field.current_layout
@@ -674,10 +674,10 @@ function Base.deepcopy(field::ScalarField)
     new_field.buffers.architecture = field.buffers.architecture
     # Deep-copy only the data arrays that exist
     if get_grid_data(field) !== nothing
-        set_grid_data!(new_field, deepcopy(get_grid_data(field)))
+        set_grid_data!(new_field, Base.deepcopy_internal(get_grid_data(field), stackdict))
     end
     if get_coeff_data(field) !== nothing
-        set_coeff_data!(new_field, deepcopy(get_coeff_data(field)))
+        set_coeff_data!(new_field, Base.deepcopy_internal(get_coeff_data(field), stackdict))
     end
     return new_field
 end
@@ -714,8 +714,7 @@ function synchronize_field_architecture!(field::ScalarField; arch::AbstractArchi
     return field
 end
 
-function allocate_data!(field::ScalarField)
-    """
+"""
     Allocate data for field following proper PencilArrays pattern.
 
     Key principles:
@@ -725,6 +724,7 @@ function allocate_data!(field::ScalarField)
     4. For RealFourier bases, coefficient array has different size (N/2 + 1 complex values)
     5. For GPU architecture, allocate on GPU using CuArray (via architecture abstraction)
     """
+function allocate_data!(field::ScalarField)
     if field.domain === nothing
         return
     end
@@ -846,8 +846,7 @@ Assign the coefficient data array while keeping buffer metadata consistent.
     return field
 end
 
-function get_local_array_size(dist::Distributor, global_shape::Tuple)
-    """
+"""
     Get local array size for this process based on MPI decomposition.
 
     IMPORTANT: This function assumes FULL MESH decomposition (no pencil/local dimension).
@@ -875,6 +874,7 @@ function get_local_array_size(dist::Distributor, global_shape::Tuple)
     Returns:
     - Tuple of local array dimensions for this process
     """
+function get_local_array_size(dist::Distributor, global_shape::Tuple)
     # Serial case: local = global
     if dist.size == 1 || dist.mesh === nothing
         return global_shape
@@ -991,13 +991,13 @@ function validate_decomposition_convention(dist::Distributor, expected_conventio
     end
 end
 
-function get_process_coordinate(dist::Distributor, dim::Int)
-    """
+"""
     Get the coordinate of this process in the specified mesh dimension.
 
     For a mesh (P₁, P₂, ..., Pₖ), the process with rank r has coordinates:
     (r % P₁, (r ÷ P₁) % P₂, ..., (r ÷ (P₁×P₂×...×Pₖ₋₁)) % Pₖ)
     """
+function get_process_coordinate(dist::Distributor, dim::Int)
     if dist.mesh === nothing || dim < 1 || dim > length(dist.mesh)
         return 0
     end
@@ -1017,8 +1017,7 @@ function get_process_coordinate(dist::Distributor, dim::Int)
     return coord
 end
 
-function get_local_range(dist::Distributor, global_size::Int, axis::Int)
-    """
+"""
     Get the local range [start, end] for this process in a given global axis.
 
     Arguments:
@@ -1033,6 +1032,7 @@ function get_local_range(dist::Distributor, global_size::Int, axis::Int)
     - PencilArrays convention: decompose LAST ndims_mesh dimensions
     - TransposableField convention: decompose FIRST ndims_mesh dimensions
     """
+function get_local_range(dist::Distributor, global_size::Int, axis::Int)
     if dist.size == 1 || dist.mesh === nothing || axis < 1 || axis > dist.dim
         return (1, global_size)
     end
@@ -1079,12 +1079,12 @@ function get_local_range(dist::Distributor, global_size::Int, axis::Int)
     return (start_idx, end_idx)
 end
 
-function global_to_local_index(dist::Distributor, global_idx::Int, axis::Int)
-    """
+"""
     Convert a global index to a local index for this process.
 
     Returns nothing if the global index is not owned by this process.
     """
+function global_to_local_index(dist::Distributor, global_idx::Int, axis::Int)
     start_idx, end_idx = get_local_range(dist, get_global_size(dist, axis), axis)
 
     if global_idx >= start_idx && global_idx <= end_idx
@@ -1094,10 +1094,10 @@ function global_to_local_index(dist::Distributor, global_idx::Int, axis::Int)
     end
 end
 
-function local_to_global_index(dist::Distributor, local_idx::Int, global_size::Int, axis::Int)
-    """
+"""
     Convert a local index to a global index.
     """
+function local_to_global_index(dist::Distributor, local_idx::Int, global_size::Int, axis::Int)
     start_idx, _ = get_local_range(dist, global_size, axis)
     return start_idx + local_idx - 1
 end
@@ -1204,8 +1204,7 @@ function get_global_sizes(dist::Distributor, domain::Domain)
     return tuple([basis.meta.size for basis in domain.bases]...)
 end
 
-function preset_scales!(field::ScalarField, scales::Union{Real, Vector{Real}, Tuple{Vararg{Real}}, Nothing})
-    """
+"""
     Set new transform scales without data transformation.
 
     Scales control the grid resolution relative to the coefficient resolution.
@@ -1224,6 +1223,7 @@ function preset_scales!(field::ScalarField, scales::Union{Real, Vector{Real}, Tu
     Returns:
     - The modified field
     """
+function preset_scales!(field::ScalarField, scales::Union{Real, Vector{Real}, Tuple{Vararg{Real}}, Nothing})
     new_scales = remedy_scales(field.dist, scales)
     old_scales = field.scales
 
@@ -1266,12 +1266,12 @@ function preset_scales!(field::ScalarField, scales::Union{Real, Vector{Real}, Tu
     return field
 end
 
-function get_scaled_shape(field::ScalarField, scales::Union{Tuple, Nothing})
-    """
+"""
     Compute the grid shape with given scales applied.
 
     For each basis, the scaled size is: ceil(Int, basis_size * scale)
     """
+function get_scaled_shape(field::ScalarField, scales::Union{Tuple, Nothing})
     if field.domain === nothing || isempty(field.bases)
         return ()
     end
@@ -1292,8 +1292,8 @@ function get_scaled_shape(field::ScalarField, scales::Union{Tuple, Nothing})
     return tuple(scaled_shape...)
 end
 
+"""Get the current scaled grid shape."""
 function get_scaled_shape(field::ScalarField)
-    """Get the current scaled grid shape."""
     if field.scales === nothing
         scales = tuple(ones(Float64, length(field.bases))...)
     else
@@ -1302,8 +1302,7 @@ function get_scaled_shape(field::ScalarField)
     return get_scaled_shape(field, scales)
 end
 
-function get_coefficient_shape(field::ScalarField)
-    """
+"""
     Get the coefficient (unscaled) shape, accounting for MPI execution context.
 
     IMPORTANT: In MPI mode with PencilFFTs, only the FIRST RealFourier axis uses RFFT
@@ -1312,6 +1311,7 @@ function get_coefficient_shape(field::ScalarField)
 
     In serial mode or MPI without PencilFFTs, all RealFourier axes use RFFT (N/2+1).
     """
+function get_coefficient_shape(field::ScalarField)
     if field.domain === nothing || isempty(field.bases)
         return ()
     end
@@ -1320,11 +1320,11 @@ function get_coefficient_shape(field::ScalarField)
     return get_coefficient_shape_for_context(field.domain, field.dist)
 end
 
-function require_scales!(field::ScalarField, scales::Union{Real, Tuple, Nothing})
-    """
+"""
     Ensure field has the specified scales, reallocating if necessary.
     Similar to require_scales pattern.
     """
+function require_scales!(field::ScalarField, scales::Union{Real, Tuple, Nothing})
     new_scales = remedy_scales(field.dist, scales)
 
     if field.scales != new_scales
@@ -1334,22 +1334,21 @@ function require_scales!(field::ScalarField, scales::Union{Real, Tuple, Nothing}
     return field
 end
 
-function dealias_scales(field::ScalarField)
-    """
+"""
     Get the standard 3/2 dealiasing scales for this field.
     Used for computing nonlinear terms without aliasing errors.
     """
+function dealias_scales(field::ScalarField)
     ndims = length(field.bases)
     return tuple(fill(1.5, ndims)...)
 end
 
+"""Apply 3/2 dealiasing scales to the field."""
 function apply_dealiasing_scales!(field::ScalarField)
-    """Apply 3/2 dealiasing scales to the field."""
     return preset_scales!(field, dealias_scales(field))
 end
 
-function set_scales!(field::ScalarField, scales::Union{Real, Vector{Real}, Tuple{Vararg{Real}}, Nothing})
-    """
+"""
     Change data to specified scales, properly handling data transformation.
     Following implementation in field:631-649
 
@@ -1372,6 +1371,7 @@ function set_scales!(field::ScalarField, scales::Union{Real, Vector{Real}, Tuple
     Returns:
     - The modified field with transformed data
     """
+function set_scales!(field::ScalarField, scales::Union{Real, Vector{Real}, Tuple{Vararg{Real}}, Nothing})
     # Remedy scales
     new_scales = remedy_scales(field.dist, scales)
     old_scales = field.scales
@@ -1498,8 +1498,8 @@ function resample_grid_data!(new_data::AbstractArray, old_data::AbstractArray,
     end
 end
 
+"""Resample 1D data using spectral interpolation."""
 function resample_1d!(new_data::AbstractVector, old_data::AbstractVector)
-    """Resample 1D data using spectral interpolation."""
     n_old = length(old_data)
     n_new = length(new_data)
 
@@ -1574,8 +1574,8 @@ function resample_1d!(new_data::AbstractVector, old_data::AbstractVector)
     end
 end
 
+"""Fallback linear interpolation for 1D resampling."""
 function resample_linear_1d!(new_data::AbstractVector, old_data::AbstractVector)
-    """Fallback linear interpolation for 1D resampling."""
     n_old = length(old_data)
     n_new = length(new_data)
 
@@ -1600,8 +1600,7 @@ function resample_linear_1d!(new_data::AbstractVector, old_data::AbstractVector)
     end
 end
 
-function resample_2d!(new_data::AbstractMatrix, old_data::AbstractMatrix)
-    """
+"""
     Resample 2D data using separable spectral interpolation.
 
     Uses 1D spectral resampling along each dimension sequentially,
@@ -1609,6 +1608,7 @@ function resample_2d!(new_data::AbstractMatrix, old_data::AbstractMatrix)
     is more robust than direct 2D FFT padding and handles arbitrary
     grid size changes correctly.
     """
+function resample_2d!(new_data::AbstractMatrix, old_data::AbstractMatrix)
     n_old = size(old_data)
     n_new = size(new_data)
 
@@ -1641,8 +1641,8 @@ function resample_2d!(new_data::AbstractMatrix, old_data::AbstractMatrix)
     end
 end
 
+"""Resample 3D data using separable 1D spectral interpolation."""
 function resample_3d!(new_data::AbstractArray{T,3}, old_data::AbstractArray{T,3}) where T
-    """Resample 3D data using separable 1D spectral interpolation."""
     n_old = size(old_data)
     n_new = size(new_data)
 
@@ -1677,8 +1677,8 @@ function resample_3d!(new_data::AbstractArray{T,3}, old_data::AbstractArray{T,3}
     end
 end
 
+"""Nearest-neighbor resampling for arbitrary dimensions."""
 function resample_nearest!(new_data::AbstractArray, old_data::AbstractArray)
-    """Nearest-neighbor resampling for arbitrary dimensions."""
     old_size = size(old_data)
     new_size = size(new_data)
     ndims_data = length(old_size)
@@ -1703,16 +1703,16 @@ end
 change_scales!(field::ScalarField, scales) = set_scales!(field, scales)
 
 # VectorField scaling methods
+"""Set scales for all vector field components."""
 function preset_scales!(field::VectorField, scales::Union{Real, Vector{Real}, Tuple{Vararg{Real}}, Nothing})
-    """Set scales for all vector field components."""
     for component in field.components
         preset_scales!(component, scales)
     end
     return field
 end
 
+"""Change scales for all vector field components."""
 function set_scales!(field::VectorField, scales::Union{Real, Vector{Real}, Tuple{Vararg{Real}}, Nothing})
-    """Change scales for all vector field components."""
     for component in field.components
         set_scales!(component, scales)
     end
@@ -1850,13 +1850,13 @@ function set_local_data!(field_data::AbstractArray, values)
 end
 
 # Data access and manipulation
-function Base.getindex(field::ScalarField, layout::String)
-    """
+"""
     Get data in specified layout.
 
     Returns local data if using PencilArrays (MPI), otherwise returns full array.
     For user code operating on local data, this is the correct access pattern.
     """
+function Base.getindex(field::ScalarField, layout::String)
     if layout == "g"
         ensure_layout!(field, :g)
         return get_local_data(get_grid_data(field))
@@ -1868,12 +1868,12 @@ function Base.getindex(field::ScalarField, layout::String)
     end
 end
 
-function Base.setindex!(field::ScalarField, values, layout::String)
-    """
+"""
     Set data in specified layout.
 
     Properly handles both PencilArray data (MPI) and regular arrays.
     """
+function Base.setindex!(field::ScalarField, values, layout::String)
     if layout == "g"
         ensure_layout!(field, :g)
         set_local_data!(get_grid_data(field), values)
@@ -1887,8 +1887,8 @@ function Base.setindex!(field::ScalarField, values, layout::String)
     end
 end
 
+"""Ensure field is in the target layout, transforming if necessary"""
 function ensure_layout!(field::ScalarField, target_layout::Symbol)
-    """Ensure field is in the target layout, transforming if necessary"""
     # Skip 0D fields (tau variables) which have no spatial data
     if isempty(field.bases)
         return
@@ -1921,15 +1921,15 @@ function ensure_layout!(field::ScalarField, target_layout::Symbol)
     # Setting it unconditionally would be incorrect if the transform failed or returned early
 end
 
+"""Ensure all components of VectorField are in the target layout"""
 function ensure_layout!(field::VectorField, target_layout::Symbol)
-    """Ensure all components of VectorField are in the target layout"""
     for comp in field.components
         ensure_layout!(comp, target_layout)
     end
 end
 
+"""Ensure all components of TensorField are in the target layout"""
 function ensure_layout!(field::TensorField, target_layout::Symbol)
-    """Ensure all components of TensorField are in the target layout"""
     for comp in field.components  # Matrix iteration goes element-by-element
         ensure_layout!(comp, target_layout)
     end
@@ -1939,11 +1939,11 @@ end
 # to avoid duplicate method definitions. The transforms.jl versions have more complete
 # implementations with optional target_layout parameters.
 
-function require_grid_space!(field::ScalarField, axis::Union{Int, Nothing}=nothing)
-    """
+"""
     Require one axis (default: all axes) to be in grid space.
     Following implementation in field:674-681
     """
+function require_grid_space!(field::ScalarField, axis::Union{Int, Nothing}=nothing)
     if field.domain === nothing
         return
     end
@@ -1963,11 +1963,11 @@ function require_grid_space!(field::ScalarField, axis::Union{Int, Nothing}=nothi
     end
 end
 
-function require_coeff_space!(field::ScalarField, axis::Union{Int, Nothing}=nothing)
-    """
+"""
     Require one axis (default: all axes) to be in coefficient space.
     Following implementation in field:683-690
     """
+function require_coeff_space!(field::ScalarField, axis::Union{Int, Nothing}=nothing)
     if field.domain === nothing
         return
     end
@@ -1987,11 +1987,11 @@ function require_coeff_space!(field::ScalarField, axis::Union{Int, Nothing}=noth
     end
 end
 
-function towards_grid_space!(field::ScalarField)
-    """
+"""
     Change to next layout towards grid space.
     Following implementation in field:664-667
     """
+function towards_grid_space!(field::ScalarField)
     if field.current_layout == :c
         # Transform from coefficient to grid space
         # Note: backward_transform_axis! sets current_layout = :g when successful
@@ -2000,11 +2000,11 @@ function towards_grid_space!(field::ScalarField)
     end
 end
 
-function towards_coeff_space!(field::ScalarField)
-    """
+"""
     Change to next layout towards coefficient space.
     Following implementation in field:669-672
     """
+function towards_coeff_space!(field::ScalarField)
     if field.current_layout == :g
         # Transform from grid to coefficient space
         # Note: forward_transform_axis! sets current_layout = :c when successful
@@ -2013,8 +2013,7 @@ function towards_coeff_space!(field::ScalarField)
     end
 end
 
-function forward_transform_axis!(field::ScalarField)
-    """
+"""
     Forward transform field using PencilFFTs for parallel transforms.
 
     CORRECT PencilFFTs usage pattern:
@@ -2027,6 +2026,7 @@ function forward_transform_axis!(field::ScalarField)
 
     Following distributor pattern in distributor:636-649
     """
+function forward_transform_axis!(field::ScalarField)
     if field.domain === nothing || field.bases === ()
         return
     end
@@ -2070,8 +2070,7 @@ function forward_transform_axis!(field::ScalarField)
     forward_transform!(field)
 end
 
-function backward_transform_axis!(field::ScalarField)
-    """
+"""
     Backward transform field using PencilFFTs for parallel transforms.
 
     CORRECT PencilFFTs usage pattern:
@@ -2081,6 +2080,7 @@ function backward_transform_axis!(field::ScalarField)
 
     Following distributor pattern in distributor:621-634
     """
+function backward_transform_axis!(field::ScalarField)
     if field.domain === nothing || field.bases === ()
         return
     end
@@ -2125,29 +2125,29 @@ function backward_transform_axis!(field::ScalarField)
 end
 
 # VectorField transform methods
+"""Require vector field components to be in grid space."""
 function require_grid_space!(field::VectorField, axis::Union{Int, Nothing}=nothing)
-    """Require vector field components to be in grid space."""
     for component in field.components
         require_grid_space!(component, axis)
     end
 end
 
+"""Require vector field components to be in coefficient space."""
 function require_coeff_space!(field::VectorField, axis::Union{Int, Nothing}=nothing)
-    """Require vector field components to be in coefficient space."""
     for component in field.components
         require_coeff_space!(component, axis)
     end
 end
 
+"""Transform vector field from grid to coefficient space."""
 function forward_transform!(field::VectorField)
-    """Transform vector field from grid to coefficient space."""
     for component in field.components
         forward_transform!(component)
     end
 end
 
+"""Transform vector field from coefficient to grid space."""
 function backward_transform!(field::VectorField)
-    """Transform vector field from coefficient to grid space."""
     for component in field.components
         backward_transform!(component)
     end
@@ -2303,8 +2303,8 @@ function fill_random!(field::VectorField, layout::String="g";
     return field
 end
 
+"""Integrate field over specified axes"""
 function integrate(field::ScalarField, axes=:)
-    """Integrate field over specified axes"""
     if field.domain === nothing
         return 0.0
     end
@@ -2324,18 +2324,18 @@ function integrate(field::ScalarField, axes=:)
 end
 
 # Vector field operations
+"""Get component field"""
 function Base.getindex(field::VectorField, i::Int)
-    """Get component field"""
     return field.components[i]
 end
 
+"""Set component field"""
 function Base.setindex!(field::VectorField, value, i::Int)
-    """Set component field"""
     field.components[i] = value
 end
 
+"""Get all components in specified layout"""
 function Base.getindex(field::VectorField, layout::String)
-    """Get all components in specified layout"""
     return [comp[layout] for comp in field.components]
 end
 
@@ -2377,13 +2377,13 @@ function Base.propertynames(field::VectorField, private::Bool=false)
 end
 
 # Tensor field operations  
+"""Get tensor component"""
 function Base.getindex(field::TensorField, i::Int, j::Int)
-    """Get tensor component"""
     return field.components[i, j]
 end
 
+"""Set tensor component"""
 function Base.setindex!(field::TensorField, value, i::Int, j::Int)
-    """Set tensor component"""
     field.components[i, j] = value
 end
 
@@ -2462,8 +2462,8 @@ end
 Base.:*(b::Real, a::ScalarField) = a * b
 
 # I/O operations
+"""Save field to NetCDF file"""
 function save_field(field::ScalarField, filename::String, dataset_name::String="field")
-    """Save field to NetCDF file"""
     ensure_layout!(field, :g)
 
     # Gather data to root process for writing
@@ -2477,8 +2477,8 @@ function save_field(field::ScalarField, filename::String, dataset_name::String="
     end
 end
 
+"""Load field from NetCDF file"""
 function load_field!(field::ScalarField, filename::String, dataset_name::String="field")
-    """Load field from NetCDF file"""
     # Broadcast success/failure from rank 0 to all ranks before scatter_array
     # to prevent deadlock if ncread throws on rank 0.
     load_ok = Ref(true)
@@ -2536,8 +2536,8 @@ function load_field!(field::ScalarField, filename::String, dataset_name::String=
 end
 
 # Optimization support functions
+"""Check if field uses spectral bases that benefit from dealiasing"""
 function has_spectral_bases(field::ScalarField)
-    """Check if field uses spectral bases that benefit from dealiasing"""
     for basis in field.bases
         if isa(basis, Union{RealFourier, ComplexFourier, ChebyshevT})
             return true
@@ -2546,19 +2546,19 @@ function has_spectral_bases(field::ScalarField)
     return false
 end
 
+"""Apply 3/2 rule dealiasing to nonlinear product"""
 function apply_dealiasing_to_product!(field::ScalarField)
-    """Apply 3/2 rule dealiasing to nonlinear product"""
     # Apply 2/3 rule cutoff for dealiasing
     # This removes the highest 1/3 of modes in each direction
     cutoff_scale = 2.0/3.0
     apply_spectral_cutoff!(field, cutoff_scale)
 end
 
-function apply_spectral_cutoff!(field::ScalarField, cutoff_scales::Union{Float64, Tuple{Vararg{Float64}}})
-    """
+"""
     Apply spectral cutoff by zeroing modes above specified relative scales.
     Following low_pass_filter implementation.
     """
+function apply_spectral_cutoff!(field::ScalarField, cutoff_scales::Union{Float64, Tuple{Vararg{Float64}}})
     # Store original scales
     original_scales = field.scales
     
@@ -2575,12 +2575,12 @@ function apply_spectral_cutoff!(field::ScalarField, cutoff_scales::Union{Float64
     set_scales!(field, original_scales)
 end
 
-function low_pass_filter!(field::ScalarField; shape=nothing, scales=nothing)
-    """
+"""
     Apply a spectral low-pass filter by zeroing modes above specified relative scales.
     The scales can be specified directly or deduced from a specified global grid shape.
     Following field:945-968 implementation.
     """
+function low_pass_filter!(field::ScalarField; shape=nothing, scales=nothing)
     original_scales = field.scales
     
     # Determine scales from shape
@@ -2599,11 +2599,11 @@ function low_pass_filter!(field::ScalarField; shape=nothing, scales=nothing)
     set_scales!(field, original_scales)
 end
 
-function high_pass_filter!(field::ScalarField; shape=nothing, scales=nothing)
-    """
+"""
     Apply a spectral high-pass filter by zeroing modes below specified relative scales.
     Following field:969-984 implementation.
     """
+function high_pass_filter!(field::ScalarField; shape=nothing, scales=nothing)
     # Store original data in coefficient space
     require_coeff_space!(field)
     data_orig = copy(get_data(field, :c))
@@ -2620,8 +2620,8 @@ function high_pass_filter!(field::ScalarField; shape=nothing, scales=nothing)
     field_data .= data_orig .- data_filt
 end
 
+"""Get field data in specified layout"""
 function get_data(field::ScalarField, layout::Symbol)
-    """Get field data in specified layout"""
     if layout == :g
         ensure_layout!(field, :g)
         return get_grid_data(field)
@@ -2633,8 +2633,7 @@ function get_data(field::ScalarField, layout::Symbol)
     end
 end
 
-function get_global_grid_shape(dist::Distributor, domain::Domain; scales=nothing)
-    """
+"""
     Get global grid shape for a domain with given scales.
 
     The global grid shape is the full size of the grid across all MPI processes.
@@ -2655,6 +2654,7 @@ function get_global_grid_shape(dist::Distributor, domain::Domain; scales=nothing
     - For a 2D domain with bases of size (64, 32) and scales (1.5, 1.5):
       Returns (96, 48)
     """
+function get_global_grid_shape(dist::Distributor, domain::Domain; scales=nothing)
     if isempty(domain.bases)
         return ()
     end
@@ -2687,13 +2687,13 @@ function get_global_grid_shape(dist::Distributor, domain::Domain; scales=nothing
     return tuple(grid_shape...)
 end
 
-function get_basis_grid_size(basis::Basis)
-    """
+"""
     Get the natural grid size for a basis.
 
     For most bases, this is the number of modes/coefficients.
     Some bases may have different grid vs coefficient sizes.
     """
+function get_basis_grid_size(basis::Basis)
     if hasfield(typeof(basis), :meta) && hasfield(typeof(basis.meta), :size)
         return basis.meta.size
     else
@@ -2702,8 +2702,7 @@ function get_basis_grid_size(basis::Basis)
     end
 end
 
-function get_global_coeff_shape(dist::Distributor, domain::Domain)
-    """
+"""
     Get global coefficient shape for a domain.
 
     The coefficient shape is the unscaled size (number of spectral modes).
@@ -2712,6 +2711,7 @@ function get_global_coeff_shape(dist::Distributor, domain::Domain)
     Returns:
     - Tuple of global coefficient dimensions
     """
+function get_global_coeff_shape(dist::Distributor, domain::Domain)
     if isempty(domain.bases)
         return ()
     end
@@ -2724,13 +2724,13 @@ function get_global_coeff_shape(dist::Distributor, domain::Domain)
     return tuple(coeff_shape...)
 end
 
-function get_basis_coeff_size(basis::Basis)
-    """
+"""
     Get the coefficient size for a basis.
 
     For Fourier bases: same as grid size
     For Chebyshev/Legendre: may differ due to boundary conditions
     """
+function get_basis_coeff_size(basis::Basis)
     if hasfield(typeof(basis), :meta) && hasfield(typeof(basis.meta), :size)
         return basis.meta.size
     else
@@ -2738,8 +2738,7 @@ function get_basis_coeff_size(basis::Basis)
     end
 end
 
-function get_local_grid_shape(dist::Distributor, domain::Domain; scales=nothing)
-    """
+"""
     Get local grid shape for this MPI process.
 
     Arguments:
@@ -2750,23 +2749,23 @@ function get_local_grid_shape(dist::Distributor, domain::Domain; scales=nothing)
     Returns:
     - Tuple of local grid dimensions for this process
     """
+function get_local_grid_shape(dist::Distributor, domain::Domain; scales=nothing)
     global_shape = get_global_grid_shape(dist, domain; scales=scales)
     return get_local_array_size(dist, global_shape)
 end
 
-function get_local_coeff_shape(dist::Distributor, domain::Domain)
-    """
+"""
     Get local coefficient shape for this MPI process.
 
     Returns:
     - Tuple of local coefficient dimensions for this process
     """
+function get_local_coeff_shape(dist::Distributor, domain::Domain)
     global_shape = get_global_coeff_shape(dist, domain)
     return get_local_array_size(dist, global_shape)
 end
 
-function get_grid_layout_info(dist::Distributor, domain::Domain; scales=nothing)
-    """
+"""
     Get comprehensive grid layout information.
 
     Returns a NamedTuple with:
@@ -2776,6 +2775,7 @@ function get_grid_layout_info(dist::Distributor, domain::Domain; scales=nothing)
     - local_end: Ending global index for this process (1-based)
     - scales: Applied scale factors
     """
+function get_grid_layout_info(dist::Distributor, domain::Domain; scales=nothing)
     n_bases = length(domain.bases)
 
     # Handle scales
@@ -2830,8 +2830,8 @@ function get_grid_layout_info(dist::Distributor, domain::Domain; scales=nothing)
 end
 
 # LoopVectorization functions
-@inline function vectorized_add!(result::AbstractArray, a::AbstractArray, b::AbstractArray)
-    """Vectorized addition: result = a + b"""
+@inline """Vectorized addition: result = a + b"""
+function vectorized_add!(result::AbstractArray, a::AbstractArray, b::AbstractArray)
     if is_gpu_array(result) || is_gpu_array(a) || is_gpu_array(b)
         result .= a .+ b
     elseif length(result) > 100
@@ -2843,8 +2843,8 @@ end
     end
 end
 
-@inline function vectorized_sub!(result::AbstractArray, a::AbstractArray, b::AbstractArray)
-    """Vectorized subtraction: result = a - b"""
+@inline """Vectorized subtraction: result = a - b"""
+function vectorized_sub!(result::AbstractArray, a::AbstractArray, b::AbstractArray)
     if is_gpu_array(result) || is_gpu_array(a) || is_gpu_array(b)
         result .= a .- b
     elseif length(result) > 100
@@ -2856,8 +2856,8 @@ end
     end
 end
 
-@inline function vectorized_mul!(result::AbstractArray, a::AbstractArray, b::AbstractArray)
-    """Vectorized multiplication: result = a * b (element-wise)"""
+@inline """Vectorized multiplication: result = a * b (element-wise)"""
+function vectorized_mul!(result::AbstractArray, a::AbstractArray, b::AbstractArray)
     if is_gpu_array(result) || is_gpu_array(a) || is_gpu_array(b)
         result .= a .* b
     elseif length(result) > 100
@@ -2869,8 +2869,8 @@ end
     end
 end
 
-@inline function vectorized_scale!(result::AbstractArray, a::AbstractArray, α::Real)
-    """Vectorized scaling: result = α * a"""
+@inline """Vectorized scaling: result = α * a"""
+function vectorized_scale!(result::AbstractArray, a::AbstractArray, α::Real)
     if is_gpu_array(result) || is_gpu_array(a)
         result .= α .* a
     elseif length(result) > 100
@@ -2882,8 +2882,8 @@ end
     end
 end
 
-@inline function vectorized_axpy!(result::AbstractArray, α::Real, x::AbstractArray, y::AbstractArray)
-    """Vectorized AXPY: result = α*x + y"""
+@inline """Vectorized AXPY: result = α*x + y"""
+function vectorized_axpy!(result::AbstractArray, α::Real, x::AbstractArray, y::AbstractArray)
     if is_gpu_array(result) || is_gpu_array(x) || is_gpu_array(y)
         result .= α .* x .+ y
     elseif length(result) > 100
@@ -2895,8 +2895,8 @@ end
     end
 end
 
-@inline function vectorized_linear_combination!(result::AbstractArray, α::Real, a::AbstractArray, β::Real, b::AbstractArray)
-    """Vectorized linear combination: result = α*a + β*b"""
+@inline """Vectorized linear combination: result = α*a + β*b"""
+function vectorized_linear_combination!(result::AbstractArray, α::Real, a::AbstractArray, β::Real, b::AbstractArray)
     if is_gpu_array(result) || is_gpu_array(a) || is_gpu_array(b)
         result .= α .* a .+ β .* b
     elseif length(result) > 100
@@ -2909,8 +2909,8 @@ end
 end
 
 # Fast field arithmetic with multi-tier implementation
+"""Fast y ← α*x + y using best available method"""
 function fast_axpy!(α::Real, x::ScalarField, y::ScalarField)
-    """Fast y ← α*x + y using best available method"""
     ensure_layout!(x, :g)
     ensure_layout!(y, :g)
 
@@ -2931,14 +2931,14 @@ function fast_axpy!(α::Real, x::ScalarField, y::ScalarField)
 end
 
 # Coordinate system utilities (moved from coords.jl to avoid circular dependency)
-function unit_vector_fields(coordsys::CoordinateSystem, dist)
-    """
+"""
     Return unit vector fields for each coordinate direction.
     Following implementation in coords:183
 
     Note: This function was moved from coords.jl to field.jl to avoid circular dependency,
     as it needs VectorField which is defined in field.jl.
     """
+function unit_vector_fields(coordsys::CoordinateSystem, dist)
     fields = VectorField[]
     for (i, coord) in enumerate(coords(coordsys))
         # Create vector field for each coordinate direction

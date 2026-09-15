@@ -247,8 +247,9 @@ function sparse_block_diag(matrices::AbstractMatrix...)
     return sparse(I_indices, J_indices, values, total_rows, total_cols)
 end
 
-"""Add two sparse matrices."""
+"""Add two sparse matrices. Deprecated: use `A + B` directly."""
 function add_sparse(A::SparseMatrixCSC, B::SparseMatrixCSC)
+    Base.depwarn("`add_sparse(A, B)` is deprecated, use `A + B` directly", :add_sparse)
     return A + B
 end
 

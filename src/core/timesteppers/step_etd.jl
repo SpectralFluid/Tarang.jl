@@ -1,5 +1,4 @@
-function step_etd_rk222!(state::TimestepperState, solver::InitialValueSolver)
-    """
+"""
     2nd-order exponential Runge-Kutta method (ETDRK2).
 
     Standard formulation from Cox-Matthews (2002), Eq. 22:
@@ -25,6 +24,7 @@ function step_etd_rk222!(state::TimestepperState, solver::InitialValueSolver)
     - Kassam & Trefethen (2005), "Fourth-Order Time Stepping for Stiff PDEs",
       SIAM J. Sci. Comput. 26(4), 1214-1233
     """
+function step_etd_rk222!(state::TimestepperState, solver::InitialValueSolver)
 
     current_state = state.history[end]
     dt = state.dt
@@ -43,8 +43,14 @@ function step_etd_rk222!(state::TimestepperState, solver::InitialValueSolver)
     L_linear, M_factor = _get_linear_operator_eff!(state, L_matrix, M_matrix)
 
     try
-        # Compute matrix exponentials and φ functions
-        exp_hL, φ₁_hL, φ₂_hL = phi_functions_matrix(L_linear, dt)
+        # Compute matrix exponentials and φ functions (cached when dt is unchanged)
+        cache = state.timestepper_data
+        cache_dt = get(cache, :etd_phi_dt, nothing)
+        if cache_dt === nothing || cache_dt != dt
+            cache[:etd_phi] = phi_functions_matrix(L_linear, dt)
+            cache[:etd_phi_dt] = dt
+        end
+        exp_hL, φ₁_hL, φ₂_hL = cache[:etd_phi]
 
         # Convert state to vector form
         X₀ = fields_to_vector(current_state)
@@ -87,8 +93,7 @@ function step_etd_rk222!(state::TimestepperState, solver::InitialValueSolver)
     end
 end
 
-function step_etd_cnab2!(state::TimestepperState, solver::InitialValueSolver)
-    """
+"""
     2nd-order exponential Adams-Bashforth method (ETDAB2/ETD-CNAB2).
 
     Formulation:
@@ -109,6 +114,7 @@ function step_etd_cnab2!(state::TimestepperState, solver::InitialValueSolver)
     - Hochbruck & Ostermann (2010), "Exponential integrators"
     - Cox & Matthews (2002), "Exponential Time Differencing for Stiff Systems"
     """
+function step_etd_cnab2!(state::TimestepperState, solver::InitialValueSolver)
 
     current_state = state.history[end]
     dt = state.dt
@@ -148,8 +154,14 @@ function step_etd_cnab2!(state::TimestepperState, solver::InitialValueSolver)
     w1 = dt_current / dt_previous
 
     try
-        # Compute exponential integrators
-        exp_hL, φ₁_hL, _ = phi_functions_matrix(L_linear, dt_current)
+        # Compute exponential integrators (cached when dt is unchanged)
+        cache = state.timestepper_data
+        cache_dt = get(cache, :etd_cnab_phi_dt, nothing)
+        if cache_dt === nothing || cache_dt != dt_current
+            cache[:etd_cnab_phi] = phi_functions_matrix(L_linear, dt_current)
+            cache[:etd_cnab_phi_dt] = dt_current
+        end
+        exp_hL, φ₁_hL, _ = cache[:etd_cnab_phi]
 
         # Convert current state to vector
         X_current = fields_to_vector(current_state)
@@ -197,8 +209,7 @@ function step_etd_cnab2!(state::TimestepperState, solver::InitialValueSolver)
     end
 end
 
-function step_etd_sbdf2!(state::TimestepperState, solver::InitialValueSolver)
-    """
+"""
     2nd-order Exponential Time Differencing Multistep Method (ETD-MS2).
 
     For the ODE: u'(t) = Lu + N(u), this implements a proper 2-step exponential
@@ -229,6 +240,7 @@ function step_etd_sbdf2!(state::TimestepperState, solver::InitialValueSolver)
     - Cox & Matthews (2002), "Exponential Time Differencing for Stiff Systems"
     - Beylkin, Keiser, & Vozovoi (1998), "A new class of time discretization schemes"
     """
+function step_etd_sbdf2!(state::TimestepperState, solver::InitialValueSolver)
 
     current_state = state.history[end]
     dt = state.dt
@@ -268,8 +280,14 @@ function step_etd_sbdf2!(state::TimestepperState, solver::InitialValueSolver)
     w = dt_current / dt_previous
 
     try
-        # Compute exponential integrators: exp(hL), φ₁(hL), φ₂(hL)
-        exp_hL, φ₁_hL, φ₂_hL = phi_functions_matrix(L_linear, dt_current)
+        # Compute exponential integrators (cached when dt is unchanged)
+        cache = state.timestepper_data
+        cache_dt = get(cache, :etd_sbdf_phi_dt, nothing)
+        if cache_dt === nothing || cache_dt != dt_current
+            cache[:etd_sbdf_phi] = phi_functions_matrix(L_linear, dt_current)
+            cache[:etd_sbdf_phi_dt] = dt_current
+        end
+        exp_hL, φ₁_hL, φ₂_hL = cache[:etd_sbdf_phi]
 
         # Convert current state to vector
         X_current = fields_to_vector(current_state)

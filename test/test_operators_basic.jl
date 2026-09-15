@@ -225,6 +225,14 @@ end
     # Dot product: u.v = sin(x)*cos(x) + cos(y)*sin(y) = 0.5*sin(2x) + 0.5*sin(2y)
     dp = u ⋅ v
     @test dp isa DotProduct
+
+    # Evaluate and verify numerical result
+    result = evaluate(dp)
+    expected = @. 0.5 * sin(2 * x) + 0.5 * sin(2 * y)
+    result_data = Tarang.get_grid_data(result)
+    if result_data !== nothing
+        @test isapprox(result_data, expected, rtol=1e-10)
+    end
 end
 
 # ============================================================================

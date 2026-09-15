@@ -9,9 +9,7 @@ This file contains all differentiation implementations including:
 - Matrix application helpers
 """
 
-using LinearAlgebra
-using SparseArrays
-using FFTW
+# LinearAlgebra, SparseArrays, FFTW already in Tarang.jl
 
 # ============================================================================
 # Gradient and Divergence Evaluation
@@ -396,12 +394,12 @@ function _apply_spectral_derivative_distributed!(coeff_data::PencilArrays.Pencil
         # Use fftfreq pattern for full complex spectrum
         N_coeff = N_global
         k0 = 2π / L
-        k_global = fftfreq(N_global) .* N_global .* k0
+        k_global = _fftfreq(N_global) .* N_global .* k0
     else
         # For ComplexFourier, use fftfreq pattern
         N_coeff = N_global
         k0 = 2π / L
-        k_global = fftfreq(N_global) .* N_global .* k0
+        k_global = _fftfreq(N_global) .* N_global .* k0
     end
 
     # CRITICAL: Validate that coefficient data global size matches expected N_coeff
@@ -449,7 +447,7 @@ function _apply_spectral_derivative_distributed!(coeff_data::AbstractArray,
         k_axis = collect(0:(N-1)) .* k0
     else
         k0 = 2π / L
-        k_axis = fftfreq(N) .* N .* k0
+        k_axis = _fftfreq(N) .* N .* k0
     end
 
     deriv_mult = (im .* k_axis) .^ order
@@ -471,7 +469,7 @@ function _get_cached_deriv_mult(basis::Union{RealFourier, ComplexFourier}, N::In
     if cached !== nothing
         return cached::Vector{ComplexF64}
     end
-    k_axis = fftfreq(N, L/N) .* 2π
+    k_axis = _fftfreq(N, L/N) .* 2π
     deriv_mult = (im .* k_axis) .^ order
     basis.transforms[cache_key] = deriv_mult
     return deriv_mult
@@ -540,7 +538,7 @@ function evaluate_fourier_derivative_gpu!(result::ScalarField, data_g::AbstractA
     if dims == 1
         f_hat = fft(data_g)
         f_hat .*= deriv_mult
-        deriv_g = real.(ifft(f_hat))
+        deriv_g = result.dtype <: Real ? real.(ifft(f_hat)) : ifft(f_hat)
         _write_to_grid_data!(result, deriv_g)
         result.current_layout = :g
 
@@ -557,7 +555,7 @@ function evaluate_fourier_derivative_gpu!(result::ScalarField, data_g::AbstractA
         end
 
         f_hat .*= mult_shaped
-        deriv_g = real.(ifft(f_hat, axis))
+        deriv_g = result.dtype <: Real ? real.(ifft(f_hat, axis)) : ifft(f_hat, axis)
         _write_to_grid_data!(result, deriv_g)
         result.current_layout = :g
 
@@ -574,7 +572,7 @@ function evaluate_fourier_derivative_gpu!(result::ScalarField, data_g::AbstractA
         end
 
         f_hat .*= mult_shaped
-        deriv_g = real.(ifft(f_hat, axis))
+        deriv_g = result.dtype <: Real ? real.(ifft(f_hat, axis)) : ifft(f_hat, axis)
         _write_to_grid_data!(result, deriv_g)
         result.current_layout = :g
     else
@@ -604,7 +602,7 @@ function evaluate_fourier_derivative_cpu!(result::ScalarField, data_g::AbstractA
         end
 
         # Inverse transform
-        deriv_g = real.(ifft(f_hat))
+        deriv_g = result.dtype <: Real ? real.(ifft(f_hat)) : ifft(f_hat)
         _write_to_grid_data!(result, deriv_g)
         result.current_layout = :g
 
@@ -631,7 +629,7 @@ function evaluate_fourier_derivative_cpu!(result::ScalarField, data_g::AbstractA
         end
 
         # Inverse transform along same axis
-        deriv_g = real.(ifft(f_hat, axis))
+        deriv_g = result.dtype <: Real ? real.(ifft(f_hat, axis)) : ifft(f_hat, axis)
         _write_to_grid_data!(result, deriv_g)
         result.current_layout = :g
 
@@ -663,7 +661,7 @@ function evaluate_fourier_derivative_cpu!(result::ScalarField, data_g::AbstractA
         end
 
         # Inverse transform along same axis
-        deriv_g = real.(ifft(f_hat, axis))
+        deriv_g = result.dtype <: Real ? real.(ifft(f_hat, axis)) : ifft(f_hat, axis)
         _write_to_grid_data!(result, deriv_g)
         result.current_layout = :g
     else
@@ -949,54 +947,68 @@ data before the DCT-I transform and reverse the result back.
 """
 function chebyshev_derivative_1d(f::AbstractVector, scale::Float64)
     N = length(f)
-
-    # A single point has zero derivative
     if N <= 1
         return zeros(eltype(f), N)
     end
+    result = similar(f)
+    chebyshev_derivative_1d!(result, f, scale)
+    return result
+end
 
-    # Tarang uses ascending grid: x_k = -cos(pi*k/(N-1)) for k = 0, 1, ..., N-1
-    # Standard DCT-I convention uses descending grid: x_k = cos(pi*k/(N-1))
-    # To use DCT-I correctly with our ascending grid, we need to reverse f
+"""
+    chebyshev_derivative_1d!(result, f, scale)
 
-    f_std = reverse(f)
+In-place Chebyshev derivative. Writes result into `result`.
+"""
+function chebyshev_derivative_1d!(result::AbstractVector, f::AbstractVector, scale::Float64)
+    N = length(f)
+    if N <= 1
+        fill!(result, zero(eltype(f)))
+        return result
+    end
 
-    # Forward DCT-I to get Chebyshev coefficients
-    coeffs_raw = FFTW.r2r(f_std, FFTW.REDFT00)
+    # Reverse f into result as workspace (ascending → descending grid)
+    @inbounds for i in 1:N
+        result[i] = f[N - i + 1]
+    end
+
+    # Forward DCT-I to get Chebyshev coefficients (allocates, but only once per call)
+    coeffs = FFTW.r2r(result, FFTW.REDFT00)
 
     # Normalize: DCT-I on N points needs (N-1) normalization
-    coeffs = copy(coeffs_raw)
-    coeffs ./= (N - 1)
+    inv_nm1 = 1.0 / (N - 1)
+    @inbounds for i in 1:N
+        coeffs[i] *= inv_nm1
+    end
     coeffs[1] /= 2
     coeffs[end] /= 2
 
-    # Apply Chebyshev derivative recurrence: c'_{k-1} = 2k * c_k + c'_{k+1}
-    deriv_coeffs = zeros(eltype(coeffs), N)
-    deriv_coeffs[N] = 0.0
-
-    for k in (N-1):-1:1
+    # Apply Chebyshev derivative recurrence in-place into result:
+    # c'_{k-1} = 2k * c_k + c'_{k+1}
+    fill!(result, zero(eltype(f)))
+    @inbounds for k in (N-1):-1:1
+        result[k] = 2 * k * coeffs[k + 1]
         if k + 2 <= N
-            deriv_coeffs[k] = 2 * k * coeffs[k + 1] + deriv_coeffs[k + 2]
-        else
-            deriv_coeffs[k] = 2 * k * coeffs[k + 1]
+            result[k] += result[k + 2]
         end
     end
 
-    # First coefficient has factor of 1/2 due to Chebyshev series normalization
-    deriv_coeffs[1] /= 2
-
-    # Apply domain scaling
-    deriv_coeffs .*= scale
+    result[1] /= 2
+    @. result *= scale
 
     # Un-normalize for inverse DCT-I
-    deriv_coeffs[1] *= 2
-    deriv_coeffs[end] *= 2
+    result[1] *= 2
+    result[end] *= 2
 
-    # Inverse DCT-I and normalize to get derivative at standard (descending) grid
-    deriv_std = FFTW.r2r(deriv_coeffs, FFTW.REDFT00) ./ 2
+    # Inverse DCT-I to get derivative at descending grid
+    deriv_std = FFTW.r2r(result, FFTW.REDFT00)
 
-    # Convert derivative back to our ascending grid
-    return reverse(deriv_std)
+    # Reverse back to ascending grid and normalize, writing into result
+    @inbounds for i in 1:N
+        result[i] = deriv_std[N - i + 1] / 2
+    end
+
+    return result
 end
 
 # ============================================================================

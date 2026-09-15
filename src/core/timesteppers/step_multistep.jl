@@ -1,5 +1,4 @@
-function step_cnab1!(state::TimestepperState, solver::InitialValueSolver)
-    """
+"""
     Crank-Nicolson Adams-Bashforth 1st order following Tarang MultistepIMEX implementation.
 
     Based on Tarang timesteppers:95-188 MultistepIMEX.step method:
@@ -8,6 +7,7 @@ function step_cnab1!(state::TimestepperState, solver::InitialValueSolver)
     - LHS solution: (a[0]*M + b[0]*L).X = RHS (following lines 174-184)
     - Proper state rotation and history management
     """
+function step_cnab1!(state::TimestepperState, solver::InitialValueSolver)
 
     current_state = state.history[end]
     dt = state.dt
@@ -97,8 +97,7 @@ function step_cnab1!(state::TimestepperState, solver::InitialValueSolver)
     @debug "CNAB1 step completed: dt=$dt, iteration=$(state.timestepper_data[:cnab1_iteration]), |X_new|=$(norm(X_new))"
 end
 
-function step_cnab2!(state::TimestepperState, solver::InitialValueSolver)
-    """
+"""
     Crank-Nicolson Adams-Bashforth 2nd order following Tarang MultistepIMEX implementation.
 
     Based on Tarang timesteppers:95-188 MultistepIMEX.step method:
@@ -107,6 +106,7 @@ function step_cnab2!(state::TimestepperState, solver::InitialValueSolver)
     - Proper history management with rotation for MX, LX, F arrays (lines 124-126)
     - Falls back to CNAB1 for iteration < 1 (line 274)
     """
+function step_cnab2!(state::TimestepperState, solver::InitialValueSolver)
 
     current_state = state.history[end]
     dt = state.dt
@@ -216,8 +216,7 @@ function step_cnab2!(state::TimestepperState, solver::InitialValueSolver)
 end
 
 # BDF methods
-function step_sbdf1!(state::TimestepperState, solver::InitialValueSolver)
-    """
+"""
     Semi-implicit BDF1 (backward Euler) following Tarang MultistepIMEX implementation.
     
     Based on Tarang timesteppers:224-252 SBDF1 coefficients:
@@ -228,6 +227,7 @@ function step_sbdf1!(state::TimestepperState, solver::InitialValueSolver)
     Implicit: 1st-order BDF (backward Euler)
     Explicit: 1st-order extrapolation (forward Euler)
     """
+function step_sbdf1!(state::TimestepperState, solver::InitialValueSolver)
     
     current_state = state.history[end]
     dt = state.dt
@@ -315,8 +315,7 @@ function step_sbdf1!(state::TimestepperState, solver::InitialValueSolver)
     @debug "SBDF1 step completed: dt=$dt, iteration=$(state.timestepper_data[:sbdf1_iteration]), |X_new|=$(norm(X_new))"
 end
 
-function step_sbdf2!(state::TimestepperState, solver::InitialValueSolver)
-    """
+"""
     Semi-implicit BDF2 following Tarang MultistepIMEX implementation.
 
     Based on Tarang timesteppers:333-367 SBDF2 coefficients:
@@ -330,6 +329,7 @@ function step_sbdf2!(state::TimestepperState, solver::InitialValueSolver)
     Implicit: 2nd-order BDF
     Explicit: 2nd-order extrapolation
     """
+function step_sbdf2!(state::TimestepperState, solver::InitialValueSolver)
 
     current_state = state.history[end]
     dt = state.dt
@@ -440,8 +440,7 @@ function step_sbdf2!(state::TimestepperState, solver::InitialValueSolver)
     @debug "SBDF2 step completed: dt=$dt_current, w1=$w1, iteration=$(state.timestepper_data[:sbdf2_iteration]), |X_new|=$(norm(X_new))"
 end
 
-function step_sbdf3!(state::TimestepperState, solver::InitialValueSolver)
-    """
+"""
     Semi-implicit BDF3 following Tarang implementation.
 
     Tarang coefficients (timesteppers:425-447):
@@ -451,6 +450,7 @@ function step_sbdf3!(state::TimestepperState, solver::InitialValueSolver)
     Implicit: 3rd-order BDF
     Explicit: 3rd-order extrapolation
     """
+function step_sbdf3!(state::TimestepperState, solver::InitialValueSolver)
 
     current_state = state.history[end]
 
@@ -574,8 +574,7 @@ function step_sbdf3!(state::TimestepperState, solver::InitialValueSolver)
     @debug "SBDF3 step completed: dt=$k2, w2=$w2, w1=$w1, |X_new|=$(norm(X_new))"
 end
 
-function step_sbdf4!(state::TimestepperState, solver::InitialValueSolver)
-    """
+"""
     Semi-implicit BDF4 following Tarang implementation.
 
     Tarang coefficients (timesteppers:466-495):
@@ -585,6 +584,7 @@ function step_sbdf4!(state::TimestepperState, solver::InitialValueSolver)
     Implicit: 4th-order BDF
     Explicit: 4th-order extrapolation
     """
+function step_sbdf4!(state::TimestepperState, solver::InitialValueSolver)
 
     current_state = state.history[end]
 

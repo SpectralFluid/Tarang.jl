@@ -387,7 +387,7 @@ end
 function add_section!(config::Config, section::String, data::Dict{String, Any}=Dict{String, Any}())
     @lock CONFIG_LOCK begin
         if haskey(config.data, section)
-            @warn "Section '$section' already exists, merging..."
+            @debug "Section '$section' already exists, merging..."
             merge_config!(config.data[section], data)
         else
             config.data[section] = data
@@ -410,7 +410,7 @@ Args:
 """
 function load_config!(config::Config, filename::String; merge::Bool=true)
     if !isfile(filename)
-        @warn "Configuration file $filename not found"
+        @debug "Configuration file $filename not found"
         return false
     end
 

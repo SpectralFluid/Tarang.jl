@@ -9,37 +9,37 @@ has() and require_linearity() methods.
 # Arithmetic Operator Types
 # ============================================================================
 
-struct AddOperator <: Operator
-    left::Any
-    right::Any
+struct AddOperator{L,R} <: Operator
+    left::L
+    right::R
 end
 
-struct SubtractOperator <: Operator
-    left::Any
-    right::Any
+struct SubtractOperator{L,R} <: Operator
+    left::L
+    right::R
 end
 
-struct MultiplyOperator <: Operator
-    left::Any
-    right::Any
+struct MultiplyOperator{L,R} <: Operator
+    left::L
+    right::R
 end
 
-struct DivideOperator <: Operator
-    left::Any
-    right::Any
+struct DivideOperator{L,R} <: Operator
+    left::L
+    right::R
 end
 
-struct PowerOperator <: Operator
-    left::Any  # base
-    right::Any # exponent
+struct PowerOperator{L,R} <: Operator
+    left::L  # base
+    right::R # exponent
 end
 
-struct NegateOperator <: Operator
-    operand::Any
+struct NegateOperator{T} <: Operator
+    operand::T
 end
 
-struct IndexOperator <: Operator
-    array::Any
+struct IndexOperator{A} <: Operator
+    array::A
     indices::Vector{Any}
 end
 
