@@ -4,6 +4,15 @@ Tarang enforces boundary conditions using the **tau method**, a spectral techniq
 
 The formulation uses explicit tau variables: tau fields are added to the state vector, and `lift()` operators inject them into the equations as extra degrees of freedom to match boundary conditions.
 
+## Tau constraints by problem type
+
+| Problem | How the constraints enter |
+|---|---|
+| [Initial value problem](../problems/initial_value.md) | Algebraic rows accompany the evolution equations and must hold during stepping. |
+| [Linear BVP](../problems/linear_boundary_value.md) | Solve the augmented linear system for fields and taus together. |
+| [Nonlinear BVP](../problems/nonlinear_boundary_value.md) | Include the constraints and taus in the nonlinear residual and Newton corrections. |
+| [Eigenvalue problem](../problems/eigenvalue.md) | Homogeneous perturbation constraints have zero mass rows in the generalized eigenproblem. |
+
 ## Why Do We Need the Tau Method?
 
 Consider the steady diffusion problem:

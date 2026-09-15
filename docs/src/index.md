@@ -64,12 +64,14 @@
 
 ### Problem API and execution support
 
+The **Solving PDEs** sidebar contains a separate section for each problem type.
+
 | Problem | Solver | Purpose |
 |---------|--------|---------|
-| `InitialValueProblem` | `InitialValueSolver` | Time evolution |
-| `LinearBoundaryValueProblem` | `BoundaryValueSolver` | Steady linear equations |
-| `NonlinearBoundaryValueProblem` | `BoundaryValueSolver` | Steady nonlinear equations |
-| `EigenvalueProblem` | `EigenvalueSolver` | Eigenvalues and modes |
+| [`InitialValueProblem`](problems/initial_value.md) | `InitialValueSolver` | Time evolution |
+| [`LinearBoundaryValueProblem`](problems/linear_boundary_value.md) | `BoundaryValueSolver` | Steady linear equations |
+| [`NonlinearBoundaryValueProblem`](problems/nonlinear_boundary_value.md) | `BoundaryValueSolver` | Steady nonlinear equations |
+| [`EigenvalueProblem`](problems/eigenvalue.md) | `EigenvalueSolver` | Eigenvalues and modes |
 
 The abbreviated `IVP`, `LBVP`, `NLBVP`, and `EVP` aliases have been removed.
 Use the corresponding full names above when updating an existing script.
