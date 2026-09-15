@@ -106,9 +106,9 @@ mutable struct Distributor
         size = MPI.Comm_size(comm)
         rank = MPI.Comm_rank(comm)
 
-        # Determine PencilArrays usage FIRST (needed for mesh generation)
-        # IMPORTANT: PencilArrays is CPU-only, so we disable it for GPU architecture
-        # For GPU+MPI, we use TransposableField which requires a 2D mesh
+        # Route based on device:
+        #   device=CPU() + MPI → PencilArrays/PencilFFTs for distributed FFTs
+        #   device=GPU()       → CUDA/cuFFT, TransposableField for MPI communication
         # Allow explicit override via use_pencil_arrays parameter
         _use_pencil_arrays = if use_pencil_arrays !== nothing
             use_pencil_arrays
@@ -200,21 +200,19 @@ mutable struct Distributor
         gpu_fft_plans = Dict{Tuple, Any}()
         gpu_arrays = Dict{Symbol, Any}()
 
-        # Log architecture and parallelization mode
+        # Log device and parallelization mode
         if rank == 0
             if is_gpu(architecture)
                 if size > 1
-                    @info "Distributor initialized with GPU architecture (distributed)"
-                    @info "  NOTE: Using custom distributed GPU instead of PencilArrays"
-                    @info "  Each MPI rank should use one GPU"
+                    @info "device=GPU(): using CUDA/cuFFT with TransposableField for MPI ($size processes)"
                 else
-                    @info "Distributor initialized with GPU architecture (single GPU)"
+                    @info "device=GPU(): using CUDA/cuFFT (single GPU)"
                 end
             else
                 if size > 1
-                    @info "Distributor initialized with CPU architecture (using PencilArrays)"
+                    @info "device=CPU(): using PencilArrays/PencilFFTs for MPI ($size processes)"
                 else
-                    @info "Distributor initialized with CPU architecture (serial)"
+                    @info "device=CPU(): serial execution"
                 end
             end
         end

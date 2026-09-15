@@ -163,9 +163,10 @@ function _to_solve_layout(data, dist::Distributor, L::PencilLinearOperator{T};
     src = data isa PencilArrays.PencilArray ? collect(data) : data
     if length(L.fourier_basis_indices) == 1
         return _transpose_fft_to_solve_2d(src, dist, L, cache)
+    elseif length(L.fourier_basis_indices) == 2
+        return _transpose_fft_to_solve_3d(src, dist, L, cache)
     else
-        error("3D mixed Fourier-Chebyshev MPI solve transpose not yet implemented. " *
-              "Use TransposableField for 3D mixed domains, or serial execution.")
+        error("Solve transpose not supported for $(length(L.fourier_basis_indices)) Fourier dimensions.")
     end
 end
 
@@ -173,15 +174,15 @@ end
 function _from_solve_layout!(dest, src::AbstractArray, dist::Distributor, L::PencilLinearOperator{T};
                              cache::Union{Nothing,Dict}=nothing) where T
     if !_needs_solve_transpose(dist, dest, L)
-        # Serial or Chebyshev already local: copy via broadcasting (handles PencilArray permutation)
         dest .= src
         return
     end
-    # Pass PencilArray directly — reverse transpose writes via logical indexing
     if length(L.fourier_basis_indices) == 1
         _transpose_solve_to_fft_2d!(dest, src, dist, L, cache)
+    elseif length(L.fourier_basis_indices) == 2
+        _transpose_solve_to_fft_3d!(dest, src, dist, L, cache)
     else
-        error("3D mixed Fourier-Chebyshev MPI solve transpose not yet implemented.")
+        error("Solve transpose not supported for $(length(L.fourier_basis_indices)) Fourier dimensions.")
     end
 end
 
@@ -310,6 +311,208 @@ function _transpose_solve_to_fft_2d!(
             for ikx in 1:nkx_j
                 pos += 1
                 dst[kx_start + ikx - 1, iz] = recv_buf[pos]
+            end
+        end
+    end
+end
+
+"""
+Get or create cached transpose info for 3D mixed domains.
+Uses a column sub-communicator (ranks sharing same kx block) to swap ky↔z.
+
+PencilFFTs output for 3D (RFFT, FFT, NoTransform) with input decomp_dims=(1,2):
+  output pencil: decomp_dims=(1,3), dim 2 (ky) local
+  → dim 1 (kx) distributed along mesh dim 1, dim 3 (z) along mesh dim 2
+
+Solve layout needs: decomp_dims=(1,2), dim 3 (z) local
+  → swap ky (local) ↔ z (distributed) within column sub-communicator
+"""
+function _get_transpose_info_3d!(cache_dict::Dict, dist::Distributor, L::PencilLinearOperator,
+                                  nkx_local::Int, nky_global::Int, nz_local::Int, ::Type{T}) where T
+    key = :solve_transpose_info_3d
+    if haskey(cache_dict, key)
+        info = cache_dict[key]
+        if info.nkx_local == nkx_local && info.nky_global == nky_global &&
+           info.nz_local == nz_local && eltype(info.send_buf) === T
+            return info
+        end
+    end
+
+    coord1 = get_process_coordinate(dist, 1)
+    coord2 = get_process_coordinate(dist, 2)
+    col_comm = MPI.Comm_split(dist.comm, coord1, coord2)
+    col_nprocs = MPI.Comm_size(col_comm)
+    col_rank = MPI.Comm_rank(col_comm)
+
+    ky_counts, ky_offs = _block_counts(nky_global, col_nprocs)
+    nky_local = ky_counts[col_rank + 1]
+    z_counts = MPI.Allgather(nz_local, col_comm)
+    z_offs = [sum(z_counts[1:r]) for r in 0:col_nprocs]
+
+    fwd_s = [nkx_local * ky_counts[j+1] * nz_local for j in 0:col_nprocs-1]
+    fwd_r = [nkx_local * nky_local * z_counts[j+1] for j in 0:col_nprocs-1]
+    max_buf = max(sum(fwd_s), sum(fwd_r))
+
+    info = (
+        nkx_local=nkx_local, nky_global=nky_global, nky_local=nky_local,
+        nz_local=nz_local, nz_global=L.Nz,
+        col_comm=col_comm, col_nprocs=col_nprocs, col_rank=col_rank,
+        ky_counts=ky_counts, ky_offs=ky_offs,
+        z_counts=z_counts, z_offs=z_offs,
+        fwd_s_counts=fwd_s, fwd_r_counts=fwd_r,
+        send_buf=Vector{T}(undef, max_buf),
+        recv_buf=Vector{T}(undef, max_buf),
+    )
+    cache_dict[key] = info
+    return info
+end
+
+"""3D FFT-output → solve-layout transpose via MPI.Alltoallv on column sub-communicator."""
+function _transpose_fft_to_solve_3d(
+    src::AbstractArray{T,3},  # (Nkx_local, Nky, Nz_local) from PencilFFT output
+    dist::Distributor,
+    L::PencilLinearOperator,
+    cache::Union{Nothing,Dict}
+) where T
+    nkx_local = size(src, 1)
+    nky_global = size(src, 2)
+    nz_local = size(src, 3)
+
+    if cache !== nothing
+        info = _get_transpose_info_3d!(cache, dist, L, nkx_local, nky_global, nz_local, T)
+    else
+        coord1 = get_process_coordinate(dist, 1)
+        coord2 = get_process_coordinate(dist, 2)
+        col_comm = MPI.Comm_split(dist.comm, coord1, coord2)
+        col_nprocs = MPI.Comm_size(col_comm)
+        col_rank = MPI.Comm_rank(col_comm)
+        ky_counts, ky_offs = _block_counts(nky_global, col_nprocs)
+        nky_local = ky_counts[col_rank + 1]
+        z_counts = MPI.Allgather(nz_local, col_comm)
+        z_offs = [sum(z_counts[1:r]) for r in 0:col_nprocs]
+        fwd_s = [nkx_local * ky_counts[j+1] * nz_local for j in 0:col_nprocs-1]
+        fwd_r = [nkx_local * nky_local * z_counts[j+1] for j in 0:col_nprocs-1]
+        max_buf = max(sum(fwd_s), sum(fwd_r))
+        info = (nkx_local=nkx_local, nky_global=nky_global, nky_local=nky_local,
+                nz_local=nz_local, nz_global=L.Nz,
+                col_comm=col_comm, col_nprocs=col_nprocs, col_rank=col_rank,
+                ky_counts=ky_counts, ky_offs=ky_offs,
+                z_counts=z_counts, z_offs=z_offs,
+                fwd_s_counts=fwd_s, fwd_r_counts=fwd_r,
+                send_buf=Vector{T}(undef, max_buf), recv_buf=Vector{T}(undef, max_buf))
+    end
+
+    (; nky_local, nz_global, col_comm, col_nprocs,
+       ky_counts, ky_offs, z_counts, z_offs,
+       fwd_s_counts, fwd_r_counts, send_buf, recv_buf) = info
+
+    # Pack: for dest rank j in col_comm, send their ky slice for all our kx and z
+    pos = 0
+    for j in 0:col_nprocs-1
+        ky_start = ky_offs[j+1] + 1
+        nky_j = ky_counts[j+1]
+        for iz in 1:nz_local
+            for iky in 1:nky_j
+                for ikx in 1:nkx_local
+                    pos += 1
+                    send_buf[pos] = src[ikx, ky_start + iky - 1, iz]
+                end
+            end
+        end
+    end
+
+    MPI.Alltoallv!(MPI.VBuffer(send_buf, fwd_s_counts), MPI.VBuffer(recv_buf, fwd_r_counts), col_comm)
+
+    # Unpack into (nkx_local, nky_local, nz_global) — Chebyshev fully local
+    dst = Array{T}(undef, nkx_local, nky_local, nz_global)
+    pos = 0
+    for j in 0:col_nprocs-1
+        z_start = z_offs[j+1] + 1
+        nz_j = z_counts[j+1]
+        for iz in 1:nz_j
+            for iky in 1:nky_local
+                for ikx in 1:nkx_local
+                    pos += 1
+                    dst[ikx, iky, z_start + iz - 1] = recv_buf[pos]
+                end
+            end
+        end
+    end
+    return dst
+end
+
+"""3D solve-layout → FFT-output transpose via MPI.Alltoallv on column sub-communicator."""
+function _transpose_solve_to_fft_3d!(
+    dst::AbstractArray{T,3},  # (Nkx_local, Nky, Nz_local) FFT output layout
+    src::AbstractArray{T,3},  # (Nkx_local, Nky_local, Nz) solve layout
+    dist::Distributor,
+    L::PencilLinearOperator,
+    cache::Union{Nothing,Dict}
+) where T
+    nkx_local = size(dst, 1)
+    nky_global = size(dst, 2)
+    nz_local = size(dst, 3)
+    nky_local = size(src, 2)
+
+    if cache !== nothing
+        info = _get_transpose_info_3d!(cache, dist, L, nkx_local, nky_global, nz_local, T)
+    else
+        coord1 = get_process_coordinate(dist, 1)
+        coord2 = get_process_coordinate(dist, 2)
+        col_comm = MPI.Comm_split(dist.comm, coord1, coord2)
+        col_nprocs = MPI.Comm_size(col_comm)
+        col_rank = MPI.Comm_rank(col_comm)
+        ky_counts, ky_offs = _block_counts(nky_global, col_nprocs)
+        z_counts = MPI.Allgather(nz_local, col_comm)
+        z_offs = [sum(z_counts[1:r]) for r in 0:col_nprocs]
+        fwd_s = [nkx_local * ky_counts[j+1] * nz_local for j in 0:col_nprocs-1]
+        fwd_r = [nkx_local * nky_local * z_counts[j+1] for j in 0:col_nprocs-1]
+        max_buf = max(sum(fwd_s), sum(fwd_r))
+        info = (nkx_local=nkx_local, nky_global=nky_global, nky_local=nky_local,
+                nz_local=nz_local, nz_global=L.Nz,
+                col_comm=col_comm, col_nprocs=col_nprocs, col_rank=col_rank,
+                ky_counts=ky_counts, ky_offs=ky_offs,
+                z_counts=z_counts, z_offs=z_offs,
+                fwd_s_counts=fwd_s, fwd_r_counts=fwd_r,
+                send_buf=Vector{T}(undef, max_buf), recv_buf=Vector{T}(undef, max_buf))
+    end
+
+    (; nz_global, col_comm, col_nprocs,
+       ky_counts, ky_offs, z_counts, z_offs,
+       fwd_s_counts, fwd_r_counts, send_buf, recv_buf) = info
+
+    # Reverse: s/r counts swapped
+    rev_s_counts = fwd_r_counts
+    rev_r_counts = fwd_s_counts
+
+    # Pack: for dest rank j, send their z range for all our kx and ky
+    pos = 0
+    for j in 0:col_nprocs-1
+        z_start = z_offs[j+1] + 1
+        nz_j = z_counts[j+1]
+        for iz in 1:nz_j
+            for iky in 1:nky_local
+                for ikx in 1:nkx_local
+                    pos += 1
+                    send_buf[pos] = src[ikx, iky, z_start + iz - 1]
+                end
+            end
+        end
+    end
+
+    MPI.Alltoallv!(MPI.VBuffer(send_buf, rev_s_counts), MPI.VBuffer(recv_buf, rev_r_counts), col_comm)
+
+    # Unpack into (nkx_local, nky_global, nz_local)
+    pos = 0
+    for j in 0:col_nprocs-1
+        ky_start = ky_offs[j+1] + 1
+        nky_j = ky_counts[j+1]
+        for iz in 1:nz_local
+            for iky in 1:nky_j
+                for ikx in 1:nkx_local
+                    pos += 1
+                    dst[ikx, ky_start + iky - 1, iz] = recv_buf[pos]
+                end
             end
         end
     end

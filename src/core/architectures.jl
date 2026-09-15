@@ -54,8 +54,7 @@ This is the default architecture.
 
 # Example
 ```julia
-arch = CPU()
-dist = Distributor(coordsys; architecture=arch)
+dist = Distributor(coordsys; device=CPU())  # default, uses PencilArrays/PencilFFTs for MPI
 ```
 """
 struct CPU <: AbstractSerialArchitecture end
@@ -97,8 +96,7 @@ Requires CUDA.jl to be loaded for full functionality.
 # Example
 ```julia
 using CUDA  # Must load CUDA first
-arch = GPU()
-dist = Distributor(coordsys; architecture=arch)
+dist = Distributor(coordsys; device=GPU())  # uses CUDA/cuFFT, TransposableField for MPI
 ```
 
 # Notes
