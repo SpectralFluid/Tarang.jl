@@ -28,6 +28,8 @@ end
         original = @allocated ext._execute_batched_fft!(outputs, inputs, forward, packed, spectrum)
         repeats = [@allocated ext._execute_batched_fft!(outputs, inputs, forward, packed, spectrum) for _ in 1:5]
         helper = [warmed_allocations(ext._execute_batched_fft!, outputs, inputs, forward, packed, spectrum) for _ in 1:5]
-        @info "FFT allocations" shape real_input original repeats helper
+        println((; shape, real_input, original, repeats, helper))
     end
 end
+
+include("test_batched_fft_workspace.jl")

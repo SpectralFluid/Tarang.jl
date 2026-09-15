@@ -3,9 +3,24 @@ using Tarang
 using FFTW
 using CUDA
 
+# Warm the measurement call as well as the executor, and use the minimum of
+# several samples to exclude one-off runtime allocations. Keep the callable as a
+# specialized argument so the measurement does not capture the testset's locals.
+function batched_fft_allocated(execute!::F, args...) where {F}
+    execute!(args...)
+    @allocated execute!(args...)
+    bytes = typemax(Int)
+    for _ in 1:5
+        bytes = min(bytes, @allocated execute!(args...))
+    end
+    return bytes
+end
+
 @testset "Packed FFT workspace reuses buffers and preserves inputs" begin
     ext = Base.get_extension(Tarang, :TarangCUDAExt)
-    for shape in ((7,), (8,5)), real_input in (false, true)
+    # The larger case makes even one new field buffer exceed the allocation
+    # budget, so allowing small runtime overhead cannot hide workspace copies.
+    for shape in ((7,), (8,5), (64,64)), real_input in (false, true)
         T = real_input ? Float64 : ComplexF64
         packed = zeros(T, shape..., 3)
         dims = ntuple(identity, length(shape))
@@ -22,8 +37,11 @@ using CUDA
         ext._execute_batched_fft!(restored, outputs, inverse, spectrum, packed)
         @test restored ≈ inputs
         @test outputs == saved
-        bytes = @allocated ext._execute_batched_fft!(outputs, inputs, forward, packed, spectrum)
+        bytes = batched_fft_allocated(ext._execute_batched_fft!, outputs, inputs, forward, packed, spectrum)
         @test bytes < 4096
+        inverse_bytes = batched_fft_allocated(ext._execute_batched_fft!, restored, outputs, inverse, spectrum, packed)
+        @test inverse_bytes < 4096
+        @test outputs == saved
     end
 end
 
