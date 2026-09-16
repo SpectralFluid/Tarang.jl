@@ -6,6 +6,9 @@ on:
       - main
     tags: '*'
   pull_request:
+  repository_dispatch:
+    types:
+      - tagbot-release
 
 concurrency:
   group: docs-deployment
@@ -20,6 +23,8 @@ jobs:
       pull-requests: read
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.tag || github.ref }}
 
       - uses: julia-actions/setup-julia@v1
         with:
