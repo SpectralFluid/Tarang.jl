@@ -9,9 +9,8 @@ on:
         default: "3"
 
 permissions:
-  actions: read
   contents: write
-  issues: read
+  issues: write
   pull-requests: read
 
 jobs:
@@ -19,7 +18,32 @@ jobs:
     if: github.event_name == 'workflow_dispatch' || github.actor == 'JuliaTagBot'
     runs-on: ubuntu-latest
     steps:
-      - uses: JuliaRegistries/TagBot@v1
+      - name: Record existing tags
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api --paginate "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/" \
+            --jq '.[].ref' | sort > "$RUNNER_TEMP/tags-before"
+
+      - id: tagbot
+        uses: JuliaRegistries/TagBot@v1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          ssh: ${{ secrets.DOCUMENTER_KEY }}
+
+      # Pushes made with GITHUB_TOKEN do not emit another push workflow run.
+      # Dispatch the documentation workflow explicitly for each new tag.
+      - name: Build documentation for new tags
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api --paginate "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/" \
+            --jq '.[].ref' | sort > "$RUNNER_TEMP/tags-after"
+
+          comm -13 "$RUNNER_TEMP/tags-before" "$RUNNER_TEMP/tags-after" |
+            while IFS= read -r ref; do
+              tag="${ref#refs/tags/}"
+              gh api --method POST "repos/$GITHUB_REPOSITORY/dispatches" \
+                -f event_type=tagbot-release \
+                -f "client_payload[tag]=$tag"
+            done
