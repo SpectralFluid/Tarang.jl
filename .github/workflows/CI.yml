@@ -20,7 +20,8 @@ jobs:
   test:
     name: Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.arch }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    # Julia 1.12 on macOS completed the suite just before the old 60-minute limit.
+    timeout-minutes: ${{ matrix.os == 'macOS-latest' && matrix.version == '1.12' && 90 || 60 }}
     strategy:
       fail-fast: false
       matrix:

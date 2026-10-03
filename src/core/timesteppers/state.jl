@@ -256,6 +256,17 @@ function _is_singular_mass(M::AbstractMatrix)
     return false
 end
 
+# Keep ETD's DAE rejection outside its numerical fallback paths.
+function _get_etd_mass_factor!(state::TimestepperState, M_matrix)
+    M_matrix === nothing && return nothing
+    M_factor = _get_mass_factor!(state, M_matrix)
+    M_factor === nothing && throw(ArgumentError(
+        "ETD timesteppers do not support a singular mass matrix (DAE system). " *
+        "Use a DAE-aware implicit timestepper for this formulation.",
+    ))
+    return M_factor
+end
+
 """
     _get_linear_operator_eff!(state, L_matrix, M_matrix) -> (L_rhs, M_factor)
 
@@ -287,19 +298,15 @@ function _get_linear_operator_eff!(state::TimestepperState, L_matrix::AbstractMa
         return cache[:L_neg]::AbstractMatrix, nothing
     end
 
-    M_factor = _get_mass_factor!(state, M_matrix)
-    M_factor === nothing && throw(ArgumentError(
-        "ETD timesteppers do not support a singular mass matrix (DAE system). " *
-        "Use a DAE-aware implicit timestepper for this formulation.",
-    ))
+    M_factor = _get_etd_mass_factor!(state, M_matrix)
 
     cache = state.timestepper_data
     if !haskey(cache, :L_eff) || get(cache, :L_eff_source, nothing) !== L_matrix
         # Sparse LU supports dense RHS blocks. ETD already requires dense matrix
         # functions; enforce its size bound before materializing this block.
-        size(L_matrix, 1) <= 4096 || throw(ArgumentError(
+        size(L_matrix, 1) <= _ETD_DENSE_MAX_SIZE || throw(ArgumentError(
             "ETD matrix exponential requires dense O(n²) storage; use RK222/SBDF2 " *
-            "for systems larger than 4096 coefficients."))
+            "for systems larger than $_ETD_DENSE_MAX_SIZE coefficients."))
         cache[:L_eff] = M_factor \ Matrix(L_matrix)   # M^{-1} * L (cached, positive)
         cache[:L_eff_neg] = -cache[:L_eff]    # Negated version (cached)
         cache[:L_eff_source] = L_matrix

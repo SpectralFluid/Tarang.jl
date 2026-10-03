@@ -1,3 +1,15 @@
+# Route large global systems before applying M⁻¹ to a dense copy of L. The
+# distributed diagonal path has already returned at each call site. Validate M
+# first so this size fallback never silently accepts an unsupported DAE.
+function _etd_oversized_fallback!(state::TimestepperState, solver::InitialValueSolver,
+                                   L_matrix, M_matrix, fallback)
+    size(L_matrix, 1) <= _ETD_DENSE_MAX_SIZE && return false
+    _get_etd_mass_factor!(state, M_matrix)
+    @warn "ETD matrix exponential exceeds the dense size limit; using $(nameof(fallback))" n=size(L_matrix, 1) maxlog=1
+    fallback(state, solver)
+    return true
+end
+
 """Return the shared ETD matrix-function cache for the current operator and `dt`."""
 function _get_etd_phi!(state::TimestepperState, L_linear, dt::Float64)
     cache = state.timestepper_data
@@ -60,6 +72,7 @@ function step_etd_rk222!(state::TimestepperState, solver::InitialValueSolver)
     end
 
     M_matrix = _get_problem_matrix(solver.problem, "M_matrix")
+    _etd_oversized_fallback!(state, solver, L_matrix, M_matrix, step_cnab2!) && return
     # L_linear = -M^{-1}*L (RHS form): converts from M*dX/dt + L*X = F
     # to the ETD form dX/dt = L_linear*X + N(X)
     L_linear, M_factor = _get_linear_operator_eff!(state, L_matrix, M_matrix)
@@ -187,6 +200,7 @@ function step_etd_cnab2!(state::TimestepperState, solver::InitialValueSolver)
     end
 
     M_matrix = _get_problem_matrix(solver.problem, "M_matrix")
+    _etd_oversized_fallback!(state, solver, L_matrix, M_matrix, step_cnab2!) && return
     # L_linear = -M^{-1}*L (RHS form): converts from M*dX/dt + L*X = F
     # to the ETD form dX/dt = L_linear*X + N(X)
     L_linear, M_factor = _get_linear_operator_eff!(state, L_matrix, M_matrix)
@@ -326,6 +340,7 @@ function step_etd_sbdf2!(state::TimestepperState, solver::InitialValueSolver)
     end
 
     M_matrix = _get_problem_matrix(solver.problem, "M_matrix")
+    _etd_oversized_fallback!(state, solver, L_matrix, M_matrix, step_sbdf2!) && return
     # L_linear = -M^{-1}*L (RHS form): converts from M*dX/dt + L*X = F
     # to the ETD form dX/dt = L_linear*X + N(X)
     L_linear, M_factor = _get_linear_operator_eff!(state, L_matrix, M_matrix)

@@ -19,6 +19,10 @@ function _bc_memory_sample(arr, sp, n)
     return value
 end
 
+# Measure inside a specialized call so older Julia versions do not count a
+# boxed ComplexF64 return at the testset's dynamically dispatched call site.
+_bc_memory_sample_bytes(arr, sp, n) = @allocated _bc_memory_sample(arr, sp, n)
+
 function _bc_memory_refresh(arr, sp, problem, n)
     value = 0.0im
     for _ in 1:n
@@ -99,9 +103,9 @@ end
     end
     @test first == snapshot # Even evicted scratch cannot alter old values.
 
-    _bc_memory_sample(y, sp, 10)
+    _bc_memory_sample_bytes(y, sp, 10)
     _bc_memory_refresh(y, sp, problem, 3)
-    sample_bytes = @allocated _bc_memory_sample(y, sp, 1000)
+    sample_bytes = _bc_memory_sample_bytes(y, sp, 1000)
     refresh_bytes = @allocated _bc_memory_refresh(y, sp, problem, 10)
     @test sample_bytes <= 64_000
     # Independently owned refreshed coefficients are intentionally allocated;
