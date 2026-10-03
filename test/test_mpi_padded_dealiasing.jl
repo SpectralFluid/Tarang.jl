@@ -3,7 +3,7 @@
 # The distributed nonlinear product used truncation-after-multiply on the decomposed
 # Fourier axis (only the non-decomposed axes were 3/2-padded), so distributed
 # nonlinear results differed from serial by O(aliasing) on the decomposed axis. The
-# round-7 fix (evaluate_padded_multiply_distributed, nonlinear_evaluation.jl)
+# round-7 fix (evaluate_padded_multiply_distributed, evaluation.jl)
 # transpose-pads the decomposed axis too, matching the serial padded multiply
 # (evaluate_padded_multiply) to roundoff. Reference computed serially (np=1).
 using Test

@@ -16,10 +16,10 @@
 - **No commits without explicit user instruction** (project rule). The `git commit` steps below are written for completeness; the executing agent MUST pause and ask before running any of them.
 
 **Key facts verified before writing this plan:**
-- `SerialFieldStorage` (src/core/field/field_types.jl:52) has `grid::Union{Nothing,AbstractArray}`, `coeff::Union{Nothing,AbstractArray}`; constructed as `new(arch, nothing, nothing)`.
+- `SerialFieldStorage` (src/core/field/types.jl:52) has `grid::Union{Nothing,AbstractArray}`, `coeff::Union{Nothing,AbstractArray}`; constructed as `new(arch, nothing, nothing)`.
 - 0-D "tau" fields have empty `bases`; `allocate_data!` early-returns for them, so they keep `nothing` forever. Every consumer already guards them with `isempty(field.bases)`.
-- Accessors `get_grid_data`/`get_coeff_data` (src/core/field/field_data/field_data_copy_alloc.jl:203,214) are one-line `getfield(getfield(field,:storage),:grid/:coeff)`.
-- Exactly 4 array-type-changing `set_*_data!` sites: `synchronize_field_architecture!` (copy_alloc.jl:83,88) and pencil setup (nonlinear_pencil_utils.jl:285-286,322-323). All other ~65 set-sites preserve element/array type.
+- Accessors `get_grid_data`/`get_coeff_data` (src/core/field/field_data/copy_alloc.jl:203,214) are one-line `getfield(getfield(field,:storage),:grid/:coeff)`.
+- Exactly 4 array-type-changing `set_*_data!` sites: `synchronize_field_architecture!` (copy_alloc.jl:83,88) and pencil setup (pencil_utils.jl:285-286,322-323). All other ~65 set-sites preserve element/array type.
 - `SpectralLinearOperator{T,N,A<:AbstractArray{T,N}}` (src/core/timesteppers/spectral_operators.jl:37) is an in-codebase proof the parametrization pattern works.
 - `TransposableFieldStorage{CT,N}` (src/core/transposable_field.jl:90) embeds `base::SerialFieldStorage` — must absorb the new parameters.
 - 12 `ScalarField{...}` annotation sites total (grep `ScalarField{` in src/).
@@ -28,10 +28,10 @@
 
 ## File Structure
 
-- `src/core/field/field_types.jl` — `SerialFieldStorage` struct + `ScalarField` inner constructors. **Core of the refactor.**
-- `src/core/field/field_data/field_data_copy_alloc.jl` — `allocate_data!`, accessors, `copy`, `deepcopy_internal`, `synchronize_field_architecture!`. **Construction-order inversion + sentinel.**
+- `src/core/field/types.jl` — `SerialFieldStorage` struct + `ScalarField` inner constructors. **Core of the refactor.**
+- `src/core/field/field_data/copy_alloc.jl` — `allocate_data!`, accessors, `copy`, `deepcopy_internal`, `synchronize_field_architecture!`. **Construction-order inversion + sentinel.**
 - `src/core/transposable_field.jl` — `TransposableFieldStorage` carries the new parameters via its `base` field.
-- `src/core/nonlinear/nonlinear_pencil_utils.jl` — 2 of the 4 type-swap sites (pencil setup).
+- `src/core/nonlinear/pencil_utils.jl` — 2 of the 4 type-swap sites (pencil setup).
 - `src/core/timesteppers/state.jl`, `src/core/timesteppers/state_utils.jl`, `src/core/solvers/lazy_rhs.jl` — `ScalarField{<:Any, SerialFieldStorage}` dispatch annotations.
 - `test/test_field_typestability.jl` — **new** regression test (inference + tau-field). The TDD anchor.
 - Barrier-deletion touches (Phase 3 Task 11): `src/core/solvers/lazy_rhs.jl` (+ enumerated siblings).
@@ -96,10 +96,10 @@ git add test/test_field_typestability.jl && git commit -m "test: add field stora
 ### Task 2: Typed empty sentinel + eager allocation for 0-D fields
 
 **Files:**
-- Modify: `src/core/field/field_data/field_data_copy_alloc.jl`
-- Modify: `src/core/field/field_types.jl`
+- Modify: `src/core/field/field_data/copy_alloc.jl`
+- Modify: `src/core/field/types.jl`
 
-- [ ] **Step 1: Add sentinel helpers** near the other allocation helpers in `field_data_copy_alloc.jl`:
+- [ ] **Step 1: Add sentinel helpers** near the other allocation helpers in `copy_alloc.jl`:
 
 ```julia
 # Typed length-0 placeholder so storage is never `nothing`. Grid uses the field
@@ -109,7 +109,7 @@ _empty_grid(::Type{T}) where {T} = Array{T,1}(undef, 0)
 _empty_coeff(::Type{T}) where {T} = Array{coefficient_eltype(T),1}(undef, 0)
 ```
 
-- [ ] **Step 2: Install the sentinel for 0-D fields** in the primary `ScalarField` inner constructor (field_types.jl). Replace:
+- [ ] **Step 2: Install the sentinel for 0-D fields** in the primary `ScalarField` inner constructor (types.jl). Replace:
 
 ```julia
         if domain !== nothing
@@ -130,7 +130,7 @@ with:
         return field
 ```
 
-Apply the same `else` sentinel install in the second inner constructor (field_types.jl:122) for its `domain === nothing` case.
+Apply the same `else` sentinel install in the second inner constructor (types.jl:122) for its `domain === nothing` case.
 
 - [ ] **Step 3: Run the regression test; Phase-1 set must PASS**
 
@@ -145,13 +145,13 @@ Expected: all PASS.
 - [ ] **Step 5: Commit** (ask user first)
 
 ```
-git add src/core/field/field_types.jl src/core/field/field_data/field_data_copy_alloc.jl && git commit -m "refactor: install typed length-0 sentinels for 0-D field storage"
+git add src/core/field/types.jl src/core/field/field_data/copy_alloc.jl && git commit -m "refactor: install typed length-0 sentinels for 0-D field storage"
 ```
 
 ### Task 3: Narrow the storage field declarations to `AbstractArray`
 
 **Files:**
-- Modify: `src/core/field/field_types.jl:54-59`
+- Modify: `src/core/field/types.jl:54-59`
 
 - [ ] **Step 1: Audit the now-affected guards** (no edit). Code that skipped tau fields via `data === nothing` must instead use `isempty(field.bases)`; a sentinel is `!== nothing`.
 
@@ -196,7 +196,7 @@ Expected: all PASS.
 - [ ] **Step 5: Commit** (ask user first)
 
 ```
-git add src/core/field/field_types.jl && git commit -m "refactor: narrow SerialFieldStorage data fields to AbstractArray (no nothing)"
+git add src/core/field/types.jl && git commit -m "refactor: narrow SerialFieldStorage data fields to AbstractArray (no nothing)"
 ```
 
 ---
@@ -208,7 +208,7 @@ Goal: remove the 4 sites that replace a field's array with a *different array ty
 ### Task 4: Architecture-fix fields; make `synchronize_field_architecture!` an assertion
 
 **Files:**
-- Modify: `src/core/field/field_data/field_data_copy_alloc.jl:79-93`
+- Modify: `src/core/field/field_data/copy_alloc.jl:79-93`
 
 - [ ] **Step 1: Append a Phase-2 test** inside the outer testset in `test/test_field_typestability.jl`:
 
@@ -252,17 +252,17 @@ Expected: all PASS. (Ignore `test/test_cpu_architecture.jl` — pre-existing unr
 - [ ] **Step 6: Commit** (ask user first)
 
 ```
-git add src/core/field/field_data/field_data_copy_alloc.jl test/test_field_typestability.jl && git commit -m "refactor: make ScalarField architecture-fixed; forbid in-place arch swaps"
+git add src/core/field/field_data/copy_alloc.jl test/test_field_typestability.jl && git commit -m "refactor: make ScalarField architecture-fixed; forbid in-place arch swaps"
 ```
 
 ### Task 5: Pencil setup builds arrays on the field's architecture
 
 **Files:**
-- Modify: `src/core/nonlinear/nonlinear_pencil_utils.jl:283-323`
+- Modify: `src/core/nonlinear/pencil_utils.jl:283-323`
 
 - [ ] **Step 1: Inspect the 4 lines**
 
-Run: `sed -n '280,325p' src/core/nonlinear/nonlinear_pencil_utils.jl`
+Run: `sed -n '280,325p' src/core/nonlinear/pencil_utils.jl`
 Expected: the `set_grid_data!(field, create_array(arch, ...))` / `set_coeff_data!` calls.
 
 - [ ] **Step 2: Add an architecture-match assertion** immediately before each `set_*_data!` pair (both functions):
@@ -283,7 +283,7 @@ Expected: LOAD OK; "MPI dealiasing product tests completed" all Pass.
 - [ ] **Step 4: Commit** (ask user first)
 
 ```
-git add src/core/nonlinear/nonlinear_pencil_utils.jl && git commit -m "refactor: assert architecture invariant in pencil-compatible data setup"
+git add src/core/nonlinear/pencil_utils.jl && git commit -m "refactor: assert architecture invariant in pencil-compatible data setup"
 ```
 
 ---
@@ -295,7 +295,7 @@ Goal: `SerialFieldStorage{G,C}` carries the concrete grid/coeff array types; acc
 ### Task 6: Value-returning allocator (invert construction order)
 
 **Files:**
-- Modify: `src/core/field/field_data/field_data_copy_alloc.jl`
+- Modify: `src/core/field/field_data/copy_alloc.jl`
 
 - [ ] **Step 1: Add `_build_field_arrays`** (the body of `allocate_data!` refactored to return `(grid, coeff)` without a field):
 
@@ -348,13 +348,13 @@ Expected: all PASS (pure refactor).
 - [ ] **Step 4: Commit** (ask user first)
 
 ```
-git add src/core/field/field_data/field_data_copy_alloc.jl && git commit -m "refactor: extract _build_field_arrays value-returning allocator"
+git add src/core/field/field_data/copy_alloc.jl && git commit -m "refactor: extract _build_field_arrays value-returning allocator"
 ```
 
 ### Task 7: Parametrize `SerialFieldStorage{G,C}`
 
 **Files:**
-- Modify: `src/core/field/field_types.jl`
+- Modify: `src/core/field/types.jl`
 
 - [ ] **Step 1: Rewrite the struct + constructor:**
 
@@ -385,7 +385,7 @@ Remove the old zero-arg `SerialFieldStorage(arch)` constructor.
     end
 ```
 
-- [ ] **Step 3: Second inner constructor** (field_types.jl:122) already receives a built `storage::S`; confirm it no longer calls the removed zero-arg constructor. If it builds storage internally, mirror Step 2.
+- [ ] **Step 3: Second inner constructor** (types.jl:122) already receives a built `storage::S`; confirm it no longer calls the removed zero-arg constructor. If it builds storage internally, mirror Step 2.
 
 - [ ] **Step 4: Update component element types.** For `VectorField`, replace the `ScalarField{T, SerialFieldStorage}[]` build:
 
@@ -399,7 +399,7 @@ Remove the old zero-arg `SerialFieldStorage(arch)` constructor.
 
 and pass `comps` to `new`. For `TensorField`, build the matrix then narrow: `comps = identity.(components_matrix)`. (All components share bases/dtype/dist, hence one concrete `S`.)
 
-- [ ] **Step 5: Update `storage_mode`** (field_types.jl:237):
+- [ ] **Step 5: Update `storage_mode`** (types.jl:237):
 
 ```julia
 storage_mode(::ScalarField{T, <:SerialFieldStorage}) where T = SerialStorage()
@@ -413,7 +413,7 @@ Expected: LOAD OK. (If `copy`/`deepcopy_internal` break on the removed zero-arg 
 - [ ] **Step 7: Commit** (ask user first)
 
 ```
-git add src/core/field/field_types.jl && git commit -m "refactor: parametrize SerialFieldStorage{G,C} on concrete array types"
+git add src/core/field/types.jl && git commit -m "refactor: parametrize SerialFieldStorage{G,C} on concrete array types"
 ```
 
 ### Task 8: Propagate parameters through `TransposableFieldStorage`

@@ -224,6 +224,11 @@ sys = GQLWaveMeanSystem(field_size, domain_size; Λ, α, horizontal_dims=(1,2), 
 | `get_cutoff(sys)` | Get Λ |
 | `set_cutoff!(sys, Λ_new)` | Change Λ |
 
+Pass the full physical fields in `fields_phys` and their `rfft(field)` transforms
+over all dimensions in `fields_hat`. The system computes inverse transforms of
+the small-scale spectra internally for wave stresses; mean profiles use the full
+physical fields. Each update uses the supplied `dt`, including when it changes.
+
 ---
 
 ## Complete GQL Simulation Example

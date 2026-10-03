@@ -25,7 +25,7 @@ const TRANSFORMS_SOURCE = joinpath(@__DIR__, "..", "ext", "cuda", "transforms.jl
 const DCT_SOURCE = joinpath(@__DIR__, "..", "ext", "cuda", "dct_distributed.jl")
 const PENCIL_SOURCE = joinpath(@__DIR__, "..", "ext", "cuda", "pencil.jl")
 const GPU_DISTRIBUTED_SOURCE = joinpath(@__DIR__, "..", "src", "core", "gpu_distributed", "transform.jl")
-const DISTRIBUTOR_SOURCE = joinpath(@__DIR__, "..", "src", "core", "distributor", "distributor_core.jl")
+const DISTRIBUTOR_SOURCE = joinpath(@__DIR__, "..", "src", "core", "distributor", "core.jl")
 
 function _definition_name(expr)
     expr isa Expr || return nothing

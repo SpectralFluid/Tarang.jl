@@ -3,7 +3,7 @@ using Tarang
 using LinearAlgebra
 using SparseArrays
 
-# Coverage tests for src/core/operators/matrices/matrices_subproblem_helpers.jl
+# Coverage tests for src/core/operators/matrices/subproblem_helpers.jl
 #
 # These exercise the per-coordinate subproblem matrix helpers on the serial CPU
 # path: Fourier wavenumber lookup, Chebyshev/Fourier differentiation matrices,

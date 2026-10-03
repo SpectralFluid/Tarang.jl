@@ -43,9 +43,9 @@ const BOUNDARY_CONDITIONS_DIR = joinpath(ROOT_DIR, "src", "core", "boundary_cond
 end
 
 @testset "Problem compilation boundary" begin
-    @test occursin("include(\"problems/problem_ir.jl\")", PROBLEMS_SOURCE)
-    @test occursin("include(\"problems/problem_types.jl\")", PROBLEMS_SOURCE)
-    @test isfile(joinpath(ROOT_DIR, "src", "core", "problems", "problem_ir.jl"))
+    @test occursin("include(\"problems/ir.jl\")", PROBLEMS_SOURCE)
+    @test occursin("include(\"problems/types.jl\")", PROBLEMS_SOURCE)
+    @test isfile(joinpath(ROOT_DIR, "src", "core", "problems", "ir.jl"))
 end
 
 @testset "Public API export structure" begin

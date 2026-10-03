@@ -34,7 +34,7 @@
 | `src/core/subsystems/subproblem_runtime.jl` (modify) | Add two `include`s |
 | `src/tools/load_matsolvers.jl` (modify) | Add one `include` |
 | `src/core/load_solver_stack.jl` (modify) | Add one `include` |
-| `src/core/solvers/solver_types.jl` (modify) | Two new `SolverBaseData` fields |
+| `src/core/solvers/types.jl` (modify) | Two new `SolverBaseData` fields |
 | `src/core/timesteppers/step_subproblem_rk.jl` (modify) | Dispatch to the batched loop |
 | `test/test_mode_batch_signature.jl` (create) | Bucketing |
 | `test/test_mode_batch_kernels_cpu.jl` (create) | Kernel bit-exactness |
@@ -1255,7 +1255,7 @@ Expected: PASS.
 Four conditions gate batching. Getting the *defaults* right is what keeps every existing CPU and MPI run byte-for-byte unchanged.
 
 **Files:**
-- Modify: `src/core/solvers/solver_types.jl:89-95` (struct) and `:121-138` (keyword constructor)
+- Modify: `src/core/solvers/types.jl:89-95` (struct) and `:121-138` (keyword constructor)
 - Modify: `src/core/subsystems/mode_batch.jl` (append the predicate)
 - Test: `test/test_mode_batch_parity.jl` (guard testsets; parity comes in Task 6)
 
@@ -1396,7 +1396,7 @@ Expected: FAIL — `batched_modes` is not an accepted keyword.
 
 - [ ] **Step 3: Extend `SolverBaseData`**
 
-In `src/core/solvers/solver_types.jl`, add two fields to the struct at line 89:
+In `src/core/solvers/types.jl`, add two fields to the struct at line 89:
 
 ```julia
 mutable struct SolverBaseData

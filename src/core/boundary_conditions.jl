@@ -6,7 +6,7 @@ The parsed BC representations, manager state, and cache storage live in
 `boundary_conditions/construction.jl`. This file keeps cache helpers, equation
 conversion, dynamic value evaluation, and refresh of `problem.equation_data`.
 
-Read this file alongside `solver_stepping.jl` and `step_subproblem_rk.jl`:
+Read this file alongside `stepping.jl` and `step_subproblem_rk.jl`:
 the solver refreshes dynamic BCs once per step, while the subproblem RK path
 refreshes them again at each stage time to preserve stage-order accuracy.
 """
@@ -442,13 +442,17 @@ function evaluate_expression(expr, current_time=0.0, coords=Dict(); parameters=n
         return evaluate_expression(expr.expression, current_time, coords; parameters, callback_coords)
     elseif isa(expr, TimeDependentValue) || isa(expr, TimeSpaceDependentValue)
         if expr.function_obj !== nothing
-            return _evaluate_function_expression(expr.function_obj, current_time, callback_coords)
+            names = expr isa TimeSpaceDependentValue && !isempty(expr.space_coordinates) ?
+                    expr.space_coordinates : nothing
+            return _evaluate_function_expression(expr.function_obj, current_time, callback_coords; coordinate_names=names)
         else
             return evaluate_expression(expr.expression, current_time, coords; parameters, callback_coords)
         end
     elseif isa(expr, SpaceDependentValue)
         if expr.function_obj !== nothing
-            return _evaluate_space_function_expression(expr.function_obj, callback_coords)
+            names = isempty(expr.coordinates) ? nothing : expr.coordinates
+            return _evaluate_space_function_expression(expr.function_obj, callback_coords;
+                                                       coordinate_names=names)
         else
             return evaluate_expression(expr.expression, current_time, coords; parameters, callback_coords)
         end
@@ -513,128 +517,119 @@ function _evaluate_string_expression(expr::String, current_time, coords; paramet
     end
 end
 
-"""
-Safely evaluate a mathematical expression string with variable substitutions.
-Only allows mathematical operations - no arbitrary code execution.
-"""
-function _safe_eval_math_expr(expr_str::String, vars::Dict{String, T}) where T
-    # Allowed mathematical functions
-    allowed_funcs = Dict{String, Function}(
-        "sin" => sin,
-        "cos" => cos,
-        "tan" => tan,
-        "sinh" => sinh,
-        "cosh" => cosh,
-        "tanh" => tanh,
-        "asin" => asin,
-        "acos" => acos,
-        "atan" => atan,
-        "exp" => exp,
-        "log" => log,
-        "log10" => log10,
-        "log2" => log2,
-        "sqrt" => sqrt,
-        "abs" => abs,
-        "sign" => sign,
-        "floor" => floor,
-        "ceil" => ceil,
-        "round" => round,
-        "rem" => rem,  # Remainder function (same as % operator)
-        "min" => min,
-        "max" => max,
-    )
-
-    # Parse the expression
-    parsed = Meta.parse(expr_str)
-
-    # Evaluate with restrictions
-    return _eval_safe_ast(parsed, vars, allowed_funcs)
+# These immutable plans contain syntax and whitelisted functions only. They never
+# retain a coordinate array, parameter dictionary, time, or evaluated BC value.
+# A bounded, locked cache also serves direct evaluate_expression calls that do
+# not belong to a BoundaryConditionManager, without growing with generated input.
+struct _BCExpressionVariable
+    name::String
+end
+struct _BCExpressionCall{F, A<:Tuple}
+    func::F
+    args::A
+end
+struct _BCExpressionBlock{A<:Tuple}
+    args::A
 end
 
-"""
-Recursively evaluate an AST node with safety restrictions.
-Only allows arithmetic operations and whitelisted functions.
-"""
-function _eval_safe_ast(node, vars::Dict{String, T}, allowed_funcs::Dict{String, Function}) where T
-    if isa(node, Number)
-        return Float64(node)
-    elseif isa(node, Symbol)
-        name = string(node)
-        if haskey(vars, name)
-            return vars[name]
-        elseif name == "pi" || name == "π"
-            return Float64(π)
-        elseif name == "e" || name == "ℯ"
-            return Float64(ℯ)
-        else
-            throw(ArgumentError("Unknown variable: $name"))
-        end
-    elseif isa(node, Expr)
-        if node.head == :call
-            func_name = string(node.args[1])
-            args = [_eval_safe_ast(arg, vars, allowed_funcs) for arg in node.args[2:end]]
+const _BC_SAFE_FUNCTIONS = (
+    sin=sin, cos=cos, tan=tan, sinh=sinh, cosh=cosh, tanh=tanh,
+    asin=asin, acos=acos, atan=atan, exp=exp, log=log, log10=log10,
+    log2=log2, sqrt=sqrt, abs=abs, sign=sign, floor=floor, ceil=ceil,
+    round=round, rem=rem, min=min, max=max, mod=mod,
+)
+const _BC_EXPRESSION_CACHE = Dict{String, Any}()
+const _BC_EXPRESSION_CACHE_LOCK = ReentrantLock()
+const _BC_EXPRESSION_CACHE_CAPACITY = 256
 
-            # Check if it's an allowed function
-            if haskey(allowed_funcs, func_name)
-                func = allowed_funcs[func_name]
-                return _apply_safe_function(func, args)
-            # Handle binary operators
-            elseif func_name == "+"
-                return _apply_safe_operator(+, args)
-            elseif func_name == "-"
-                if length(args) == 1
-                    return _apply_safe_operator(-, args)
-                else
-                    return _apply_safe_operator(-, args)
-                end
-            elseif func_name == "*"
-                return _apply_safe_operator(*, args)
-            elseif func_name == "/"
-                return _apply_safe_operator(/, args)
-            elseif func_name == "^"
-                return _apply_safe_operator(^, args)
-            elseif func_name == "%"
-                # Julia's % is rem (remainder), not mod
-                return _apply_safe_operator(rem, args)
-            elseif func_name == "mod"
-                return _apply_safe_operator(mod, args)
-            else
-                throw(ArgumentError("Function not allowed: $func_name"))
-            end
+function _bc_safe_function(name)
+    if name isa Symbol && haskey(_BC_SAFE_FUNCTIONS, name)
+        return getproperty(_BC_SAFE_FUNCTIONS, name)
+    end
+    name === :+ && return +
+    name === :- && return -
+    name === :* && return *
+    name === :/ && return /
+    name === :^ && return ^
+    name === :% && return rem
+    throw(ArgumentError("Function not allowed: $name"))
+end
+
+"""Validate parsed syntax and convert it to an immutable evaluation plan."""
+function _build_bc_expression(node)
+    if node isa Number
+        return Float64(node)
+    elseif node isa Symbol
+        return _BCExpressionVariable(string(node))
+    elseif node isa Expr
+        if node.head == :call
+            func = _bc_safe_function(node.args[1])
+            args = Tuple(_build_bc_expression(arg) for arg in node.args[2:end])
+            return _BCExpressionCall(func, args)
         elseif node.head == :block
-            # Handle block expressions (multiple statements)
-            result = nothing
-            for child in node.args
-                if !isa(child, LineNumberNode)
-                    result = _eval_safe_ast(child, vars, allowed_funcs)
-                end
-            end
-            return result
+            args = Tuple(_build_bc_expression(arg) for arg in node.args if !(arg isa LineNumberNode))
+            return _BCExpressionBlock(args)
         elseif node.head == :(=)
             throw(ArgumentError("Assignment not allowed in expressions"))
-        else
-            throw(ArgumentError("Expression type not allowed: $(node.head)"))
         end
-    elseif isa(node, LineNumberNode)
+        throw(ArgumentError("Expression type not allowed: $(node.head)"))
+    elseif node isa LineNumberNode
         return nothing
-    else
-        throw(ArgumentError("Unsupported node type: $(typeof(node))"))
+    end
+    throw(ArgumentError("Unsupported node type: $(typeof(node))"))
+end
+
+function _cached_bc_expression(expr::String)
+    lock(_BC_EXPRESSION_CACHE_LOCK) do
+        haskey(_BC_EXPRESSION_CACHE, expr) && return _BC_EXPRESSION_CACHE[expr]
+        plan = _build_bc_expression(Meta.parse(expr))
+        length(_BC_EXPRESSION_CACHE) >= _BC_EXPRESSION_CACHE_CAPACITY && empty!(_BC_EXPRESSION_CACHE)
+        _BC_EXPRESSION_CACHE[expr] = plan
+        return plan
     end
 end
 
-function _apply_safe_function(func::Function, args::AbstractVector)
+"""
+Safely evaluate a mathematical expression with current variable substitutions.
+Only validated syntax is cached; calls never reuse values from earlier inputs.
+"""
+function _safe_eval_math_expr(expr_str::String, vars::Dict{String, T}) where T
+    return _eval_bc_expression(_cached_bc_expression(expr_str), vars)
+end
+
+_eval_bc_expression(node::Number, vars) = node
+_eval_bc_expression(::Nothing, vars) = nothing
+function _eval_bc_expression(node::_BCExpressionVariable, vars)
+    name = node.name
+    if haskey(vars, name)
+        return vars[name]
+    elseif name == "pi" || name == "π"
+        return Float64(π)
+    elseif name == "e" || name == "ℯ"
+        return Float64(ℯ)
+    end
+    throw(ArgumentError("Unknown variable: $name"))
+end
+function _eval_bc_expression(node::_BCExpressionCall, vars)
+    args = map(arg -> _eval_bc_expression(arg, vars), node.args)
+    return _apply_safe_function(node.func, args)
+end
+function _eval_bc_expression(node::_BCExpressionBlock, vars)
+    result = nothing
+    for arg in node.args
+        result = _eval_bc_expression(arg, vars)
+    end
+    return result
+end
+
+function _apply_safe_function(func::Function, args::Union{Tuple, AbstractVector})
     if any(arg -> arg isa AbstractArray, args)
         return broadcast(func, args...)
     end
     return func(args...)
 end
 
-function _apply_safe_operator(op::Function, args::AbstractVector)
-    if any(arg -> arg isa AbstractArray, args)
-        return broadcast(op, args...)
-    end
-    return op(args...)
-end
+_apply_safe_operator(op::Function, args::Union{Tuple, AbstractVector}) = _apply_safe_function(op, args)
 
 """
 Evaluate a function expression with appropriate arguments.
@@ -669,7 +664,34 @@ function _try_callback_candidates(func::Function, candidates)
     return false, nothing
 end
 
-function _evaluate_function_expression(func::Function, current_time, coords)
+function _callback_coordinate_args(coords, coordinate_names=nothing)
+    if coordinate_names !== nothing
+        return Tuple(map(coordinate_names) do name
+            value = _coord_value(coords, String(name))
+            value === nothing && throw(ArgumentError("Boundary callback coordinate '$name' is unavailable"))
+            value
+        end)
+    end
+
+    # Preserve coordinate order even for domains such as (x,z), (y,z), or z alone.
+    # Dictionary iteration order does not determine positional callback arguments.
+    x = _coord_value(coords, "x")
+    y = _coord_value(coords, "y")
+    z = _coord_value(coords, "z")
+    if x !== nothing || y !== nothing
+        return Tuple(value for value in (x, y, z) if value !== nothing)
+    end
+    r = _coord_value(coords, "r")
+    theta = something(_coord_value(coords, "θ"), _coord_value(coords, "theta"), missing)
+    phi = something(_coord_value(coords, "φ"), _coord_value(coords, "phi"), missing)
+    # An axial z also occurs in cylindrical domains. Include it after the radial
+    # coordinates instead of mistaking it for a one-dimensional Cartesian domain.
+    return Tuple(value for value in (r, theta, phi, z) if value !== nothing && value !== missing)
+end
+
+function _evaluate_function_expression(func::Function, current_time, coords; coordinate_names=nothing)
+    coordinate_args = _callback_coordinate_args(coords, coordinate_names)
+    args = (current_time, coordinate_args...)
     # Speculative probe of the container convention `func(t, coords)`. This one probe must
     # stay permissive: a two-argument callback written as `func(t, x)` is indistinguishable
     # from `func(t, coords)` by dispatch, so it gets *called* here with the coordinate
@@ -693,7 +715,7 @@ function _evaluate_function_expression(func::Function, current_time, coords)
             phi = _coord_value(coords, "phi")
         end
 
-        args = if x !== nothing && y !== nothing && z !== nothing
+        legacy_args = if x !== nothing && y !== nothing && z !== nothing
             (current_time, x, y, z)
         elseif x !== nothing && y !== nothing
             (current_time, x, y)
@@ -707,7 +729,8 @@ function _evaluate_function_expression(func::Function, current_time, coords)
             (current_time,)
         end
 
-        candidates = length(args) == 1 ? (args, ()) : (args, (current_time,), ())
+        candidates = coordinate_names === nothing ?
+            (args, legacy_args, (current_time,), ()) : (args, (current_time,), ())
         matched, value = _try_callback_candidates(func, candidates)
         matched && return value
 
@@ -722,7 +745,8 @@ function _evaluate_function_expression(func::Function, current_time, coords)
         "(time,) and (). Define a method for one of these."))
 end
 
-function _evaluate_space_function_expression(func::Function, coords)
+function _evaluate_space_function_expression(func::Function, coords; coordinate_names=nothing)
+    args = _callback_coordinate_args(coords, coordinate_names)
     # Speculative probe of the container convention `func(coords)`; see the note in
     # `_evaluate_function_expression`. Preserve its failure unless a coordinate-style
     # signature is actually applicable.
@@ -744,7 +768,7 @@ function _evaluate_space_function_expression(func::Function, coords)
             phi = _coord_value(coords, "phi")
         end
 
-        args = if x !== nothing && y !== nothing && z !== nothing
+        legacy_args = if x !== nothing && y !== nothing && z !== nothing
             (x, y, z)
         elseif x !== nothing && y !== nothing
             (x, y)
@@ -764,7 +788,7 @@ function _evaluate_space_function_expression(func::Function, coords)
             ()
         end
 
-        candidates = isempty(args) ? (args,) : (args, ())
+        candidates = coordinate_names === nothing ? (args, legacy_args, ()) : (args, ())
         matched, value = _try_callback_candidates(func, candidates)
         matched && return value
 

@@ -213,6 +213,11 @@ has decayed slightly (`max|u_x| = 0.985`, from 1.0).
 
 Specify the derivative (flux) at the boundary.
 
+Neumann and Robin conditions use the derivative in the named coordinate's
+positive direction at **both** walls. For example, `∂z(T)(z=0)` means
+`∂T/∂z`, not the outward-normal derivative. On a lower `z` wall,
+`∂T/∂n = -∂T/∂z`; account for that sign when prescribing an outward flux.
+
 ### Basic Setup
 
 ```julia
@@ -262,6 +267,10 @@ use `["x", "y", "z"]` for a vector in that order. Each generated condition
 contributes one scalar row and works with a whole-vector bulk equation and
 vector tau fields.
 
+The `free_slip!` convenience helper instead applies zero coordinate derivative
+to the named field, including every component of a vector. Use `stress_free_bc`
+for an impermeable wall: it also fixes the normal velocity to zero.
+
 Alternatively, declare the components as separate `ScalarField`s, each with
 its own tau pair. The following example uses no slip at the bottom and a
 stress-free wall at the top:
@@ -298,7 +307,10 @@ top), recovered to `1.7e-16`.
 
 ## Robin Boundary Conditions
 
-Linear combination: $\alpha u + \beta \frac{\partial u}{\partial n} = \gamma$
+Linear combination on a `z` wall:
+$\alpha u + \beta \frac{\partial u}{\partial z} = \gamma$.
+To prescribe $\alpha u + \beta_n \partial u/\partial n = \gamma$ at the
+lower wall, pass `beta = -beta_n`; at the upper wall, pass `beta = beta_n`.
 
 Parameters registered with `add_parameters!` may be used as constant
 coefficients on the left-hand side and in constant or spatial/time-dependent

@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-10
 **Status:** approved (per-stage RK scope)
-**Area:** `src/core/subsystems/subproblem_io.jl`, `src/core/transforms/transform_fourier.jl`, `src/core/timesteppers/step_subproblem_rk.jl`
+**Area:** `src/core/subsystems/subproblem_io.jl`, `src/core/transforms/fourier.jl`, `src/core/timesteppers/step_subproblem_rk.jl`
 
 ## Problem
 
@@ -49,7 +49,7 @@ flag.** This is the load-bearing safety difference from the assumed-risky design
 ## Mechanism (2 code changes + 1 call site)
 
 1. **`backward_transform!(field, target=:g; apply_coupled_dct::Bool=true)`**
-   (`transform_fourier.jl`) — new kwarg mirroring the existing `forward_transform!`
+   (`fourier.jl`) — new kwarg mirroring the existing `forward_transform!`
    one; when `false`, skip `_apply_distributed_coupled_dct!(field, false)` and do
    only the Fourier `ldiv`. Default `true` → all existing callers unchanged.
 2. **`from_solve_layout!(stash, dist; to_grid::Bool=false)`**

@@ -11,7 +11,8 @@ julia --project=. test/run_gpu_fc_2d.jl
 
 The first runner exercises real/complex nonlinear products, custom-stream
 ordering, aliasing, device allocations, CFL buffer reuse, 3D mode batching, RK
-stage fusion, batched FFT helpers, and optional iterative solvers. The second
+stage fusion, batched FFT helpers, direct-solver metadata reuse, higher-order
+Chebyshev derivatives, fused complex DCT staging, and optional iterative solvers. The second
 checks complete Fourier–Chebyshev boundary-value and evolution paths.
 
 To create an isolated test environment without modifying the package project,
@@ -72,6 +73,12 @@ script can also be copied into the baseline checkout. Record both commits.
 | CFL | Reuses one frequency grid per registered velocity and fuses component accumulation | Device reductions may still allocate small scratch and return a host scalar |
 | Batched FFT helpers | Reuse packed input/output storage | Plans and buffers are bound to task/device/stream; fetch a plan in the context that executes it |
 | CG/GMRES | Reusable `solve!` vectors, Krylov basis, and host workspace | Public `solve` returns owned results; each concurrent solve needs its own solver/preconditioner instance |
+| Batched stage kernels | Gather, scatter, matrix application and assembly stay queued on the task's CUDA stream | CPU/unknown backends retain completion waits; host access and communication still require completion |
+| Direct solvers | Batched LU owns pointer tables, pivots and status storage; `CuDenseLU.solve!` writes into a compatible GPU destination | Singular/invalid solves still raise; matrix storage changes require refactorization |
+| Distributed transform scratch | FFT and DCT request one purpose-keyed output buffer each | Removes two unused FFT grids and three unused DCT grids per cached configuration |
+| Transpose metadata | Workspace-owned plans reuse validated chunk geometry and NCCL wire counts | Distinct geometry/context gets a distinct plan; MPI/NCCL completion waits remain |
+| Mixed complex DCT | Axis permutation is fused into real/imaginary packing and unpacking | Removes complex permutation scratch and two full-array passes |
+| Higher Chebyshev derivatives | Repeat the coefficient recurrence between one forward/backward transform pair | Positive orders use two FFT executions; endpoint weights and domain scaling are preserved |
 
 For 1024×1024×512, explicit complex nonlinear scratch decreases from **105 GiB to
 62 GiB**. The real-input layout uses approximately **44.5 GiB**, including the

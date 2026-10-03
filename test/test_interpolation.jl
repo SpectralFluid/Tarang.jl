@@ -1,5 +1,5 @@
 # Tests for the interpolation operator and its Clenshaw / Jacobi polynomial
-# reconstruction helpers (src/core/operators/operations/operations_interpolate.jl).
+# reconstruction helpers (src/core/operators/operations/interpolate.jl).
 #
 # The polynomial evaluators are checked against closed-form polynomial values so
 # the test is an INDEPENDENT oracle: a mismatch means a real bug, not a tautology.

@@ -806,8 +806,8 @@ function _push_vector_state!(history::Vector{V}, vector::AbstractVector{<:Number
 end
 
 # Forcing → RHS coefficient view. Every concrete forcing type supplies its own
-# `_matched_forcing_view` (stochastic_forcing_diagnostics.jl for the stochastic
-# types, stochastic_forcing_deterministic.jl for DeterministicForcing). There is
+# `_matched_forcing_view` (diagnostics.jl for the stochastic
+# types, deterministic.jl for DeterministicForcing). There is
 # deliberately NO untyped fallback: the one that used to live here sliced
 # `forcing.cached_forcing` to the target's size whatever the array held, which
 # is how a registered DeterministicForcing had its physical-grid values added
@@ -862,6 +862,33 @@ function _solve_algebraic_constraints!(problem::Problem, state::Vector{<:ScalarF
     end
 end
 
+"""Recognize a constant multiple of one directly stored algebraic variable.
+Derivatives and other operators are deliberately excluded: they need a solve."""
+function _simple_constraint_variable(expr)
+    if expr isa VectorField || (expr isa ScalarField && !isempty(expr.bases))
+        return (expr, 1.0)
+    elseif expr isa NegateOperator
+        part = _simple_constraint_variable(expr.operand)
+        return part === nothing ? nothing : (part[1], -part[2])
+    elseif expr isa MultiplyOperator
+        coefficient = _mass_scalar(expr.left)
+        operand = expr.right
+        if coefficient === nothing
+            coefficient = _mass_scalar(expr.right)
+            operand = expr.left
+        end
+        coefficient === nothing && return nothing
+        part = _simple_constraint_variable(operand)
+        return part === nothing ? nothing : (part[1], coefficient * part[2])
+    elseif expr isa DivideOperator
+        coefficient = _mass_scalar(expr.right)
+        (coefficient === nothing || iszero(coefficient)) && return nothing
+        part = _simple_constraint_variable(expr.left)
+        return part === nothing ? nothing : (part[1], part[2] / coefficient)
+    end
+    return nothing
+end
+
 """
 Try to solve a simple algebraic constraint of the form: var - expr = 0
 """
@@ -875,42 +902,44 @@ function _try_solve_simple_constraint!(problem, L_expr, F_expr, state::Vector{<:
     target_name = nothing
     eval_expr = nothing
 
-    # Check if L_expr is a direct variable
-    if isa(L_expr, ScalarField)
-        target_var = L_expr
-        target_name = L_expr.name
-        eval_expr = F_expr
-    elseif isa(L_expr, VectorField)
-        target_var = L_expr
-        target_name = L_expr.name
-        eval_expr = F_expr
-    elseif isa(L_expr, AddOperator)
-        # Look for pattern: var - expr = 0 (represented as Add(var, Negate(expr)))
-        terms = _flatten_add_terms(L_expr)
-        for term in terms
-            if isa(term, VectorField)
-                target_var = term
-                target_name = term.name
-                # Find the negated expression
-                for other in terms
-                    if isa(other, NegateOperator)
-                        eval_expr = other.operand
-                        break
-                    end
-                end
+    # Isolate an algebraic variable from the COMPLETE equation a*var + rest = F.
+    # Evolved fields can also occur as direct terms (u+w-v=0): never replace
+    # their stage values while trying to refresh the diagnostic variable v.
+    terms = _flatten_add_terms(L_expr)
+    evolved = Set{String}()
+    for equation in problem.equation_data
+        for i in _find_time_derivative_targets(equation.mass, state, problem.variables)
+            push!(evolved, state[i].name)
+        end
+    end
+    for term in terms
+        candidate = _simple_constraint_variable(term)
+        candidate === nothing && continue
+        variable, _ = candidate
+        any(comp -> comp.name in evolved, scalar_components(variable)) && continue
+        any(var -> _operand_matches_variable(variable, var), problem.variables) || continue
+
+        coefficient = 0.0
+        rhs_terms = Any[]
+        (F_expr === nothing || is_zero_expression(F_expr)) || push!(rhs_terms, F_expr)
+        isolatable = true
+        for other in terms
+            part = _simple_constraint_variable(other)
+            if part !== nothing && _operand_matches_variable(part[1], variable)
+                coefficient += part[2]
+            elseif _references_problem_variable(other, [variable])
+                isolatable = false  # e.g. v + lap(v): requires an operator solve
                 break
-            elseif isa(term, ScalarField) && !isempty(term.bases)
-                target_var = term
-                target_name = term.name
-                for other in terms
-                    if isa(other, NegateOperator)
-                        eval_expr = other.operand
-                        break
-                    end
-                end
-                break
+            else
+                push!(rhs_terms, _negate_term(other))
             end
         end
+        (!isolatable || iszero(coefficient)) && continue
+        target_var = variable
+        target_name = variable.name
+        eval_expr = combine_operators(rhs_terms)
+        coefficient == 1 || (eval_expr = DivideOperator(eval_expr, ConstantOperator(coefficient)))
+        break
     end
 
     if target_var === nothing || eval_expr === nothing
@@ -936,7 +965,8 @@ function _try_solve_simple_constraint!(problem, L_expr, F_expr, state::Vector{<:
 
     try
         # Evaluate the expression to get the value
-        result = evaluate_solver_expression(eval_expr, problem.variables; layout=:g)
+        template = target_var isa ScalarField ? target_var : nothing
+        result = evaluate_solver_expression(eval_expr, problem.variables; layout=:g, template)
 
         if isa(result, ScalarField) && isa(target_var, ScalarField)
             # Update the target variable

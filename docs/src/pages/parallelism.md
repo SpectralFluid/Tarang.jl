@@ -23,6 +23,43 @@ These paths are covered by the CPU concurrency regressions in the
 [default test suite](testing.md). MPI collectives still require matching calls
 from all ranks; adding Julia threads does not change that requirement.
 
+Runge–Kutta and multistep subproblem steppers can also solve independent Fourier
+modes concurrently within each CPU rank. Each worker owns its mode's RHS, result,
+and factor workspace. Boundary evaluation, factor construction, field writes,
+and MPI layout changes remain on the coordinating task.
+
+```julia
+solver = InitialValueSolver(problem, RK222(); threaded_modes=true)
+```
+
+The default, `threaded_modes=nothing`, enables workers only when enough local
+modes and matrix work are available, Julia has multiple default-pool threads,
+BLAS uses one thread, and the solver uses a supported built-in matrix solver.
+Use `false` to disable this phase, or `true` to bypass the automatic thresholds
+when benchmarking; a custom matrix solver must then support concurrent solves
+on separate factor instances. CPU execution, at least two local modes, and
+multiple Julia threads are still required. This setting applies
+to the subproblem steppers; pure-Fourier diagonal steppers have a different solve
+path. Set BLAS/FFTW thread counts before stepping, and keep ranks times threads
+within the allocated CPU budget.
+
+Compatible CPU/MPI RHS fields are transformed together before mode solves.
+Packing fields into a local batch dimension lets each pencil exchange carry
+several fields in one collective. Plans and scratch are cached by domain, dtype,
+and batch width; mixed Fourier–Chebyshev transforms keep their coupled-axis
+normalization and solve-layout transposes. Scaled fields and unsupported layouts
+continue through the individual transform path. For comparisons, configure every
+rank identically before stepping:
+
+```julia
+Tarang.set_group_transforms!(true; max_batch_size=32) # default
+Tarang.set_group_transforms!(false)                 # individual transforms
+```
+
+Distributed mean, variance, and RMS output reductions combine their local moments
+and integer sample counts into one sum collective per statistic. Boundary plane
+FFTs are also shared across local modes until the boundary values are refreshed.
+
 ## MPI Basics
 
 ### Initialization

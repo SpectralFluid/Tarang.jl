@@ -10,17 +10,17 @@ Key parallelization features:
 
 
 # Runtime map:
-#   distributor_core.jl              — distributor types, topology setup, layouts, and local indexing
-#   distributor_mpi.jl               — gather/scatter/allreduce helpers, cache limits, and mesh utilities
-#   distributor_transpose.jl         — transpose-pencil helpers and transpose-buffer cache
-#   distributor_exchange.jl          — async MPI exchange, communication buffers, and diagnostics
-#   distributor_grouped_transpose.jl — grouped PencilArray transpose support
+#   core.jl              — distributor types, topology setup, layouts, and local indexing
+#   mpi.jl               — gather/scatter/allreduce helpers, cache limits, and mesh utilities
+#   transpose.jl         — transpose-pencil helpers and transpose-buffer cache
+#   exchange.jl          — async MPI exchange, communication buffers, and diagnostics
+#   grouped_transpose.jl — grouped PencilArray transpose support
 
-include("distributor/distributor_core.jl")
-include("distributor/distributor_mpi.jl")
-include("distributor/distributor_transpose.jl")
-include("distributor/distributor_exchange.jl")
-include("distributor/distributor_grouped_transpose.jl")
+include("distributor/core.jl")
+include("distributor/mpi.jl")
+include("distributor/transpose.jl")
+include("distributor/exchange.jl")
+include("distributor/grouped_transpose.jl")
 
 # ============================================================================
 # Exports

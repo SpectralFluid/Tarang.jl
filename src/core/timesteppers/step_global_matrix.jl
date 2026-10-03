@@ -104,8 +104,8 @@ function step_mcnab2!(state::TimestepperState, solver::InitialValueSolver)
         MX_current = _timestep_matvec!(state, :mcnab2_MX_current_vec, M_matrix, X_current)
         LX_current = _timestep_matvec!(state, :mcnab2_LX_current_vec, L_matrix, X_current)
 
-        F_current = evaluate_rhs(solver, current_state, solver.sim_time)
-        F_current_vec = _timestep_fields_vector!(state, :mcnab2_F_current_vec, F_current)
+        F_current_vec = _timestep_global_rhs_vector!(state, :mcnab2_F_current_vec,
+                                                       solver, current_state, solver.sim_time)
 
         # Rotate and store history
         MX_history = state.timestepper_data[:MX_history]::Vector{Vector{ComplexF64}}
@@ -133,7 +133,7 @@ function step_mcnab2!(state::TimestepperState, solver::InitialValueSolver)
         cache_key = (a[1], b[1])
         if get(state.timestepper_data, :mcnab2_lhs_key, nothing) !== cache_key
             state.timestepper_data[:mcnab2_lhs_key] = cache_key
-            state.timestepper_data[:mcnab2_lhs_factor] = factorize(a[1] * M_matrix + b[1] * L_matrix)
+            state.timestepper_data[:mcnab2_lhs_factor] = _factorize_timestep_matrix(a[1] * M_matrix + b[1] * L_matrix)
         end
         X_new = _timestep_vector_buffer!(state, :mcnab2_X_new_vec, length(rhs))
         _timestep_ldiv!(X_new, state.timestepper_data[:mcnab2_lhs_factor], rhs)
@@ -241,8 +241,8 @@ function step_cnlf2!(state::TimestepperState, solver::InitialValueSolver)
         LX_current = _timestep_matvec!(state, :cnlf2_LX_current_vec, L_matrix, X_current)
         LX_previous = _timestep_matvec!(state, :cnlf2_LX_previous_vec, L_matrix, X_previous)
 
-        F_current = evaluate_rhs(solver, current_state, solver.sim_time)
-        F_current_vec = _timestep_fields_vector!(state, :cnlf2_F_current_vec, F_current)
+        F_current_vec = _timestep_global_rhs_vector!(state, :cnlf2_F_current_vec,
+                                                       solver, current_state, solver.sim_time)
 
         # Build RHS in-place (zero allocations):
         # RHS = c[2]*F^n - a[2]*M*X^n - a[3]*M*X^{n-1} - b[2]*L*X^n - b[3]*L*X^{n-1}
@@ -257,7 +257,7 @@ function step_cnlf2!(state::TimestepperState, solver::InitialValueSolver)
         cache_key = (a1, b1)
         if get(state.timestepper_data, :cnlf2_lhs_key, nothing) !== cache_key
             state.timestepper_data[:cnlf2_lhs_key] = cache_key
-            state.timestepper_data[:cnlf2_lhs_factor] = factorize(a1 * M_matrix + b1 * L_matrix)
+            state.timestepper_data[:cnlf2_lhs_factor] = _factorize_timestep_matrix(a1 * M_matrix + b1 * L_matrix)
         end
         X_new = _timestep_vector_buffer!(state, :cnlf2_X_new_vec, length(rhs))
         _timestep_ldiv!(X_new, state.timestepper_data[:cnlf2_lhs_factor], rhs)

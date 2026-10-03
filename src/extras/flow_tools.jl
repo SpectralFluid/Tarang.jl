@@ -10,14 +10,14 @@ using LinearAlgebra
 using MPI
 using FFTW: fftshift
 
-include("flow_tools/flow_tools_cfl.jl")
-include("flow_tools/flow_tools_diagnostics.jl")
-include("flow_tools/flow_tools_spectrum_types.jl")
-include("flow_tools/flow_tools_domain_utils.jl")
-include("flow_tools/flow_tools_spectra.jl")
-include("flow_tools/flow_tools_streamfunction.jl")
-include("flow_tools/flow_tools_qg.jl")
-include("flow_tools/flow_tools_boundary_advection.jl")
+include("flow_tools/cfl.jl")
+include("flow_tools/diagnostics.jl")
+include("flow_tools/spectrum_types.jl")
+include("flow_tools/domain_utils.jl")
+include("flow_tools/spectra.jl")
+include("flow_tools/streamfunction.jl")
+include("flow_tools/qg.jl")
+include("flow_tools/boundary_advection.jl")
 
 # Turbulence statistics
 """Calculate basic turbulence statistics"""

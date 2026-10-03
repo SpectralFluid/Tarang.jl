@@ -32,10 +32,6 @@ _is_zero_F_expr(x::Number) = x == 0
 _is_zero_F_expr(c::ConstantOperator) = c.value == 0
 _is_zero_F_expr(::Any) = false
 
-_extract_F_constant(c::ConstantOperator) = Float64(c.value)
-_extract_F_constant(x::Number) = Float64(x)
-_extract_F_constant(::Any) = nothing
-
 """
     _evaluate_alg_F(F_expr, sp) -> ComplexF64
 
@@ -98,9 +94,13 @@ DC-mode value is `v` itself — no scaling applied.
 """
 function _bc_constant_projection(v::Float64, sp::Subproblem)
     v == 0 && return ComplexF64(0)
+    return _bc_constant_projection(v, _bc_fourier_axis_sizes(sp),
+                                    _subproblem_fourier_group_indices(sp))
+end
+
+function _bc_constant_projection(v::Float64, sizes::Tuple, fourier_idx::Tuple)
     # Every separable (Fourier) axis of this subproblem must be at its DC
     # mode (global index 1) for a constant to have any contribution.
-    fourier_idx = _subproblem_fourier_group_indices(sp)
     for k in fourier_idx
         if k != 1
             return ComplexF64(0)
@@ -108,27 +108,14 @@ function _bc_constant_projection(v::Float64, sp::Subproblem)
     end
     # DC on every Fourier axis → `v * ∏ N_k` via unnormalized FFTs.
     scale = 1.0
-    for N in _bc_fourier_axis_sizes(sp)
+    for N in sizes
         scale *= Float64(N)
     end
     return ComplexF64(v * scale)
 end
 
-function _find_bc_fourier_basis(sp::Subproblem)
-    for var in sp.problem.variables
-        for comp in scalar_components(var)
-            for basis in comp.bases
-                if basis !== nothing && isa(basis, FourierBasis)
-                    return basis
-                end
-            end
-        end
-    end
-    return nothing
-end
-
 """
-    _bc_fourier_axis_sizes(sp) -> Vector{Int}
+    _bc_fourier_axis_sizes(sp) -> Tuple{Vararg{Int}}
 
 Ordered list of grid sizes for the problem's separable (Fourier) axes. Used
 to determine the expected output shape of a BC array so that lower-rank
@@ -136,6 +123,8 @@ user inputs (e.g. `sin(x)` in a 3D problem) can be broadcast to the full
 output before being transformed.
 """
 function _bc_fourier_axis_sizes(sp::Subproblem)
+    cached = sp.runtime.bc_fourier_sizes
+    cached !== nothing && return cached
     sizes = Int[]
     seen = Set{String}()
     for var in sp.problem.variables
@@ -150,62 +139,28 @@ function _bc_fourier_axis_sizes(sp::Subproblem)
             end
         end
     end
-    return sizes
+    # A new compiled subproblem is required when the problem's bases change,
+    # just as for its matrices and existing field-size/index caches.
+    return sp.runtime.bc_fourier_sizes = Tuple(sizes)
 end
 
 """
-    _subproblem_fourier_group_indices(sp) -> Vector{Int}
+    _subproblem_fourier_group_indices(sp) -> Tuple{Vararg{Int}}
 
 Return the 1-based Fourier mode indices for every separable axis of this
-subproblem. For a 2D problem with one Fourier axis this is `[kx_global]`;
-for a 3D problem it's `[kx_global, ky_global]`.
+subproblem. For a 2D problem with one Fourier axis this is `(kx_global,)`;
+for a 3D problem it's `(kx_global, ky_global)`.
 """
 function _subproblem_fourier_group_indices(sp::Subproblem)
+    cached = sp.runtime.bc_fourier_indices
+    cached !== nothing && sp.runtime.bc_fourier_group === sp.group && return cached
     idx = Int[]
     for g in sp.group
         g isa Integer || continue
         push!(idx, g + 1)
     end
-    return idx
-end
-
-"""Expand a BC array onto the full boundary plane spanned by the Fourier axes.
-
-A BC that depends on a subset of the Fourier axes evaluates to an array with singleton (or
-missing) dimensions — `(1, Ny)` for `cos(2πy/Ly)`, `(Nx,)` for `sin(2πx/Lx)` in a 1-Fourier-axis
-problem. Broadcast it up to `fourier_sizes` so the transform is taken over the right axes.
-
-A 1-D array in a MULTI-Fourier-axis problem is ambiguous — it carries no axis identity — and used
-to be silently treated as the first axis. It can only arise now if a caller registered a
-coordinate array by hand, so accept it when its length pins the axis unambiguously and refuse
-otherwise, rather than guessing."""
-function _expand_bc_array_to_plane(arr::AbstractArray, fourier_sizes)
-    dims = Tuple(fourier_sizes)
-    size(arr) == dims && return arr
-    n = length(dims)
-
-    if ndims(arr) == n
-        # Singleton dims → broadcast. (Every non-singleton dim must already match.)
-        all(d -> size(arr, d) == dims[d] || size(arr, d) == 1, 1:n) || return arr
-        out = Array{Float64}(undef, dims)
-        out .= arr
-        return out
-    end
-
-    if ndims(arr) == 1 && n >= 2
-        matches = findall(==(length(arr)), collect(dims))
-        if length(matches) == 1
-            shape = ntuple(d -> d == matches[1] ? length(arr) : 1, n)
-            out = Array{Float64}(undef, dims)
-            out .= reshape(arr, shape)
-            return out
-        end
-        @warn "BC array of length $(length(arr)) is ambiguous on a boundary plane of size " *
-              "$dims — it does not identify which axis it varies along. Register the " *
-              "coordinate with its axis shape (e.g. reshape to (1, N)) so the BC is applied to " *
-              "the intended direction." maxlog=3
-    end
-    return arr
+    sp.runtime.bc_fourier_group = sp.group
+    return sp.runtime.bc_fourier_indices = Tuple(idx)
 end
 
 """
@@ -215,42 +170,50 @@ Project a grid-space array `arr` (from a space-dependent BC) onto the current
 subproblem's Fourier mode. Returns a `ComplexF64` value suitable for writing
 into the BC row of the raw equation-space vector.
 
-`arr` is first expanded onto the full boundary plane (see
-`_expand_bc_array_to_plane`), then transformed. The FFT result is cached by
-identity on `sp.problem.parameters` via an `IdDict`, so all subproblems sharing
-the same `ArrayOperator` reuse a single FFT per refresh.
+The FFT result is cached by original array identity and boundary-plane shape in
+the problem's compiled runtime. Expansion onto the full boundary plane happens
+only on a cache miss, so all modes sharing an `ArrayOperator` reuse one FFT per
+refresh, including profiles that vary along only one tangential coordinate.
 """
-function _bc_array_projection(arr::AbstractArray, sp::Subproblem)
+function _bc_array_projection(arr::AbstractArray, sp::Subproblem)::ComplexF64
     (arr === nothing || length(arr) == 0) && return ComplexF64(0)
+    return _bc_array_projection(arr, sp, _bc_fourier_axis_sizes(sp),
+                                _subproblem_fourier_group_indices(sp))
+end
 
-    fourier_sizes = _bc_fourier_axis_sizes(sp)
+# Recover the concrete geometry tuple types at the cache boundary, so tuple
+# iteration and shape-key lookup do not box integers once per Fourier mode.
+function _bc_array_projection(arr::AbstractArray, sp::Subproblem,
+                              fourier_sizes::S, fourier_idx::I)::ComplexF64 where {S<:Tuple,I<:Tuple}
     if isempty(fourier_sizes)
         # No Fourier axes at all (pure-coupled / BVP-like). Use arr[1] as
         # the DC-mode value.
         return ComplexF64(first(arr))
     end
 
-    # The BC expression is evaluated against coordinate arrays that carry their axis identity in
-    # their shape (see `_auto_register_coordinate_fields!`), so a BC depending on only some of the
-    # Fourier axes comes back with singleton dims — `(1, Ny)` for `cos(2πy/Ly)`. Expand it onto the
-    # full boundary plane before transforming; otherwise the FFT is taken over the wrong axis and
-    # the profile is silently applied along the wrong direction.
-    arr = _expand_bc_array_to_plane(arr, fourier_sizes)
-
     coeffs = _get_or_compute_bc_array_coeffs!(arr, sp, fourier_sizes)
     coeffs === nothing && return ComplexF64(0)
+    # Refine the cache's rank-erased array type before reading a scalar. This
+    # keeps both indexing and the ComplexF64 return unboxed in the mode loop.
+    if coeffs isa Vector{ComplexF64} || coeffs isa Matrix{ComplexF64} ||
+       coeffs isa Array{ComplexF64,3}
+        return _sample_bc_coefficients(coeffs, fourier_idx)
+    end
+    @warn "BC array projection: unsupported coefficient rank $(ndims(coeffs))" maxlog=3
+    return ComplexF64(0)
+end
 
-    fourier_idx = _subproblem_fourier_group_indices(sp)
-    if ndims(coeffs) == 1
+function _sample_bc_coefficients(coeffs::Array{ComplexF64,N}, fourier_idx::Tuple)::ComplexF64 where N
+    if N == 1
         kx = isempty(fourier_idx) ? 1 : first(fourier_idx)
         return (kx >= 1 && kx <= length(coeffs)) ?
                ComplexF64(coeffs[kx]) : ComplexF64(0)
-    elseif ndims(coeffs) == 2
+    elseif N == 2
         length(fourier_idx) >= 2 || return ComplexF64(0)
         kx, ky = fourier_idx[1], fourier_idx[2]
         return (1 <= kx <= size(coeffs, 1) && 1 <= ky <= size(coeffs, 2)) ?
                ComplexF64(coeffs[kx, ky]) : ComplexF64(0)
-    elseif ndims(coeffs) == 3
+    elseif N == 3
         length(fourier_idx) >= 3 || return ComplexF64(0)
         kx, ky, kz = fourier_idx[1], fourier_idx[2], fourier_idx[3]
         return (1 <= kx <= size(coeffs, 1) &&
@@ -263,6 +226,42 @@ function _bc_array_projection(arr::AbstractArray, sp::Subproblem)
     end
 end
 
+# Only FFT working storage survives boundary refresh. Coefficients returned by
+# the cache remain independently owned snapshots: another boundary, or the next
+# refresh, must never overwrite an array retained by a caller. The coordinating
+# task consumes the scratch synchronously, just as it owns the BC value cache.
+const _BC_FFT_SCRATCH_CAPACITY = 8
+
+struct BCProjectionScratch{T,N,P}
+    plane::Array{T,N}
+    plan::P
+end
+
+function _bc_projection_scratch!(context, ::Type{T}, shape::NTuple{N,Int}) where {T,N}
+    cache = get!(context.workspaces, :bc_fft_scratch) do
+        Dict{Tuple, Any}()
+    end::Dict{Tuple, Any}
+    key = (T, shape)
+    scratch = get(cache, key, nothing)
+    scratch !== nothing && return scratch
+    length(cache) >= _BC_FFT_SCRATCH_CAPACITY && empty!(cache)
+    plane = Array{T}(undef, shape)
+    flags = FFTW.ESTIMATE | FFTW.UNALIGNED
+    plan = T <: Complex ? FFTW.plan_fft(plane; flags) : FFTW.plan_rfft(plane; flags)
+    return cache[key] = BCProjectionScratch(plane, plan)
+end
+
+function _compute_bc_coefficients!(scratch::BCProjectionScratch, arr)
+    _copy_bc_plane!(scratch.plane, arr)
+    # Each refreshed boundary owns its output, while input and plan are reused.
+    shape = size(scratch.plane)
+    coeff_shape = eltype(scratch.plane) <: Complex ? shape :
+                  Base.setindex(shape, first(shape) ÷ 2 + 1, 1)
+    coefficients = Array{ComplexF64}(undef, coeff_shape)
+    mul!(coefficients, scratch.plan, scratch.plane)
+    return coefficients
+end
+
 """
     _get_or_compute_bc_array_coeffs!(arr, sp, fourier_sizes) -> coefficients
 
@@ -273,117 +272,65 @@ Cache-backed helper that:
    real input) and complex FFT along remaining axes.
 3. Returns the complex coefficient array for downstream indexing.
 
-The result is cached in the problem's compiled-runtime cache by array object
-identity (`IdDict`) so all subproblems reusing the same `arr` share a single
-FFT per refresh without mixing runtime state into user parameters.
+The result is cached by original array identity (`IdDict`) and Fourier plane
+shape. Looking up the original array before expansion avoids retaining and
+transforming a fresh full plane for every mode. Boundary refresh invalidates
+this cache; gather boundary data on the coordinating task before local solves.
 """
 function _get_or_compute_bc_array_coeffs!(arr::AbstractArray,
                                           sp::Subproblem,
-                                          fourier_sizes::Vector{Int})
-    cache = compiled_problem(sp.problem).caches.bc_rfft
-    cached = get(cache, arr, nothing)
+                                          fourier_sizes::Union{Tuple, Vector{Int}})
+    context = compiled_problem(sp.problem).caches
+    cache = context.bc_rfft
+    shape = Tuple(fourier_sizes)
+    by_shape = get(cache, arr, nothing)
+    cached = by_shape === nothing ? nothing : get(by_shape, shape, nothing)
     cached !== nothing && return cached
 
     coeffs = try
-        broadcast_arr = _broadcast_bc_array_to_output(arr, fourier_sizes)
-        _forward_fft_bc(broadcast_arr)
+        T = eltype(arr) <: Complex ? ComplexF64 : Float64
+        scratch = _bc_projection_scratch!(context, T, shape)
+        _compute_bc_coefficients!(scratch, arr)
     catch err
+        # Invalid/ambiguous geometry is a user error, not a zero boundary.
+        err isa ArgumentError && rethrow()
         @warn "BC array FFT failed: $err" maxlog=1
         return nothing
     end
 
-    cache[arr] = coeffs
+    if by_shape === nothing
+        by_shape = Dict{Tuple, Array{ComplexF64}}()
+        cache[arr] = by_shape
+    end
+    by_shape[shape] = coeffs
     return coeffs
 end
 
-"""
-    _broadcast_bc_array_to_output(arr, fourier_sizes) -> Array
-
-Broadcast a grid-space BC array to the full Fourier-output shape.
-
-- If `arr` already matches `fourier_sizes`, returns it (as a concrete array).
-- If `arr` has fewer dimensions, reshape it into a singleton-padded shape
-  and broadcast to the full shape. We assume the user supplies the array
-  in axis order matching the problem's Fourier axes, so a 1D `arr` of
-  length `fourier_sizes[k]` is broadcast along the matching dimension and
-  replicated along the rest.
-- A single-element `arr` becomes a uniform constant over the full shape.
-"""
-function _broadcast_bc_array_to_output(arr::AbstractArray, fourier_sizes::Vector{Int})
-    output_shape = Tuple(fourier_sizes)
-    ndout = length(fourier_sizes)
-
-    # Scalar-ish input (length 1) → constant over the output.
+"""Copy/broadcast a boundary into FFT input without intermediate plane copies."""
+function _copy_bc_plane!(plane::Array{T,N}, arr::AbstractArray) where {T,N}
+    shape = size(plane)
     if length(arr) == 1
-        result = Array{Float64}(undef, output_shape...)
-        fill!(result, Float64(first(arr)))
-        return result
-    end
-
-    # Exact match (shape and rank) → collect to a concrete array to keep
-    # downstream FFT predictable.
-    if size(arr) == output_shape
-        return collect(Float64.(arr))
-    end
-
-    # Same rank, same total length but different dim ordering (unusual).
-    if length(arr) == prod(output_shape)
-        return reshape(collect(Float64.(arr)), output_shape...)
-    end
-
-    # Lower-dimensional input: pad its shape with trailing singletons so
-    # that Julia's `broadcast` can expand it along the missing axes.
-    nd_in = ndims(arr)
-    if nd_in < ndout
-        # Try to match each input dimension to an output dimension of the
-        # same size; fall back to leading-dim match.
-        dims_padded = ntuple(i -> i <= nd_in ? size(arr, i) : 1, ndout)
-        if dims_padded[1] == output_shape[1] || any(i -> dims_padded[i] == output_shape[i], 1:nd_in)
-            reshaped = reshape(collect(Float64.(arr)), dims_padded)
-            target = Array{Float64}(undef, output_shape...)
-            target .= reshaped
-            return target
-        end
-    end
-
-    # Length matches a single Fourier axis but rank is 1 — broadcast along
-    # the first axis with that size. (Covers 1D `sin(x)` in 3D problems.)
-    if nd_in == 1
-        for (axis, sz) in enumerate(output_shape)
-            if length(arr) == sz
-                # Reshape to have the Fourier length on `axis`, singletons elsewhere.
-                rshape = ntuple(i -> i == axis ? sz : 1, ndout)
-                reshaped = reshape(collect(Float64.(arr)), rshape)
-                target = Array{Float64}(undef, output_shape...)
-                target .= reshaped
-                return target
-            end
-        end
-    end
-
-    throw(ArgumentError(
-        "BC array shape $(size(arr)) incompatible with Fourier output " *
-        "shape $(output_shape); provide the array in either the full " *
-        "output shape or a 1-D/1-element form that can be broadcast."
-    ))
-end
-
-"""
-    _forward_fft_bc(arr) -> complex coefficient array
-
-Unnormalized forward Fourier transform matching Tarang's `RealFourier`
-convention: `FFTW.rfft` along the first dimension for real input, full
-`FFTW.fft` for complex input. Multi-dim real input transforms the first
-dim with `rfft` and remaining dims with `fft`, matching the shape that
-`_bc_fourier_axis_sizes` + `_subproblem_fourier_group_indices` expect
-when looking up per-mode coefficients.
-"""
-function _forward_fft_bc(arr::AbstractArray)
-    if eltype(arr) <: Complex
-        return FFTW.fft(ComplexF64.(arr))
+        fill!(plane, first(arr))
+    elseif size(arr) == shape
+        copyto!(plane, arr)
+    elseif ndims(arr) == N && all(d -> size(arr, d) in (1, shape[d]), 1:N)
+        plane .= arr
+    elseif ndims(arr) == 1 && N >= 2 && count(==(length(arr)), shape) > 1
+        throw(ArgumentError("BC array of length $(length(arr)) is ambiguous on a boundary " *
+                            "plane of size $shape; provide its axis shape (e.g. (1, N))."))
+    elseif length(arr) == length(plane)
+        copyto!(plane, reshape(arr, shape))
+    elseif ndims(arr) == 1 && count(==(length(arr)), shape) == 1
+        axis = findfirst(==(length(arr)), shape)
+        reshaped = reshape(arr, ntuple(d -> d == axis ? length(arr) : 1, N))
+        plane .= reshaped
+    elseif ndims(arr) < N && all(d -> size(arr, d) in (1, shape[d]), 1:N)
+        plane .= reshape(arr, ntuple(d -> size(arr, d), N))
     else
-        return FFTW.rfft(Float64.(arr))
+        throw(ArgumentError("BC array shape $(size(arr)) incompatible with Fourier output " *
+                            "shape $shape; provide a broadcastable boundary plane."))
     end
+    return plane
 end
 
 """
@@ -410,20 +357,28 @@ wrong `1/γ` scaling for inhomogeneous algebraic constraints.
 """
 function gather_eqn_F!(dest::AbstractVector{ComplexF64}, sp::Subproblem, solver,
                        pde_F_fields::Vector, state_fields::Vector)
-    problem = sp.problem
-    eqns = problem.equation_data
-
     eqn_sizes = _subproblem_eqn_sizes(sp)
     eqn_targets = _subproblem_eqn_targets(sp, state_fields)
     I_raw = _subproblem_raw_eqn_size(sp)
 
     raw = _subproblem_cached_vector!(sp, :gather_eqn_F_raw, I_raw; like=dest)
+    _gather_eqn_F_raw!(raw, sp, pde_F_fields, state_fields, eqn_sizes, eqn_targets)
+    compress_equation_space!(dest, sp, raw)
+    return dest
+end
+
+# Recover the concrete cached-buffer type before indexing it or walking field
+# targets. The equation geometry is already compiled; no EquationIR lookup is
+# needed for PDE rows, and all field values are still gathered at this call.
+function _gather_eqn_F_raw!(raw::AbstractVector{ComplexF64}, sp::Subproblem,
+                            pde_F_fields::Vector, state_fields::Vector,
+                            eqn_sizes::Vector{Int}, eqn_targets::Vector{Vector{Int}})
     fill!(raw, zero(eltype(raw)))
 
-    kx_global = _kx_index_global(sp)
+    kx_global = Int(_kx_index_global(sp))
 
     i0 = 0
-    for (eq_idx, eq_data) in enumerate(eqns)
+    for eq_idx in eachindex(eqn_sizes)
         eq_size = eqn_sizes[eq_idx]
         if eq_size == 0
             continue
@@ -436,7 +391,7 @@ function gather_eqn_F!(dest::AbstractVector{ComplexF64}, sp::Subproblem, solver,
                 if tidx >= 1 && tidx <= length(pde_F_fields)
                     fld = pde_F_fields[tidx]
                     if fld !== nothing
-                        offset = _gather_field_raw!(raw, offset, fld, kx_global, sp)
+                        offset = _gather_field_raw!(raw, offset, fld, kx_global, sp)::Int
                         continue
                     end
                 end
@@ -450,8 +405,27 @@ function gather_eqn_F!(dest::AbstractVector{ComplexF64}, sp::Subproblem, solver,
         i0 += eq_size
     end
 
-    compress_equation_space!(dest, sp, raw)
-    return dest
+    return raw
+end
+
+function _subproblem_algebraic_blocks(sp::Subproblem, eqns::AbstractVector)
+    cached = sp.runtime.algebraic_blocks
+    cached !== nothing && return cached
+    eqn_sizes = _subproblem_eqn_sizes(sp)
+    basis = _subproblem_cheb_basis_from_sp(sp)
+    Nz = basis === nothing ? 1 : basis.meta.size
+    blocks = _SubproblemAlgebraicBlock[]
+    offset = 0
+    for (eq_idx, eq_data) in enumerate(eqns)
+        n = eqn_sizes[eq_idx]
+        if n > 0 && _is_zero_m_term(get(eq_data, "M", nothing))
+            push!(blocks, _SubproblemAlgebraicBlock(eq_idx, offset, n,
+                                                   _is_bulk_eqn_size(n, Nz)))
+        end
+        offset += n
+    end
+    sp.runtime.algebraic_blocks = blocks
+    return blocks
 end
 
 # Is this BC F expression provably IMMUTABLE — a value fixed at problem build?
@@ -485,12 +459,9 @@ function alg_F_is_static(sp::Subproblem)
     cached = sp.runtime.alg_F_static
     cached !== nothing && return cached::Bool
     static = true
-    eqn_sizes = _subproblem_eqn_sizes(sp)
-    for (eq_idx, eq_data) in enumerate(sp.problem.equation_data)
-        eqn_sizes[eq_idx] == 0 && continue
-        M_expr = get(eq_data, "M", nothing)
-        is_alg = M_expr === nothing || _is_zero_m_term(M_expr)
-        is_alg || continue
+    eqns = sp.problem.equation_data
+    for block in _subproblem_algebraic_blocks(sp, eqns)
+        eq_data = eqns[block.equation]
         F_expr = get(eq_data, "F_expr", nothing)
         if F_expr === nothing
             F_expr = get(eq_data, "F", nothing)
@@ -524,7 +495,7 @@ function gather_alg_F!(dest::AbstractVector{ComplexF64}, sp::Subproblem)
     problem = sp.problem
     eqns = problem.equation_data
 
-    eqn_sizes = _subproblem_eqn_sizes(sp)
+    blocks = _subproblem_algebraic_blocks(sp, eqns)
     I_raw = _subproblem_raw_eqn_size(sp)
 
     # Build the sparse BC F vector on the HOST via scalar writes (a few nonzero
@@ -536,57 +507,8 @@ function gather_alg_F!(dest::AbstractVector{ComplexF64}, sp::Subproblem)
     if raw_cpu === nothing || length(raw_cpu) != I_raw
         raw_cpu = zeros(ComplexF64, I_raw)
         sp.runtime.gather_alg_F_raw_cpu = raw_cpu
-    else
-        fill!(raw_cpu, zero(ComplexF64))
     end
-
-    # `is_alg` below is "has no time derivative", which in an InitialValueProblem means a BC or
-    # constraint row — but in a BVP/NonlinearBoundaryValueProblem means EVERY equation, the bulk PDE
-    # included. Only the rows `apply_bc_override!` actually writes (`sp.bc_rows`,
-    # i.e. the non-bulk blocks) are read downstream, so a bulk equation's F is
-    # computed and then discarded. Classify the block the same way the row split
-    # itself does, and suppress the unsupported-BC warning for bulk rows: the
-    # value is still computed exactly as before, so this changes no result.
-    cheb_basis = _subproblem_cheb_basis_from_sp(sp)
-    Nz_alg = cheb_basis !== nothing ? cheb_basis.meta.size : 1
-
-    i0 = 0
-    for (eq_idx, eq_data) in enumerate(eqns)
-        eq_size = eqn_sizes[eq_idx]
-        if eq_size == 0
-            continue
-        end
-
-        M_expr = get(eq_data, "M", nothing)
-        is_alg = M_expr === nothing || _is_zero_m_term(M_expr)
-
-        if is_alg
-            F_expr = get(eq_data, "F_expr", nothing)
-            if F_expr === nothing
-                F_expr = get(eq_data, "F", nothing)
-            end
-            if !_is_zero_F_expr(F_expr)
-                is_bulk = _is_bulk_eqn_size(eq_size, Nz_alg)
-                coeff = _evaluate_alg_F(F_expr, sp; warn_unsupported = !is_bulk)
-                if coeff != 0
-                    # Replicate the value across all rows of the BC
-                    # equation's block. For scalar BCs `eq_size == 1` and
-                    # this writes a single entry; for vector BCs (e.g.
-                    # `u(z=0) = c` with `u` a 2-component vector, `eq_size
-                    # == 2`) the same coefficient is written to every
-                    # component row. The Interpolate LHS for a vector
-                    # operand is `kron(I_ncomp, row)`, so replicating the
-                    # scalar F across rows enforces the same value on each
-                    # component — which is what "u = c" means.
-                    @inbounds for r in 1:eq_size
-                        raw_cpu[i0 + r] = coeff
-                    end
-                end
-            end
-        end
-
-        i0 += eq_size
-    end
+    _gather_alg_F_raw!(raw_cpu, sp, eqns, blocks)
 
     # Upload the CPU-built raw vector into the device-resident raw buffer.
     # This is an INTENTIONAL one-shot H2D upload of a freshly host-built staging
@@ -604,4 +526,35 @@ function gather_alg_F!(dest::AbstractVector{ComplexF64}, sp::Subproblem)
     # comment in SubproblemRuntimeCache).
     sp.runtime.alg_F_gathered_into = dest
     return dest
+end
+
+function _gather_alg_F_raw!(raw::Vector{ComplexF64}, sp::Subproblem,
+                            eqns::AbstractVector,
+                            blocks::Vector{_SubproblemAlgebraicBlock})
+    fill!(raw, zero(ComplexF64))
+    for block in blocks
+        # Boundary refresh can replace either the expression or the entire IR
+        # entry. Cache only its row geometry; always read the current value.
+        eq_data = eqns[block.equation]
+        F_expr = get(eq_data, "F_expr", nothing)
+        F_expr === nothing && (F_expr = get(eq_data, "F", nothing))
+        _write_alg_F_block!(raw, F_expr, sp, block.offset, block.size, block.bulk)
+    end
+    return raw
+end
+
+function _write_alg_F_block!(raw::Vector{ComplexF64}, F_expr, sp::Subproblem,
+                             offset::Int, size::Int, bulk::Bool)
+    _is_zero_F_expr(F_expr) && return nothing
+    # In a BVP the bulk PDE is algebraic too. Its value is computed as before,
+    # but unsupported-expression warnings apply only to actual boundary rows.
+    coeff = _evaluate_alg_F(F_expr, sp; warn_unsupported=!bulk)::ComplexF64
+    if coeff != 0
+        # A vector boundary equation repeats the same prescribed scalar over
+        # its component rows, matching kron(I_ncomp, row) in its LHS matrix.
+        @inbounds for r in 1:size
+            raw[offset + r] = coeff
+        end
+    end
+    return nothing
 end

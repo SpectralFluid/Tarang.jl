@@ -76,4 +76,33 @@ end
     @test MPI.Allreduce(local_uy_error, MPI.MAX, comm) < 1e-10
 end
 
+@testset "MPI constraint refresh retains every term (rank=$rank)" begin
+    coords = CartesianCoordinates("x", "y")
+    dist = Distributor(coords; mesh=(nprocs,), dtype=Float64, architecture=CPU())
+    bases = (RealFourier(coords["x"]; size=8), RealFourier(coords["y"]; size=8))
+    domain = Domain(dist, bases)
+    u = ScalarField(domain, "u")
+    v = ScalarField(domain, "v")
+    w = ScalarField(domain, "w")
+    set!(u, 0.0)
+    set!(v, 1.0)
+    set!(w, 1.0)
+    problem = InitialValueProblem([u, v, w])
+    add_equation!(problem, "dt(u) = v")
+    add_equation!(problem, "v - u - w = 0")
+    add_equation!(problem, "dt(w) = 0")
+    dt = 1e-3
+    solver = InitialValueSolver(problem, RK222(); dt)
+    for _ in 1:10
+        step!(solver)
+    end
+    # u' = u + 1, u(0) = 0. This also exercises the matrix-free MPI path,
+    # which relies on constraint refresh instead of a global matrix solve.
+    ensure_layout!(u, :g)
+    local_error = maximum(abs, _local_grid_data(u) .- expm1(solver.sim_time))
+    @test MPI.Allreduce(local_error, MPI.MAX, comm) < 1e-8
+    ensure_layout!(w, :g)
+    @test MPI.Allreduce(maximum(abs, _local_grid_data(w) .- 1), MPI.MAX, comm) < 1e-12
+end
+
 rank == 0 && println("MPI algebraic constraint tests completed")

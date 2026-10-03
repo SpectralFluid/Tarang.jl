@@ -74,8 +74,13 @@ TARANG_BENCH_SHAPE=2048x2048 TARANG_BENCH_RANKS=1,2 TARANG_BENCH_THREADS=2 julia
 ```
 
 The driver does not reserve or bind CPUs. Use your site's allocation and affinity
-settings; ensure ranks × threads fits the assigned cores. More Julia threads
-enable FFTW threading here but do not parallelize every per-mode solver loop.
+settings; ensure ranks × threads fits the assigned cores. This periodic scalar
+benchmark exercises FFTW threading and the diagonal solve path. To measure
+threaded local mode solves, use a mixed Fourier–Chebyshev problem and compare
+`InitialValueSolver(...; threaded_modes=false)` with `threaded_modes=true`,
+keeping BLAS at one thread and holding the rank/FFTW settings fixed. The default
+`threaded_modes=nothing` uses a conservative local-work threshold and leaves
+small problems serial.
 
 ## Externally launched cluster runs
 

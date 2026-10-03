@@ -70,7 +70,7 @@ src/core/solvers/solver_checkpoint.jl             NEW
 ```
 
 Rejected alternatives: growing `field_layout_arithmetic_io.jl` (already mixes field
-arithmetic with I/O) and putting the solver layer in `solver_stepping.jl` (already
+arithmetic with I/O) and putting the solver layer in `stepping.jl` (already
 large); adding a read mode to `NetCDFFileHandler` (a scheduling object — restart
 needs none of its cadences, tasks, or evaluator wiring).
 
@@ -143,7 +143,7 @@ load_state!(solver, path::AbstractString) -> solver
 
 Writes every field in `solver.state` under its `.name` (a vector variable appears
 as its components `u_x`, `u_z`, …), plus global attributes `sim_time`,
-`iteration`, `dt` (`solver_types.jl:211,212,219`). `load_state!` restores fields
+`iteration`, `dt` (`types.jl:211,212,219`). `load_state!` restores fields
 and clock, then re-syncs the solver's field handles.
 
 On-disk naming, used by both `save_state` and `save_field`:
@@ -224,7 +224,7 @@ MPI tests in the MPI list.
 | `src/core/solvers/solver_checkpoint.jl` | new |
 | `src/core/solvers.jl` | include the new module |
 | `src/core/field/field_layout/field_layout_arithmetic_io.jl` | fix both functions, delegate to the slab layer |
-| `src/core/solvers/solver_utils.jl` | export `save_state`, `load_state!` alongside `solve!`, `run!` |
+| `src/core/solvers/utils.jl` | export `save_state`, `load_state!` alongside `solve!`, `run!` |
 | `test/test_slab_io.jl` | new — unit + serial |
 | `test/test_checkpoint_restart.jl` | new — serial |
 | `test/test_mpi_checkpoint_restart.jl` | new — MPI, the rank-count matrix |

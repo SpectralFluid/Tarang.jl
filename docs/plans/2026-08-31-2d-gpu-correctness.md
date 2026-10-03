@@ -15,7 +15,7 @@
 **Files:**
 - Modify: `test/test_field_typestability.jl`
 - Modify: `test/test_gpu_transform_correctness.jl`
-- Modify: `src/core/field/field_types.jl`
+- Modify: `src/core/field/types.jl`
 
 **Steps:**
 
@@ -29,8 +29,8 @@
 **Files:**
 - Modify: `test/test_cov_field_data_scales.jl`
 - Modify: `test/test_gpu_transform_correctness.jl`
-- Modify: `src/core/transforms/transform_layout.jl`
-- Modify: `src/core/transforms/transform_fourier.jl`
+- Modify: `src/core/transforms/layout.jl`
+- Modify: `src/core/transforms/fourier.jl`
 - Modify: `ext/cuda/transforms.jl`
 
 **Step 1: Write failing tests**
@@ -109,7 +109,7 @@ Factor field-aware forcing injection: deterministic forcing adds to an exact-sha
 **Files:**
 - Modify: `test/test_derivatives_polynomial.jl`
 - Modify: `test/test_gpu_transform_correctness.jl`
-- Modify: `src/core/operators/derivatives/derivatives_polynomial.jl`
+- Modify: `src/core/operators/derivatives/polynomial.jl`
 
 **Step 1: Write a failing test**
 

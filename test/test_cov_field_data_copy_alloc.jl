@@ -1,4 +1,4 @@
-# Coverage tests for src/core/field/field_data/field_data_copy_alloc.jl
+# Coverage tests for src/core/field/field_data/copy_alloc.jl
 #
 # Targets the serial-CPU-reachable behavior of the field copy/allocation
 # helpers: Base.copy / Base.deepcopy (grid AND coeff layout), coefficient_eltype,

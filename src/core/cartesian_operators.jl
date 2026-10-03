@@ -22,17 +22,17 @@ Key features:
 
 
 # Runtime map:
-#   cartesian_operator_core.jl         — common operator traits, component extraction, and tensor helpers
-#   cartesian_operator_differential.jl — Cartesian gradient/divergence/curl/laplacian/trace/skew operators
-#   cartesian_operator_evaluation.jl   — evaluation helpers for Cartesian operators
-#   cartesian_operator_direct_product.jl — direct-product operator variants and their structure
-#   cartesian_operator_dispatch.jl     — dispatch glue, fallbacks, and evaluate integration
+#   core.jl         — common operator traits, component extraction, and tensor helpers
+#   differential.jl — Cartesian gradient/divergence/curl/laplacian/trace/skew operators
+#   evaluation.jl   — evaluation helpers for Cartesian operators
+#   direct_product.jl — direct-product operator variants and their structure
+#   dispatch.jl     — dispatch glue, fallbacks, and evaluate integration
 
-include("cartesian_operators/cartesian_operator_core.jl")
-include("cartesian_operators/cartesian_operator_differential.jl")
-include("cartesian_operators/cartesian_operator_evaluation.jl")
-include("cartesian_operators/cartesian_operator_direct_product.jl")
-include("cartesian_operators/cartesian_operator_dispatch.jl")
+include("cartesian_operators/core.jl")
+include("cartesian_operators/differential.jl")
+include("cartesian_operators/evaluation.jl")
+include("cartesian_operators/direct_product.jl")
+include("cartesian_operators/dispatch.jl")
 
 # ============================================================================
 # Exports

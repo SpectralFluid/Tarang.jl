@@ -4,7 +4,7 @@
 
 **Goal:** Split 3 large files (field.jl, problems.jl, solvers.jl) into focused sub-files, flatten deeply nested functions, and remove duplicated code patterns.
 
-**Architecture:** Follow the existing hub-file pattern used by `operators/operators.jl` and `timesteppers/timesteppers.jl` — each large file becomes a directory with a hub file that includes sub-files in dependency order. No logic changes, just moving code.
+**Architecture:** Follow the existing hub-file pattern used by `operators/core.jl` and `timesteppers/core.jl` — each large file becomes a directory with a hub file that includes sub-files in dependency order. No logic changes, just moving code.
 
 **Tech Stack:** Julia, no new dependencies
 
@@ -13,9 +13,9 @@
 ## Task 1: Split `field.jl` (3032 lines → 4 files)
 
 **Files:**
-- Create: `src/core/field/field_types.jl`
-- Create: `src/core/field/field_data.jl`
-- Create: `src/core/field/field_layout.jl`
+- Create: `src/core/field/types.jl`
+- Create: `src/core/field/data.jl`
+- Create: `src/core/field/layout.jl`
 - Create: `src/core/field/field_operations.jl`
 - Replace: `src/core/field.jl` → hub file (includes the 4 sub-files)
 
@@ -23,15 +23,15 @@ Split boundaries (based on existing `# ====` section markers in the file):
 
 | New file | Lines from field.jl | What it contains |
 |----------|-------------------|------------------|
-| `field_types.jl` | 1–310 | Abstract types, storage modes, ScalarField, VectorField, TensorField, LockedField struct definitions and constructors |
-| `field_data.jl` | 311–1225 | Property access, component stack/unstack, data allocation, distributed shape computation |
-| `field_layout.jl` | 1226–2180 | Scale management, layout transitions, ensure_layout!, forward/backward transforms |
+| `types.jl` | 1–310 | Abstract types, storage modes, ScalarField, VectorField, TensorField, LockedField struct definitions and constructors |
+| `data.jl` | 311–1225 | Property access, component stack/unstack, data allocation, distributed shape computation |
+| `layout.jl` | 1226–2180 | Scale management, layout transitions, ensure_layout!, forward/backward transforms |
 | `field_operations.jl` | 2181–3031 | fill_random, integrate, arithmetic, filtering, unit vectors, exports |
 
 - [ ] **Step 1:** Create directory `src/core/field/`
-- [ ] **Step 2:** Copy lines 1–310 from `field.jl` into `src/core/field/field_types.jl`
-- [ ] **Step 3:** Copy lines 311–1225 into `src/core/field/field_data.jl`
-- [ ] **Step 4:** Copy lines 1226–2180 into `src/core/field/field_layout.jl`
+- [ ] **Step 2:** Copy lines 1–310 from `field.jl` into `src/core/field/types.jl`
+- [ ] **Step 3:** Copy lines 311–1225 into `src/core/field/data.jl`
+- [ ] **Step 4:** Copy lines 1226–2180 into `src/core/field/layout.jl`
 - [ ] **Step 5:** Copy lines 2181–3031 into `src/core/field/field_operations.jl`
 - [ ] **Step 6:** Replace `src/core/field.jl` with a hub file:
 
@@ -40,15 +40,15 @@ Split boundaries (based on existing `# ====` section markers in the file):
 Field types and operations for Tarang.jl
 
 Split into sub-files for readability:
-- field_types.jl: ScalarField, VectorField, TensorField definitions
-- field_data.jl: Data access, allocation, distributed shapes
-- field_layout.jl: Layout transitions, transforms
+- types.jl: ScalarField, VectorField, TensorField definitions
+- data.jl: Data access, allocation, distributed shapes
+- layout.jl: Layout transitions, transforms
 - field_operations.jl: Arithmetic, integration, filtering
 """
 
-include("field/field_types.jl")
-include("field/field_data.jl")
-include("field/field_layout.jl")
+include("field/types.jl")
+include("field/data.jl")
+include("field/layout.jl")
 include("field/field_operations.jl")
 ```
 
@@ -59,20 +59,20 @@ include("field/field_operations.jl")
 ## Task 2: Split `problems.jl` (3419 lines → 4 files)
 
 **Files:**
-- Create: `src/core/problems/problem_types.jl`
-- Create: `src/core/problems/problem_parsing.jl`
-- Create: `src/core/problems/problem_matrices.jl`
-- Create: `src/core/problems/problem_utils.jl`
+- Create: `src/core/problems/types.jl`
+- Create: `src/core/problems/parsing.jl`
+- Create: `src/core/problems/matrices.jl`
+- Create: `src/core/problems/utils.jl`
 - Replace: `src/core/problems.jl` → hub file
 
 Split boundaries:
 
 | New file | Lines from problems.jl | What it contains |
 |----------|----------------------|------------------|
-| `problem_types.jl` | 1–619 | IVP/LBVP/NLBVP/EVP definitions, constructors, add_equation!, add_bc!, stochastic forcing, parameter management |
-| `problem_parsing.jl` | 620–1620 | Expression parsing, evaluation, helper operators (ZeroOperator, ConstantOperator), coerce_constant_value |
-| `problem_matrices.jl` | 1621–2605 | Matrix building, build_expression_matrix_block, RHS forcing vectors, operator processing |
-| `problem_utils.jl` | 2606–3419 | Domain setup, validation, substitution, expression_to_string, namespace handling, introspection, exports |
+| `types.jl` | 1–619 | IVP/LBVP/NLBVP/EVP definitions, constructors, add_equation!, add_bc!, stochastic forcing, parameter management |
+| `parsing.jl` | 620–1620 | Expression parsing, evaluation, helper operators (ZeroOperator, ConstantOperator), coerce_constant_value |
+| `matrices.jl` | 1621–2605 | Matrix building, build_expression_matrix_block, RHS forcing vectors, operator processing |
+| `utils.jl` | 2606–3419 | Domain setup, validation, substitution, expression_to_string, namespace handling, introspection, exports |
 
 - [ ] **Step 1:** Create directory `src/core/problems/`
 - [ ] **Step 2–5:** Copy each section into its file
@@ -83,16 +83,16 @@ Split boundaries:
 Problem definitions and equation parsing for Tarang.jl
 
 Split into sub-files for readability:
-- problem_types.jl: IVP, LBVP, NLBVP, EVP definitions
-- problem_parsing.jl: Expression parsing and evaluation
-- problem_matrices.jl: Matrix building for solvers
-- problem_utils.jl: Validation, substitution, introspection
+- types.jl: IVP, LBVP, NLBVP, EVP definitions
+- parsing.jl: Expression parsing and evaluation
+- matrices.jl: Matrix building for solvers
+- utils.jl: Validation, substitution, introspection
 """
 
-include("problems/problem_types.jl")
-include("problems/problem_parsing.jl")
-include("problems/problem_matrices.jl")
-include("problems/problem_utils.jl")
+include("problems/types.jl")
+include("problems/parsing.jl")
+include("problems/matrices.jl")
+include("problems/utils.jl")
 ```
 
 - [ ] **Step 7:** Verify — run: `julia --project -e 'using Tarang; println("OK")'`
@@ -102,20 +102,20 @@ include("problems/problem_utils.jl")
 ## Task 3: Split `solvers.jl` (2518 lines → 4 files)
 
 **Files:**
-- Create: `src/core/solvers/solver_types.jl`
-- Create: `src/core/solvers/solver_stepping.jl`
-- Create: `src/core/solvers/solver_compiled_rhs.jl`
-- Create: `src/core/solvers/solver_utils.jl`
+- Create: `src/core/solvers/types.jl`
+- Create: `src/core/solvers/stepping.jl`
+- Create: `src/core/solvers/compiled_rhs.jl`
+- Create: `src/core/solvers/utils.jl`
 - Replace: `src/core/solvers.jl` → hub file
 
 Split boundaries:
 
 | New file | Lines from solvers.jl | What it contains |
 |----------|---------------------|------------------|
-| `solver_types.jl` | 1–670 | All type definitions (Solver, SolverBaseData, RHS instructions, InitialValueSolver, BoundaryValueSolver, EigenvalueSolver), constructors, dispatch |
-| `solver_stepping.jl` | 671–963 | step!, proceed, BC application, linear/nonlinear solve, eigenvalue solve |
-| `solver_compiled_rhs.jl` | 964–2348 | Vector ↔ field conversions, expression evaluation, RHS compilation, instruction execution |
-| `solver_utils.jl` | 2349–2518 | Diagnostics, performance logging, exports |
+| `types.jl` | 1–670 | All type definitions (Solver, SolverBaseData, RHS instructions, InitialValueSolver, BoundaryValueSolver, EigenvalueSolver), constructors, dispatch |
+| `stepping.jl` | 671–963 | step!, proceed, BC application, linear/nonlinear solve, eigenvalue solve |
+| `compiled_rhs.jl` | 964–2348 | Vector ↔ field conversions, expression evaluation, RHS compilation, instruction execution |
+| `utils.jl` | 2349–2518 | Diagnostics, performance logging, exports |
 
 - [ ] **Step 1:** Create directory `src/core/solvers/`
 - [ ] **Step 2–5:** Copy each section into its file
@@ -126,16 +126,16 @@ Split boundaries:
 Solver implementations for Tarang.jl
 
 Split into sub-files for readability:
-- solver_types.jl: Solver definitions and constructors
-- solver_stepping.jl: Time stepping, BVP/EVP solve
-- solver_compiled_rhs.jl: RHS compilation and execution
-- solver_utils.jl: Diagnostics and exports
+- types.jl: Solver definitions and constructors
+- stepping.jl: Time stepping, BVP/EVP solve
+- compiled_rhs.jl: RHS compilation and execution
+- utils.jl: Diagnostics and exports
 """
 
-include("solvers/solver_types.jl")
-include("solvers/solver_stepping.jl")
-include("solvers/solver_compiled_rhs.jl")
-include("solvers/solver_utils.jl")
+include("solvers/types.jl")
+include("solvers/stepping.jl")
+include("solvers/compiled_rhs.jl")
+include("solvers/utils.jl")
 ```
 
 - [ ] **Step 7:** Verify — run: `julia --project -e 'using Tarang; println("OK")'`
@@ -145,7 +145,7 @@ include("solvers/solver_utils.jl")
 ## Task 4: Flatten `expression_to_string` using dispatch
 
 **Files:**
-- Modify: `src/core/problems/problem_utils.jl` (after Task 2 split)
+- Modify: `src/core/problems/utils.jl` (after Task 2 split)
 
 Replace the 16-branch if/elseif chain (lines 2956–3010 of original problems.jl) with Julia multiple dispatch:
 
@@ -188,11 +188,11 @@ expression_to_string(expr) = hasfield(typeof(expr), :name) ? expr.name : string(
 ## Task 5: Replace duplicated `coerce_constant_value` inline patterns
 
 **Files:**
-- Modify: `src/core/problems/problem_matrices.jl` (after Task 2 split)
+- Modify: `src/core/problems/matrices.jl` (after Task 2 split)
 
 - [ ] **Step 1:** Replace 3 inline duplicates with the existing helper.
 
-At line 2306 of original problems.jl (now in problem_matrices.jl), change:
+At line 2306 of original problems.jl (now in matrices.jl), change:
 ```julia
 # Before:
 coeff = isa(expr.right, ConstantOperator) ? expr.right.value : expr.right

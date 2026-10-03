@@ -21,6 +21,63 @@ const NETCDF_TIME_GROUP = "time"
 const NETCDF_GRIDS_GROUP = "grids"
 const NETCDF_VARS_GROUP = "vars"
 
+# Transient values are valid for one write; owned scratch survives between writes.
+# Rescaled-field accounting uses global shapes so cache eviction stays identical
+# across MPI ranks, even when their local slabs have different sizes.
+mutable struct NetCDFStagingCache
+    cpu_cache::Dict{Tuple, Any}
+    buffers::Dict{Tuple, Any}
+    rescaled::Dict{Tuple, Any}
+    buffer_bytes::Int
+    rescaled_bytes::Int
+    max_bytes::Int
+    max_entries::Int
+    function NetCDFStagingCache(; max_bytes::Integer=256*1024^2, max_entries::Integer=32)
+        max_bytes >= 0 || throw(ArgumentError("staging_max_bytes must be nonnegative"))
+        max_entries >= 0 || throw(ArgumentError("staging_max_entries must be nonnegative"))
+        new(Dict{Tuple, Any}(), Dict{Tuple, Any}(), Dict{Tuple, Any}(),
+            0, 0, Int(max_bytes), Int(max_entries))
+    end
+end
+
+function Base.empty!(cache::NetCDFStagingCache)
+    empty!(cache.cpu_cache)
+    empty!(cache.buffers)
+    empty!(cache.rescaled)
+    cache.buffer_bytes = cache.rescaled_bytes = 0
+    return cache
+end
+
+function _output_buffer!(cache::NetCDFStagingCache, key, ::Type{T}, shape::Tuple) where T
+    buffer_key = (key, T, shape)
+    buffer = get(cache.buffers, buffer_key, nothing)
+    buffer === nothing || return buffer
+    buffer = Array{T}(undef, shape)
+    bytes = sizeof(T) * length(buffer)
+    available = cache.max_bytes - cache.rescaled_bytes
+    available_entries = cache.max_entries - length(cache.rescaled)
+    if cache.max_bytes > 0 && available_entries > 0 && bytes <= available
+        if length(cache.buffers) >= available_entries || cache.buffer_bytes + bytes > available
+            empty!(cache.buffers)
+            cache.buffer_bytes = 0
+        end
+        cache.buffers[buffer_key] = buffer
+        cache.buffer_bytes += bytes
+    end
+    return buffer
+end
+_output_buffer!(::Nothing, key, ::Type{T}, shape::Tuple) where T = Array{T}(undef, shape)
+
+function _stage_cpu_array!(cache::NetCDFStagingCache, key, data)
+    local_data = data isa PencilArrays.PencilArray ? parent(data) : data
+    if is_gpu_array(local_data)
+        buffer = _output_buffer!(cache, (:host, key), eltype(local_data), size(local_data))
+        copyto!(buffer, local_data)
+        return buffer
+    end
+    return get_cpu_data(local_data)
+end
+
 """
 NetCDF File Handler matching Tarang H5FileHandler structure
 
@@ -29,6 +86,13 @@ Follows Tarang pattern:
 - base_path/handler_name_s1.nc for gathered files
 - /scales/ group with time coordinates
 - /tasks/ group with field data
+
+`staging_max_bytes` (default 256 MiB) and `staging_max_entries` (default 32)
+bound retained output scratch per handler. Setting either limit to zero disables
+retention. Outputs larger than the byte budget still work using transient scratch;
+the budget does not limit peak memory during a write. Scaled-field scratch is
+charged by global size to keep MPI cache decisions consistent across ranks.
+Retained buffers refresh on every write and are released by `close!`.
 """
 mutable struct NetCDFFileHandler
     # Base attributes (matching Tarang)
@@ -69,12 +133,15 @@ mutable struct NetCDFFileHandler
 
     # Cache of variable names already created in the current file set
     _created_vars::Set{String}
+    _staging_cache::NetCDFStagingCache
     
     function NetCDFFileHandler(base_path::String, dist, vars;
                               group=nothing, wall_dt=nothing, sim_dt=nothing, iter=nothing,
                               max_writes=nothing, mode="overwrite", 
                               precision::NetCDFPrecision=Float64,
-                              parallel="gather", solver=nothing)
+                              parallel="gather", solver=nothing,
+                              staging_max_bytes::Integer=256*1024^2,
+                              staging_max_entries::Integer=32)
         
         mode in ("overwrite", "append") ||
             throw(ArgumentError("NetCDFFileHandler mode must be \"overwrite\" or \"append\", got $(repr(mode))"))
@@ -104,7 +171,8 @@ mutable struct NetCDFFileHandler
                      Vector{Dict{String, Any}}(),
                      comm, rank, size,
                      -1, -1,  # last_sim_div, last_wall_div (uninitialized)
-                     Set{String}())  # _created_vars
+                     Set{String}(),  # _created_vars
+                     NetCDFStagingCache(; max_bytes=staging_max_bytes, max_entries=staging_max_entries))
 
         if mode == "overwrite"
             _output_collectively(handler, "NetCDFFileHandler overwrite cleanup") do
@@ -125,20 +193,6 @@ mutable struct NetCDFFileHandler
         return handler
     end
 end
-
-mutable struct NetCDFStagingCache
-    cpu_cache::Dict{Tuple, Any}
-    # Staging fields for tasks whose `scales` differ from their source field's.
-    # Keyed by (source field, output scales) and deliberately NOT dropped by
-    # `empty!`: the staged CPU arrays are per-write, but re-allocating a whole
-    # rescaled field (grid + coefficient buffers) on every write is what made
-    # `scales`-converting output allocate N field copies per `process!`.
-    rescaled::Dict{Tuple, Any}
-
-    NetCDFStagingCache() = new(Dict{Tuple, Any}(), Dict{Tuple, Any}())
-end
-
-Base.empty!(cache::NetCDFStagingCache) = (empty!(cache.cpu_cache); cache)
 
 function output_root_from_base_path(base_path::String)
     parent = dirname(base_path)
@@ -1869,7 +1923,8 @@ function process!(handler::NetCDFFileHandler; iteration=nothing, wall_time=nothi
             group_ncwrite(Int64[handler.total_write_num], filename, NETCDF_TIME_GROUP, "write_number", start=[write_index])
         end
 
-        stage_cache = NetCDFStagingCache()
+        stage_cache = handler._staging_cache
+        empty!(stage_cache.cpu_cache)
         for task in handler.tasks
             write_task_data!(handler, filename, task, write_index, stage_cache)
         end
@@ -1887,6 +1942,10 @@ function process!(handler::NetCDFFileHandler; iteration=nothing, wall_time=nothi
         empty!(handler._created_vars)
         union!(handler._created_vars, prior_state.created_vars)
         rethrow(e)
+    finally
+        # Do not keep borrowed field arrays or evicted scratch alive through the
+        # per-write deduplication map, including after a failed callback/write.
+        empty!(handler._staging_cache.cpu_cache)
     end
 
     return true
@@ -2067,7 +2126,7 @@ function _stage_task_data!(handler::NetCDFFileHandler, task::Dict,
         comp_data = [_stage_scalar_field!(stage_cache, c, layout_symbol; scales=task["scales"]) for c in comps]
         spatial_shape = size(comp_data[1])
         data_shape = (length(comp_data), spatial_shape...)
-        data_arr = zeros(eltype(comp_data[1]), data_shape)
+        data_arr = _output_buffer!(stage_cache, (:components, objectid(operator)), eltype(comp_data[1]), data_shape)
         for (i, arr) in enumerate(comp_data)
             # Use selectdim-style indexing to handle any number of spatial dimensions
             indices = (i, ntuple(_ -> Colon(), ndims(arr))...)
@@ -2079,7 +2138,7 @@ function _stage_task_data!(handler::NetCDFFileHandler, task::Dict,
         first_data = _stage_scalar_field!(stage_cache, comps[1, 1], layout_symbol; scales=task["scales"])
         spatial_shape = size(first_data)
         data_shape = (size(comps, 1), size(comps, 2), spatial_shape...)
-        data_arr = zeros(eltype(first_data), data_shape)
+        data_arr = _output_buffer!(stage_cache, (:components, objectid(operator)), eltype(first_data), data_shape)
         for i in 1:size(comps, 1), j in 1:size(comps, 2)
             # Use selectdim-style indexing to handle any number of spatial dimensions
             indices = (i, j, ntuple(_ -> Colon(), length(spatial_shape))...)
@@ -2098,7 +2157,8 @@ function _stage_task_data!(handler::NetCDFFileHandler, task::Dict,
     return operator, data
 end
 
-function _postprocess_task_data(task::Dict, data, precision::Type=Float64)
+function _postprocess_task_data(task::Dict, data, precision::Type=Float64,
+                                cache::Union{Nothing,NetCDFStagingCache}=nothing)
     # A staged array may alias a live CPU field and is reused by other tasks.
     # Give callbacks private storage so in-place operations (even before an
     # exception) cannot change the simulation or contaminate later output.
@@ -2111,28 +2171,31 @@ function _postprocess_task_data(task::Dict, data, precision::Type=Float64)
         data = [data]
     elseif isa(data, AbstractArray)
         # Use get_cpu_data() for GPU-safe conversion to CPU Array
-        data = get_cpu_data(data)
+        data = cache === nothing ? get_cpu_data(data) : _stage_cpu_array!(cache, (:callback, objectid(task)), data)
     else
         data = [data]  # Fallback for other types
     end
     # NetCDF doesn't support complex types: split into real/imag along a leading dimension
     is_complex_data = eltype(data) <: Complex
     if is_complex_data
-        RT = real(eltype(data))
-        real_part = Array{RT}(real.(data))
-        imag_part = Array{RT}(imag.(data))
-        data = cat(reshape(real_part, 1, size(real_part)...),
-                   reshape(imag_part, 1, size(imag_part)...); dims=1)
+        packed = _output_buffer!(cache, (:encoded, objectid(task)), precision, (2, size(data)...))
+        selectdim(packed, 1, 1) .= real.(data)
+        selectdim(packed, 1, 2) .= imag.(data)
+        data = packed
     end
     # Ensure contiguous Array (not ReshapedArray/SubArray) for NetCDF.jl, at the
     # handler's requested precision. Only NUMERIC task data can be coerced: a
     # `postprocess` returning anything else (a Bool mask, a label) would hit an
     # InexactError/MethodError here instead of being written as what it is.
     if eltype(data) <: Number
-        data = Array{precision}(data)
+        if !(data isa Array{precision})
+            packed = _output_buffer!(cache, (:encoded, objectid(task)), precision, size(data))
+            copyto!(packed, data)
+            data = packed
+        end
         nc_type = precision
     else
-        data = Array(data)
+        data = data isa Array ? data : Array(data)
         nc_type = eltype(data)
     end
     return data, is_complex_data, nc_type
@@ -2152,7 +2215,7 @@ function write_task_data!(handler::NetCDFFileHandler, filename::String, task::Di
     end
     data, is_complex_data, nc_type =
         _output_collectively(handler, "write_task_data!($(task_name)) postprocess") do
-            _postprocess_task_data(task, data, handler.precision)
+            _postprocess_task_data(task, data, handler.precision, stage_cache)
         end
 
     # From here on: per-rank fallible NetCDF I/O, settled collectively — see
@@ -2249,6 +2312,52 @@ function materialize_output_operator(operator, layout_symbol::Symbol)
     return operator
 end
 
+function _refresh_scaled_output!(cache::NetCDFStagingCache, field::ScalarField, output_scales)
+    ensure_layout!(field, :g)
+    source_grid = get_grid_data(field)
+    key = (objectid(field), field.scales, output_scales, size(source_grid))
+    entry = get(cache.rescaled, key, nothing)
+    if entry === nothing || entry.source.value !== field
+        work = copy(field)
+        ensure_layout!(work, :c)
+        input_grid = get_grid_data(work)
+        # Retain both geometries; refreshing must not resize the working grid
+        # down and back up on every output. This also retains scale-change guards.
+        set_scales!(work, output_scales)
+        output_grid = get_grid_data(work)
+        entry = (; source=WeakRef(field), work, input_grid, output_grid)
+
+        # Global sizes keep rescaled-field cache decisions rank-independent.
+        # Host buffers can be evicted independently because they own no plans.
+        bytes = sizeof(field.dtype) * (prod(get_scaled_shape(field, field.scales)) +
+                                       prod(get_scaled_shape(field, output_scales))) +
+                sizeof(eltype(get_coeff_data(work))) * prod(get_coefficient_shape(field))
+        if cache.max_bytes > 0 && cache.max_entries > 0 && bytes <= cache.max_bytes
+            if length(cache.rescaled) >= cache.max_entries || cache.rescaled_bytes + bytes > cache.max_bytes
+                empty!(cache.rescaled)
+                cache.rescaled_bytes = 0
+            end
+            cache.rescaled[key] = entry
+            cache.rescaled_bytes += bytes
+            if cache.buffer_bytes + cache.rescaled_bytes > cache.max_bytes ||
+               length(cache.buffers) + length(cache.rescaled) > cache.max_entries
+                empty!(cache.buffers)
+                cache.buffer_bytes = 0
+            end
+        end
+    end
+    work = entry.work
+    set_grid_data!(work, entry.input_grid)
+    work.scales = field.scales
+    work.current_layout = :g
+    copyto!(entry.input_grid, source_grid)
+    ensure_layout!(work, :c)
+    set_grid_data!(work, entry.output_grid)
+    work.scales = output_scales
+    work.current_layout = :c
+    return work
+end
+
 function _stage_scalar_field!(cache::NetCDFStagingCache, field::ScalarField, layout::Symbol;
                               scales=nothing)
     norm_layout = layout == :c ? :c : :g
@@ -2259,14 +2368,7 @@ function _stage_scalar_field!(cache::NetCDFStagingCache, field::ScalarField, lay
     end
     staged_field = field
     if norm_layout == :g && output_scales != field.scales
-        staged_field = get!(() -> copy(field), cache.rescaled,
-                            (objectid(field), output_scales))
-        # Match the source geometry before copying, then rescale: the buffer is
-        # reused across writes and is left at `output_scales` by the previous one.
-        set_scales!(staged_field, field.scales)
-        copy_field_data!(staged_field, field)
-        ensure_layout!(staged_field, :c)
-        set_scales!(staged_field, output_scales)
+        staged_field = _refresh_scaled_output!(cache, field, output_scales)
     end
     ensure_layout!(staged_field, norm_layout)
     arr = norm_layout == :c ? get_coeff_data(staged_field) : get_grid_data(staged_field)
@@ -2284,7 +2386,7 @@ function _stage_scalar_field!(cache::NetCDFStagingCache, field::ScalarField, lay
               "and decomposed differently than the metadata assumes. Write " *
               "grid-space output instead, or gather coefficients manually.")
     end
-    staged = get_cpu_data(arr)
+    staged = _stage_cpu_array!(cache, key, arr)
     cache.cpu_cache[key] = staged
     return staged
 end
@@ -2567,35 +2669,22 @@ function _reduction_comm(field)
 end
 
 function _global_mean_val(data, field)
-    s = sum(data); n = length(data)
-    comm = _reduction_comm(field)
-    if comm !== nothing
-        s = MPI.Allreduce(s, MPI.SUM, comm)
-        n = MPI.Allreduce(n, MPI.SUM, comm)
-    end
+    ld = _local_reduction_data(data)
+    s, n = _allreduce_moments((sum(ld), length(ld)), _reduction_comm(field))
     return s / n
 end
 
 # Sample variance (÷(N-1)), matching serial netcdf_var, via global moments:
 # (Σx² − (Σx)²/N)/(N−1).
 function _global_var_val(data, field)
-    s1 = sum(data); s2 = sum(abs2, data); n = length(data)
-    comm = _reduction_comm(field)
-    if comm !== nothing
-        s1 = MPI.Allreduce(s1, MPI.SUM, comm)
-        s2 = MPI.Allreduce(s2, MPI.SUM, comm)
-        n  = MPI.Allreduce(n,  MPI.SUM, comm)
-    end
+    ld = _local_reduction_data(data)
+    s1, s2, n = _allreduce_moments((sum(ld), sum(abs2, ld), length(ld)), _reduction_comm(field))
     return (s2 - abs2(s1) / n) / max(1, n - 1)
 end
 
 function _global_rms_val(data, field)
-    s2 = sum(abs2, data); n = length(data)
-    comm = _reduction_comm(field)
-    if comm !== nothing
-        s2 = MPI.Allreduce(s2, MPI.SUM, comm)
-        n  = MPI.Allreduce(n,  MPI.SUM, comm)
-    end
+    ld = _local_reduction_data(data)
+    s2, n = _allreduce_moments((sum(abs2, ld), length(ld)), _reduction_comm(field))
     return sqrt(s2 / n)
 end
 
@@ -2673,7 +2762,7 @@ function resolve_dimension_index(field, dim)
 
         # Resolve against the field's ACTUAL axis order first. Coordinate names are
         # arbitrary user strings, so the x=1/y=2/z=3 table must NOT take precedence over a
-        # field whose axes are e.g. (z, x): the operator path (operations_integrate.jl)
+        # field whose axes are e.g. (z, x): the operator path (integrate.jl)
         # resolves via basis.meta.element_label, and these task helpers must match it, or
         # they silently reduce the WRONG axis (out-of-range dims are a silent no-op).
         idx = get_dimension_index_from_field(field, dim)
@@ -2708,7 +2797,7 @@ Get dimension index from field's domain information.
 function get_dimension_index_from_field(field, dim_symbol)
     if hasproperty(field, :bases)
         # Match against each basis's coordinate label. Use basis.meta.element_label —
-        # the SAME attribute the operator path (operations_integrate.jl) resolves on —
+        # the SAME attribute the operator path (integrate.jl) resolves on —
         # not basis.coord.name (which the previous broken fallback used).
         for (i, basis) in enumerate(field.bases)
             if hasproperty(basis, :meta) && Symbol(basis.meta.element_label) == dim_symbol
@@ -2729,7 +2818,7 @@ function apply_field_slices(data, field, slices)
 
     # Build slice indices
     ndims_data = ndims(data)
-    indices = [Colon() for _ in 1:ndims_data]
+    indices = Union{Colon,Int}[Colon() for _ in 1:ndims_data]
 
     for (dim, value) in pairs(slices)
         dim_idx = resolve_dimension_index(field, dim)
@@ -2787,6 +2876,7 @@ function close!(handler::NetCDFFileHandler)
 
     # Clear the variable-creation cache so it does not carry over
     empty!(handler._created_vars)
+    empty!(handler._staging_cache)
 
     return nothing
 end

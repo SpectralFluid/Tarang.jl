@@ -33,13 +33,13 @@ the *first* — appear as an independently-maintained `if/else` in nine places:
 
 | file | line | what it derives |
 |---|---|---|
-| `core/operators/derivatives/derivatives_fourier.jl` | 34 | `decomp_dims`, then `axis in decomp_dims` |
-| `core/field/field_data/field_data_copy_alloc.jl` | 330 | `get_local_array_size`, both branches |
-| `core/field/field_layout/field_layout_filters_shapes.jl` | 272 | local start/end per axis |
-| `core/field/field_data/field_data_distributor_utils.jl` | 79 | `get_local_range` — computes `mesh_axis` inline |
-| `core/distributor/distributor_core.jl` | 603 | `decomp_dims` for `create_pencil` |
-| `core/distributor/distributor_core.jl` | 898 | `global_dim_idx` per mesh dim |
-| `core/distributor/distributor_core.jl` | 1069 | `local_indices` |
+| `core/operators/derivatives/fourier.jl` | 34 | `decomp_dims`, then `axis in decomp_dims` |
+| `core/field/field_data/copy_alloc.jl` | 330 | `get_local_array_size`, both branches |
+| `core/field/field_layout/filters_shapes.jl` | 272 | local start/end per axis |
+| `core/field/field_data/distributor_utils.jl` | 79 | `get_local_range` — computes `mesh_axis` inline |
+| `core/distributor/core.jl` | 603 | `decomp_dims` for `create_pencil` |
+| `core/distributor/core.jl` | 898 | `global_dim_idx` per mesh dim |
+| `core/distributor/core.jl` | 1069 | `local_indices` |
 | `tools/netcdf_output.jl` | 1299 | slab start |
 | `tools/netcdf_output.jl` | 1442 | slab count |
 
@@ -118,10 +118,10 @@ function mesh_axis_for end
 is_decomposed_axis(dist, ndim, axis) = mesh_axis_for(dist, ndim, axis) !== nothing
 ```
 
-Placement: `src/core/distributor/distributor_core.jl`, beside `local_indices`,
+Placement: `src/core/distributor/core.jl`, beside `local_indices`,
 which becomes its first consumer. `mesh_axis_for` is not new logic — it is
 `get_local_range`'s inline `mesh_axis` computation
-(`field_data_distributor_utils.jl:86-100`) lifted out and named, so that site
+(`distributor_utils.jl:86-100`) lifted out and named, so that site
 becomes a caller rather than a tenth copy.
 
 ### Work
@@ -129,11 +129,11 @@ becomes a caller rather than a tenth copy.
 Rewrite each of the nine sites to call these. Two sites need care rather than
 mechanical substitution:
 
-- `distributor_core.jl:603` derives `decomp_dims` for `create_pencil` with a
+- `core.jl:603` derives `decomp_dims` for `create_pencil` with a
   `decomp_index` variant that keeps one dim local for FFT. That is a *different*
   question from "which axes are decomposed for storage" and keeps its own helper;
   only its `decomp_index === nothing` branch delegates to `decomposed_axes`.
-- `field_data_copy_alloc.jl:330` is the definition that everything else must match
+- `copy_alloc.jl:330` is the definition that everything else must match
   (it decides the allocated array shape). It delegates, and its remainder handling
   — PencilArrays' real range via `pencil_local_range` when available, the
   remainder-on-first fallback otherwise — stays where it is.
@@ -176,7 +176,7 @@ hand-driven `TransposableField`.
 - `storage_mode(::ScalarField{T,<:TransposableFieldStorage}) = TransposableStorage()`
   is dispatched (`transposable_field.jl:103`); `is_transposable_storage` exists.
 - `ScalarField` has an inner constructor taking an explicit storage
-  (`field_types.jl:133`).
+  (`types.jl:133`).
 - `_build_field_arrays` already allocates the correct ZLocal-shaped arrays on the
   non-pencil path (verified: `mesh=(2,2)`, 16×12 at np=4 → local `(8,6)`).
 - The transform engine itself is verified coefficient-exact against serial: 2-D
@@ -208,7 +208,7 @@ the storage type holds a reference.
 3. `forward_transform!` / `backward_transform!` dispatch on
    `storage_mode(field) isa TransposableStorage` → the verified
    `distributed_forward_transform!` / `distributed_backward_transform!`.
-4. Delete the two refusals (`transform_gpu.jl:366`, `transform_fourier.jl:135`).
+4. Delete the two refusals (`gpu.jl:366`, `fourier.jl:135`).
    The basis-level refusals in `validate_mpi_fourier_only` stay — they are correct
    and state a real constraint (RealFourier's half spectrum has no representation
    in the fixed-shape transpose buffers).

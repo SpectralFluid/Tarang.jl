@@ -263,9 +263,30 @@ function _validated_chunk_size(count::Int, divisor::Int, dim::Int,
     return count ÷ divisor
 end
 
-# Convert small CPU int arrays to GPU. These are tiny (2-8 elements for MPI
-# process counts), so allocation cost is negligible — no caching needed.
+# Metadata is owned by the TransposableField workspace, never a process-global
+# cache: another workspace/task must not replace arrays a pending kernel uses.
 _to_gpu(cpu_array::Vector{Int}) = CuArray(cpu_array)
+
+function _gpu_transpose_chunk_plan(shape::Tuple, counts::Vector{Int},
+                                   displs::Vector{Int}, dim::Int, nranks::Int,
+                                   operation::Symbol, cache)
+    1 <= dim <= length(shape) || throw(ArgumentError("invalid transpose dimension $dim"))
+    geometry = (CUDA.context(), shape, nranks)
+    key = (operation, dim, geometry, Tuple(counts), Tuple(displs))
+    cached = cache === nothing ? nothing : get(cache, key, nothing)
+    cached === nothing || return cached
+    divisor = prod(shape[i] for i in eachindex(shape) if i != dim)
+    chunks = [_validated_chunk_size(counts[r], divisor, dim, r, String(operation))
+              for r in 1:nranks]
+    device = (_to_gpu(chunks), _to_gpu(displs), _to_gpu(cumsum(chunks)))
+    if cache !== nothing
+        # Only synchronized launchers cache metadata: their previous kernels
+        # have completed before bounded eviction. Keys own the count values.
+        length(cache) >= 32 && empty!(cache)
+        cache[key] = device
+    end
+    return device
+end
 
 """
     gpu_pack_for_transpose!(buffer, data, counts, displs, dim, nranks)
@@ -275,9 +296,12 @@ Launch GPU kernel to pack data for transpose operation.
 function gpu_pack_for_transpose!(buffer::CuArray, data::CuArray,
                                  counts::Vector{Int}, displs::Vector{Int},
                                  dim::Int, nranks::Int;
-                                 synchronize::Bool=true)
+                                 synchronize::Bool=true, metadata_cache=nothing)
     isempty(data) && return buffer
     ndims_data = ndims(data)
+    # Standalone asynchronous launches keep the original temporary ownership.
+    # Workspace calls synchronize packing before posting their MPI request.
+    synchronize || (metadata_cache = nothing)
 
     # Ensure we're on the device where data lives for allocations, kernel launch, and sync
     data_device = CUDA.device(data)
@@ -289,32 +313,9 @@ function gpu_pack_for_transpose!(buffer::CuArray, data::CuArray,
         Nx, Ny, Nz = size(data)
         n_elements = Nx * Ny * Nz
 
-        # Compute chunk_sizes from counts (kernel expects chunk size, not total count)
-        # CRITICAL: Validate divisibility to catch MPI count/displ mismatches early
-        chunk_sizes = zeros(Int, nranks)
-        if dim == 3
-            divisor = Nx * Ny
-            for r in 1:nranks
-                chunk_sizes[r] = _validated_chunk_size(
-                    counts[r], divisor, dim, r, "pack")
-            end
-        elseif dim == 2
-            divisor = Nx * Nz
-            for r in 1:nranks
-                chunk_sizes[r] = _validated_chunk_size(
-                    counts[r], divisor, dim, r, "pack")
-            end
-        else  # dim == 1
-            divisor = Ny * Nz
-            for r in 1:nranks
-                chunk_sizes[r] = _validated_chunk_size(
-                    counts[r], divisor, dim, r, "pack")
-            end
-        end
-
-        chunk_sizes_gpu = _to_gpu(chunk_sizes)
-        displs_gpu = _to_gpu(displs)
-        prefix_sums_gpu = _to_gpu(cumsum(chunk_sizes))
+        chunk_sizes_gpu, displs_gpu, prefix_sums_gpu =
+            _gpu_transpose_chunk_plan(size(data), counts, displs, dim, nranks,
+                                      :pack, metadata_cache)
 
         kernel = pack_for_transpose_kernel_3d!(CUDABackend())
         kernel(buffer, data, Nx, Ny, Nz, nranks, dim, chunk_sizes_gpu, displs_gpu, prefix_sums_gpu;
@@ -324,24 +325,9 @@ function gpu_pack_for_transpose!(buffer::CuArray, data::CuArray,
         Nx, Ny = size(data)
         n_elements = Nx * Ny
 
-        # Compute chunk_sizes from counts
-        # CRITICAL: Validate divisibility to catch MPI count/displ mismatches early
-        chunk_sizes = zeros(Int, nranks)
-        if dim == 2
-            for r in 1:nranks
-                chunk_sizes[r] = _validated_chunk_size(
-                    counts[r], Nx, dim, r, "pack")
-            end
-        else  # dim == 1
-            for r in 1:nranks
-                chunk_sizes[r] = _validated_chunk_size(
-                    counts[r], Ny, dim, r, "pack")
-            end
-        end
-
-        chunk_sizes_gpu = _to_gpu(chunk_sizes)
-        displs_gpu = _to_gpu(displs)
-        prefix_sums_gpu = _to_gpu(cumsum(chunk_sizes))
+        chunk_sizes_gpu, displs_gpu, prefix_sums_gpu =
+            _gpu_transpose_chunk_plan(size(data), counts, displs, dim, nranks,
+                                      :pack, metadata_cache)
 
         kernel = pack_for_transpose_kernel_2d!(CUDABackend())
         kernel(buffer, data, Nx, Ny, nranks, dim, chunk_sizes_gpu, displs_gpu, prefix_sums_gpu;
@@ -366,9 +352,12 @@ Launch GPU kernel to unpack data after transpose operation.
 function gpu_unpack_from_transpose!(data::CuArray, buffer::CuArray,
                                     counts::Vector{Int}, displs::Vector{Int},
                                     dim::Int, nranks::Int;
-                                    synchronize::Bool=true)
+                                    synchronize::Bool=true, metadata_cache=nothing)
     isempty(data) && return data
     ndims_data = ndims(data)
+    # Standalone asynchronous launches keep the original temporary ownership.
+    # Workspace calls synchronize packing before posting their MPI request.
+    synchronize || (metadata_cache = nothing)
 
     # Ensure we're on the device where data lives for allocations, kernel launch, and sync
     data_device = CUDA.device(data)
@@ -380,32 +369,9 @@ function gpu_unpack_from_transpose!(data::CuArray, buffer::CuArray,
         Nx, Ny, Nz = size(data)
         n_elements = Nx * Ny * Nz
 
-        # Compute chunk_sizes from counts (kernel expects chunk size, not total count)
-        # CRITICAL: Validate divisibility to catch MPI count/displ mismatches early
-        chunk_sizes = zeros(Int, nranks)
-        if dim == 2  # After Z→Y: receiving y-chunks
-            divisor = Nx * Nz
-            for r in 1:nranks
-                chunk_sizes[r] = _validated_chunk_size(
-                    counts[r], divisor, dim, r, "unpack")
-            end
-        elseif dim == 1  # After Y→X: receiving x-chunks
-            divisor = Ny * Nz
-            for r in 1:nranks
-                chunk_sizes[r] = _validated_chunk_size(
-                    counts[r], divisor, dim, r, "unpack")
-            end
-        else  # dim == 3: receiving z-chunks
-            divisor = Nx * Ny
-            for r in 1:nranks
-                chunk_sizes[r] = _validated_chunk_size(
-                    counts[r], divisor, dim, r, "unpack")
-            end
-        end
-
-        chunk_sizes_gpu = _to_gpu(chunk_sizes)
-        displs_gpu = _to_gpu(displs)
-        prefix_sums_gpu = _to_gpu(cumsum(chunk_sizes))
+        chunk_sizes_gpu, displs_gpu, prefix_sums_gpu =
+            _gpu_transpose_chunk_plan(size(data), counts, displs, dim, nranks,
+                                      :unpack, metadata_cache)
 
         kernel = unpack_from_transpose_kernel_3d!(CUDABackend())
         kernel(data, buffer, Nx, Ny, Nz, nranks, dim, chunk_sizes_gpu, displs_gpu, prefix_sums_gpu;
@@ -415,24 +381,9 @@ function gpu_unpack_from_transpose!(data::CuArray, buffer::CuArray,
         Nx, Ny = size(data)
         n_elements = Nx * Ny
 
-        # Compute chunk_sizes from counts
-        # CRITICAL: Validate divisibility to catch MPI count/displ mismatches early
-        chunk_sizes = zeros(Int, nranks)
-        if dim == 2  # Receiving y-chunks
-            for r in 1:nranks
-                chunk_sizes[r] = _validated_chunk_size(
-                    counts[r], Nx, dim, r, "unpack")
-            end
-        else  # dim == 1: Receiving x-chunks
-            for r in 1:nranks
-                chunk_sizes[r] = _validated_chunk_size(
-                    counts[r], Ny, dim, r, "unpack")
-            end
-        end
-
-        chunk_sizes_gpu = _to_gpu(chunk_sizes)
-        displs_gpu = _to_gpu(displs)
-        prefix_sums_gpu = _to_gpu(cumsum(chunk_sizes))
+        chunk_sizes_gpu, displs_gpu, prefix_sums_gpu =
+            _gpu_transpose_chunk_plan(size(data), counts, displs, dim, nranks,
+                                      :unpack, metadata_cache)
 
         kernel = unpack_from_transpose_kernel_2d!(CUDABackend())
         kernel(data, buffer, Nx, Ny, nranks, dim, chunk_sizes_gpu, displs_gpu, prefix_sums_gpu;
@@ -457,8 +408,8 @@ Override pack_for_transpose! for GPU architecture.
 """
 function Tarang.pack_for_transpose!(buffer::CuArray, data::CuArray,
                                     counts::Vector{Int}, displs::Vector{Int},
-                                    dim::Int, nranks::Int, arch::Tarang.GPU)
-    return gpu_pack_for_transpose!(buffer, data, counts, displs, dim, nranks)
+                                    dim::Int, nranks::Int, arch::Tarang.GPU; metadata_cache=nothing)
+    return gpu_pack_for_transpose!(buffer, data, counts, displs, dim, nranks; metadata_cache)
 end
 
 """
@@ -466,8 +417,8 @@ Override unpack_from_transpose! for GPU architecture.
 """
 function Tarang.unpack_from_transpose!(data::CuArray, buffer::CuArray,
                                        counts::Vector{Int}, displs::Vector{Int},
-                                       dim::Int, nranks::Int, arch::Tarang.GPU)
-    return gpu_unpack_from_transpose!(data, buffer, counts, displs, dim, nranks)
+                                       dim::Int, nranks::Int, arch::Tarang.GPU; metadata_cache=nothing)
+    return gpu_unpack_from_transpose!(data, buffer, counts, displs, dim, nranks; metadata_cache)
 end
 
 # ============================================================================
@@ -601,7 +552,7 @@ end
 Override fft_in_dim! for GPU arrays using CUFFT.
 
 Accepts the `plan` keyword its callers always pass (see `transform_in_dim!` in
-src/core/transpose/transpose_transforms.jl) but ignores it: the plan handed down
+src/core/transpose/transforms.jl) but ignores it: the plan handed down
 may be a CPU FFTW plan or a placeholder, so the cached CUFFT plan is used instead.
 """
 function Tarang.fft_in_dim!(data::CuArray, dim::Int, direction::Symbol, arch::Tarang.GPU;
@@ -621,9 +572,8 @@ function Tarang.fft_in_dim!(data::CuArray, dim::Int, direction::Symbol, arch::Ta
                                      inverse=(direction != :forward), device_id=device_id)
         # `data .= cufft_plan * data` allocated a whole device array per call.
         # C2C is non-destructive, so transform into cached scratch and copy back.
-        # count=3 keeps this key disjoint from the count=1/count=2 users in the
-        # single-GPU transform chain (transforms.jl, cheb_deriv.jl).
-        scratch = get_gpu_dct_scratch(Tarang.architecture(data), size(data), eltype(data), 3)[1]
+        scratch = get_gpu_dct_scratch(Tarang.architecture(data), size(data), eltype(data), 1;
+                                      purpose=:transpose_fft)[1]
         mul!(scratch, cufft_plan, data)
         copyto!(data, scratch)
         CUDA.synchronize()
@@ -690,14 +640,14 @@ Override dct_in_dim! for GPU arrays.
 
 Tarang's Chebyshev transform is DCT-I (REDFT00) on the Gauss–Lobatto grid, so
 this must match the CPU distributed reference `Tarang.dct_in_dim!(…, ::CPU)` in
-src/core/transpose/transpose_transforms.jl EXACTLY:
+src/core/transpose/transforms.jl EXACTLY:
   forward:  REDFT00, 1/(N-1) normalization, half-weight at both endpoints,
             NO odd-degree sign flip
   backward: double both endpoint coefficients, REDFT00, divide by 2
 
 The verified GPU DCT-I building block `gpu_dct1_along_dim!` (ext/cuda/cheb_deriv.jl)
 implements the same transform but in the reversed-grid convention of
-transform_chebyshev.jl, whose output is `(-1)^k ×` the CPU reference here
+chebyshev.jl, whose output is `(-1)^k ×` the CPU reference here
 (a grid reversal ≡ an odd-degree coefficient sign flip). We therefore undo that
 flip explicitly: AFTER the forward transform, and on the coefficients BEFORE the
 backward transform.
@@ -718,11 +668,10 @@ function Tarang.dct_in_dim!(data::CuArray{T,N}, dim::Int, direction::Symbol, arc
     # through data3 writes data). `dim` stays valid: trailing dims are appended.
     data3 = N == 3 ? data : reshape(data, size(data)..., ntuple(_ -> 1, 3 - N)...)
 
-    # Cached scratch, not a per-call `similar`. count=4 keeps the key disjoint
-    # from the count=1/count=2 users in the single-GPU transform chain and from
-    # `fft_in_dim!`'s count=3 — the scratch cache hands the SAME buffers to every
-    # caller whose (device, shape, eltype, count) key matches.
-    out3 = get_gpu_dct_scratch(Tarang.architecture(data), size(data3), T, 4)[1]
+    # Separate purpose avoids aliasing the nested DCT/FFT scratch without
+    # retaining unused arrays just to distinguish the cache key.
+    out3 = get_gpu_dct_scratch(Tarang.architecture(data), size(data3), T, 1;
+                               purpose=:transpose_dct)[1]
 
     # Complex data goes through `gpu_dct1_along_dim!`'s complex method, which
     # packs re/im as extra batch columns and runs ONE batched DCT-I. The previous

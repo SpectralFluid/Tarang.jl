@@ -12,7 +12,7 @@
 
 **Files:**
 - Modify: `test/test_deriv_pool_ownership.jl`
-- Modify: `src/core/operators/derivatives/derivatives_eval.jl`
+- Modify: `src/core/operators/derivatives/eval.jl`
 
 **Step 1: Write the failing test**
 

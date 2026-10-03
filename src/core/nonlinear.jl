@@ -13,19 +13,19 @@ Key features:
 - Support for various nonlinear operators
 """
 
-include("nonlinear/nonlinear_core.jl")
+include("nonlinear/core.jl")
 
-include("nonlinear/nonlinear_padding.jl")
-include("nonlinear/nonlinear_real_padding.jl")
-include("nonlinear/nonlinear_transforms.jl")
+include("nonlinear/padding.jl")
+include("nonlinear/real_padding.jl")
+include("nonlinear/transforms.jl")
 
-include("nonlinear/nonlinear_dealiasing.jl")
+include("nonlinear/dealiasing.jl")
 
 # Runtime allocation and pencil-compatibility helpers live out of line so
 # the remaining code reads as the nonlinear execution path.
-include("nonlinear/nonlinear_pencil_utils.jl")
+include("nonlinear/pencil_utils.jl")
 
-include("nonlinear/nonlinear_evaluation.jl")
+include("nonlinear/evaluation.jl")
 
 # ============================================================================
 # Exports

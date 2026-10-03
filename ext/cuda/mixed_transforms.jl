@@ -84,7 +84,7 @@ function plan_gpu_mixed_transform(arch::GPU{CuDevice}, bases::Tuple, local_grid_
     transform_order = vcat(fourier_dims, chebyshev_dims)
 
     # Which axis is R2C, and the resulting coefficient shape, come from the SHARED
-    # layout rules (src/core/transforms/transform_layout.jl) — the same code
+    # layout rules (src/core/transforms/layout.jl) — the same code
     # `coefficient_shape` and the CPU stage specs use. Deriving them here instead
     # is what let this plan disagree with the rest of the framework: it sized the
     # coefficient buffer from the GRID shape, so a scaled Chebyshev axis silently
@@ -132,11 +132,24 @@ end
 
 const GPU_MIXED_TRANSFORM_CACHE = GPUMixedTransformCache(Dict{Tuple, GPUMixedTransformPlan}(), ReentrantLock())
 
-struct GPUMixedTransformScratch{CA,RA}
-    complex_a::CA
-    complex_b::CA
-    real_input::RA
-    real_output::RA
+mutable struct GPUMixedTransformScratch{CT,RT,N}
+    shape::NTuple{N,Int}
+    complex_a::Union{Nothing,CuArray{CT,N}}
+    complex_b::Union{Nothing,CuArray{CT,N}}
+    real_input::Union{Nothing,CuArray{RT,N}}
+    real_output::Union{Nothing,CuArray{RT,N}}
+end
+
+# Allocate only buffers used by this stage. In particular, real Chebyshev
+# stages need no complex ping-pong pair, and complex stages need no real grids.
+function _mixed_buffer!(scratch::GPUMixedTransformScratch{CT,RT}, ::Val{slot}) where {CT,RT,slot}
+    buffer = getfield(scratch, slot)
+    if buffer === nothing
+        T = slot in (:complex_a, :complex_b) ? CT : RT
+        buffer = CUDA.zeros(T, scratch.shape...)
+        setfield!(scratch, slot, buffer)
+    end
+    return buffer
 end
 
 const GPU_MIXED_SCRATCH_CACHE = Dict{Tuple,Any}()
@@ -148,21 +161,15 @@ function get_gpu_mixed_transform_scratch(plan::GPUMixedTransformPlan,
            Tuple(plan.stage_shapes), shape, CT)
     scratch = lock(GPU_MIXED_TRANSFORM_CACHE.lock) do
         get!(GPU_MIXED_SCRATCH_CACHE, key) do
-            complex_a = CUDA.zeros(CT, shape...)
-            complex_b = CUDA.zeros(CT, shape...)
-            GPUMixedTransformScratch(
-                complex_a,
-                complex_b,
-                CUDA.zeros(RT, shape...),
-                CUDA.zeros(RT, shape...),
-            )
+            GPUMixedTransformScratch{CT,RT,length(shape)}(shape, nothing, nothing, nothing, nothing)
         end
     end
     return scratch::GPUMixedTransformScratch
 end
 
 @inline function _next_mixed_complex_buffer(current, scratch::GPUMixedTransformScratch)
-    return current === scratch.complex_a ? scratch.complex_b : scratch.complex_a
+    return current === scratch.complex_a ? _mixed_buffer!(scratch, Val(:complex_b)) :
+                                           _mixed_buffer!(scratch, Val(:complex_a))
 end
 
 """
@@ -249,7 +256,7 @@ function gpu_mixed_forward_transform!(coeff_data::CuArray{T, N}, grid_data::CuAr
                 gpu_fft_dim!(output, current_data, fft_plan)
             else
                 if eltype(current_data) <: Real
-                    input = output === scratch.complex_b ? scratch.complex_a : scratch.complex_b
+                    input = _next_mixed_complex_buffer(output, scratch)
                     input .= complex.(current_data)
                     gpu_fft_dim!(output, input, fft_plan)
                 else
@@ -278,7 +285,7 @@ function gpu_mixed_forward_transform!(coeff_data::CuArray{T, N}, grid_data::CuAr
                 gpu_dct1_along_dim!(dct_out, current_data, dim, :forward)
                 current_data = dct_out
             else
-                dct_out = direct_final ? coeff_data : scratch.real_output
+                dct_out = direct_final ? coeff_data : _mixed_buffer!(scratch, Val(:real_output))
                 gpu_dct1_along_dim!(dct_out, current_data, dim, :forward)
                 current_data = dct_out
             end
@@ -298,9 +305,9 @@ function gpu_mixed_forward_transform!(coeff_data::CuArray{T, N}, grid_data::CuAr
                         Tarang._copy_axis_prefix!(resized, current_data, dim)
                         current_data = resized
                     else
-                        Tarang._copy_axis_prefix!(resized_scratch.real_output,
+                        Tarang._copy_axis_prefix!(_mixed_buffer!(resized_scratch, Val(:real_output)),
                                                   current_data, dim)
-                        current_data = resized_scratch.real_output
+                        current_data = _mixed_buffer!(resized_scratch, Val(:real_output))
                     end
                 end
             end
@@ -355,9 +362,9 @@ function gpu_mixed_backward_transform!(grid_data::CuArray{T, N}, coeff_data::CuA
                     Tarang._zero_pad_axis_prefix!(padded, current_data, dim)
                     dct_input = padded
                 else
-                    Tarang._zero_pad_axis_prefix!(scratch.real_input,
+                    Tarang._zero_pad_axis_prefix!(_mixed_buffer!(scratch, Val(:real_input)),
                                                   current_data, dim)
-                    dct_input = scratch.real_input
+                    dct_input = _mixed_buffer!(scratch, Val(:real_input))
                 end
             end
 
@@ -371,7 +378,7 @@ function gpu_mixed_backward_transform!(grid_data::CuArray{T, N}, coeff_data::CuA
                 current_disposable = true   # scratch ping-pong buffer
             else
                 out_tgt = (is_final && eltype(grid_data) == eltype(dct_input)) ?
-                          grid_data : scratch.real_output
+                          grid_data : _mixed_buffer!(scratch, Val(:real_output))
                 gpu_dct1_along_dim!(out_tgt, dct_input, dim, :backward)
                 current_data = out_tgt
                 current_disposable = out_tgt !== grid_data
@@ -400,7 +407,7 @@ function gpu_mixed_backward_transform!(grid_data::CuArray{T, N}, coeff_data::CuA
                 scratch = get_gpu_mixed_transform_scratch(plan, complex_T, output_shape)
                 output = _next_mixed_complex_buffer(current_data, scratch)
                 if eltype(current_data) <: Real
-                    input = output === scratch.complex_b ? scratch.complex_a : scratch.complex_b
+                    input = _next_mixed_complex_buffer(output, scratch)
                     input .= complex.(current_data)
                     gpu_ifft_dim!(output, input, fft_plan)
                 else

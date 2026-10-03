@@ -144,7 +144,7 @@ using InteractiveUtils
         # Backward transform must size the irfft from the SCALED grid (scale ×
         # basis.meta.size), not the base size, mirroring the scale-correct forward.
         # Regression for the rfft-axis detection / irfft-size bug surfaced by the
-        # storage parametrization (transform_fourier.jl backward path).
+        # storage parametrization (fourier.jl backward path).
         u = ScalarField(dist, "u", (xb, yb), Float64)
         set_scales!(u, (1.5, 1.5))
         ensure_layout!(u, :g)

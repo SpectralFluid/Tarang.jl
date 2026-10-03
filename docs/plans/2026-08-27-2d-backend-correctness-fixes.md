@@ -55,11 +55,11 @@ Run the new MPI regression file at two and four ranks, plus `test/test_mpi_diago
 ### Task 3: Make MPI transform planning domain- and dtype-aware
 
 **Files:**
-- Modify: `src/core/distributor/distributor_core.jl`
-- Modify: `src/core/transforms/transform_planning.jl`
-- Modify: `src/core/transforms/transform_gpu.jl`
-- Modify: `src/core/transforms/transform_fourier.jl`
-- Modify: `src/core/field/field_data/field_data_copy_alloc.jl`
+- Modify: `src/core/distributor/core.jl`
+- Modify: `src/core/transforms/planning.jl`
+- Modify: `src/core/transforms/gpu.jl`
+- Modify: `src/core/transforms/fourier.jl`
+- Modify: `src/core/field/field_data/copy_alloc.jl`
 
 **Step 1: Add cached plan state**
 
@@ -86,7 +86,7 @@ Run the new regression file at two/four ranks and the existing transform-plannin
 ### Task 4: Reject unsupported distributed scaling before mutation
 
 **Files:**
-- Modify: `src/core/field/field_data/field_data_scales.jl`
+- Modify: `src/core/field/field_data/scales.jl`
 - Modify: `docs/src/getting_started/running_with_mpi.md`
 
 **Step 1: Move the distributed resize guard before every mutation**
@@ -102,7 +102,7 @@ Run the new regression test, `test/test_mpi_decomp_forcing_audit.jl`, all padded
 **Files:**
 - Modify: `ext/cuda/transpose_kernels.jl`
 - Modify: `test/test_gpu_transpose_kernels_cpu.jl`
-- Modify: `src/core/field/field_layout/field_layout_access.jl`
+- Modify: `src/core/field/field_layout/access.jl`
 - Modify: `test/test_transform_inplace.jl`
 
 **Step 1: Write failing tests**

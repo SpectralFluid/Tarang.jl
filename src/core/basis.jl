@@ -48,14 +48,14 @@ export Basis, IntervalBasis, JacobiBasis, FourierBasis,
 
 
 # Runtime map:
-#   basis_core.jl             — basis types, metadata, constructors, and MPI validation
-#   basis_wavenumbers.jl      — Fourier wavenumber storage/layout helpers
-#   basis_product_matrices.jl — NCC product matrices and valid-element filtering
-#   basis_operators.jl        — derivative bases, conversions, differentiation, dispatch
-#   basis_interface.jl        — grid/interface methods and basis evaluation helpers
+#   core.jl             — basis types, metadata, constructors, and MPI validation
+#   wavenumbers.jl      — Fourier wavenumber storage/layout helpers
+#   product_matrices.jl — NCC product matrices and valid-element filtering
+#   operators.jl        — derivative bases, conversions, differentiation, dispatch
+#   interface.jl        — grid/interface methods and basis evaluation helpers
 
-include("basis/basis_core.jl")
-include("basis/basis_wavenumbers.jl")
-include("basis/basis_product_matrices.jl")
-include("basis/basis_operators.jl")
-include("basis/basis_interface.jl")
+include("basis/core.jl")
+include("basis/wavenumbers.jl")
+include("basis/product_matrices.jl")
+include("basis/operators.jl")
+include("basis/interface.jl")

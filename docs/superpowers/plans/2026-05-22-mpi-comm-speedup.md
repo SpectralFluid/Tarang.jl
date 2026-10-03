@@ -28,7 +28,7 @@ Per distributed nonlinear product, transposes **per rank** (1 forward + 3 backwa
 **Interpretation:**
 - Transpose **count is constant** in rank count (slab/1D decomposition). So scaling ranks shrinks per-message bytes but never reduces the *number* of all-to-alls per product.
 - At 2–8 ranks, messages are ~0.1–1 MB → bandwidth-leaning. At hundreds of ranks, per-message bytes → KB → **latency-bound**, where the constant count hurts most.
-- Each field transforms **independently** — `transform_grouped.jl` has a batch path but it is **orphaned** (no caller in timesteppers/solvers/nonlinear) and even it applies "per-field", so there is currently no message coalescing anywhere.
+- Each field transforms **independently** — `grouped.jl` has a batch path but it is **orphaned** (no caller in timesteppers/solvers/nonlinear) and even it applies "per-field", so there is currently no message coalescing anywhere.
 
 This makes **field batching (Phase 1)** the highest-leverage lever: it reduces the constant all-to-all *count* by coalescing the N independent field transposes into one, a pure latency win that compounds with rank count.
 
@@ -39,13 +39,13 @@ This makes **field batching (Phase 1)** the highest-leverage lever: it reduces t
 **Idea:** When several same-shaped fields must transform in the same direction (the state vector each stage; the operands of an RHS), stack them along a trailing batch dimension into a single PencilArray and issue **one** `MPI_Alltoallv` instead of N. PencilFFTs supports batched/extra-dimension plans, so the FFT + transpose run once over the batch.
 
 **Design spike — INVESTIGATED 2026-05-22, findings below:**
-- [x] **Existing `transform_grouped.jl` batch infra is ineffective for MPI.** `_pencil_batch_forward_transform!`/`_pencil_batch_backward_transform!` loop per-field (`for field in fields; plan * grid_data`) — its own docstring says "applied per-field". So wiring it up yields ZERO transpose coalescing. Only the `_stacked_*` (FFTW/serial) path truly batches, and that path has no MPI transpose. Net: the orphaned code does not solve this; real batching must be built.
-- [x] **Batched `PencilFFTPlan` works (verified, 2 ranks).** A plan over `(Nx, Ny, B)` with `RFFT, FFT, NoTransform` (B = batch axis) round-trips at err 8.9e-16, preserves the batch dim, and one `plan * u` moves all B slices in a single transpose-set. `NoTransform` on a trailing axis is already the codebase pattern (transform_planning.jl:219 uses it for non-Fourier axes). ⇒ k fields in one batched transpose = 1 transpose-set instead of k.
+- [x] **Existing `grouped.jl` batch infra is ineffective for MPI.** `_pencil_batch_forward_transform!`/`_pencil_batch_backward_transform!` loop per-field (`for field in fields; plan * grid_data`) — its own docstring says "applied per-field". So wiring it up yields ZERO transpose coalescing. Only the `_stacked_*` (FFTW/serial) path truly batches, and that path has no MPI transpose. Net: the orphaned code does not solve this; real batching must be built.
+- [x] **Batched `PencilFFTPlan` works (verified, 2 ranks).** A plan over `(Nx, Ny, B)` with `RFFT, FFT, NoTransform` (B = batch axis) round-trips at err 8.9e-16, preserves the batch dim, and one `plan * u` moves all B slices in a single transpose-set. `NoTransform` on a trailing axis is already the codebase pattern (planning.jl:219 uses it for non-Fourier axes). ⇒ k fields in one batched transpose = 1 transpose-set instead of k.
 - [ ] **Open design detail:** in the probe, PencilFFTs' default decomposition *also split the batch dim* (input decomp dims `(2,3)`). For batching we want the batch axis kept LOCAL so all slices ride one transpose — build the `Pencil` with an explicit decomposition over the Fourier dims only, matching the existing per-field plan's layout so stacked/unstacked buffers align.
-- [ ] **Still to trace:** the exact state-transform call sites to intercept (`state_utils.jl`, `lazy_rhs.jl`, `nonlinear_evaluation.jl`) — where ≥2 same-shaped fields transform in the same direction (state vector at stage start; RHS component backwards).
+- [ ] **Still to trace:** the exact state-transform call sites to intercept (`state_utils.jl`, `lazy_rhs.jl`, `evaluation.jl`) — where ≥2 same-shaped fields transform in the same direction (state vector at stage start; RHS component backwards).
 
 **Files (expected — confirm in spike):**
-- Modify: `src/core/transforms/transform_grouped.jl` (real batched transpose over a stacked buffer)
+- Modify: `src/core/transforms/grouped.jl` (real batched transpose over a stacked buffer)
 - Modify: `src/core/timesteppers/state_utils.jl` and/or the RHS path to call the batched transform for the state vector
 - Test: `test/test_mpi_batched_transform.jl` (new) — correctness vs per-field, 2 and 4 ranks
 

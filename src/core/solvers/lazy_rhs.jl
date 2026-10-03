@@ -383,7 +383,7 @@ is not, the honest move is to decline the translation so the solver keeps its ex
     classical recurrence for UNNORMALIZED Pₙ while the transform stores ORTHONORMAL P̃ₙ = γₙPₙ
     coefficients, so applying it to a Legendre field's coefficients was silently wrong
     (measured: error 5.3 on an amplitude-11.8 answer, wrong sign). That mismatch is now
-    bridged once, at `spectral_derivative_matrix` (basis_operators.jl), which
+    bridged once, at `spectral_derivative_matrix` (operators.jl), which
     `_lazy_differentiation_matrix` uses — so the lazy path is correct here and compiles.
     Verified against the interpreted recurrence: ChebyshevT 5.7e-14, ChebyshevU 1.7e-13,
     Legendre 1.0e-12.
@@ -1294,51 +1294,68 @@ function _lazy_differentiation_matrix(basis::JacobiBasis, order::Int, data::Abst
     end
 end
 
-"""Apply a 1D matrix `D` along `axis` of multi-dimensional array `data` in place.
+# Task ownership survives thread migration and prevents independent RHS calls
+# sharing mutable scratch. Bound the cache so changing resolutions cannot retain
+# an unlimited number of full-volume arrays. No basis or field is retained.
+const _DIFF_MATMUL_CACHE_KEY = gensym(:tarang_diff_matmul)
+struct _DiffMatmulCache
+    owner::Task
+    entries::Dict{Any,Any}
+end
+_diff_matmul_cache_token(data::AbstractArray) = _device_cache_token(data)
 
-The 1D/2D cases (the common Chebyshev/Jacobi spectral derivative) reuse a scratch
-buffer cached in `basis.transforms`, keyed by `(size, eltype)`, instead of
-allocating the matmul output every call. Safe because lazy RHS evaluation is
-sequential — the buffer is filled and consumed within a single call before any
-other lazy derivative runs on the same basis. This scratch is not checked out
-exclusively and requires sequential use of that basis."""
-function _apply_1d_matrix!(data::AbstractArray, D::AbstractMatrix, axis::Int, basis)
-    nd = ndims(data)
-    if nd == 1 || nd == 2
-        tmp = _diff_matmul_buffer(basis, data)
-        _matmul_axis_into!(data, D, tmp, axis)
-        return data
+function _diff_matmul_workspace(data::AbstractArray{T,N}, axis::Int) where {T,N}
+    tls = task_local_storage()
+    cache = get(tls, _DIFF_MATMUL_CACHE_KEY, nothing)
+    if !(cache isa _DiffMatmulCache) || cache.owner !== current_task()
+        cache = _DiffMatmulCache(current_task(), Dict{Any,Any}())
+        tls[_DIFF_MATMUL_CACHE_KEY] = cache
     end
+    key = (typeof(data), size(data), axis, _diff_matmul_cache_token(data))
+    workspace = get(cache.entries, key, nothing)
+    workspace !== nothing && return workspace
+    length(cache.entries) >= 8 && empty!(cache.entries)
+    workspace = if N <= 2
+        similar(data)
+    else
+        perm = ntuple(i -> i == 1 ? axis : i <= axis ? i - 1 : i, N)
+        shape = ntuple(i -> size(data, perm[i]), N)
+        # Both matrices share storage with their shaped arrays; reshape creates
+        # headers only, once at setup, including for device arrays.
+        input = similar(data, shape)
+        output = similar(data, shape)
+        (input, output, reshape(input, shape[1], :),
+         reshape(output, shape[1], :), perm, invperm(perm))
+    end
+    cache.entries[key] = workspace
+    return workspace
+end
 
-    # Higher-dimensional (rare): permutedims path, left allocating.
-    dims = [axis; [i for i in 1:ndims(data) if i != axis]]
-    permuted = permutedims(data, dims)
-    reshaped = reshape(permuted, size(permuted, 1), :)
-    transformed = D * reshaped
-    reshaped_back = reshape(transformed, size(permuted)...)
-    unpermuted = permutedims(reshaped_back, invperm(dims))
-    copyto!(data, unpermuted)
+"""Apply `D` along `axis` in place using task/device-owned reusable scratch."""
+function _apply_1d_matrix!(data::AbstractArray, D::AbstractMatrix, axis::Int, basis)
+    1 <= axis <= ndims(data) || throw(ArgumentError("Invalid derivative axis $axis"))
+    size(D) == (size(data, axis), size(data, axis)) ||
+        throw(DimensionMismatch("Differentiation matrix must preserve the selected axis size"))
+    _matmul_axis_into!(data, D, _diff_matmul_workspace(data, axis), axis)
     return data
 end
 
-"""Reusable matmul scratch for `_apply_1d_matrix!`, cached per basis by shape+eltype."""
-function _diff_matmul_buffer(basis, data::AbstractArray)
-    key = (:diff_matmul_tmp, size(data), eltype(data))
-    return _get_basis_cache!(basis, key) do
-        similar(data)
-    end
-end
-
-# Function barrier: `tmp` arrives `Any`-typed from the `Dict{Any,Any}` basis.transforms
-# cache (`data` is already concrete post storage parametrization), so dispatching here
-# recovers `tmp`'s concrete type and keeps `mul!`/`copyto!` allocation-free.
+# Function barriers recover concrete workspace types from the heterogeneous cache.
 @inline function _matmul_axis_into!(data::AbstractArray, D::AbstractMatrix, tmp::AbstractArray, axis::Int)
     if ndims(data) == 1 || axis == 1
-        mul!(tmp, D, data)            # (D * data) along first axis
-    else  # 2D, axis == 2
-        mul!(tmp, data, transpose(D)) # (data * Dᵀ) along second axis
+        mul!(tmp, D, data)
+    else
+        mul!(tmp, data, transpose(D))
     end
     copyto!(data, tmp)
+    return data
+end
+
+function _matmul_axis_into!(data::AbstractArray, D::AbstractMatrix, workspace::Tuple, axis::Int)
+    input, output, input_matrix, output_matrix, perm, inverse = workspace
+    permutedims!(input, data, perm)
+    mul!(output_matrix, D, input_matrix)
+    permutedims!(data, output, inverse)
     return data
 end
 
@@ -1421,7 +1438,7 @@ function build_lazy_rhs_plan!(solver::InitialValueSolver)
 
     # `equation_data` is filled by `build_matrix_expressions!`, which runs as part of
     # global-matrix assembly — the step a pure-Fourier GPU InitialValueProblem deliberately SKIPS
-    # (solver_types.jl, `_gpu_pure_fourier_state`). Treating "no IR" as "nothing to
+    # (types.jl, `_gpu_pure_fourier_state`). Treating "no IR" as "nothing to
     # compile" therefore produced, on every such solver, a plan holding only zero
     # fields and flagged `is_compiled = true`. That flag makes
     # `_compiled_lazy_rhs_available` true, so `evaluate_rhs` took the lazy path, got

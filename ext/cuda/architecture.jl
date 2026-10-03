@@ -55,6 +55,12 @@ function Tarang.device(gpu::GPU{CuDevice})
     return CUDABackend()
 end
 
+# Batched stage operations use the current task's CUDA stream, including the
+# cuBLAS solve. Leave them queued; synchronizing each gather/scatter/SpMV blocks
+# the host without adding ordering. Callers handing results to another stream
+# or an external transport must establish that boundary explicitly.
+Tarang._batch_finish!(::CUDABackend) = nothing
+
 """
     array_type(::GPU{CuDevice})
 

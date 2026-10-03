@@ -11,11 +11,11 @@
 ## Tasks and verification
 
 - [x] Baseline: run nonlinear and spectral-padding tests in this isolated worktree.
-- [x] Nonlinear memory: write storage-budget and alias/ownership regression tests; observe old implementation fail the budget; reduce six complex arrays to three and add destination output. Files: `src/core/nonlinear/nonlinear_padding.jl`, `nonlinear_evaluation.jl`, `src/core/solvers/lazy_rhs.jl`.
+- [x] Nonlinear memory: write storage-budget and alias/ownership regression tests; observe old implementation fail the budget; reduce six complex arrays to three and add destination output. Files: `src/core/nonlinear/padding.jl`, `evaluation.jl`, `src/core/solvers/lazy_rhs.jl`.
 - [x] Transforms: test real/complex, odd/even, mixed axes, Nyquist corners, coefficient input/output; add reduced real FFT workspace and avoid round trips where field conventions permit. Cache repeated operands only within an explicit RHS scope with bounded storage.
 - [x] CUDA padding: verify stream ordering against installed CUDA/KA implementation, remove redundant host waits and result clear, add strict CUDA regressions.
 - [x] Mode batching/RK: extend gather/scatter eligibility to coupled 3D modes with bounded batches and fuse field-stage combinations. Test numerical parity, actual batching engagement and retained small-dt contributions. Files: mode-batch helpers and `src/core/timesteppers/`.
-- [x] CFL: test warmed allocation and unchanged adaptive dt; cache/fuse frequency buffers in `src/extras/flow_tools/flow_tools_cfl.jl`.
+- [x] CFL: test warmed allocation and unchanged adaptive dt; cache/fuse frequency buffers in `src/extras/flow_tools/cfl.jl`.
 - [x] Optional solvers/FFT: cache batched FFT execution buffers with clear concurrency ownership; reuse CG/GMRES buffers and in-place operations while preserving convergence semantics. Files: `ext/cuda/batched_fft.jl`, `src/tools/gpu_matsolvers.jl`.
 - [x] Validation: run targeted CPU/JLArray, nonlinear ownership, timestep and MPI regressions; provide a strict CUDA runner and repeatable benchmark reporting time, allocation and memory. Actual H200 timings are user-run.
 - [x] Review each component and the integrated diff for scope and correctness; resolve findings. Publish the reviewed changes on the separate `perf/single-gpu-nonlinear` branch and draft PR.

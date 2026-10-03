@@ -1,8 +1,8 @@
 """
 Extended tests for temporal filter helper modules with independent analytic oracles:
-  - temporal_filters_imex_etd.jl  (ETD/IMEX coefficient precompute, φ-functions)
-  - temporal_filters_gql.jl       (GQL wavenumber decomposition)
-  - temporal_filters_wave_mean.jl (horizontal-mean / wave-mean decomposition)
+  - imex_etd.jl  (ETD/IMEX coefficient precompute, φ-functions)
+  - gql.jl       (GQL wavenumber decomposition)
+  - wave_mean.jl (horizontal-mean / wave-mean decomposition)
 
 Every expected value comes from closed-form math, NOT from running the function
 under test on itself.

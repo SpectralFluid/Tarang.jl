@@ -12,7 +12,7 @@ Alternatives considered: rejecting all nonconstant boundary values would remove 
 
 ## 1. Boundary context and refresh
 
-Files: `src/core/boundary_conditions.jl`, `src/core/boundary_conditions/types.jl` if needed, `src/core/solvers/solver_types.jl`, `src/core/problems/problem_types.jl`; new focused boundary-value regression file(s).
+Files: `src/core/boundary_conditions.jl`, `src/core/boundary_conditions/types.jl` if needed, `src/core/solvers/types.jl`, `src/core/problems/types.jl`; new focused boundary-value regression file(s).
 
 - [x] Add/run failing numerical tests for spatial Dirichlet/Neumann values in both linear and nonlinear BVPs (audit error 1.0 / 0.761594).
 - [x] Add/run tests comparing raw and structured moving Robin conditions (raw currently returns 0 instead of 0.06).
@@ -24,7 +24,7 @@ Files: `src/core/boundary_conditions.jl`, `src/core/boundary_conditions/types.jl
 
 ## 2. Stress-free component assembly
 
-Files: `src/core/subsystems/subproblem_types.jl`, `src/core/problems/problem_matrices/problem_matrices_expr_analysis.jl`, `src/core/operators/matrices/matrices_expression.jl`, `src/core/operators/matrices/matrices_subproblem_operators.jl` and related component matrix helpers as required; new component boundary regression file.
+Files: `src/core/subsystems/subproblem_types.jl`, `src/core/problems/problem_matrices/expr_analysis.jl`, `src/core/operators/matrices/expression.jl`, `src/core/operators/matrices/subproblem_operators.jl` and related component matrix helpers as required; new component boundary regression file.
 
 - [x] Add/run a failing public `StressFreeBC` solve with square-system and value assertions; use nontrivial manufactured vector fields to test normal/tangential behavior.
 - [x] Make generic `Component` output sizing scalar where appropriate in global and subproblem assembly.
@@ -33,7 +33,7 @@ Files: `src/core/subsystems/subproblem_types.jl`, `src/core/problems/problem_mat
 
 ## 3. GPU buffer ownership
 
-Files: `src/core/solvers/solver_stepping.jl`, `src/core/field/field_types.jl`, `src/core/field/field_data/field_data_copy_alloc.jl` and `src/core/field/field_layout/field_layout_vectorized.jl` as needed; new JLArray boundary regression and CUDA coverage in `test/test_gpu_fc_2d_complete.jl`.
+Files: `src/core/solvers/stepping.jl`, `src/core/field/types.jl`, `src/core/field/field_data/copy_alloc.jl` and `src/core/field/field_layout/vectorized.jl` as needed; new JLArray boundary regression and CUDA coverage in `test/test_gpu_fc_2d_complete.jl`.
 
 - [x] Add/run failing JLArray tests for public GPU BVP solve/scatter and `unit_vector_fields` construction with scalar indexing disabled.
 - [x] Allocate steady-solve RHS, algebraic RHS, and solution buffers on the correct backend. The nonlinear GPU path already raises an explicit unsupported-operation error; preserve that guard.
@@ -42,7 +42,7 @@ Files: `src/core/solvers/solver_stepping.jl`, `src/core/field/field_types.jl`, `
 
 ## 4. Periodic markers and integration
 
-Files: `src/core/problems/problem_parsing.jl`, new `test/test_periodic_bc_marker.jl`, `test/file_lists.jl`, relevant boundary/GPU documentation.
+Files: `src/core/problems/parsing.jl`, new `test/test_periodic_bc_marker.jl`, `test/file_lists.jl`, relevant boundary/GPU documentation.
 
 - [x] Add/run a failing test for `add_bc!(problem, periodic_bc(...))`; verify no equation is emitted and the Fourier solve remains correct.
 - [x] Skip equation conversion for periodic metadata without duplicating constraints. Regression: 8/8 assertions pass.

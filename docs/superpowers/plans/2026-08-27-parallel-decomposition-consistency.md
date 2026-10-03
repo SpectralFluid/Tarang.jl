@@ -57,16 +57,16 @@ $JULIA --project=. -e 'using Pkg; Pkg.test()'
 - `test/test_mpi_transposable_parity.jl` — coefficient-level parity of the distributed transform against the serial reference, 2-D and 3-D, meshes `(N,1)`, `(1,N)`, `(2,2)`.
 
 **Modified:**
-- `src/core/distributor/distributor_core.jl` — home of `decomposed_axes` / `mesh_axis_for` / `is_decomposed_axis`; `local_indices`, `create_pencil` full-decomp branch, `Base.close` early-return bug, transpose workspace cache.
-- `src/core/field/field_data/field_data_distributor_utils.jl` — `get_local_range` delegates.
-- `src/core/field/field_data/field_data_copy_alloc.jl` — `get_local_array_size` delegates.
-- `src/core/field/field_layout/field_layout_filters_shapes.jl` — local start/end delegates.
-- `src/core/operators/derivatives/derivatives_fourier.jl` — decomposed-axis guard delegates.
+- `src/core/distributor/core.jl` — home of `decomposed_axes` / `mesh_axis_for` / `is_decomposed_axis`; `local_indices`, `create_pencil` full-decomp branch, `Base.close` early-return bug, transpose workspace cache.
+- `src/core/field/field_data/distributor_utils.jl` — `get_local_range` delegates.
+- `src/core/field/field_data/copy_alloc.jl` — `get_local_array_size` delegates.
+- `src/core/field/field_layout/filters_shapes.jl` — local start/end delegates.
+- `src/core/operators/derivatives/fourier.jl` — decomposed-axis guard delegates.
 - `src/tools/netcdf_output.jl` — slab start and count delegate.
-- `src/core/field/field_types.jl` — `ScalarField` selects `TransposableFieldStorage` for GPU+MPI.
+- `src/core/field/types.jl` — `ScalarField` selects `TransposableFieldStorage` for GPU+MPI.
 - `src/core/transposable_field.jl` — `TransposableFieldStorage` gains a workspace reference.
-- `src/core/transforms/transform_gpu.jl` — dispatch on `TransposableStorage`; delete refusal.
-- `src/core/transforms/transform_fourier.jl` — delete refusal.
+- `src/core/transforms/gpu.jl` — dispatch on `TransposableStorage`; delete refusal.
+- `src/core/transforms/fourier.jl` — delete refusal.
 - `test/test_transposable_field.jl` — restore the vacuous serial testset.
 - `test/file_lists.jl` — register the two new files.
 
@@ -277,7 +277,7 @@ git add test/test_mpi_transposable_parity.jl test/file_lists.jl
 ## Task 2: Introduce `decomposed_axes`
 
 **Files:**
-- Modify: `src/core/distributor/distributor_core.jl` (add near `local_indices`, around line 1055)
+- Modify: `src/core/distributor/core.jl` (add near `local_indices`, around line 1055)
 - Create: `test/test_decomposition_convention.jl`
 - Modify: `test/file_lists.jl`
 
@@ -370,7 +370,7 @@ Expected: FAIL with `UndefVarError: decomposed_axes not defined`.
 
 - [ ] **Step 3: Write the implementation**
 
-In `src/core/distributor/distributor_core.jl`, immediately before `function local_indices(`:
+In `src/core/distributor/core.jl`, immediately before `function local_indices(`:
 
 ```julia
 """
@@ -459,7 +459,7 @@ In `test/file_lists.jl`, add to `TEST_FILES` after `"test_distributor.jl",`:
 ```
 
 ```bash
-git add src/core/distributor/distributor_core.jl test/test_decomposition_convention.jl test/file_lists.jl
+git add src/core/distributor/core.jl test/test_decomposition_convention.jl test/file_lists.jl
 ```
 
 ---
@@ -469,7 +469,7 @@ git add src/core/distributor/distributor_core.jl test/test_decomposition_convent
 `get_local_range` computes `mesh_axis` inline — it is the prior art for `mesh_axis_for` and the smallest, safest migration to do first.
 
 **Files:**
-- Modify: `src/core/field/field_data/field_data_distributor_utils.jl:79-110`
+- Modify: `src/core/field/field_data/distributor_utils.jl:79-110`
 
 **Interfaces:**
 - Consumes: `mesh_axis_for(dist, ndim, axis)` from Task 2.
@@ -500,7 +500,7 @@ Expected: pass (this pins the serial contract that the rewrite must not disturb)
 
 - [ ] **Step 3: Rewrite the body**
 
-In `src/core/field/field_data/field_data_distributor_utils.jl`, replace the block that begins `mesh_dim = length(dist.mesh)` and ends with the `if mesh_axis === nothing || mesh_axis < 1 || mesh_axis > mesh_dim` guard (currently lines 84-106) with:
+In `src/core/field/field_data/distributor_utils.jl`, replace the block that begins `mesh_dim = length(dist.mesh)` and ends with the `if mesh_axis === nothing || mesh_axis < 1 || mesh_axis > mesh_dim` guard (currently lines 84-106) with:
 
 ```julia
     # `dist.dim` is this distributor's field dimensionality; get_local_range is
@@ -546,7 +546,7 @@ Expected: `54 passed, 0 failed` at each. Any regression here is a real conventio
 - [ ] **Step 5: Stage**
 
 ```bash
-git add src/core/field/field_data/field_data_distributor_utils.jl test/test_decomposition_convention.jl
+git add src/core/field/field_data/distributor_utils.jl test/test_decomposition_convention.jl
 ```
 
 ---
@@ -554,20 +554,20 @@ git add src/core/field/field_data/field_data_distributor_utils.jl test/test_deco
 ## Task 4: Migrate the three local-shape/index functions and force them to agree
 
 `get_local_array_size` (the allocator), `local_indices` (the index math), and
-`compute_local_shape` (a third copy, in `distributor_core.jl`) each derive the
+`compute_local_shape` (a third copy, in `core.jl`) each derive the
 convention independently. Two of them **disagree** when a field has fewer
 dimensions than the mesh: `get_local_array_size` leaves the shape whole
 (`if ndims_global >= ndims_mesh`), while `local_indices` uses `dist.dim` and
 would split it. `decomposed_axes` resolves this in favour of the allocator.
 
 Note there are two similarly-named functions: `compute_local_shape(dist, global_shape)`
-in `distributor_core.jl:883` (this task) and `compute_local_shape(global_shape, decomp_dim, nprocs, rank)`
+in `core.jl:883` (this task) and `compute_local_shape(global_shape, decomp_dim, nprocs, rank)`
 in `gpu_distributed.jl:91` (a different, explicitly-parameterised function — leave it alone).
 
 **Files:**
-- Modify: `src/core/distributor/distributor_core.jl:1058-1100` (`local_indices`)
-- Modify: `src/core/distributor/distributor_core.jl:883-930` (`compute_local_shape`)
-- Modify: `src/core/field/field_data/field_data_copy_alloc.jl:318-382` (`get_local_array_size`)
+- Modify: `src/core/distributor/core.jl:1058-1100` (`local_indices`)
+- Modify: `src/core/distributor/core.jl:883-930` (`compute_local_shape`)
+- Modify: `src/core/field/field_data/copy_alloc.jl:318-382` (`get_local_array_size`)
 - Modify: `test/test_decomposition_convention.jl`
 
 **Interfaces:**
@@ -605,7 +605,7 @@ which exercises both functions on live decompositions across 54 files.
 
 - [ ] **Step 3: Rewrite `local_indices`**
 
-In `src/core/distributor/distributor_core.jl`, replace the whole body between
+In `src/core/distributor/core.jl`, replace the whole body between
 `function local_indices(dist::Distributor, axis::Int, global_size::Int)` and the
 line `n_procs = dist.mesh[mesh_dim]` (currently lines 1058 through the fixup
 block ending around line 1096) with:
@@ -631,7 +631,7 @@ rather than restating the rule.
 
 - [ ] **Step 4: Rewrite `get_local_array_size`**
 
-In `src/core/field/field_data/field_data_copy_alloc.jl`, replace the
+In `src/core/field/field_data/copy_alloc.jl`, replace the
 `if dist.use_pencil_arrays ... else ... end` block (lines 330-378) with:
 
 ```julia
@@ -671,7 +671,7 @@ Task 7's ratchet scans prose as well as code, so a surviving comment fails it.
 
 - [ ] **Step 5: Rewrite `compute_local_shape`**
 
-In `src/core/distributor/distributor_core.jl`, in `compute_local_shape(dist, global_shape)`,
+In `src/core/distributor/core.jl`, in `compute_local_shape(dist, global_shape)`,
 replace the `for i in 1:min(ndims_mesh, ndims_global)` loop and its
 `global_dim_idx = if dist.use_pencil_arrays ... else i end` derivation with:
 
@@ -707,8 +707,8 @@ Expected: `54 passed, 0 failed` twice, and `Testing Tarang tests passed`.
 - [ ] **Step 8: Stage**
 
 ```bash
-git add src/core/distributor/distributor_core.jl \
-        src/core/field/field_data/field_data_copy_alloc.jl \
+git add src/core/distributor/core.jl \
+        src/core/field/field_data/copy_alloc.jl \
         test/test_decomposition_convention.jl
 ```
 
@@ -717,9 +717,9 @@ git add src/core/distributor/distributor_core.jl \
 ## Task 5: Migrate the derivative guard and the layout filter
 
 **Files:**
-- Modify: `src/core/operators/derivatives/derivatives_fourier.jl:30-46`
-- Modify: `src/core/field/field_layout/field_layout_filters_shapes.jl:265-295`
-- Modify: `src/core/nonlinear/nonlinear_pencil_utils.jl:100-136` (`is_shape_compatible`)
+- Modify: `src/core/operators/derivatives/fourier.jl:30-46`
+- Modify: `src/core/field/field_layout/filters_shapes.jl:265-295`
+- Modify: `src/core/nonlinear/pencil_utils.jl:100-136` (`is_shape_compatible`)
 
 **Interfaces:**
 - Consumes: `is_decomposed_axis`, `decomposed_axes` from Task 2.
@@ -727,7 +727,7 @@ git add src/core/distributor/distributor_core.jl \
 
 - [ ] **Step 1: Rewrite the derivative guard**
 
-In `src/core/operators/derivatives/derivatives_fourier.jl`, replace the block from
+In `src/core/operators/derivatives/fourier.jl`, replace the block from
 `ndims_mesh = length(dist.mesh)` through `if axis in decomp_dims` with:
 
 ```julia
@@ -739,7 +739,7 @@ Everything inside that `if` body is unchanged.
 
 - [ ] **Step 2: Rewrite the layout filter**
 
-In `src/core/field/field_layout/field_layout_filters_shapes.jl`, replace the
+In `src/core/field/field_layout/filters_shapes.jl`, replace the
 `if dist.use_pencil_arrays ... else ... end` block (lines 273-292) with:
 
 ```julia
@@ -761,7 +761,7 @@ inventory. It derives the convention TWICE inside one function (once for
 and `mesh` as loose arguments rather than a `Distributor`. `decomposed_axes`
 takes an untyped `dist` precisely so a lightweight stand-in works here.
 
-In `src/core/nonlinear/nonlinear_pencil_utils.jl`, replace the whole
+In `src/core/nonlinear/pencil_utils.jl`, replace the whole
 `for i in 1:num_dims` loop body's convention logic — from
 `# Determine if this dimension is decomposed based on convention` through the
 second `mesh_idx = if use_pencil_arrays ... end` block — with:
@@ -810,9 +810,9 @@ The derivative guard is exercised by `test_mpi_collective_budget.jl` and
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/core/operators/derivatives/derivatives_fourier.jl \
-        src/core/field/field_layout/field_layout_filters_shapes.jl \
-        src/core/nonlinear/nonlinear_pencil_utils.jl
+git add src/core/operators/derivatives/fourier.jl \
+        src/core/field/field_layout/filters_shapes.jl \
+        src/core/nonlinear/pencil_utils.jl
 git commit -m "refactor: derive decomposed axes from decomposed_axes in three more sites"
 ```
 
@@ -821,7 +821,7 @@ git commit -m "refactor: derive decomposed axes from decomposed_axes in three mo
 ## Task 6: Migrate `create_pencil` and the NetCDF slab sites
 
 **Files:**
-- Modify: `src/core/distributor/distributor_core.jl:598-612`
+- Modify: `src/core/distributor/core.jl:598-612`
 - Modify: `src/tools/netcdf_output.jl:1290-1310` (slab start)
 - Modify: `src/tools/netcdf_output.jl:1435-1455` (slab count)
 
@@ -831,7 +831,7 @@ git commit -m "refactor: derive decomposed axes from decomposed_axes in three mo
 
 - [ ] **Step 1: Migrate `create_pencil`'s full-decomposition branch**
 
-In `src/core/distributor/distributor_core.jl`, replace only the
+In `src/core/distributor/core.jl`, replace only the
 `decomp_index === nothing` branch:
 
 ```julia
@@ -938,7 +938,7 @@ $JULIA --project=. -e 'using Pkg; Pkg.test()'
 - [ ] **Step 8: Stage**
 
 ```bash
-git add src/core/distributor/distributor_core.jl src/tools/netcdf_output.jl
+git add src/core/distributor/core.jl src/tools/netcdf_output.jl
 ```
 
 ---
@@ -963,7 +963,7 @@ Append to `test/test_decomposition_convention.jl`:
     # up disagreeing about a field with fewer dims than the mesh. A tenth copy
     # must fail the build, not wait for the next audit.
     srcdir = joinpath(@__DIR__, "..", "src")
-    allowed = joinpath("core", "distributor", "distributor_core.jl")
+    allowed = joinpath("core", "distributor", "core.jl")
 
     offenders = String[]
     for (root, _, files) in walkdir(srcdir), file in files
@@ -1023,7 +1023,7 @@ blames the user's install for a structural impossibility. With `decomposed_axes`
 in place the condition is one line.
 
 **Files:**
-- Modify: `src/core/transforms/transform_planning.jl:283-306`
+- Modify: `src/core/transforms/planning.jl:283-306`
 - Modify: `test/test_decomposition_convention.jl`
 
 **Interfaces:**
@@ -1080,7 +1080,7 @@ Expected: FAIL — the raised message still contains "PencilFFTs installation".
 
 - [ ] **Step 3: Implement the guard**
 
-In `src/core/transforms/transform_planning.jl`, immediately before the
+In `src/core/transforms/planning.jl`, immediately before the
 `trailing = collect(...)` line, insert:
 
 ```julia
@@ -1116,7 +1116,7 @@ Expected: both pass.
 $JULIA --project=. test/run_mpi_ci.jl 2
 $JULIA --project=. test/run_mpi_ci.jl 4
 $JULIA --project=. -e 'using Pkg; Pkg.test()'
-git add src/core/transforms/transform_planning.jl \
+git add src/core/transforms/planning.jl \
         test/test_decomposition_convention.jl \
         test/test_mpi_transform_planning_guards.jl
 ```
@@ -1134,7 +1134,7 @@ GPU+MPI cases, so those distributors never register as closed, `isopen` keeps
 returning `true`, and the workspace cache Task 10 adds would never be released.
 
 **Files:**
-- Modify: `src/core/distributor/distributor_core.jl:299-329`
+- Modify: `src/core/distributor/core.jl:299-329`
 - Modify: `test/test_distributor.jl`
 
 **Interfaces:**
@@ -1171,7 +1171,7 @@ Expected: FAIL at `@test !isopen(dist)`.
 
 - [ ] **Step 3: Implement**
 
-In `src/core/distributor/distributor_core.jl`, replace:
+In `src/core/distributor/core.jl`, replace:
 
 ```julia
     dist.closed && return nothing
@@ -1208,7 +1208,7 @@ Expected: pass; `54 passed, 0 failed`.
 - [ ] **Step 5: Stage**
 
 ```bash
-git add src/core/distributor/distributor_core.jl test/test_distributor.jl
+git add src/core/distributor/core.jl test/test_distributor.jl
 ```
 
 ---
@@ -1224,7 +1224,7 @@ which the 2026-08-20 audit found is **never written** — a dead always-empty fi
 Replace it rather than adding a tenth cache.
 
 **Files:**
-- Modify: `src/core/distributor/distributor_core.jl` (struct field, constructor, `close`)
+- Modify: `src/core/distributor/core.jl` (struct field, constructor, `close`)
 - Modify: `src/core/transposable_field.jl` (workspace accessor)
 - Modify: `test/test_transposable_field.jl`
 
@@ -1329,7 +1329,7 @@ end
 ```
 
 `TransposableField` is already a `mutable struct`, so `ws.field = field` is legal.
-Verify with `grep -n "mutable struct TransposableField" src/core/transpose/transpose_types.jl`
+Verify with `grep -n "mutable struct TransposableField" src/core/transpose/types.jl`
 before relying on it; if it is immutable, make the `field` slot mutable in that struct.
 
 - [ ] **Step 6: Release the cache in `close`**
@@ -1352,7 +1352,7 @@ Expected: all pass.
 - [ ] **Step 8: Stage**
 
 ```bash
-git add src/core/distributor/distributor_core.jl \
+git add src/core/distributor/core.jl \
         src/core/transposable_field.jl \
         test/test_transposable_field.jl
 ```
@@ -1362,7 +1362,7 @@ git add src/core/distributor/distributor_core.jl \
 ## Task 11: Construct `TransposableFieldStorage` for distributed GPU fields
 
 **Files:**
-- Modify: `src/core/field/field_types.jl:120-133`
+- Modify: `src/core/field/types.jl:120-133`
 - Modify: `src/core/transposable_field.jl:88-103`
 - Modify: `test/test_transposable_field.jl`
 
@@ -1433,7 +1433,7 @@ before assuming it.
 
 - [ ] **Step 4: Select the storage in the constructor**
 
-In `src/core/field/field_types.jl`, in the primary `ScalarField` inner
+In `src/core/field/types.jl`, in the primary `ScalarField` inner
 constructor, replace:
 
 ```julia
@@ -1473,7 +1473,7 @@ architecture(s::TransposableFieldStorage) = architecture(s.base)
 Check the exact accessor names and arities first:
 
 ```bash
-grep -rn --include="*.jl" "SerialFieldStorage)" src/core/field/field_types.jl | head -20
+grep -rn --include="*.jl" "SerialFieldStorage)" src/core/field/types.jl | head -20
 ```
 
 and mirror every one of them. A missed accessor is a `MethodError` at first use,
@@ -1493,7 +1493,7 @@ regresses, the fix is to parametrize rather than widen; do not loosen the ratche
 - [ ] **Step 7: Stage**
 
 ```bash
-git add src/core/field/field_types.jl src/core/transposable_field.jl \
+git add src/core/field/types.jl src/core/transposable_field.jl \
         test/test_transposable_field.jl
 ```
 
@@ -1502,8 +1502,8 @@ git add src/core/field/field_types.jl src/core/transposable_field.jl \
 ## Task 12: Dispatch `forward_transform!` on transposable storage
 
 **Files:**
-- Modify: `src/core/transforms/transform_gpu.jl:301-315, 358-375`
-- Modify: `src/core/transforms/transform_fourier.jl:128-145`
+- Modify: `src/core/transforms/gpu.jl:301-315, 358-375`
+- Modify: `src/core/transforms/fourier.jl:128-145`
 
 **Interfaces:**
 - Consumes: `transpose_workspace!` (Task 10), `is_transposable_storage` (Task 11).
@@ -1511,7 +1511,7 @@ git add src/core/field/field_types.jl src/core/transposable_field.jl \
 
 - [ ] **Step 1: Add the forward dispatch**
 
-In `src/core/transforms/transform_gpu.jl`, immediately after
+In `src/core/transforms/gpu.jl`, immediately after
 `ensure_layout!(field, :g)` in `forward_transform!` (line 308), insert:
 
 ```julia
@@ -1530,7 +1530,7 @@ branch must NOT set it again.
 
 - [ ] **Step 2: Add the backward dispatch**
 
-In `src/core/transforms/transform_fourier.jl`, in `backward_transform!`,
+In `src/core/transforms/fourier.jl`, in `backward_transform!`,
 immediately after its `ensure_layout!(field, :c)` call, insert the mirror:
 
 ```julia
@@ -1543,7 +1543,7 @@ immediately after its `ensure_layout!(field, :c)` call, insert the mirror:
 
 - [ ] **Step 3: Delete the two refusals**
 
-At `src/core/transforms/transform_gpu.jl:358-366`, delete the `is_gpu_array` arm:
+At `src/core/transforms/gpu.jl:358-366`, delete the `is_gpu_array` arm:
 
 ```julia
         if is_gpu_array(get_grid_data(field))
@@ -1552,14 +1552,14 @@ At `src/core/transforms/transform_gpu.jl:358-366`, delete the `is_gpu_array` arm
 ```
 
 leaving the CPU arm as an unconditional `error(...)`. Do the same at
-`src/core/transforms/transform_fourier.jl:132-140` for `get_coeff_data`.
+`src/core/transforms/fourier.jl:132-140` for `get_coeff_data`.
 
 A distributed GPU field can no longer reach this point — it returned at Step 1 or
 Step 2 — so the arm is now unreachable text, and unreachable text rots.
 
 - [ ] **Step 4: Keep the basis-level refusals**
 
-Do **not** touch `validate_mpi_fourier_only` (`src/core/basis/basis_core.jl:152-190`).
+Do **not** touch `validate_mpi_fourier_only` (`src/core/basis/core.jl:152-190`).
 Its RealFourier and non-Fourier refusals state real constraints: the transpose
 buffers are fixed-shape and cannot hold a half spectrum. Verify they still fire:
 
@@ -1596,7 +1596,7 @@ Expected: `54 passed, 0 failed` twice; `Testing Tarang tests passed`.
 - [ ] **Step 6: Stage**
 
 ```bash
-git add src/core/transforms/transform_gpu.jl src/core/transforms/transform_fourier.jl
+git add src/core/transforms/gpu.jl src/core/transforms/fourier.jl
 ```
 
 ---

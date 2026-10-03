@@ -18,14 +18,14 @@
 |------|---------|
 | `src/core/timesteppers/pencil_operators.jl` | Add workspace fields to `PencilLinearOperator`, pass to field kernels |
 | `src/core/timesteppers/step_pencil_imex.jl` | Use `ldiv!` in wavenumber loops, Symbol cache keys, shell-alloc instead of copy |
-| `src/core/field/field_data.jl` | Layout-aware `Base.copy(field)` |
+| `src/core/field/data.jl` | Layout-aware `Base.copy(field)` |
 | `src/core/timesteppers/state.jl` | Add `_vec_workspace` to `TimestepperState` |
 | `src/core/timesteppers/state_utils.jl` | Add `fields_to_vector!` in-place variant |
 | `src/core/timesteppers/step_rk.jl` | Use `fields_to_vector!` in RK paths |
 | `src/core/distributor.jl` | Add `pencil_fft_plan` field, parameterize `Layout{N}` |
-| `src/core/transforms/transform_types.jl` | Simplify `_find_pencil_plan` to field access |
-| `src/core/transforms/transform_planning.jl` | Set `dist.pencil_fft_plan` during plan setup |
-| `src/core/transforms/transform_legendre.jl` | Set `dist.pencil_fft_plan` during 3D plan setup |
+| `src/core/transforms/types.jl` | Simplify `_find_pencil_plan` to field access |
+| `src/core/transforms/planning.jl` | Set `dist.pencil_fft_plan` during plan setup |
+| `src/core/transforms/legendre.jl` | Set `dist.pencil_fft_plan` during 3D plan setup |
 | `test/test_pencil_imex.jl` | Add `@allocated` regression tests |
 
 ---
@@ -282,7 +282,7 @@ git commit -m "perf: use Symbol constants for cache keys, eliminate String alloc
 ### Task 4: Layout-aware `copy(field)`
 
 **Files:**
-- Modify: `src/core/field/field_data.jl:396-414`
+- Modify: `src/core/field/data.jl:396-414`
 
 - [ ] **Step 1: Make `copy` only copy the live data array**
 
@@ -327,7 +327,7 @@ Expected: All tests pass.
 - [ ] **Step 3: Commit**
 
 ```
-git add src/core/field/field_data.jl
+git add src/core/field/data.jl
 git commit -m "perf: layout-aware copy(field) — only copy live data array"
 ```
 
@@ -379,9 +379,9 @@ git commit -m "perf: shell-allocate new fields in pencil IMEX instead of copy"
 
 **Files:**
 - Modify: `src/core/distributor.jl:36-83` (struct + constructor)
-- Modify: `src/core/transforms/transform_types.jl` (`_find_pencil_plan`)
-- Modify: `src/core/transforms/transform_planning.jl` (set cached plan)
-- Modify: `src/core/transforms/transform_legendre.jl` (set cached plan)
+- Modify: `src/core/transforms/types.jl` (`_find_pencil_plan`)
+- Modify: `src/core/transforms/planning.jl` (set cached plan)
+- Modify: `src/core/transforms/legendre.jl` (set cached plan)
 
 - [ ] **Step 1: Add `pencil_fft_plan` field to Distributor**
 
@@ -403,17 +403,17 @@ And add `pencil_fft_plan` to the `new(...)` call at the appropriate position.
 
 - [ ] **Step 3: Set the cached plan during plan creation**
 
-In `src/core/transforms/transform_planning.jl`, after `push!(dist.transforms, fft_plan)`, add:
+In `src/core/transforms/planning.jl`, after `push!(dist.transforms, fft_plan)`, add:
 
 ```julia
         dist.pencil_fft_plan = fft_plan
 ```
 
-Do the same in `src/core/transforms/transform_legendre.jl` after the equivalent `push!`.
+Do the same in `src/core/transforms/legendre.jl` after the equivalent `push!`.
 
 - [ ] **Step 4: Simplify `_find_pencil_plan` to a field access**
 
-In `src/core/transforms/transform_types.jl`, replace the function:
+In `src/core/transforms/types.jl`, replace the function:
 
 ```julia
 function _find_pencil_plan(dist)
@@ -439,8 +439,8 @@ Same test as Task 2, Step 5.
 - [ ] **Step 6: Commit**
 
 ```
-git add src/core/distributor.jl src/core/transforms/transform_types.jl \
-        src/core/transforms/transform_planning.jl src/core/transforms/transform_legendre.jl
+git add src/core/distributor.jl src/core/transforms/types.jl \
+        src/core/transforms/planning.jl src/core/transforms/legendre.jl
 git commit -m "perf: cache PencilFFTPlan on Distributor, eliminate Vector{Any} scan"
 ```
 

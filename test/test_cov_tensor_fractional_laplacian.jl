@@ -1,5 +1,5 @@
 """
-Coverage tests for src/core/operators/tensor/tensor_fractional_laplacian.jl
+Coverage tests for src/core/operators/tensor/fractional_laplacian.jl
 
 Targets serial-CPU reachable lines that were previously uncovered:
   - evaluate_fractional_laplacian dispatch (ScalarField + VectorField + bad operand)

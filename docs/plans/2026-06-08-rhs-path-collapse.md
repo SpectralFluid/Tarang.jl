@@ -11,7 +11,7 @@ Equation-RHS evaluation has two implementations of the same operator semantics:
 - **Lazy** (`src/core/solvers/lazy_rhs.jl`, 917 LOC) — `translate_to_lazy` builds a typed
   `LazyFuture` tree once (`build_lazy_rhs_plan!`), evaluated by `evaluate_lazy!` /
   `execute_lazy_rhs_buffered!`. Fast, type-specialized, low-alloc.
-- **Interpreted** (`src/core/solvers/solver_compiled_rhs.jl`, 722 LOC) — `evaluate_solver_expression`
+- **Interpreted** (`src/core/solvers/compiled_rhs.jl`, 722 LOC) — `evaluate_solver_expression`
   walks the operator tree directly. ~100× more allocation.
 
 `evaluate_rhs` (`state_utils.jl:15`) picks lazy when `is_compiled`, else silently falls back to
@@ -23,8 +23,8 @@ whole solver to the 100× path with no signal. The `dx` silent-drop bug lived in
 
 **Interpreted is NOT just an RHS fallback — it is load-bearing elsewhere** and cannot be deleted:
 
-- BVP steady solve — `solver_stepping.jl:238`
-- Nonlinear BVP Newton iteration — `solver_stepping.jl:322`
+- BVP steady solve — `stepping.jl:238`
+- Nonlinear BVP Newton iteration — `stepping.jl:322`
 - Algebraic constraint solving — `state_utils.jl:828, 933, 953` (`_try_solve_simple_constraint!`,
   `_evaluate_poisson_rhs`)
 
@@ -35,7 +35,7 @@ silent fallback), not speed.
 Lazy is a strict *subset* of interpreted. To make lazy total for the IVP RHS, these must gain lazy
 support (interpreted handles them, lazy returns `nothing` → fallback):
 
-1. `TensorField` (`solver_compiled_rhs.jl:176`)
+1. `TensorField` (`compiled_rhs.jl:176`)
 2. `ArrayOperator` (`:185`)
 3. `IndexOperator` (`:283`)
 4. `DotProduct` / `CrossProduct` Futures (`_translate_future_to_lazy` only does Add/Sub/Negate/Multiply)

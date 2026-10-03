@@ -150,7 +150,7 @@ Run the focused forcing tests and `test/test_stochastic_forcing.jl`. Commit as
 ### Task 4: GPU-aware default mixed subproblem solver
 
 **Files:**
-- Modify: `src/core/solvers/solver_types.jl`
+- Modify: `src/core/solvers/types.jl`
 - Test: `test/test_solvers.jl`
 - Test: `test/test_gpu_transform_correctness.jl`
 

@@ -3,7 +3,7 @@ using Tarang
 using LinearAlgebra
 using InteractiveUtils: subtypes
 
-# Coverage-focused tests for src/core/solvers/solver_state_vectors.jl
+# Coverage-focused tests for src/core/solvers/state_vectors.jl
 #
 # This module owns the field <-> flat-solver-vector conversion boundary
 # (pack/unpack). All functions live in the Tarang module namespace but are not

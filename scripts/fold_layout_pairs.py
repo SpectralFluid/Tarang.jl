@@ -3,7 +3,7 @@
 `<L>_data!(x)`.
 
 Only the adjacent, same-operand pattern is touched. `grid_data!` / `coeff_data!`
-(src/core/field/field_layout/field_layout_access.jl) are defined as exactly that
+(src/core/field/field_layout/access.jl) are defined as exactly that
 pair, so the rewrite cannot change behaviour. Everything else — a layout set for
 a read that happens later or elsewhere — is left for the layout ratchet
 (test/test_layout_discipline_ratchet.jl) to count.
@@ -20,9 +20,9 @@ ACC = {"g": ("get_grid_data", "grid_data!"), "c": ("get_coeff_data", "coeff_data
 folded = 0
 for d, _, files in os.walk(ROOT):
     for f in files:
-        if not f.endswith(".jl") or f == "field_layout_access.jl":
-            continue
         p = os.path.join(d, f)
+        if not f.endswith(".jl") or os.path.relpath(p, ROOT) == os.path.join("core", "field", "field_layout", "access.jl"):
+            continue
         L = open(p).read().split("\n")
         out, i, changed = [], 0, False
         while i < len(L):

@@ -1,5 +1,6 @@
 using Test
 using Tarang
+import FFTW
 
 function _advance_field_rk!(solver, state)
     ts = state.timestepper
@@ -44,44 +45,53 @@ end
 end
 
 @testset "2D field-native RK reuses bounded workspace" begin
-    for ts in (RK111(), RK222(), RK443())
-        @test Tarang._workspace_count(ts) == ts.stages + 1
-    end
+    # FFTW's Julia thread callbacks allocate scheduler metadata. Pin planning
+    # to one FFT thread so this budget measures solver workspace reuse, and
+    # restore the caller's policy for subsequent tests.
+    fftw_threads = FFTW.get_num_threads()
+    FFTW.set_num_threads(1)
+    try
+        for ts in (RK111(), RK222(), RK443())
+            @test Tarang._workspace_count(ts) == ts.stages + 1
+        end
 
-    n = 16
-    coords = CartesianCoordinates("x", "y")
-    dist = Distributor(coords; dtype=Float64, device=CPU())
-    xb = RealFourier(coords["x"]; size=n, bounds=(0.0, 2pi), dealias=3/2)
-    yb = RealFourier(coords["y"]; size=n, bounds=(0.0, 2pi), dealias=3/2)
-    domain = Domain(dist, (xb, yb))
+        n = 16
+        coords = CartesianCoordinates("x", "y")
+        dist = Distributor(coords; dtype=Float64, device=CPU())
+        xb = RealFourier(coords["x"]; size=n, bounds=(0.0, 2pi), dealias=3/2)
+        yb = RealFourier(coords["y"]; size=n, bounds=(0.0, 2pi), dealias=3/2)
+        domain = Domain(dist, (xb, yb))
 
-    zeta = ScalarField(domain, "zeta")
-    psi = ScalarField(domain, "psi")
-    velocity = VectorField(domain, "u")
-    tau_psi = ScalarField(dist, "tau_psi", (), Float64)
-    problem = InitialValueProblem([zeta, psi, velocity, tau_psi])
-    add_parameters!(problem; nu=1e-8, drag=1e-3)
-    add_equation!(problem, "dt(zeta) = -u⋅∇(zeta) - drag*zeta - nu*Δ⁴(zeta)")
-    add_equation!(problem, "Δ(psi) + tau_psi - zeta = 0")
-    add_equation!(problem, "u - skew(grad(psi)) = 0")
-    add_bc!(problem, "integ(psi) = 0")
+        zeta = ScalarField(domain, "zeta")
+        psi = ScalarField(domain, "psi")
+        velocity = VectorField(domain, "u")
+        tau_psi = ScalarField(dist, "tau_psi", (), Float64)
+        problem = InitialValueProblem([zeta, psi, velocity, tau_psi])
+        add_parameters!(problem; nu=1e-8, drag=1e-3)
+        add_equation!(problem, "dt(zeta) = -u⋅∇(zeta) - drag*zeta - nu*Δ⁴(zeta)")
+        add_equation!(problem, "Δ(psi) + tau_psi - zeta = 0")
+        add_equation!(problem, "u - skew(grad(psi)) = 0")
+        add_bc!(problem, "integ(psi) = 0")
 
-    dt = 1e-3
-    solver = InitialValueSolver(problem, RK222(); dt)
-    x = Tarang.get_grid_coordinates(domain; on_device=false)["x"]
-    y = Tarang.get_grid_coordinates(domain; on_device=false)["y"]
-    zeta["g"] = 1e-3 .* (sin.(x) .* cos.(y'))
-    state = Tarang._ensure_timestepper_state!(solver, dt)
+        dt = 1e-3
+        solver = InitialValueSolver(problem, RK222(); dt)
+        x = Tarang.get_grid_coordinates(domain; on_device=false)["x"]
+        y = Tarang.get_grid_coordinates(domain; on_device=false)["y"]
+        zeta["g"] = 1e-3 .* (sin.(x) .* cos.(y'))
+        state = Tarang._ensure_timestepper_state!(solver, dt)
 
-    for _ in 1:6
+        for _ in 1:6
+            _advance_field_rk!(solver, state)
+        end
+        recycled = get(state.timestepper_data, :explicit_field_rk_recycle, nothing)
         _advance_field_rk!(solver, state)
-    end
-    recycled = get(state.timestepper_data, :explicit_field_rk_recycle, nothing)
-    _advance_field_rk!(solver, state)
-    @test state.history[end] === recycled
+        @test state.history[end] === recycled
 
-    GC.gc()
-    allocated = @allocated _advance_field_rk!(solver, state)
-    @info "2D field-native RK warmed host allocation" bytes=allocated
-    @test allocated < 100_000
+        GC.gc()
+        allocated = @allocated _advance_field_rk!(solver, state)
+        @info "2D field-native RK warmed host allocation" bytes=allocated
+        @test allocated < 100_000
+    finally
+        FFTW.set_num_threads(fftw_threads)
+    end
 end

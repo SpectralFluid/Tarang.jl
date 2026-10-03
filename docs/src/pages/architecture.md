@@ -83,7 +83,7 @@ owning manifest and never as a one-off include in `src/Tarang.jl`:
 | 11 | `extras/load_extras.jl` | flow tools, plot tools, quick domains, analysis tasks |
 | 12 | `tools/load_pretty_printing.jl` | `show` methods |
 
-Entry points such as `src/core/field.jl`, `src/core/operators/operators.jl`,
+Entry points such as `src/core/field.jl`, `src/core/operators/core.jl`,
 `src/core/transforms.jl`, and `src/core/stochastic_forcing.jl` aggregate
 implementation files from their respective directories. Forcing is split
 under `src/core/forcing/`.
@@ -151,7 +151,7 @@ leak through user parameters or be reused by an unrelated solver run.
 
 For an InitialValueProblem, trace these files:
 
-1. `core/solvers/solver_types.jl` resets compiled state, parses equations,
+1. `core/solvers/types.jl` resets compiled state, parses equations,
    assembles global compatibility matrices, builds subproblems, and compiles
    the RHS plan.
 2. `core/problems/problem_matrices/` converts each `EquationIR` into sparse
@@ -160,10 +160,10 @@ For an InitialValueProblem, trace these files:
    applies valid-mode filtering, and owns per-mode runtime buffers.
 4. `core/solvers/lazy_rhs.jl` translates explicit expressions into a
    type-specialized evaluation tree.
-5. `core/solvers/solver_execution_plan.jl` records, once, the facts every later
+5. `core/solvers/execution_plan.jl` records, once, the facts every later
    decision reads: architecture (`:cpu`/`:gpu`), distribution, spectral
    structure, and whether global matrices and subproblems were assembled.
-6. `core/solvers/solver_stepping.jl` refreshes dynamic boundary conditions and
+6. `core/solvers/stepping.jl` refreshes dynamic boundary conditions and
    calls the timestepper dispatcher (`core/timesteppers/dispatch.jl`), which
    checks stochastic-forcing and single-GPU implicit-operator compatibility.
 7. `core/timesteppers/step_selection.jl` chooses the runtime path; the
@@ -300,7 +300,7 @@ mesh_axis_for(dist, ndim, axis)   # which mesh dimension splits `axis`, or nothi
 
 The two conventions it encodes differ: with PencilArrays the **last**
 `length(mesh)` axes are decomposed, and with `TransposableField` (GPU+MPI) the
-**first** ones are. Both live in `src/core/distributor/distributor_core.jl` and
+**first** ones are. Both live in `src/core/distributor/core.jl` and
 nowhere else.
 
 Use these helpers at call sites; `test_decomposition_convention.jl` detects

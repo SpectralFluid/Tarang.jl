@@ -1,5 +1,5 @@
 # =============================================================================
-# Tests for src/core/basis/basis_product_matrices.jl
+# Tests for src/core/basis/product_matrices.jl
 #
 # NCC (non-constant-coefficient) product matrices: ncc_matrix / product_matrix
 # for RealFourier and JacobiBasis, plus the Jacobi/Legendre linearization
@@ -92,7 +92,7 @@ function legendre_lin_oracle(m::Int, n::Int, k::Int)
     return (2k + 1) / 2 * sum(w .* Pm .* Pn .* Pk)
 end
 
-@testset "NCC product matrices (basis_product_matrices.jl)" begin
+@testset "NCC product matrices (product_matrices.jl)" begin
 
     # =======================================================================
     # RealFourier

@@ -144,7 +144,7 @@ const LAYER_ALLOWLIST = Dict(
     "dispatch_preprocess" => 2,
     "dispatch_check"      => 2,
 
-    # core/solvers/solver_stepping.jl drives output handlers directly. Removing
+    # core/solvers/stepping.jl drives output handlers directly. Removing
     # these needs the handler interface that core/evaluator.jl also wants — the
     # evaluator stores `netcdf_handlers` as a struct field, so the fix is an
     # abstract handler protocol, not a call-site edit.
@@ -221,7 +221,8 @@ end
     end
 
     # The arithmetic half stayed in core and must not have taken the I/O with it.
-    arith = [f for f in keys(stage_of) if endswith(f, "field_layout_arithmetic.jl")]
+    arith = [f for f in keys(stage_of)
+             if relpath(f, LAYER_SRC) == joinpath("core", "field", "field_layout", "arithmetic.jl")]
     @test length(arith) == 1
     @test _layer_owner(only(arith)) == "core"
     arith_src = read(only(arith), String)

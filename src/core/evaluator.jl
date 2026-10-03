@@ -472,21 +472,13 @@ global_max(reducer::GlobalArrayReducer, value::Real) = reduce_scalar(reducer, Fl
     is transferred to CPU for MPI reduction across ranks.
     """
 function global_mean(reducer::GlobalArrayReducer, data::AbstractArray)
-    # Reduce the LOCAL slab via `parent` (see global_sum): summing a PencilArray is
-    # collective, so sum(data) + reduce_scalar would double-reduce → nprocs× mean.
-    ld = parent(data)
-    local_sum = Float64(real(sum(ld)))
-    local_size = Float64(length(ld))
-    if eltype(data) <: Complex
-        local_imag = Float64(imag(sum(ld)))
-        global_real = reduce_scalar(reducer, local_sum, MPI.SUM)
-        global_imag = reduce_scalar(reducer, local_imag, MPI.SUM)
-        global_size = reduce_scalar(reducer, local_size, MPI.SUM)
-        return global_size > 0 ? complex(global_real, global_imag) / global_size : 0.0
-    end
-    global_sum = reduce_scalar(reducer, local_sum, MPI.SUM)
-    global_size = reduce_scalar(reducer, local_size, MPI.SUM)
-    return global_size > 0 ? global_sum / global_size : 0.0
+    # PencilArray sums are collective: reduce only its local slab, then combine
+    # sum and count once. Preserve this API's Float64/ComplexF64 result convention.
+    ld = _local_reduction_data(data)
+    local_sum = eltype(data) <: Complex ? ComplexF64(sum(ld)) : Float64(sum(ld))
+    comm = MPI.Initialized() && !MPI.Finalized() ? reducer.comm : nothing
+    total, n = _allreduce_moments((local_sum, length(ld)), comm)
+    return n > 0 ? total / n : 0.0
 end
 
 """

@@ -587,7 +587,7 @@ _get_equation_data(problem::Problem) = problem.equation_data
 function _get_residual_expression(eq_data)
     if isa(eq_data, AbstractDict)
         # The parser writes these under LOWERCASE "lhs"/"rhs"
-        # (problem_matrices_build.jl). This read "LHS"/"RHS", which nothing in the
+        # (build.jl). This read "LHS"/"RHS", which nothing in the
         # package ever writes, so the subtraction branch was unreachable and every
         # residual fell through to `F` — a Newton Jacobian missing the entire
         # implicit `L` contribution, with no error to say so.

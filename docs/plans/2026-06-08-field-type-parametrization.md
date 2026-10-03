@@ -22,13 +22,13 @@ Blast radius and a payoff-killing paradox:
   signatures** across **60–80 files**.
 - **Container erasure eats ~60% of the win.** Parametrizing bases makes *each distinct bases tuple a
   distinct concrete type*. But fields live in heterogeneous containers:
-  - `InitialValueSolver.state::Vector{<:ScalarField}` (`solver_types.jl:218`)
+  - `InitialValueSolver.state::Vector{<:ScalarField}` (`types.jl:218`)
   - `FieldPool.available::Dict{PoolKey, Vector{ScalarField}}` (`field_pool.jl:56`)
   - RK stage buffers `Vector{Vector{ScalarField}}` (`step_diagonal_imex.jl`, `step_rk.jl`)
-  - `_DERIV_RESULT_POOL::Dict{Tuple, Vector{ScalarField}}` (`derivatives_eval.jl:142`)
+  - `_DERIV_RESULT_POOL::Dict{Tuple, Vector{ScalarField}}` (`eval.jl:142`)
   A multi-field system (e.g. u, T on different bases) makes these vectors abstract-element *again* →
   iterating them still boxes.
-- **It actively breaks an existing optimization:** `_concretize_state_fields` (`solver_types.jl:161`)
+- **It actively breaks an existing optimization:** `_concretize_state_fields` (`types.jl:161`)
   narrows the state vector to a concrete type when all fields share a type. With per-bases types, a
   mixed-bases system fails the narrowing → state stays abstract. So the refactor can make the *solver
   state* less concrete, not more.

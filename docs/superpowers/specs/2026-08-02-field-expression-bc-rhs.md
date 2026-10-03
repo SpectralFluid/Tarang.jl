@@ -103,7 +103,7 @@ Three pieces:
 At BC→equation lowering, after the string has been parsed against the namespace, test
 whether the resulting tree references a `ScalarField`/`VectorField`. Reuse
 `_detect_equation_variables` (already used by `_references_variable` in
-`problem_matrices_spectral.jl`) rather than writing a new tree walk.
+`spectral.jl`) rather than writing a new tree walk.
 
 A BC that does must be registered as **both** space- and time-dependent, so its cached
 value is keyed by time and re-evaluated every step: the referenced fields evolve, and a
@@ -126,7 +126,7 @@ Given the BC's `coordinate` and `position` (both are fields on `DirichletBC` /
 - gather to a global array over the Fourier axes. Under MPI the boundary row lives on
   whichever rank owns that index, and the consumer needs the whole line. Use the
   zero-fill + `MPI.Allreduce(+)` pattern from `_allgather_global_grid`
-  (`operations_integrate.jl`) — a built-in reduction op, safe on every architecture,
+  (`integrate.jl`) — a built-in reduction op, safe on every architecture,
   unlike `gather`.
 
 The result must be a plain global `Array` over the Fourier axes, matching what

@@ -786,13 +786,7 @@ function _leftover_prestage!(sp, sp_idx, MX0, RHS, ALG_F, state_fields,
     RHS[sp_idx] = rhs
 
     alg_f = _sp_stage_vector!(sp, :alg_f, n_eq, mx0)
-    # `alg_F_is_static` mirrors the guard in step_subproblem_rk.jl: BC values
-    # read live from parameter fields / BC arrays must re-gather every step.
-    if bc_dynamic || !alg_F_is_static(sp) ||
-       sp.runtime.alg_F_gathered_into !== alg_f
-        gather_alg_F!(alg_f, sp)
-    end
-    ALG_F[sp_idx] = alg_f
+    ALG_F[sp_idx] = _ensure_alg_F!(alg_f, sp, bc_dynamic)
     return nothing
 end
 
@@ -1035,10 +1029,7 @@ function step_subproblem_rk_batched!(solver::InitialValueSolver,
                                   MX0, RHS, F, LX)
         end
 
-        for (f, fft_pa) in _fg_F_stash
-            set_coeff_data!(f, fft_pa)
-        end
-        _release_rhs_buffer!(F_fields, solver)
+        _restore_subproblem_rhs!(F_fields, _fg_F_stash, solver)
     end
 
     # The public state is at `t + dt`, which an arbitrary tableau need not use

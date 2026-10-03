@@ -13,12 +13,12 @@ This file contains all differentiation implementations including:
 
 
 # Runtime map:
-#   derivatives_eval.jl         — gradient/divergence evaluators and Differentiate dispatch
-#   derivatives_fourier.jl      — Fourier derivative implementations for local and distributed layouts
-#   derivatives_polynomial.jl   — Chebyshev and Legendre derivative implementations
-#   derivatives_matrix_apply.jl — dense/sparse matrix application helpers along arbitrary axes
+#   eval.jl         — gradient/divergence evaluators and Differentiate dispatch
+#   fourier.jl      — Fourier derivative implementations for local and distributed layouts
+#   polynomial.jl   — Chebyshev and Legendre derivative implementations
+#   matrix_apply.jl — dense/sparse matrix application helpers along arbitrary axes
 
-include("derivatives/derivatives_eval.jl")
-include("derivatives/derivatives_fourier.jl")
-include("derivatives/derivatives_polynomial.jl")
-include("derivatives/derivatives_matrix_apply.jl")
+include("derivatives/eval.jl")
+include("derivatives/fourier.jl")
+include("derivatives/polynomial.jl")
+include("derivatives/matrix_apply.jl")

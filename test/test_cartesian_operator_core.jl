@@ -1,5 +1,5 @@
 """
-Dedicated tests for `src/core/cartesian_operators/cartesian_operator_core.jl`.
+Dedicated tests for `src/core/cartesian_operators/core.jl`.
 
 Targets the previously-uncovered surface of the CartesianComponent operator and
 its core helpers:

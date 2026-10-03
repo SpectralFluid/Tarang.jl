@@ -1,7 +1,7 @@
 """
 Legendre's stored coefficients are ORTHONORMAL; its classical matrices are not.
 
-`setup_legendre_transform!` (transform_planning.jl) normalizes with
+`setup_legendre_transform!` (planning.jl) normalizes with
 `sqrt((2n+1)/2)`, so a Legendre field stores coefficients of `P̃ₙ = γₙ Pₙ`. But
 `differentiation_matrix` implements the classical recurrence for un-normalized
 `Pₙ`, and `evaluate_basis` returns un-normalized `Pₙ` values. Both of those are
@@ -22,7 +22,7 @@ Measured before the fix:
                                                     ~80% relative, no error raised
 
 The bridge is `stored_basis_scaling` / `spectral_derivative_matrix` /
-`evaluate_stored_basis` in basis_operators.jl. These tests pin the bridge and the
+`evaluate_stored_basis` in operators.jl. These tests pin the bridge and the
 end-to-end result, and — importantly — pin that ChebyshevT is UNCHANGED, since a
 bridge that quietly rescaled Chebyshev would break everything else.
 """

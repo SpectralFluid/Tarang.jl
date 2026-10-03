@@ -85,6 +85,22 @@ struct NCCLTransposeBuffer{T}
 
     # Pencil reference
     pencil::PencilDecomposition
+
+    # Immutable geometry entries shared only by this buffer. Full-grid and
+    # coefficient pencils can alternate without re-uploading their metadata.
+    chunk_plans::Dict{Tuple,NTuple{3,CuArray{Int,1}}}
+    wire_plans::Dict{Tuple,NTuple{4,Vector{Int}}}
+end
+
+# Retain the existing constructor used by backend harnesses and callers.
+function NCCLTransposeBuffer{T}(send, recv, sc, rc, sd, rd,
+                               s_chunks, s_displs, s_prefix,
+                               r_chunks, r_displs, r_prefix,
+                               host, comms, pencil) where {T}
+    return NCCLTransposeBuffer{T}(send, recv, sc, rc, sd, rd,
+        s_chunks, s_displs, s_prefix, r_chunks, r_displs, r_prefix,
+        host, comms, pencil, Dict{Tuple,NTuple{3,CuArray{Int,1}}}(),
+        Dict{Tuple,NTuple{4,Vector{Int}}}())
 end
 
 """
@@ -155,27 +171,29 @@ end
 """
     _stage_chunk_plan!(buffer, side, n_total, npeers) -> (chunks, displs, prefix)
 
-Fill `buffer`'s preallocated device chunk-plan vectors for an even split of
-`n_total` across `npeers` peers (remainder to the first `n_total % npeers`), and
-return them. `side` is `:send` or `:recv`, selecting which host displacement
-vector to upload alongside.
-
-Entries past `npeers` are left stale on purpose: every consumer — the pack and
-unpack kernels and `_gpu_find_rank` — is passed `nranks` explicitly and reads
-only `1:nranks`.
-
-Allocation-free. The three device vectors, and the host staging vector the chunk
-sizes and prefix sums are built in, all live on `buffer`.
+Return a buffer-owned device chunk plan for this exact split and displacement
+geometry. Entries are immutable after upload, including when full-grid and
+coefficient pencils alternate. Communication remains synchronous, so bounded
+cache eviction cannot discard metadata from an unfinished kernel.
 """
 function _stage_chunk_plan!(buffer::NCCLTransposeBuffer, side::Symbol,
                             n_total::Int, npeers::Int)
-    chunks_dev, displs_dev, prefix_dev, displs_host = if side === :send
-        buffer.send_chunks_dev, buffer.send_displs_dev, buffer.send_prefix_dev, buffer.send_displs
+    initial, displs_host = if side === :send
+        (buffer.send_chunks_dev, buffer.send_displs_dev, buffer.send_prefix_dev), buffer.send_displs
     elseif side === :recv
-        buffer.recv_chunks_dev, buffer.recv_displs_dev, buffer.recv_prefix_dev, buffer.recv_displs
+        (buffer.recv_chunks_dev, buffer.recv_displs_dev, buffer.recv_prefix_dev), buffer.recv_displs
     else
         error("_stage_chunk_plan!: side must be :send or :recv, got $side")
     end
+    # The vectors contain geometry only; no communicator handle is borrowed.
+    # Exact values distinguish uneven splits and the two pencils used by DCT.
+    key = (side, CUDA.context(), n_total, npeers, ntuple(i -> displs_host[i], npeers))
+    cached = get(buffer.chunk_plans, key, nothing)
+    cached === nothing || return cached
+    length(buffer.chunk_plans) >= 32 && empty!(buffer.chunk_plans)
+    first_side = !any(k -> k[1] === side, keys(buffer.chunk_plans))
+    chunks_dev, displs_dev, prefix_dev = first_side ? initial :
+        ntuple(_ -> similar(initial[1]), 3)
 
     host = buffer.host_scratch
     base, rem = divrem(n_total, npeers)
@@ -184,13 +202,39 @@ function _stage_chunk_plan!(buffer::NCCLTransposeBuffer, side::Symbol,
         c = base + (i - 1 < rem ? 1 : 0)
         host[i] = c
         acc += c
-        host[npeers + i] = acc      # prefix sums staged behind the chunk sizes
+        host[npeers + i] = acc
     end
-
     copyto!(chunks_dev, 1, host, 1, npeers)
     copyto!(prefix_dev, 1, host, npeers + 1, npeers)
     copyto!(displs_dev, 1, displs_host, 1, npeers)
-    return chunks_dev, displs_dev, prefix_dev
+    plan = (chunks_dev, displs_dev, prefix_dev)
+    buffer.chunk_plans[key] = plan
+    return plan
+end
+
+# Cache the exact wire counts, avoiding sliced vectors and repeat complex-count
+# conversions. Public nccl_alltoall! retains its standalone complex API.
+function _nccl_wire_plan!(buffer::NCCLTransposeBuffer{T}, npeers::Int) where {T}
+    counts = (buffer.send_counts, buffer.recv_counts, buffer.send_displs, buffer.recv_displs)
+    key = ntuple(j -> ntuple(i -> counts[j][i], npeers), 4)
+    cached = get(buffer.wire_plans, key, nothing)
+    cached === nothing || return cached
+    length(buffer.wire_plans) >= 32 && empty!(buffer.wire_plans)
+    factor = T <: Complex ? 2 : 1
+    plan = ntuple(j -> [factor * counts[j][i] for i in 1:npeers], 4)
+    buffer.wire_plans[key] = plan
+    return plan
+end
+
+function _nccl_buffer_alltoall!(buffer::NCCLTransposeBuffer{T}, comm, npeers::Int;
+                                my_rank::Int) where {T}
+    sc, rc, sd, rd = _nccl_wire_plan!(buffer, npeers)
+    send, recv = if T <: Complex
+        reinterpret(real(T), buffer.send_buffer), reinterpret(real(T), buffer.recv_buffer)
+    else
+        buffer.send_buffer, buffer.recv_buffer
+    end
+    return nccl_alltoall!(send, recv, sc, rc, sd, rd, comm; my_rank)
 end
 
 # ============================================================================
@@ -539,6 +583,15 @@ sizes) may require more sophisticated handling in future versions.
 function Tarang.transpose_z_to_y!(buffer::NCCLTransposeBuffer{T},
                             data::CuArray{T, 3},
                             pencil::PencilDecomposition) where T
+    output = CUDA.zeros(T, pencil.y_pencil_shape...)
+    return _transpose_z_to_y!(output, buffer, data, pencil)
+end
+
+# Destination-taking variant for plan-owned intermediates. Public calls above
+# continue returning an independently owned array.
+function _transpose_z_to_y!(output::CuArray{T,3}, buffer::NCCLTransposeBuffer{T},
+                              data::CuArray{T,3}, pencil::PencilDecomposition) where T
+    size(output) == pencil.y_pencil_shape || throw(DimensionMismatch("transpose_z_to_y! destination shape"))
     # CRITICAL: Use error() instead of @assert for production safety
     if current_orientation(pencil) != :z_pencil
         error("transpose_z_to_y!: Must be in Z-pencil orientation, currently in $(current_orientation(pencil))")
@@ -553,7 +606,6 @@ function Tarang.transpose_z_to_y!(buffer::NCCLTransposeBuffer{T},
     # For single-rank row comm, just reshape
     if row_size == 1
         set_orientation!(pencil, :y_pencil)
-        output = CUDA.zeros(T, pencil.y_pencil_shape...)
         copyto!(reshape(output, :), reshape(data, :))
         return output
     end
@@ -566,26 +618,8 @@ function Tarang.transpose_z_to_y!(buffer::NCCLTransposeBuffer{T},
               "multi-GPU transposes (see the init_nccl_subcomms! warning for the root cause).")
     end
 
-    # Compute counts: split Z (fully local) among row_size peers, gather Y
     Ny_global = pencil.global_shape[2]
-    row_rank = MPI.Comm_rank(pencil.row_comm)
-    Nz_me = div(Nz, row_size) + (row_rank < mod(Nz, row_size) ? 1 : 0)
-    for i in 1:row_size
-        Nz_i = div(Nz, row_size) + ((i-1) < mod(Nz, row_size) ? 1 : 0)
-        Ny_i = div(Ny_global, row_size) + ((i-1) < mod(Ny_global, row_size) ? 1 : 0)
-        # Send: our (Nx_local, Ny_local) face × Nz_i z-slices for rank i
-        buffer.send_counts[i] = Nx_local * Ny_local * Nz_i
-        # Recv: rank i's Ny_i y-chunk × our Nz_me z-slices
-        buffer.recv_counts[i] = Nx_local * Ny_i * Nz_me
-    end
-
-    # Compute displacements
-    buffer.send_displs[1] = 0
-    buffer.recv_displs[1] = 0
-    for i in 2:row_size
-        buffer.send_displs[i] = buffer.send_displs[i-1] + buffer.send_counts[i-1]
-        buffer.recv_displs[i] = buffer.recv_displs[i-1] + buffer.recv_counts[i-1]
-    end
+    _compute_transpose_counts!(buffer, pencil, :z_to_y, size(data), row_size)
 
     # Pack data: split by Z dimension (z_chunk_sizes for each rank)
     chunk_sizes_gpu, displs_gpu, prefix_sums_gpu =
@@ -597,15 +631,9 @@ function Tarang.transpose_z_to_y!(buffer::NCCLTransposeBuffer{T},
 
     # Perform NCCL all-to-all (pass my_rank to avoid self-send deadlock)
     row_rank = MPI.Comm_rank(pencil.row_comm)
-    nccl_alltoall!(
-        buffer.send_buffer, buffer.recv_buffer,
-        buffer.send_counts[1:row_size], buffer.recv_counts[1:row_size],
-        buffer.send_displs[1:row_size], buffer.recv_displs[1:row_size],
-        buffer.nccl_subcomms.row_comm; my_rank=row_rank
-    )
+    _nccl_buffer_alltoall!(buffer, buffer.nccl_subcomms.row_comm, row_size; my_rank=row_rank)
 
     # Create output in Y-pencil shape and unpack
-    output = CUDA.zeros(T, pencil.y_pencil_shape...)
     Nx_y, Ny_y, Nz_y = pencil.y_pencil_shape
 
     # Unpack: each peer contributed its Ny_local chunk (Y-chunks)
@@ -640,6 +668,15 @@ in future versions.
 function Tarang.transpose_y_to_z!(buffer::NCCLTransposeBuffer{T},
                             data::CuArray{T, 3},
                             pencil::PencilDecomposition) where T
+    output = CUDA.zeros(T, pencil.z_pencil_shape...)
+    return _transpose_y_to_z!(output, buffer, data, pencil)
+end
+
+# Destination-taking variant for plan-owned intermediates. Public calls above
+# continue returning an independently owned array.
+function _transpose_y_to_z!(output::CuArray{T,3}, buffer::NCCLTransposeBuffer{T},
+                              data::CuArray{T,3}, pencil::PencilDecomposition) where T
+    size(output) == pencil.z_pencil_shape || throw(DimensionMismatch("transpose_y_to_z! destination shape"))
     # CRITICAL: Use error() instead of @assert for production safety
     if current_orientation(pencil) != :y_pencil
         error("transpose_y_to_z!: Must be in Y-pencil orientation, currently in $(current_orientation(pencil))")
@@ -653,7 +690,6 @@ function Tarang.transpose_y_to_z!(buffer::NCCLTransposeBuffer{T},
 
     if row_size == 1
         set_orientation!(pencil, :z_pencil)
-        output = CUDA.zeros(T, pencil.z_pencil_shape...)
         copyto!(reshape(output, :), reshape(data, :))
         return output
     end
@@ -666,29 +702,8 @@ function Tarang.transpose_y_to_z!(buffer::NCCLTransposeBuffer{T},
               "multi-GPU transposes (see the init_nccl_subcomms! warning for the root cause).")
     end
 
-    # For Y->Z transpose: partition Y (send Y-chunks), receive Z-chunks
-    # Y-pencil: (Nx_local, Ny, Nz_local) where Ny is full, Nz is partitioned
-    # Z-pencil: (Nx_local, Ny_local, Nz) where Ny is partitioned, Nz is full
     Nz_global = pencil.global_shape[3]
-    Ny_local_after = pencil.z_pencil_shape[2]  # Ny/row_size after transpose
-
-    for i in 1:row_size
-        # CRITICAL FIX: Correct counts for Y→Z transpose
-        # Send: partition Ny dimension for each destination rank
-        Ny_chunk_for_i = div(Ny, row_size) + ((i-1) < mod(Ny, row_size) ? 1 : 0)
-        buffer.send_counts[i] = Nx_local * Ny_chunk_for_i * Nz_local
-
-        # Recv: receive Nz_chunk from each source rank
-        Nz_chunk_from_i = div(Nz_global, row_size) + ((i-1) < mod(Nz_global, row_size) ? 1 : 0)
-        buffer.recv_counts[i] = Nx_local * Ny_local_after * Nz_chunk_from_i
-    end
-
-    buffer.send_displs[1] = 0
-    buffer.recv_displs[1] = 0
-    for i in 2:row_size
-        buffer.send_displs[i] = buffer.send_displs[i-1] + buffer.send_counts[i-1]
-        buffer.recv_displs[i] = buffer.recv_displs[i-1] + buffer.recv_counts[i-1]
-    end
+    _compute_transpose_counts!(buffer, pencil, :y_to_z, size(data), row_size)
 
     # CRITICAL FIX: Use proper pack kernel for uneven decomposition
     # Partition Y dimension and pack data for each destination rank
@@ -700,14 +715,8 @@ function Tarang.transpose_y_to_z!(buffer::NCCLTransposeBuffer{T},
     CUDA.synchronize()
 
     row_rank = MPI.Comm_rank(pencil.row_comm)
-    nccl_alltoall!(
-        buffer.send_buffer, buffer.recv_buffer,
-        buffer.send_counts[1:row_size], buffer.recv_counts[1:row_size],
-        buffer.send_displs[1:row_size], buffer.recv_displs[1:row_size],
-        buffer.nccl_subcomms.row_comm; my_rank=row_rank
-    )
+    _nccl_buffer_alltoall!(buffer, buffer.nccl_subcomms.row_comm, row_size; my_rank=row_rank)
 
-    output = CUDA.zeros(T, pencil.z_pencil_shape...)
     Nx_z, Ny_z, Nz_z = pencil.z_pencil_shape
 
     recv_chunk_sizes_gpu, recv_displs_gpu, recv_prefix_sums_gpu =
@@ -745,6 +754,15 @@ in future versions.
 function Tarang.transpose_y_to_x!(buffer::NCCLTransposeBuffer{T},
                             data::CuArray{T, 3},
                             pencil::PencilDecomposition) where T
+    output = CUDA.zeros(T, pencil.x_pencil_shape...)
+    return _transpose_y_to_x!(output, buffer, data, pencil)
+end
+
+# Destination-taking variant for plan-owned intermediates. Public calls above
+# continue returning an independently owned array.
+function _transpose_y_to_x!(output::CuArray{T,3}, buffer::NCCLTransposeBuffer{T},
+                              data::CuArray{T,3}, pencil::PencilDecomposition) where T
+    size(output) == pencil.x_pencil_shape || throw(DimensionMismatch("transpose_y_to_x! destination shape"))
     # CRITICAL: Use error() instead of @assert for production safety
     if current_orientation(pencil) != :y_pencil
         error("transpose_y_to_x!: Must be in Y-pencil orientation, currently in $(current_orientation(pencil))")
@@ -758,7 +776,6 @@ function Tarang.transpose_y_to_x!(buffer::NCCLTransposeBuffer{T},
 
     if col_size == 1
         set_orientation!(pencil, :x_pencil)
-        output = CUDA.zeros(T, pencil.x_pencil_shape...)
         copyto!(reshape(output, :), reshape(data, :))
         return output
     end
@@ -771,25 +788,8 @@ function Tarang.transpose_y_to_x!(buffer::NCCLTransposeBuffer{T},
               "multi-GPU transposes (see the init_nccl_subcomms! warning for the root cause).")
     end
 
-    # Compute counts: split Y (fully local) among col_size peers, gather X
     Nx_global = pencil.global_shape[1]
-    col_rank = MPI.Comm_rank(pencil.col_comm)
-    Ny_me = div(Ny, col_size) + (col_rank < mod(Ny, col_size) ? 1 : 0)
-    for i in 1:col_size
-        Ny_i = div(Ny, col_size) + ((i-1) < mod(Ny, col_size) ? 1 : 0)
-        Nx_i = div(Nx_global, col_size) + ((i-1) < mod(Nx_global, col_size) ? 1 : 0)
-        # Send: our (Nx_local, Nz_local) face × Ny_i y-slices for rank i
-        buffer.send_counts[i] = Nx_local * Ny_i * Nz_local
-        # Recv: rank i's Nx_i x-chunk × our Ny_me y-slices
-        buffer.recv_counts[i] = Nx_i * Ny_me * Nz_local
-    end
-
-    buffer.send_displs[1] = 0
-    buffer.recv_displs[1] = 0
-    for i in 2:col_size
-        buffer.send_displs[i] = buffer.send_displs[i-1] + buffer.send_counts[i-1]
-        buffer.recv_displs[i] = buffer.recv_displs[i-1] + buffer.recv_counts[i-1]
-    end
+    _compute_transpose_counts!(buffer, pencil, :y_to_x, size(data), col_size)
 
     # Pack data: split by Y dimension (y_chunk_sizes for each rank)
     chunk_sizes_gpu, displs_gpu, prefix_sums_gpu =
@@ -800,14 +800,8 @@ function Tarang.transpose_y_to_x!(buffer::NCCLTransposeBuffer{T},
     CUDA.synchronize()
 
     col_rank = MPI.Comm_rank(pencil.col_comm)
-    nccl_alltoall!(
-        buffer.send_buffer, buffer.recv_buffer,
-        buffer.send_counts[1:col_size], buffer.recv_counts[1:col_size],
-        buffer.send_displs[1:col_size], buffer.recv_displs[1:col_size],
-        buffer.nccl_subcomms.col_comm; my_rank=col_rank
-    )
+    _nccl_buffer_alltoall!(buffer, buffer.nccl_subcomms.col_comm, col_size; my_rank=col_rank)
 
-    output = CUDA.zeros(T, pencil.x_pencil_shape...)
     Nx_x, Ny_x, Nz_x = pencil.x_pencil_shape
 
     recv_chunk_sizes_gpu, recv_displs_gpu, recv_prefix_sums_gpu =
@@ -842,6 +836,15 @@ in future versions.
 function Tarang.transpose_x_to_y!(buffer::NCCLTransposeBuffer{T},
                             data::CuArray{T, 3},
                             pencil::PencilDecomposition) where T
+    output = CUDA.zeros(T, pencil.y_pencil_shape...)
+    return _transpose_x_to_y!(output, buffer, data, pencil)
+end
+
+# Destination-taking variant for plan-owned intermediates. Public calls above
+# continue returning an independently owned array.
+function _transpose_x_to_y!(output::CuArray{T,3}, buffer::NCCLTransposeBuffer{T},
+                              data::CuArray{T,3}, pencil::PencilDecomposition) where T
+    size(output) == pencil.y_pencil_shape || throw(DimensionMismatch("transpose_x_to_y! destination shape"))
     # CRITICAL: Use error() instead of @assert for production safety
     if current_orientation(pencil) != :x_pencil
         error("transpose_x_to_y!: Must be in X-pencil orientation, currently in $(current_orientation(pencil))")
@@ -855,7 +858,6 @@ function Tarang.transpose_x_to_y!(buffer::NCCLTransposeBuffer{T},
 
     if col_size == 1
         set_orientation!(pencil, :y_pencil)
-        output = CUDA.zeros(T, pencil.y_pencil_shape...)
         copyto!(reshape(output, :), reshape(data, :))
         return output
     end
@@ -868,27 +870,10 @@ function Tarang.transpose_x_to_y!(buffer::NCCLTransposeBuffer{T},
               "multi-GPU transposes (see the init_nccl_subcomms! warning for the root cause).")
     end
 
-    # For X->Y transpose, we split X among ranks and gather Y
-    Nx_global = Nx  # In X-pencil, Nx is the full global X dimension
+    Nx_global = Nx
     Ny_global = pencil.global_shape[2]
     col_rank = MPI.Comm_rank(pencil.col_comm)
-
-    for i in 1:col_size
-        Nx_i = div(Nx_global, col_size) + ((i-1) < mod(Nx_global, col_size) ? 1 : 0)
-        Ny_i = div(Ny_global, col_size) + ((i-1) < mod(Ny_global, col_size) ? 1 : 0)
-        # Send: Nx_i x-slices × our (Ny_local, Nz_local)
-        buffer.send_counts[i] = Nx_i * Ny_local * Nz_local
-        # Recv: rank i's Ny_i y-slices × our Nx_local
-        Nx_me = div(Nx_global, col_size) + (col_rank < mod(Nx_global, col_size) ? 1 : 0)
-        buffer.recv_counts[i] = Nx_me * Ny_i * Nz_local
-    end
-
-    buffer.send_displs[1] = 0
-    buffer.recv_displs[1] = 0
-    for i in 2:col_size
-        buffer.send_displs[i] = buffer.send_displs[i-1] + buffer.send_counts[i-1]
-        buffer.recv_displs[i] = buffer.recv_displs[i-1] + buffer.recv_counts[i-1]
-    end
+    _compute_transpose_counts!(buffer, pencil, :x_to_y, size(data), col_size)
 
     # Pack data: split by X dimension using GPU kernel
     chunk_sizes_gpu, displs_gpu, prefix_sums_gpu =
@@ -898,14 +883,8 @@ function Tarang.transpose_x_to_y!(buffer::NCCLTransposeBuffer{T},
            chunk_sizes_gpu, displs_gpu, col_size, prefix_sums_gpu; ndrange=total)
     CUDA.synchronize()
 
-    nccl_alltoall!(
-        buffer.send_buffer, buffer.recv_buffer,
-        buffer.send_counts[1:col_size], buffer.recv_counts[1:col_size],
-        buffer.send_displs[1:col_size], buffer.recv_displs[1:col_size],
-        buffer.nccl_subcomms.col_comm; my_rank=col_rank
-    )
+    _nccl_buffer_alltoall!(buffer, buffer.nccl_subcomms.col_comm, col_size; my_rank=col_rank)
 
-    output = CUDA.zeros(T, pencil.y_pencil_shape...)
     Nx_y, Ny_y, Nz_y = pencil.y_pencil_shape
 
     recv_chunk_sizes_gpu, recv_displs_gpu, recv_prefix_sums_gpu =
@@ -929,10 +908,10 @@ end
 
 Compute send/recv counts for the specified transpose direction.
 
-The formulas mirror EXACTLY the inline count computations inside the production
-`transpose_z_to_y!`/`transpose_y_to_z!`/`transpose_y_to_x!`/`transpose_x_to_y!`
-(pairwise symmetric, uneven-decomposition-aware, per-rank chunk sizes — never
-full pencil dims). Invariant: `sum(send_counts) == prod(<source pencil shape>)`.
+Use the same uneven-partition formulas as the production transpose drivers,
+with the buffer's original pencil. The drivers pass their current pencil and
+source shape explicitly because DCT shares one buffer between full-grid and
+coefficient pencils. Invariant: `sum(send_counts) == prod(<source pencil shape>)`.
 
 # Arguments
 - `buffer`: Transpose buffer to update counts in
@@ -947,13 +926,19 @@ function compute_transpose_counts!(buffer::NCCLTransposeBuffer, direction::Symbo
         comm_size = MPI.Comm_size(pencil.col_comm)
     end
 
+    source_shape = direction == :z_to_y ? pencil.z_pencil_shape :
+                   direction == :x_to_y ? pencil.x_pencil_shape : pencil.y_pencil_shape
+    return _compute_transpose_counts!(buffer, pencil, direction, source_shape, comm_size)
+end
+
+function _compute_transpose_counts!(buffer::NCCLTransposeBuffer, pencil::PencilDecomposition,
+                                    direction::Symbol, source_shape::NTuple{3,Int}, comm_size::Int)
     if direction == :z_to_y
         # Z->Y (row comm): split our fully-local Z among peers, gather Y.
         # Source layout is the Z-pencil (Nx_local, Ny_local, Nz_global).
         Ny_g = pencil.global_shape[2]
-        Nz_g = pencil.global_shape[3]
-        Nx_local = pencil.z_pencil_shape[1]
-        Ny_local = pencil.z_pencil_shape[2]
+        Nz_g = source_shape[3]
+        Nx_local, Ny_local = source_shape[1:2]
         row_rank = MPI.Comm_rank(pencil.row_comm)
         Nz_me = div(Nz_g, comm_size) + (row_rank < mod(Nz_g, comm_size) ? 1 : 0)
 
@@ -968,10 +953,10 @@ function compute_transpose_counts!(buffer::NCCLTransposeBuffer, direction::Symbo
     elseif direction == :y_to_z
         # Y->Z (row comm): split our fully-local Y among peers, gather Z.
         # Source layout is the Y-pencil (Nx_local, Ny_global, Nz_local).
-        Ny_g = pencil.global_shape[2]
+        Ny_g = source_shape[2]
         Nz_g = pencil.global_shape[3]
-        Nx_local = pencil.y_pencil_shape[1]
-        Nz_local = pencil.y_pencil_shape[3]
+        Nx_local = source_shape[1]
+        Nz_local = source_shape[3]
         Ny_local_after = pencil.z_pencil_shape[2]  # our Y chunk after transpose
 
         for i in 1:comm_size
@@ -986,9 +971,9 @@ function compute_transpose_counts!(buffer::NCCLTransposeBuffer, direction::Symbo
         # Y->X (col comm): split our fully-local Y among peers, gather X.
         # Source layout is the Y-pencil (Nx_local, Ny_global, Nz_local).
         Nx_g = pencil.global_shape[1]
-        Ny_g = pencil.global_shape[2]
-        Nx_local = pencil.y_pencil_shape[1]
-        Nz_local = pencil.y_pencil_shape[3]
+        Ny_g = source_shape[2]
+        Nx_local = source_shape[1]
+        Nz_local = source_shape[3]
         col_rank = MPI.Comm_rank(pencil.col_comm)
         Ny_me = div(Ny_g, comm_size) + (col_rank < mod(Ny_g, comm_size) ? 1 : 0)
 
@@ -1003,10 +988,10 @@ function compute_transpose_counts!(buffer::NCCLTransposeBuffer, direction::Symbo
     elseif direction == :x_to_y
         # X->Y (col comm): split our fully-local X among peers, gather Y.
         # Source layout is the X-pencil (Nx_global, Ny_local, Nz_local).
-        Nx_g = pencil.global_shape[1]
+        Nx_g = source_shape[1]
         Ny_g = pencil.global_shape[2]
-        Ny_local = pencil.x_pencil_shape[2]
-        Nz_local = pencil.x_pencil_shape[3]
+        Ny_local = source_shape[2]
+        Nz_local = source_shape[3]
         col_rank = MPI.Comm_rank(pencil.col_comm)
         Nx_me = div(Nx_g, comm_size) + (col_rank < mod(Nx_g, comm_size) ? 1 : 0)
 
@@ -1038,5 +1023,7 @@ end
 Clean up NCCL transpose buffer resources.
 """
 function finalize_nccl_transpose!(buffer::NCCLTransposeBuffer)
+    empty!(buffer.chunk_plans)
+    empty!(buffer.wire_plans)
     Tarang.finalize_nccl_subcomms!(buffer.nccl_subcomms)
 end

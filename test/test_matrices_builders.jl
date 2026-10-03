@@ -1,4 +1,4 @@
-# Tests for src/core/operators/matrices/matrices_builders.jl
+# Tests for src/core/operators/matrices/builders.jl
 #
 # Covers the low-level operator-matrix builders:
 #   - fourier_differentiation_matrix(::ComplexFourier, order)
@@ -16,7 +16,7 @@ using Tarang
 using LinearAlgebra
 using SparseArrays
 
-@testset "matrices_builders.jl" begin
+@testset "builders.jl" begin
 
     # ------------------------------------------------------------------
     # ComplexFourier differentiation matrix

@@ -4,20 +4,20 @@ Guard tests for CPU correctness audit batch 3 (2026-06-19, fix/cpu-correctness-b
 Six wrong-answer bugs found by an ultracode multi-subsystem audit + adversarial
 verification, all FIXED and verified here against analytic oracles:
 
-  C1 (HIGH) matrices_subproblem_operators.jl — Interpolate BC row hardcoded the
+  C1 (HIGH) subproblem_operators.jl — Interpolate BC row hardcoded the
        ChebyshevT recurrence T_n(ξ) for EVERY Jacobi coupled basis, so Dirichlet/
        point BCs on ChebyshevU/V/Ultraspherical/Legendre/Jacobi enforced the wrong
        functional (U_n(±1)=(±1)^n(n+1) ≠ T_n(±1)). Fixed via basis-aware evaluate_basis.
-  C2 (MED) matrices_subproblem_operators.jl — Integrate-constraint weight row
+  C2 (MED) subproblem_operators.jl — Integrate-constraint weight row
        hardcoded ∫T_n=L/2·2/(1-n²) (SIGN-FLIPPED for non-Chebyshev). Fixed via the
        exact basis-aware spectral row wₙ=Σ_j q_j φ_n(z_j).
-  C3 (MED) problem_matrices_spectral.jl — nested/composed differential operators on
+  C3 (MED) spectral.jl — nested/composed differential operators on
        the implicit LHS dropped all but the OUTERMOST derivative, so ∂x(∂x(u)) was
        assembled as (ik)¹ not (ik)²=-k² (a diffusion term silently became advection).
        Fixed by composing D_outer · matrix(operand).
-  C4 (MED) flow_tools_spectra.jl — 3D enstrophy_spectrum used a mode-count kmax
+  C4 (MED) spectra.jl — 3D enstrophy_spectrum used a mode-count kmax
        ceiling against PHYSICAL |k|, dropping resolved vorticity modes on L<2π.
-  C5 (MED) flow_tools_spectra.jl — scalar power_spectrum reported mode-number
+  C5 (MED) spectra.jl — scalar power_spectrum reported mode-number
        wavenumbers (omitted 2π/L), disagreeing with energy_spectrum on non-2π domains.
   C7 (LOW) boundary_conditions/construction.jl — time/space dependency detection
        (\\bt\\b regex) missed implicit-multiplication forms like "sin(2t)"/"2x",

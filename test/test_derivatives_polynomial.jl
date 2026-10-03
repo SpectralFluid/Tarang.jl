@@ -1,5 +1,5 @@
 """
-Test suite for src/core/operators/derivatives/derivatives_polynomial.jl
+Test suite for src/core/operators/derivatives/polynomial.jl
 
 Targets the polynomial (Jacobi-family) spectral-derivative kernels:
   - evaluate_chebyshev_derivative!  (ChebyshevT path, via Differentiate)
@@ -40,7 +40,7 @@ function setup_field(basis, dist, fz::Function)
     return f, z
 end
 
-@testset "derivatives_polynomial.jl" begin
+@testset "polynomial.jl" begin
 
     # ========================================================================
     # Part A: ChebyshevT derivative via the Differentiate operator

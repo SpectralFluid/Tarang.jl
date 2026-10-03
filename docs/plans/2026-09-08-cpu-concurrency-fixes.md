@@ -10,7 +10,7 @@ The user authorized fixes for the two reproduced concurrency defects. Work proce
 
 ## 1. Fourier derivative scratch
 
-Files: `src/core/operators/derivatives/derivatives_fourier.jl`, new `test/test_cpu_fourier_concurrency.jl`. The adjacent borrowed-result pool in `derivatives_eval.jl` and its regression `test/test_cpu_derivative_result_concurrency.jl` also need task isolation so same-basis public callers remain independent throughout evaluation.
+Files: `src/core/operators/derivatives/fourier.jl`, new `test/test_cpu_fourier_concurrency.jl`. The adjacent borrowed-result pool in `eval.jl` and its regression `test/test_cpu_derivative_result_concurrency.jl` also need task isolation so same-basis public callers remain independent throughout evaluation.
 
 - [x] Add regression coverage for concurrent public derivative calls on independent same-shaped fields and cold/warm cache behavior. Observe numerical failure before source changes.
 - [x] Replace shared mutable scratch reuse with exclusive checkout and exception-safe return. Keep FFT plans/buffers reusable and preserve parallel computation.

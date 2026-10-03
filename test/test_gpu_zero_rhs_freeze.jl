@@ -1,7 +1,7 @@
 # Regression: a pure-Fourier GPU InitialValueProblem had an identically-zero right-hand side, so the
 # solution held its initial condition forever with no error and no warning.
 #
-# THE CHAIN. `_gpu_pure_fourier_state` (solver_types.jl) deliberately skips global
+# THE CHAIN. `_gpu_pure_fourier_state` (types.jl) deliberately skips global
 # matrix assembly for a pure-Fourier GPU InitialValueProblem — the host matrices are unused there and
 # prohibitive at production sizes. But that assembly is also what fills
 # `problem.equation_data`, and `build_lazy_rhs_plan!` read an empty `equation_data` as

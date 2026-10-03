@@ -40,8 +40,8 @@ function _count_layout_calls(root::AbstractString)
     per_file = Dict{String, Int}()
     for (dir, _, files) in walkdir(root), f in files
         endswith(f, ".jl") || continue
-        f == "field_layout_access.jl" && continue
         path = joinpath(dir, f)
+        relpath(path, root) == joinpath("core", "field", "field_layout", "access.jl") && continue
         n = 0
         for raw in eachline(path)
             code = strip(raw)

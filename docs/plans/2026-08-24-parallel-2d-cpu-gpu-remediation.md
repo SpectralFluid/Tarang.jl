@@ -12,7 +12,7 @@
 
 **Files:**
 - Modify: `test/test_transposable_field.jl`
-- Modify: `src/core/transpose/transpose_transforms.jl`
+- Modify: `src/core/transpose/transforms.jl`
 
 **Step 1: Write the failing test**
 
@@ -35,7 +35,7 @@ Run the same two-rank test and expect all assertions to pass.
 **Files:**
 - Modify: `test/test_transposable_field.jl`
 - Modify: `src/core/gpu_distributed.jl`
-- Modify: `src/core/transpose/transpose_transforms.jl`
+- Modify: `src/core/transpose/transforms.jl`
 
 **Step 1: Write the failing tests**
 

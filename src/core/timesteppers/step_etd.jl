@@ -89,8 +89,8 @@ function step_etd_rk222!(state::TimestepperState, solver::InitialValueSolver)
         mul!(a_n, exp_hL, X₀)
 
         # Stage 1 (predictor): Evaluate nonlinear term N(u_n) at current state
-        F₀ = evaluate_rhs(solver, current_state, solver.sim_time)
-        F₀_vec = _timestep_fields_vector!(state, :etd_rk2_Fraw, F₀)
+        F₀_vec = _timestep_global_rhs_vector!(state, :etd_rk2_Fraw,
+                                             solver, current_state, solver.sim_time)
         _apply_mass_inverse!(N_buf, M_factor, F₀_vec)
 
         # Predictor: c = a_n + h*φ₁(hL)*N(u_n)  — reuse diff as φ₁*N_u_n scratch
@@ -101,8 +101,8 @@ function step_etd_rk222!(state::TimestepperState, solver::InitialValueSolver)
         vector_to_fields!(temp_state, c_vec, current_state)
 
         # Stage 2 (corrector): Evaluate N(c) at predicted state
-        F_c = evaluate_rhs(solver, temp_state, solver.sim_time + dt)
-        F_c_vec = _timestep_fields_vector!(state, :etd_rk2_Fraw, F_c)
+        F_c_vec = _timestep_global_rhs_vector!(state, :etd_rk2_Fraw,
+                                              solver, temp_state, solver.sim_time + dt)
         # Reuse diff as N_c (mass-inverse applied in place); save N_u_n → N_buf
         _apply_mass_inverse!(diff, M_factor, F_c_vec)
 
@@ -204,8 +204,8 @@ function step_etd_cnab2!(state::TimestepperState, solver::InitialValueSolver)
         X_current = _timestep_fields_vector!(state, :etd_cnab2_X_current, current_state)
 
         # Evaluate nonlinear term N(u_n) — in-place mass inverse
-        F_current = evaluate_rhs(solver, current_state, solver.sim_time)
-        F_raw = _timestep_fields_vector!(state, :etd_cnab2_Fraw, F_current)
+        F_raw = _timestep_global_rhs_vector!(state, :etd_cnab2_Fraw,
+                                             solver, current_state, solver.sim_time)
         n = length(F_raw)
         F_current_vec = _timestep_vector_buffer!(state, :etd_cnab2_Fcur, n)
         _apply_mass_inverse!(F_current_vec, M_factor, F_raw)
@@ -215,8 +215,8 @@ function step_etd_cnab2!(state::TimestepperState, solver::InitialValueSolver)
         _prepend_history_buffer!(F_history, F_current_vec, 2)
         if length(F_history) < 2 && length(state.history) >= 2
             prev_state = state.history[end-1]
-            F_prev_raw = _timestep_fields_vector!(state, :etd_cnab2_Fprev_raw,
-                                             evaluate_rhs(solver, prev_state, solver.sim_time - dt_previous))
+            F_prev_raw = _timestep_global_rhs_vector!(state, :etd_cnab2_Fprev_raw,
+                                             solver, prev_state, solver.sim_time - dt_previous)
             F_prev_vec = _timestep_vector_buffer!(state, :etd_cnab2_Fprev, n)
             _apply_mass_inverse!(F_prev_vec, M_factor, F_prev_raw)
             push!(F_history, copy(F_prev_vec))
@@ -344,8 +344,8 @@ function step_etd_sbdf2!(state::TimestepperState, solver::InitialValueSolver)
         n = length(X_current)
 
         # Evaluate nonlinear term N(uₙ) at current state — in-place mass inverse
-        F_current = evaluate_rhs(solver, current_state, solver.sim_time)
-        F_raw = _timestep_fields_vector!(state, :etd_sbdf2_Fraw, F_current)
+        F_raw = _timestep_global_rhs_vector!(state, :etd_sbdf2_Fraw,
+                                             solver, current_state, solver.sim_time)
         F_current_vec = _timestep_vector_buffer!(state, :etd_sbdf2_Fcur, n)
         _apply_mass_inverse!(F_current_vec, M_factor, F_raw)
 
@@ -354,8 +354,8 @@ function step_etd_sbdf2!(state::TimestepperState, solver::InitialValueSolver)
         _prepend_history_buffer!(F_history, F_current_vec, 2)
         if length(F_history) < 2 && length(state.history) >= 2
             prev_state = state.history[end-1]
-            F_prev_raw = _timestep_fields_vector!(state, :etd_sbdf2_Fprev_raw,
-                                             evaluate_rhs(solver, prev_state, solver.sim_time - dt_previous))
+            F_prev_raw = _timestep_global_rhs_vector!(state, :etd_sbdf2_Fprev_raw,
+                                             solver, prev_state, solver.sim_time - dt_previous)
             F_prev_vec = _timestep_vector_buffer!(state, :etd_sbdf2_Fprev, n)
             _apply_mass_inverse!(F_prev_vec, M_factor, F_prev_raw)
             push!(F_history, copy(F_prev_vec))

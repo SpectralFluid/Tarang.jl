@@ -9,28 +9,29 @@ This module provides spectral transforms for various bases:
 ## File Organization
 
 This module is split into multiple files for maintainability:
-- transform_layout.jl: THE layout rules (axis ops, shapes, eltypes) both backends share
-- transform_types.jl: Core type definitions + in-place dispatch protocol
-- transform_planning.jl: Transform planning (builds 1D FFTW plans)
-- transform_gpu.jl: Serial CPU + GPU dispatch (`forward_transform!`)
-- transform_fourier.jl: Fourier transform execution (in-place and legacy)
-- transform_chebyshev.jl: Chebyshev transform execution (in-place and legacy)
-- transform_legendre.jl: Legendre transform execution
-- transform_transposable.jl: TransposableField transform planning
+- layout.jl: THE layout rules (axis ops, shapes, eltypes) both backends share
+- types.jl: Core type definitions + in-place dispatch protocol
+- planning.jl: Transform planning (builds 1D FFTW plans)
+- gpu.jl: Serial CPU + GPU dispatch (`forward_transform!`)
+- fourier.jl: Fourier transform execution (in-place and legacy)
+- chebyshev.jl: Chebyshev transform execution (in-place and legacy)
+- legendre.jl: Legendre transform execution
+- transposable.jl: TransposableField transform planning
 """
 
 # PencilFFTs, FFTW, LinearAlgebra, SparseArrays already in Tarang.jl
 
 # Include all the split files
-include("transforms/transform_layout.jl")
-include("transforms/transform_types.jl")
-include("transforms/transform_planning.jl")
-include("transforms/transform_gpu.jl")
-include("transforms/transform_fourier.jl")
-include("transforms/transform_chebyshev.jl")
-include("transforms/transform_fft_dct.jl")
-include("transforms/transform_legendre.jl")
-include("transforms/transform_transposable.jl")
+include("transforms/layout.jl")
+include("transforms/types.jl")
+include("transforms/planning.jl")
+include("transforms/gpu.jl")
+include("transforms/fourier.jl")
+include("transforms/chebyshev.jl")
+include("transforms/fft_dct.jl")
+include("transforms/legendre.jl")
+include("transforms/transposable.jl")
+include("transforms/grouped.jl")
 
 # ============================================================================
 # Exports

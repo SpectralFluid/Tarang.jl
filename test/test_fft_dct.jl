@@ -1,5 +1,5 @@
 """
-Tests for the O(N log N) FFT-based DCT (`transform_fft_dct.jl`) that replaces the
+Tests for the O(N log N) FFT-based DCT (`fft_dct.jl`) that replaces the
 O(N²) cos-sum used by the GPU multi-dimensional DCT. Device-agnostic, so the
 ALGORITHM is fully validated here on the CPU; the GPU runs the identical code via
 CUFFT (and `test_gpu_transform_correctness.jl` checks GPU==CPU end-to-end).

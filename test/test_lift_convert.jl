@@ -1,7 +1,7 @@
 """
 Test suite for tau-method Lift and basis Convert operators.
 
-Target module: src/core/operators/operations/operations_lift_convert.jl
+Target module: src/core/operators/operations/lift_convert.jl
 
 Functions exercised:
   evaluate_convert, evaluate_lift, apply_lift_nd!,

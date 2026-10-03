@@ -27,7 +27,7 @@
 #      term into a wrong answer rather than a failure.
 #
 #   2. `div(a*grad(u))` is supported (`evaluate_divergence` in
-#      operators/derivatives/derivatives_eval.jl), expanded with the exact
+#      operators/derivatives/eval.jl), expanded with the exact
 #      product rule
 #
 #          ∇·(a ∇u) = a ∇²u + ∇a·∇u = Σₖ (a ∂ₖ²u + ∂ₖa ∂ₖu)
