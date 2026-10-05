@@ -1,4 +1,4 @@
-# Serial-CPU coverage tests for src/core/solvers/solver_utils.jl
+# Serial-CPU coverage tests for src/core/solvers/utils.jl
 #
 # Targets the helper utilities:
 #   - estimate_subproblem_cost(sp)        : LU/nnz/bc cost heuristic

@@ -51,7 +51,7 @@ This plan covers 2D domains (1 Fourier + 1 Chebyshev). Extension to 3D (2 Fourie
 |------|--------|----------------|
 | `src/core/pencil_matrices.jl` | **Create** | PencilMatrixSystem struct, per-pencil assembly, factorization cache |
 | `src/core/timesteppers/step_pencil_imex.jl` | **Modify** | Per-pencil IMEX RK step function |
-| `src/core/solvers/solver_types.jl` | **Modify** | Build pencil matrices during solver construction |
+| `src/core/solvers/types.jl` | **Modify** | Build pencil matrices during solver construction |
 | `src/core/operators/matrices.jl` | **Modify** | Add `pencil_operator_matrix` for per-kx operator blocks |
 | `test/test_pencil_matrices.jl` | **Create** | Unit tests for pencil matrix assembly and solve |
 | `test/test_pencil_imex.jl` | **Create** | Integration test: 1D heat equation with Chebyshev + tau |
@@ -687,7 +687,7 @@ git commit -m "feat: per-pencil IMEX RK step function"
 ## Task 6: Solver Integration
 
 **Files:**
-- Modify: `src/core/solvers/solver_types.jl`
+- Modify: `src/core/solvers/types.jl`
 
 Build pencil matrices during solver construction for mixed Fourier-Chebyshev domains.
 
@@ -734,7 +734,7 @@ Add `_try_build_pencil_system!(solver)` at the end of `_build_initial_value_solv
 - [ ] **Step 3: Commit**
 
 ```bash
-git add src/core/solvers/solver_types.jl
+git add src/core/solvers/types.jl
 git commit -m "feat: auto-detect mixed domain and build pencil system"
 ```
 

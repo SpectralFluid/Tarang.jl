@@ -52,7 +52,7 @@ mutable struct TimestepperState{TS<:TimeStepper, V<:Vector{<:ScalarField}, W<:Ve
     stage::Int
     timestepper_data::Dict{Symbol, Any}  # Additional data for specific timesteppers
 
-    # Pre-allocated workspace fields for zero-allocation time-stepping
+    # Owned scratch fields, retained after their first use.
     workspace_fields::W  # Reusable scratch fields
     workspace_allocated::Bool
 
@@ -64,32 +64,32 @@ mutable struct TimestepperState{TS<:TimeStepper, V<:Vector{<:ScalarField}, W<:Ve
     forcing_generated::Bool  # Flag to track if forcing was generated this timestep
 
     function TimestepperState(timestepper::TS, dt::Float64, initial_state::V;
-                              forcing=nothing) where {TS<:TimeStepper, V<:Vector{<:ScalarField}}
+                              forcing=nothing,
+                              workspace_sets::Int=_workspace_count(timestepper)) where {TS<:TimeStepper, V<:Vector{<:ScalarField}}
+        workspace_sets >= 0 || throw(ArgumentError("workspace_sets must be nonnegative"))
         dt_history = [dt]
         timestepper_data = Dict{Symbol, Any}()
 
-        # Pre-allocate workspace fields FIRST — workspace allocation can
-        # invalidate shared buffers from the distributor's layout cache,
-        # so it must happen before copying the initial state.
-        n_fields = length(initial_state)
-        n_workspace_sets = _workspace_count(timestepper)
+        # Direct construction retains the existing reservation API. Solvers
+        # request zero sets: global and subproblem steppers use other buffers,
+        # while field-native steppers acquire and retain just the slots they use.
         workspace_fields = _empty_workspace_fields(initial_state)
 
-        for _ in 1:n_workspace_sets
+        for _ in 1:workspace_sets
             for field in initial_state
                 ws_field = ScalarField(field.dist, field.name, field.bases, field.dtype)
                 push!(workspace_fields, ws_field)
             end
         end
 
-        # Copy AFTER workspace allocation to avoid buffer aliasing
+        # History owns its numerical buffers independently of scratch fields.
         initial_history = copy_state(initial_state)
         history = Vector{typeof(initial_history)}(undef, 1)
         history[1] = initial_history
 
         new{TS, typeof(initial_history), typeof(workspace_fields)}(
             timestepper, dt, history, dt_history, 0, timestepper_data,
-            workspace_fields, true, forcing, 1, false)
+            workspace_fields, !isempty(workspace_fields), forcing, 1, false)
     end
 end
 
@@ -210,6 +210,12 @@ end
 #   CNAB/SBDF use L_matrix directly (no mass inversion, they build M+L system)
 # ============================================================================
 
+# A row permutation can make an invertible mass/stage matrix Hermitian with a
+# zero diagonal. Sparse factorize chooses unpivoted LDL in that case and fails
+# on a zero pivot. These matrices are general systems; use pivoted sparse LU.
+_factorize_timestep_matrix(A::AbstractMatrix) = factorize(A)
+_factorize_timestep_matrix(A::SparseMatrixCSC) = isdiag(A) ? factorize(A) : lu(A)
+
 """
 Return a cached factorization of the mass matrix, or `nothing` if M is
 singular (DAE system with non-evolution equations that have zero M rows).
@@ -221,7 +227,7 @@ function _get_mass_factor!(state::TimestepperState, M_matrix::AbstractMatrix)
         if _is_singular_mass(M_matrix)
             cache[:M_factor] = nothing
         else
-            cache[:M_factor] = factorize(M_matrix)
+            cache[:M_factor] = _factorize_timestep_matrix(M_matrix)
         end
         cache[:M_factor_source] = M_matrix
         cache[:L_eff] = nothing
@@ -248,6 +254,17 @@ function _is_singular_mass(M::AbstractMatrix)
         end
     end
     return false
+end
+
+# Keep ETD's DAE rejection outside its numerical fallback paths.
+function _get_etd_mass_factor!(state::TimestepperState, M_matrix)
+    M_matrix === nothing && return nothing
+    M_factor = _get_mass_factor!(state, M_matrix)
+    M_factor === nothing && throw(ArgumentError(
+        "ETD timesteppers do not support a singular mass matrix (DAE system). " *
+        "Use a DAE-aware implicit timestepper for this formulation.",
+    ))
+    return M_factor
 end
 
 """
@@ -281,15 +298,16 @@ function _get_linear_operator_eff!(state::TimestepperState, L_matrix::AbstractMa
         return cache[:L_neg]::AbstractMatrix, nothing
     end
 
-    M_factor = _get_mass_factor!(state, M_matrix)
-    M_factor === nothing && throw(ArgumentError(
-        "ETD timesteppers do not support a singular mass matrix (DAE system). " *
-        "Use a DAE-aware implicit timestepper for this formulation.",
-    ))
+    M_factor = _get_etd_mass_factor!(state, M_matrix)
 
     cache = state.timestepper_data
     if !haskey(cache, :L_eff) || get(cache, :L_eff_source, nothing) !== L_matrix
-        cache[:L_eff] = M_factor \ L_matrix   # M^{-1} * L (cached, positive)
+        # Sparse LU supports dense RHS blocks. ETD already requires dense matrix
+        # functions; enforce its size bound before materializing this block.
+        size(L_matrix, 1) <= _ETD_DENSE_MAX_SIZE || throw(ArgumentError(
+            "ETD matrix exponential requires dense O(n²) storage; use RK222/SBDF2 " *
+            "for systems larger than $_ETD_DENSE_MAX_SIZE coefficients."))
+        cache[:L_eff] = M_factor \ Matrix(L_matrix)   # M^{-1} * L (cached, positive)
         cache[:L_eff_neg] = -cache[:L_eff]    # Negated version (cached)
         cache[:L_eff_source] = L_matrix
     end
@@ -608,70 +626,48 @@ Return the number of workspace field sets needed for a timestepper.
 # distributed diagonal path needs only one state per stage, so this is the
 # tight upper bound shared by all RK dispatches.
 #
-# RKGFY and RKSMR reach exactly the same two paths and were missing from this
-# list, so they fell to the `::TimeStepper` default of 2. That is not a
-# smaller budget — `get_workspace_field!` does not grow the pool, it returns a
-# FRESH `ScalarField` for every index past the end, and
-# `step_distributed_diagonal_imex_rk!` asks for one per (stage, field) on EVERY
-# step. Measured at 128x128 on 2 MPI ranks: RK443 5,984 B/step against the same
-# tableau under a scheme with no entry here at 409,712 B/step, growing with the
-# grid.
-_workspace_count(ts::RK111) = ts.stages + 1
-_workspace_count(ts::RK222) = ts.stages + 1
-_workspace_count(ts::RK443) = ts.stages + 1
-_workspace_count(ts::RKGFY) = ts.stages + 1
-_workspace_count(ts::RKSMR) = ts.stages + 1
-
-function _workspace_count(::Union{CNAB1, CNAB2})
-    return 2
-end
-
-function _workspace_count(::Union{SBDF1, SBDF2, SBDF3, SBDF4})
-    return 2
-end
-
-function _workspace_count(::Union{ETD_RK222, ETD_CNAB2, ETD_SBDF2})
-    return 3
-end
+# This reservation is used for direct TimestepperState construction. Solver
+# states start empty and grow on demand, so a matrix-based stepper need not
+# reserve the field-native stepper's full-volume scratch.
+_workspace_count(ts::Union{RK111, RK222, RK443, RKGFY, RKSMR}) = ts.stages + 1
+_workspace_count(::Union{CNAB1, CNAB2, SBDF1, SBDF2, SBDF3, SBDF4}) = 2
+_workspace_count(::Union{ETD_RK222, ETD_CNAB2, ETD_SBDF2}) = 3
 
 # Diagonal-IMEX RK pools one Y set AND one F set per stage (the F sets used to
 # be per-step `copy_state` allocations).
 _workspace_count(ts::Union{DiagonalIMEX_RK222, DiagonalIMEX_RK443}) = 2 * ts.stages
 
-function _workspace_count(::DiagonalIMEX_SBDF2)
-    return 4  # Stage storage for diagonal IMEX multistep
-end
-
-function _workspace_count(::TimeStepper)
-    return 2  # Default fallback
-end
+_workspace_count(::DiagonalIMEX_SBDF2) = 4  # Stage storage for diagonal IMEX multistep
+_workspace_count(::TimeStepper) = 2  # Default fallback
 
 """
     get_workspace_field!(state::TimestepperState, template::ScalarField, idx::Int)
 
-Get a pre-allocated workspace field, or allocate one if needed.
+Get an owned workspace field, allocating and retaining missing slots on demand.
 """
 function get_workspace_field!(state::TimestepperState, template::ScalarField, idx::Int)
-    if idx <= length(state.workspace_fields)
-        ws = state.workspace_fields[idx]
-        # Do NOT rename: workspace sets are built from the initial state in the
-        # same flattened order, so `ws` already carries the name of the variable
-        # it stands for. Re-stamping it from an arbitrary template lets a buffer
-        # take an unrelated field's name, and `_diagonal_operand_multiplier`
-        # decides field identity by name.
-        # Reset to grid layout
-        ws.current_layout = :g
-        return ws
-    else
-        # Fallback: allocate new field (should rarely happen)
-        return ScalarField(template.dist, template.name, template.bases, template.dtype)
+    idx >= 1 || throw(ArgumentError("workspace index must be positive"))
+    if idx > length(state.workspace_fields)
+        current = state.history[end]
+        for slot in (length(state.workspace_fields) + 1):idx
+            # Fill skipped slots in the canonical flattened state order. The
+            # requested slot keeps its caller's template, including its name.
+            source = slot == idx || isempty(current) ? template : current[mod1(slot, length(current))]
+            push!(state.workspace_fields,
+                  ScalarField(source.dist, source.name, source.bases, source.dtype))
+        end
+        state.workspace_allocated = true
     end
+    ws = state.workspace_fields[idx]
+    # Never rename an existing slot: diagonal operand matching uses field names.
+    ws.current_layout = :g
+    return ws
 end
 
 """
     _workspace_field_state!(state, key, template, set_index)
 
-Return a cached state-vector container whose fields refer to one preallocated
+Return a cached state-vector container whose fields refer to one reusable
 workspace set. `set_index` is one-based; only the small host container is cached
 here, while the field storage remains owned by `state.workspace_fields`.
 """
@@ -757,11 +753,7 @@ end
 
 """Push a state into a one-entry history and retain the dropped storage."""
 function _push_recycled_history_state!(state::TimestepperState, key::Symbol, new_state)
-    push!(state.history, new_state)
-    while length(state.history) > 1
-        state.timestepper_data[key] = popfirst!(state.history)
-    end
-    return state.history
+    return _push_trim_recycle!(state.history, new_state, 1, state, key)
 end
 
 """Push into a bounded history vector and stash the dropped storage under `key`

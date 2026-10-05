@@ -3,7 +3,7 @@ using Tarang
 using Random
 
 # ============================================================================
-# Tests for src/core/field/field_layout/field_layout_operations.jl
+# Tests for src/core/field/field_layout/operations.jl
 #
 # This file holds the field-data layout *operations* that sit on top of the
 # layout-aware storage: fill_random!, the MPI-reproducible random fill helper,
@@ -23,7 +23,7 @@ using Random
 #     field; identical seeds give identical fields (determinism).
 # ============================================================================
 
-@testset "field_layout_operations.jl" begin
+@testset "operations.jl" begin
 
     # ------------------------------------------------------------------
     # 1. ensure_layout! round-trip + idempotence (used by every op here)

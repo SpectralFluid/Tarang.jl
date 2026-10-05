@@ -322,15 +322,32 @@ function CuDenseLU(matrix::AbstractMatrix; kwargs...)
 end
 
 function MatSolvers.solve(s::CuDenseLU{T}, rhs::AbstractVector) where T
-    # Transfer RHS to GPU if needed using helper
-    b_gpu = _is_gpu_array(rhs) ? copy(rhs) : _gpu_array(rhs, T)
+    length(rhs) == s.n || throw(DimensionMismatch("CuDenseLU right-hand side length"))
+    return _cudense_with_context(s.A_gpu) do
+        b_gpu = _is_gpu_array(rhs) && eltype(rhs) === T ? copy(rhs) : _gpu_array(rhs, T)
+        _cudense_solve!(b_gpu, s.A_gpu, s.ipiv)
+        b_gpu
+    end
+end
 
-    # Solve using pre-factored LU
-    # cusolverDnXgetrs solves A*X = B using LU factorization
-    _cusolver().getrs!('N', s.A_gpu, s.ipiv, b_gpu)
+# Recover concrete array types from the backend-erased factor storage.
+_cudense_solve!(dest, matrix, pivots) = _cusolver().getrs!('N', matrix, pivots, dest)
+_cudense_with_context(f::F, matrix) where {F} = f()
+_cudense_inplace_compatible(dest, matrix) = _is_gpu_array(dest)
 
-    # Return result (caller decides if they want CPU or GPU)
-    return b_gpu
+function MatSolvers.solve!(dest::AbstractVector, s::CuDenseLU{T},
+                           rhs::AbstractVector) where T
+    length(rhs) == s.n && length(dest) == s.n ||
+        throw(DimensionMismatch("CuDenseLU vector length"))
+    if !_cudense_inplace_compatible(dest, s.A_gpu) || eltype(dest) != T ||
+       (dest !== rhs && Base.mightalias(dest, rhs))
+        return copyto!(dest, MatSolvers.solve(s, rhs))
+    end
+    return _cudense_with_context(s.A_gpu) do
+        dest === rhs || copyto!(dest, rhs)
+        _cudense_solve!(dest, s.A_gpu, s.ipiv)
+        dest
+    end
 end
 
 # ============================================================================

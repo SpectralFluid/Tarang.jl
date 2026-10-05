@@ -1,4 +1,4 @@
-# Serial-CPU coverage tests for src/core/problems/problem_parsing.jl
+# Serial-CPU coverage tests for src/core/problems/parsing.jl
 #
 # Exercises the equation/expression parser: parse_expression, parse_equation,
 # evaluate_parsed_expression (arithmetic, n-ary operators, differential operators,

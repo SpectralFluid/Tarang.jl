@@ -22,7 +22,7 @@
 # so the list cannot quietly grow again.
 
 # Root of the problem hierarchy (`InitialValueProblem`, `LinearBoundaryValueProblem`, `NonlinearBoundaryValueProblem`, `EigenvalueProblem`, all in
-# problems/problem_types.jl). Declared here rather than next to those structs
+# problems/types.jl). Declared here rather than next to those structs
 # because the operator layer loads two stages earlier and needs the name to
 # annotate signatures — `symbolic_diff.jl` takes `::Problem`, which is what
 # stops a duck-typed stand-in from reaching code that assumes the equation IR.
@@ -58,8 +58,8 @@ abstract type AbstractRHSPlan end
 # 2. The rotating result pools do not track outstanding borrows. They hand out slot `idx % N` and
 #    reissue it after N further checkouts no matter who is still holding it:
 #
-#      `_DerivativeResultPool` (16 per task) — `operators/derivatives/derivatives_eval.jl`
-#      `_NL_RESULT_POOL`      ( 8) — `nonlinear/nonlinear_padding.jl`
+#      `_DerivativeResultPool` (16 per task) — `operators/derivatives/eval.jl`
+#      `_NL_RESULT_POOL`      ( 8) — `nonlinear/padding.jl`
 #      `_POISSON_RESULT_POOL` ( 4) — `timesteppers/state_utils.jl`
 #
 # THE CONTRACT. A rotating-pool result may be borrowed only by a caller that

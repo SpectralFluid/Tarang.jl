@@ -2,7 +2,8 @@
 
 include("solvers.jl")
 include("stochastic_forcing.jl")
-include("timesteppers/timesteppers.jl")
+include("timesteppers/core.jl")
+include("timesteppers/step_local_modes.jl")
 include("timesteppers/step_subproblem_rk.jl")
 include("timesteppers/step_subproblem_rk_batched.jl")
 include("timesteppers/step_subproblem_multistep.jl")

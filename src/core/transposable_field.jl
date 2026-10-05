@@ -49,29 +49,29 @@ Backward transform reverses this process.
 ## File Organization
 
 This module is split into multiple files for maintainability:
-- transpose_types.jl: Core type definitions
-- transpose_shapes.jl: Local shape computation
-- transpose_buffers.jl: Buffer allocation
-- transpose_counts.jl: MPI count computation
-- transpose_pack_unpack.jl: Data packing operations
-- transpose_mpi.jl: MPI communication helpers
-- transpose_sync.jl: Synchronous transpose operations
-- transpose_async.jl: Asynchronous transpose operations
-- transpose_transforms.jl: Distributed FFT operations
+- types.jl: Core type definitions
+- shapes.jl: Local shape computation
+- buffers.jl: Buffer allocation
+- counts.jl: MPI count computation
+- pack_unpack.jl: Data packing operations
+- mpi.jl: MPI communication helpers
+- sync.jl: Synchronous transpose operations
+- async.jl: Asynchronous transpose operations
+- transforms.jl: Distributed FFT operations
 """
 
 # MPI, FFTW already in Tarang.jl
 
 # Include all the split files
-include("transpose/transpose_types.jl")
-include("transpose/transpose_shapes.jl")
-include("transpose/transpose_buffers.jl")
-include("transpose/transpose_counts.jl")
-include("transpose/transpose_pack_unpack.jl")
-include("transpose/transpose_mpi.jl")
-include("transpose/transpose_sync.jl")
-include("transpose/transpose_async.jl")
-include("transpose/transpose_transforms.jl")
+include("transpose/types.jl")
+include("transpose/shapes.jl")
+include("transpose/buffers.jl")
+include("transpose/counts.jl")
+include("transpose/pack_unpack.jl")
+include("transpose/mpi.jl")
+include("transpose/sync.jl")
+include("transpose/async.jl")
+include("transpose/transforms.jl")
 
 # ============================================================================
 # TransposableFieldStorage (deferred from field.jl due to type dependencies)
@@ -118,7 +118,7 @@ TransposableFieldStorage(arch, grid::G, coeff::C) where {G<:AbstractArray,C<:Abs
     TransposableFieldStorage{G,C}(arch, grid, coeff)
 
 # Deferred storage_mode dispatch (TransposableFieldStorage is now defined).
-# Stays in this file (rather than field_types.jl, which is loaded first) only
+# Stays in this file (rather than types.jl, which is loaded first) only
 # for locality with the rest of the transpose subsystem it marks — it no
 # longer depends on any type defined by the transpose/*.jl includes above.
 storage_mode(::ScalarField{T, <:TransposableFieldStorage}) where T = TransposableStorage()
@@ -273,7 +273,7 @@ staging buffers. Call `wait_transpose!` on the returned workspace before
 starting a new async transpose on it.
 """
 function transpose_workspace!(dist::Distributor, field::ScalarField)
-    # Matches create_pencil's guard (distributor_core.jl): without it, a
+    # Matches create_pencil's guard (core.jl): without it, a
     # transform reached after `close` would repopulate
     # transpose_workspace_cache and MPI.Comm_split fresh sub-communicators on
     # a Distributor that has already told every rank it is done — the exact
@@ -326,6 +326,7 @@ function Base.close(tf::TransposableField)
         wait_transpose!(tf)
     end
 
+    empty!(tf.buffers.gpu_metadata)
     free_topology_2d!(tf.topology)
     tf.comms.zy_comm = nothing
     tf.comms.yx_comm = nothing

@@ -24,8 +24,8 @@ end
 #   * PROSE  -- the convention restated in words: "decompose(s) [the]
 #     LAST/FIRST ..." in either word order. Cheap to write, cheap to omit.
 #   * ARITHMETIC -- the convention re-derived in code, which a comment-less
-#     copy can't dodge. The two shapes distributor_mpi.jl, netcdf_output.jl,
-#     and nonlinear_transforms.jl actually had before migration:
+#     copy can't dodge. The two shapes mpi.jl, netcdf_output.jl,
+#     and transforms.jl actually had before migration:
 #       - a coordinate variable bound straight off mesh[1] (`P1 = mesh[1]`,
 #         then `coord1 = rank % P1`) instead of asking mesh_axis_for which
 #         axis that even is;
@@ -124,7 +124,7 @@ end
 @testset "get_process_coordinate accepts an explicit rank" begin
     # Untyped (duck-typed like decomposed_axes/mesh_axis_for), and its `rank`
     # argument defaults to `dist.rank` but can name ANY rank -- what
-    # distributor_mpi.jl's scatter loop and netcdf_output.jl's
+    # mpi.jl's scatter loop and netcdf_output.jl's
     # get_local_shape/get_local_start (both driven by an explicit `rank`, not
     # necessarily this process's own) both need. FakeDist has no `.rank`
     # field at all, so passing rank explicitly below also confirms the
@@ -134,7 +134,7 @@ end
 
     # 2-D mesh, column-major: coord[1] = rank % mesh[1], coord[2] = (rank ÷
     # mesh[1]) % mesh[2] -- matches the OLD coord1/coord2/dest_coord1/
-    # dest_coord2 formulas at distributor_mpi.jl and netcdf_output.jl.
+    # dest_coord2 formulas at mpi.jl and netcdf_output.jl.
     d2 = FakeDist(6, (2, 3), false)
     @test [Tarang.get_process_coordinate(d2, 1, r) for r in 0:5] == [0, 1, 0, 1, 0, 1]
     @test [Tarang.get_process_coordinate(d2, 2, r) for r in 0:5] == [0, 0, 1, 1, 2, 2]
@@ -179,8 +179,8 @@ end
     # around them — file_rederives_convention/line_rederives_convention
     # (defined above) run both. A line that also names `decomposed_axes` is
     # citing the authority, not re-deriving independently, so it is exempt
-    # even if it also matches PROSE or ARITHMETIC (see transform_planning.jl
-    # and field_data_distributor_utils.jl, which explain the convention in
+    # even if it also matches PROSE or ARITHMETIC (see planning.jl
+    # and distributor_utils.jl, which explain the convention in
     # error text that now cites decomposed_axes by name).
     #
     # KNOWN_OFFENDERS below (declared after the scan) is an explicit, named,
@@ -190,7 +190,7 @@ end
     # Every future entry is a TODO for a follow-up migration task, not a
     # permanent exemption.
     srcdir = joinpath(@__DIR__, "..", "src")
-    allowed = joinpath("core", "distributor", "distributor_core.jl")
+    allowed = joinpath("core", "distributor", "core.jl")
 
     offenders = String[]
     for (root, _, files) in walkdir(srcdir), file in files
@@ -204,7 +204,7 @@ end
     @info "convention re-derivation scan: $(length(found)) file(s) match" sort(collect(found))
 
     # THE TARGET: zero known offenders. A new hand-rolled re-derivation
-    # anywhere in src/ (outside distributor_core.jl, the authority file)
+    # anywhere in src/ (outside core.jl, the authority file)
     # fails this test by breaking set equality below.
     KNOWN_OFFENDERS = Dict{String, String}()
     known = Set(keys(KNOWN_OFFENDERS))
@@ -253,8 +253,8 @@ end
 
     # Citing decomposed_axes on the SAME line exempts it, even though the
     # line still contains the arithmetic or prose shape being explained --
-    # this is what lets transform_planning.jl's error message and
-    # field_data_distributor_utils.jl's error strings stay readable instead
+    # this is what lets planning.jl's error message and
+    # distributor_utils.jl's error strings stay readable instead
     # of being mangled just to dodge the regex.
     @test !line_rederives_convention("P1 = mesh[1]  # superseded by decomposed_axes")
     @test !line_rederives_convention(
@@ -296,7 +296,7 @@ end
     # dict here, not the real (empty) KNOWN_OFFENDERS above, so this can't
     # itself fail CI.
     srcdir = joinpath(@__DIR__, "..", "src")
-    allowed = joinpath("core", "distributor", "distributor_core.jl")
+    allowed = joinpath("core", "distributor", "core.jl")
     real_found = Set{String}()
     for (root, _, files) in walkdir(srcdir), file in files
         endswith(file, ".jl") || continue
@@ -309,7 +309,7 @@ end
 end
 
 @testset "_uses_transpose_storage" begin
-    # Real GPU+MPI field construction (field_types.jl:140) asks this predicate
+    # Real GPU+MPI field construction (types.jl:140) asks this predicate
     # to choose between TransposableFieldStorage (explicit-transpose GPU+MPI
     # transforms) and SerialFieldStorage (PencilFFTs/local transforms). Nothing
     # tested it directly before this testset. If it ever inverts — a refactor

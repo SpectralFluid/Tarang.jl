@@ -239,7 +239,7 @@ rule as the CPU solver's `Tarang._axis_dealias_cutoff(basis, factor)` with
     kmax = min(floor(N / (2·factor)), (N − 1) ÷ 3)
 
 The `(N − 1) ÷ 3` cap enforces `3·kmax < N`, so quadratic products (modes up to
-`2·kmax`) cannot alias back into `[−kmax, kmax]` — see nonlinear_dealiasing.jl.
+`2·kmax`) cannot alias back into `[−kmax, kmax]` — see dealiasing.jl.
 
 `cutoff` accepts EITHER convention, disambiguated by magnitude (they are
 numerically disjoint — both mean "dealiasing off" only at exactly 1):
@@ -464,7 +464,7 @@ end
 
 Per-axis (src_range, dst_range) copy list for spectral pad/truncate, replicating
 EXACTLY the Nyquist conventions of the CPU `Tarang.resample_1d!`
-(src/core/field/field_data/field_data_scales.jl):
+(src/core/field/field_data/scales.jl):
 
 - Upsampling from even n_old: the old Nyquist bin (index n_old÷2+1) is ZEROED
   (not copied) — copying it one-sidedly would leave a non-Hermitian spectrum and
@@ -735,6 +735,10 @@ end
 # host arrays): two CuArrays on different devices must never share cached
 # buffers or CUFFT plans.
 Tarang._device_cache_token(x::CuArray) = CUDA.deviceid(CUDA.device(x))
+# Derivative scratch is task-owned; separate streams/contexts within that task
+# must not reuse an array while previous GPU work is still in flight.
+Tarang._diff_matmul_cache_token(x::CuArray) =
+    (CUDA.context(x), CUDA.deviceid(CUDA.device(x)), CUDA.stream())
 
 """
     copy_to_device(a::AbstractArray, target::CuArray)

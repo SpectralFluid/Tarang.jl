@@ -355,7 +355,9 @@ end
     @test prob.compiled.linear_matrix === prob.parameters["L_matrix"]
     @test prob.compiled.mass_matrix === prob.parameters["M_matrix"]
 
-    prob.compiled.caches.bc_rfft[f] = :cached
+    prob.compiled.caches.bc_rfft[f] = Dict{Tuple, Array{ComplexF64}}(
+        (1,) => ComplexF64[1],
+    )
     Tarang.reset_compiled_problem!(prob)
     @test isempty(prob.compiled.caches.bc_rfft)
     @test prob.compiled.linear_matrix === nothing

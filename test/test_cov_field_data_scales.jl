@@ -1,6 +1,6 @@
 using Test, Tarang, LinearAlgebra
 
-# Coverage tests for src/core/field/field_data/field_data_scales.jl
+# Coverage tests for src/core/field/field_data/scales.jl
 # Focus: serial-CPU scale management + spectral resampling helpers.
 # All expected values are analytic / round-trip / invariant based.
 

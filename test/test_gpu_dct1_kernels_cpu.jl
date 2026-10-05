@@ -27,7 +27,16 @@ using Test
 using Tarang
 using KernelAbstractions
 using FFTW
-using LinearAlgebra: mul!
+import LinearAlgebra: mul!
+
+mutable struct _DCTCountedFFT{P}
+    plan::P
+    calls::Int
+end
+function mul!(output, plan::_DCTCountedFFT, input)
+    plan.calls += 1
+    return mul!(output, plan.plan, input)
+end
 
 const _CUDA_LOADED = try
     @eval using CUDA
@@ -38,7 +47,7 @@ catch err
 end
 
 # Independent statement of Tarang's Chebyshev DCT-I convention
-# (transform_chebyshev.jl): forward = REDFT00 · 1/(N-1) · ½-endpoints · odd-flip.
+# (chebyshev.jl): forward = REDFT00 · 1/(N-1) · ½-endpoints · odd-flip.
 function _ref_cheb_forward(x::Vector{Float64})
     n = length(x)
     c = FFTW.r2r(x, FFTW.REDFT00) ./ (n - 1)
@@ -147,26 +156,41 @@ n_ref_len(c) = length(c)
             @test back == cx
         end
 
+        @testset "fused axis permutation and complex packing" begin
+            for T in (Float32,Float64), shape in ((5,7), (4,5,7), (1,5,3), (3,1,7)), axis in 2:length(shape)
+                cx = randn(Complex{T}, shape)
+                n, batch = size(cx, axis), length(cx) ÷ size(cx, axis)
+                packed = fill(T(NaN), n, 2batch)
+                perm = (axis, (d for d in 1:length(shape) if d != axis)...)
+                reference = reshape(permutedims(cx, perm), n, batch)
+                runk(ext._cheb_pack_permuted_reim_kernel!, packed, cx, n, batch,
+                     stride(cx, axis); ndrange=(n,batch))
+                @test packed[:,1:batch] == real.(reference)
+                @test packed[:,batch+1:end] == imag.(reference)
+                restored = similar(cx)
+                runk(ext._cheb_unpack_permuted_reim_kernel!, restored, packed, n, batch,
+                     stride(cx, axis); ndrange=(n,batch))
+                @test restored == cx
+            end
+        end
+
         # Full derivative pipeline — the ext kernels composed exactly as
-        # `_apply_gpu_cheb_deriv_1!` does, FFTW in place of cuFFT.
-        function emu_cheb_deriv_1!(out::Matrix{Float64}, mat::Matrix{Float64}, scale::Float64)
+        # `_apply_gpu_cheb_deriv_nth!` does, FFTW in place of cuFFT.
+        function emu_cheb_deriv_nth!(out::Matrix{T}, mat::Matrix{T}, scale::Float64,
+                                      order::Int) where T
             n, batch = size(mat)
             M = 2 * (n - 1)
-            work_ext = zeros(M, batch)
-            work_cx = zeros(ComplexF64, n, batch)
-            work_real = zeros(n, batch)
-            work_deriv = zeros(n, batch)
-            p = FFTW.plan_rfft(work_ext, 1)
-            runk(ext._dct1_reverse_ext_kernel!, work_ext, mat, n, batch; ndrange=(M, batch))
-            mul!(work_cx, p, work_ext)
-            runk(ext._extract_real_kernel!, work_real, work_cx, n, batch; ndrange=(n, batch))
-            runk(ext._cheb_coeff_to_deriv_kernel!, work_deriv, work_real, n, batch,
-                 1.0 / (n - 1), scale; ndrange=batch)
-            runk(ext._dct1_ext_kernel!, work_ext, work_deriv, n, batch; ndrange=(M, batch))
-            mul!(work_cx, p, work_ext)
-            runk(ext._dct1_extract_finalize_kernel!, out, work_cx, n, batch; ndrange=(n, batch))
+            work_ext = zeros(T, M, batch)
+            work_cx = zeros(Complex{T}, n, batch)
+            work_real = zeros(T, n, batch)
+            work_deriv = zeros(T, n, batch)
+            p = _DCTCountedFFT(FFTW.plan_rfft(work_ext, 1),0)
+            workspace = (;work_ext,work_cx,work_real,work_deriv,rfft_plan=p)
+            ext._cheb_deriv_pipeline!(mat,out,scale,order,workspace,Tarang.CPU())
+            @test p.calls == (order == 0 ? 0 : 2)
             return out
         end
+        emu_cheb_deriv_1!(out, mat, scale) = emu_cheb_deriv_nth!(out, mat, scale, 1)
 
         @testset "derivative pipeline matches chebyshev_derivative_1d! (n=$n)" for n in (9, 17)
             batch = 4
@@ -178,12 +202,63 @@ n_ref_len(c) = length(c)
                 Tarang.chebyshev_derivative_1d!(expect, mat[:, j], scale)
                 @test got[:, j] ≈ expect atol = 1e-11
             end
-            # order 2 == applying the 1-pass twice (what _apply_gpu_cheb_deriv_nth! does)
+            # Retain the old two-round-trip result as an independent low-order reference.
             got2 = emu_cheb_deriv_1!(similar(mat), got, scale)
+            @test emu_cheb_deriv_nth!(similar(mat), mat, scale, 2) ≈ got2 atol=1e-9
             for j in 1:batch
                 e1 = similar(mat[:, j]); Tarang.chebyshev_derivative_1d!(e1, mat[:, j], scale)
                 e2 = similar(e1);        Tarang.chebyshev_derivative_1d!(e2, e1, scale)
                 @test got2[:, j] ≈ e2 atol = 1e-9
+            end
+        end
+
+        @testset "higher derivatives stay in coefficient space, with alias-safe output" begin
+            for T in (Float32,Float64), n in (9,12)
+                scale = 2.0 / 3.7
+                x = T.(-cos.(pi .* (0:n-1) ./ (n-1)))
+                degree = min(8,n-1)
+                mat = hcat(x.^degree, T(0.3) .* x.^(degree-1))
+                original = copy(mat)
+                orders = T === Float64 ? (0,1,2,3,4,8,n) : (0,1,2,3,n)
+                for order in orders
+                    exact = hcat([order > d ? zeros(T,n) :
+                                  T(amplitude * prod(d-order+1:d) * scale^order) .* x.^(d-order)
+                                  for (d,amplitude) in ((degree,1.0),(degree-1,0.3))]...)
+                    tolerance = (T === Float64 ? 2e-8 : 2e-3) * max(1,maximum(abs,exact))
+                    got = emu_cheb_deriv_nth!(similar(mat), mat, scale, order)
+                    @test got ≈ exact atol=tolerance rtol=0
+                    @test mat == original
+                    inplace = copy(mat)
+                    @test emu_cheb_deriv_nth!(inplace, inplace, scale, order) === inplace
+                    @test inplace ≈ got atol=tolerance rtol=0
+                end
+            end
+        end
+
+        @testset "complex nonleading derivatives use fused packing, including in-place" begin
+            shape = (5,9,8)
+            scale = 2.0 / 3.7
+            for axis in 2:3, order in (0,1,2,3,9)
+                n, batch = shape[axis], prod(shape) ÷ shape[axis]
+                nodes = -cos.(pi .* (0:n-1) ./ (n-1))
+                x = reshape(nodes, ntuple(d -> d == axis ? n : 1,3))
+                amplitude = [(1+0.7im) * (1+sum(I[d]/10 for d in 1:3 if d != axis))
+                             for I in CartesianIndices(shape)]
+                original = amplitude .* x.^5
+                exact = order > 5 ? zero(original) :
+                        amplitude .* (prod(6-order:5) * scale^order) .* x.^(5-order)
+                for inplace in (false,true)
+                    input = copy(original)
+                    output = inplace ? input : similar(input)
+                    packed = zeros(n,2batch)
+                    runk(ext._cheb_pack_permuted_reim_kernel!,packed,input,n,batch,
+                         stride(input,axis);ndrange=(n,batch))
+                    emu_cheb_deriv_nth!(packed,packed,scale,order)
+                    runk(ext._cheb_unpack_permuted_reim_kernel!,output,packed,n,batch,
+                         stride(input,axis);ndrange=(n,batch))
+                    @test output ≈ exact atol=1e-8 rtol=0
+                    inplace || @test input == original
+                end
             end
         end
 
@@ -260,14 +335,11 @@ n_ref_len(c) = length(c)
                 emu_dct1!(packed, packed, dir)
                 runk(ext._cheb_unpack_reim_kernel!, cout, packed, n, batch; ndrange=(n, batch))
             else
-                other = ntuple(i -> i < dim ? i : i + 1, N - 1)
-                perm = (dim, other...)
-                pshape = ntuple(i -> size(inp, perm[i]), N)
-                cs = permutedims(inp, perm); cmat = reshape(cs, n, batch)
-                runk(ext._cheb_pack_reim_kernel!, packed, cmat, n, batch; ndrange=(n, 2batch))
+                runk(ext._cheb_pack_permuted_reim_kernel!, packed, inp, n, batch,
+                     stride(inp,dim); ndrange=(n,batch))
                 emu_dct1!(packed, packed, dir)
-                runk(ext._cheb_unpack_reim_kernel!, cmat, packed, n, batch; ndrange=(n, batch))
-                permutedims!(out, reshape(cs, pshape), invperm(perm))
+                runk(ext._cheb_unpack_permuted_reim_kernel!, out, packed, n, batch,
+                     stride(inp,dim); ndrange=(n,batch))
             end
             return out
         end

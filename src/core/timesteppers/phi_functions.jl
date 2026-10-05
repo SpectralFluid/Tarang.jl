@@ -1,4 +1,6 @@
 # Exponential Time Differencing (ETD) utility functions
+const _ETD_DENSE_MAX_SIZE = 4096
+
 """
 Compute φ functions for exponential time differencing methods.
 
@@ -72,7 +74,7 @@ function phi_functions_matrix(A::AbstractMatrix, dt::Float64)
 
     # Full matrix functions retain dense O(n²) storage and cost O(n³).
     # Check the original dimension before allocating any dense work buffers.
-    if n > 4096
+    if n > _ETD_DENSE_MAX_SIZE
         throw(ArgumentError(
             "ETD matrix exponential requires dense O(n²) storage but n=$n is too large. " *
             "Use RK222/SBDF2 for this problem size, or reduce resolution."))

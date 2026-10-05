@@ -359,6 +359,7 @@ function step_diagonal_imex_sbdf2!(state::TimestepperState, solver::InitialValue
     F_history = state.timestepper_data[:ddi_sbdf2_F_history]::Vector{Vector{ScalarField}}
 
     F_n = evaluate_rhs(solver, current_state, t)
+    _group_rhs_coefficients!(F_n)
 
     if iteration == 0 || length(state.history) < 2
         # Startup runs once: the copies below allocate, but every steady step
@@ -496,7 +497,7 @@ function _distributed_diagonal_imex_applicable(solver::InitialValueSolver)
     # field only. The `nothing`-basis caveat that used to be documented here was
     # phantom — `ScalarField.bases` is `Tuple{Vararg{Basis}}` and cannot hold
     # `nothing`, so the loose and strict readings agreed on every input this can
-    # receive. See `is_fourier_basis` in basis/basis_core.jl.
+    # receive. See `is_fourier_basis` in basis/core.jl.
     return all(is_fourier_axis, field.bases)
 end
 
@@ -678,7 +679,7 @@ function _diagonal_deriv_grid(field::ScalarField, coord::Coordinate, order::Int)
         # `out` lives on the field's device (similar_zeros above) but `ik` is a
         # host Vector — broadcasting a host array into a CuArray kernel fails
         # (non-isbits argument). Upload the 1-D multiplier first, mirroring
-        # add_wavenumber_squared_contribution! (tensor_fractional_laplacian.jl).
+        # add_wavenumber_squared_contribution! (fractional_laplacian.jl).
         # Without this, any DiagonalIMEX GPU problem whose implicit L contains a
         # derivative-of-self term (dt(u) + β*d(u,x) = …) died with an opaque
         # GPU kernel-compilation error. (The PencilArray branch above keeps the
@@ -778,6 +779,7 @@ function step_distributed_diagonal_imex_sbdf2!(state::TimestepperState, solver::
     Fhist = state.timestepper_data[:dd_imex_Fhist]::Vector{Vector{ScalarField}}
 
     F_n = evaluate_rhs(solver, current_state, t)
+    _group_rhs_coefficients!(F_n)
 
     if iteration == 0 || length(state.history) < 2
         # SBDF1 startup: (1 + dt·L̂) X_new = X_n + dt·F_n
@@ -903,6 +905,7 @@ function step_distributed_diagonal_etd_rk222!(state::TimestepperState, solver::I
     # only φ-fields (those read by the predictor/corrector) are written.
     n_fields = length(current_state)
     _Nn_src = evaluate_rhs(solver, current_state, t)
+    _group_rhs_coefficients!(_Nn_src)
     N_n = _ddetd_nn_cache!(state, current_state, n_fields)
     @inbounds for i in 1:n_fields
         haskey(phis, i) || continue
@@ -929,6 +932,7 @@ function step_distributed_diagonal_etd_rk222!(state::TimestepperState, solver::I
     # Corrector: Xₙ₊₁ = c + dt·φ₂⊙(N(c) − N(Xₙ)), written in place into `pred`.
     # evaluate_rhs refreshes pred's algebraic state internally (no separate refresh).
     N_c = evaluate_rhs(solver, pred, t + dt)
+    _group_rhs_coefficients!(N_c)
     for (i, field) in enumerate(pred)
         haskey(phis, i) || continue
         ensure_layout!(field, :c); ensure_layout!(N_c[i], :c); ensure_layout!(N_n[i], :c)
@@ -1040,6 +1044,7 @@ function step_distributed_diagonal_imex_rk!(state::TimestepperState, solver::Ini
         # read downstream (those with a diagonal L̂) are copied; algebraic/0D
         # fields' F is never used by the explicit accumulation.
         F_result = evaluate_rhs(solver, Y, t + cc[s] * dt)
+        _group_rhs_coefficients!(F_result)
         dst = Fs_cache[s]
         @inbounds for i in 1:n_fields
             haskey(Lhats, i) || continue

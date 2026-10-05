@@ -148,9 +148,11 @@ _dct_cache_device_id(arch::GPU) = _current_device_id()
 # call (same assumption the plan work-buffer reuse already makes).
 const _GPU_DCT_SCRATCH_CACHE = Dict{Tuple, Any}()
 
-"""Get `count` cached, reusable `(shape, T)` GPU scratch buffers (thread-safe)."""
-function get_gpu_dct_scratch(arch::GPU, shape::NTuple{N,Int}, ::Type{T}, count::Int) where {N,T}
-    key = (_dct_cache_device_id(arch), shape, T, count)
+"""Get `count` reusable GPU buffers; `purpose` separates independent scratch users."""
+function get_gpu_dct_scratch(arch::GPU, shape::NTuple{N,Int}, ::Type{T}, count::Int; purpose::Symbol=:default) where {N,T}
+    # Preserve the original key for existing callers and cache inspection.
+    base_key = (_dct_cache_device_id(arch), shape, T, count)
+    key = purpose === :default ? base_key : (base_key..., purpose)
     buffers = lock(_GPU_DCT_PLAN_CACHE_LOCK) do
         get!(() -> CuArray{T,N}[CUDA.zeros(T, shape...) for _ in 1:count],
              _GPU_DCT_SCRATCH_CACHE, key)

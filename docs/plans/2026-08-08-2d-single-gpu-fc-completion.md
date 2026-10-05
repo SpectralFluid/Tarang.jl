@@ -13,7 +13,7 @@
 **Files:**
 - Create: `test/test_transform_stage_shapes.jl`
 - Modify: `test/file_lists.jl`
-- Modify: `src/core/transforms/transform_layout.jl`
+- Modify: `src/core/transforms/layout.jl`
 
 **Step 1: Write the failing shape-contract tests**
 
@@ -75,7 +75,7 @@ Expected: both files pass.
 **Step 5: Commit**
 
 ```bash
-git add src/core/transforms/transform_layout.jl test/test_transform_stage_shapes.jl test/file_lists.jl
+git add src/core/transforms/layout.jl test/test_transform_stage_shapes.jl test/file_lists.jl
 git commit -m "refactor: expose mixed transform stage shapes"
 ```
 
@@ -216,7 +216,7 @@ git commit -m "feat: complete scaled 2D FC GPU transforms"
 
 **Files:**
 - Modify: `test/test_gpu_fc_2d_complete.jl`
-- Modify only if a value mismatch is demonstrated: `src/core/nonlinear/nonlinear_padding.jl`
+- Modify only if a value mismatch is demonstrated: `src/core/nonlinear/padding.jl`
 - Modify only if a value mismatch is demonstrated: `ext/cuda/utils.jl`
 
 **Step 1: Write derivative RED tests**
@@ -240,7 +240,7 @@ Run the focused CUDA file. If existing kernels pass, make no production change. 
 **Step 4: Commit tests and any demonstrated fix**
 
 ```bash
-git add test/test_gpu_fc_2d_complete.jl src/core/nonlinear/nonlinear_padding.jl ext/cuda/utils.jl
+git add test/test_gpu_fc_2d_complete.jl src/core/nonlinear/padding.jl ext/cuda/utils.jl
 git commit -m "test: validate 2D FC GPU derivatives and dealiasing"
 ```
 

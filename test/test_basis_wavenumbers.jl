@@ -1,4 +1,4 @@
-# Tests for Fourier wavenumber layout helpers (src/core/basis/basis_wavenumbers.jl).
+# Tests for Fourier wavenumber layout helpers (src/core/basis/wavenumbers.jl).
 #
 # Every expected array is hand-computed from the documented storage layout, so
 # the test is an independent oracle, not a mirror of the implementation.
@@ -11,7 +11,7 @@ using Tarang
 
 const W = Tarang
 
-@testset "basis_wavenumbers.jl" begin
+@testset "wavenumbers.jl" begin
     coords = CartesianCoordinates("x")
 
     @testset "wavenumbers(RealFourier) native cos/sin layout" begin

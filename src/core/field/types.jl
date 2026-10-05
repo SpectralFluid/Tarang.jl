@@ -1,0 +1,354 @@
+"""
+Field classes for data fields
+"""
+
+# PencilArrays, LinearAlgebra, SparseArrays, LoopVectorization already in Tarang.jl
+using LinearAlgebra: mul!, ldiv!
+using NetCDF
+using Random
+
+abstract type Operand end
+
+# ---------------------------------------------------------------------------
+# Field storage traits (serial vs pencil-distributed)
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Field Storage Hierarchy
+#
+# ScalarField{T, S} is parameterized on:
+#   T — element type (Float64, Float32, etc.)
+#   S — storage backend (<: AbstractFieldStorage)
+#
+# Storage backends:
+#   SerialFieldStorage   — local Array/CuArray (serial/GPU), or PencilArray for
+#                          MPI-distributed FFT (no separate Pencil storage type;
+#                          MPI binds the storage param to abstract PencilArray)
+#   TransposableFieldStorage — 2D pencil decomposition with transposes (GPU+MPI)
+#
+# Adding S as a type parameter enables the compiler to specialize
+# forward_transform!/backward_transform! without runtime dispatch.
+# ---------------------------------------------------------------------------
+
+abstract type AbstractFieldStorage end
+
+# Legacy trait types (kept for compatibility with existing storage_mode() dispatch)
+abstract type FieldStorageMode end
+struct SerialStorage <: FieldStorageMode end
+struct PencilStorage <: FieldStorageMode end
+struct TransposableStorage <: FieldStorageMode end
+
+storage_mode(dist::Distributor) = dist.use_pencil_arrays ? PencilStorage() : SerialStorage()
+
+is_pencil_storage(x) = storage_mode(x) isa PencilStorage
+is_serial_storage(x) = storage_mode(x) isa SerialStorage
+is_transposable_storage(x) = storage_mode(x) isa TransposableStorage
+
+"""
+    SerialFieldStorage{G,C} <: AbstractFieldStorage
+
+Storage for serial (single-process) or PencilArray-backed fields.
+Wraps the existing FieldBuffers structure.
+
+Parametrized on the grid (`G`) and coefficient (`C`) array types. Grid storage
+is concrete on every backend. MPI mixed-basis coefficient storage fixes all
+`PencilArray` parameters except the pencil layout, because the subproblem
+solver temporarily swaps between FFT and solve pencils; this keeps inference
+bounded without rejecting the valid layout swap. The arrays are built up-front
+by `_build_field_arrays` (or typed length-0 sentinels for 0-D fields).
+"""
+mutable struct SerialFieldStorage{G<:AbstractArray, C<:AbstractArray} <: AbstractFieldStorage
+    architecture::AbstractArchitecture
+    grid::G
+    coeff::C
+    current_layout::Symbol
+end
+
+# Keep the three-argument constructors, including the explicitly parameterized
+# form used for mixed-pencil storage. Layout validity belongs to the arrays:
+# two field handles sharing storage must observe the same authoritative buffer.
+SerialFieldStorage{G,C}(arch, grid, coeff) where {G,C} =
+    SerialFieldStorage{G,C}(arch, grid, coeff, :g)
+SerialFieldStorage(arch, grid::G, coeff::C) where {G<:AbstractArray,C<:AbstractArray} =
+    SerialFieldStorage{G,C}(arch, grid, coeff)
+
+# Grid arrays never change pencil permutation, so they can always use their
+# exact type. Mixed Fourier–Chebyshev subproblem solves temporarily swap the
+# coefficient array between FFT and solve pencils. Those arrays differ only in
+# the final Pencil type parameter; retain every other parameter so inference is
+# narrow while permitting that intentional swap.
+_grid_storage_param(a::AbstractArray) = typeof(a)
+_coeff_storage_param(a::PencilArrays.PencilArray{T,N,A,Nd,Np}) where {T,N,A,Nd,Np} =
+    PencilArrays.PencilArray{T,N,A,Nd,Np}
+_coeff_storage_param(a::AbstractArray) = typeof(a)
+
+# TransposableFieldStorage is defined in transposable_field.jl (loaded later,
+# for locality with the rest of the transpose subsystem it marks). It inherits
+# from AbstractFieldStorage defined above and mirrors SerialFieldStorage's
+# fields exactly (architecture, grid, coeff, current_layout) — it exists only to be a
+# distinct type for storage_mode/dispatch, so the field accessors below need
+# no per-storage-type specialization.
+
+# Backward-compatible alias: FieldBuffers is now SerialFieldStorage
+const FieldBuffers = SerialFieldStorage
+
+@inline function _update_field_buffer_architecture!(buffers::AbstractFieldStorage, value)
+    if value === nothing
+        return
+    elseif value isa AbstractArray
+        buffers.architecture = architecture(value)
+    end
+end
+
+mutable struct ScalarField{T, S<:AbstractFieldStorage} <: Operand
+    dist::Distributor
+    name::String
+    bases::Tuple{Vararg{Basis}}
+    domain::Union{Nothing, Domain}
+    dtype::Type{T}
+
+    # Strongly retain the exact plan that owns PencilArray storage. This is
+    # intentionally type-erased because transform types load after field types;
+    # `_field_transform_bundle` restores the concrete return type.
+    transform_bundle::Any
+
+    storage::S
+
+    # Layout information
+    layout::Union{Nothing, Layout}
+    # `current_layout` is a public property backed by `storage.current_layout`.
+
+    # Scale information
+    scales::Union{Nothing, Tuple{Vararg{Float64}}}  # Current scales for each dimension
+
+    # Transform preference (:auto, :cpu, :gpu). GPU fields reject :cpu.
+    fft_mode::Symbol
+
+    # Pool tracking metadata (managed by FieldPool)
+    _from_pool::Bool
+    _pool_generation::Int
+
+    function ScalarField(dist::Distributor, name::String="field", bases::Tuple{Vararg{Basis}}=(),
+                         dtype::Type{T}=dist.dtype) where T
+        domain = length(bases) > 0 ? get_or_build_domain(dist, bases) : nothing
+        bases = domain === nothing ? bases : domain.bases
+        layout = length(bases) > 0 ? get_layout(dist, bases, dtype) : nothing
+        initial_scales = length(bases) > 0 ? ntuple(_ -> 1.0, dist.dim) : nothing
+
+        # Build the concrete arrays BEFORE storage so SerialFieldStorage{G,C} is
+        # parametrized on their real types. 0-D fields get typed length-0
+        # sentinels so storage is never nothing (Phase 1 type-stability).
+        g, c = domain !== nothing ? _build_field_arrays(dist, domain, T) :
+                                   (_empty_grid(T, dist.architecture),
+                                    _empty_coeff(T, dist.architecture))
+        bundle = domain === nothing ? nothing : transform_plan_bundle(domain, T)
+        # A distributed GPU field transforms by explicit transposes
+        # (TransposableField), never by PencilFFTs (which is CPU-only). Record
+        # that at the type level so the transform can dispatch on it instead of
+        # erroring at the call site. TransposableFieldStorage carries the same
+        # (architecture, grid, coeff, current_layout) fields as SerialFieldStorage — the
+        # transpose buffers/counts/comms/topology live on the Distributor-side
+        # workspace cache (`transpose_workspace!`), not here, so this selection
+        # alone performs no collective MPI call.
+        storage = if _uses_transpose_storage(dist.architecture, dist.size)
+            TransposableFieldStorage{_grid_storage_param(g), _coeff_storage_param(c)}(dist.architecture, g, c)
+        else
+            SerialFieldStorage{_grid_storage_param(g), _coeff_storage_param(c)}(dist.architecture, g, c)
+        end
+        return new{T, typeof(storage)}(dist, name, bases, domain, dtype, bundle,
+                                       storage, layout, initial_scales, :auto, false, 0)
+    end
+
+    # Copy metadata around already-owned arrays without allocating a discarded
+    # pair of buffers or rebuilding plans. Pool ownership never transfers.
+    function ScalarField(source::ScalarField{T}, storage::S) where {T, S<:AbstractFieldStorage}
+        return new{T,S}(source.dist, source.name, source.bases, source.domain,
+            source.dtype, source.transform_bundle, storage, source.layout,
+            source.scales, source.fft_mode, false, 0)
+    end
+
+    # Inner constructor for explicit storage type (e.g., TransposableFieldStorage)
+    function ScalarField(dist::Distributor, name::String, bases::Tuple{Vararg{Basis}},
+                         dtype::Type{T}, storage::S) where {T, S<:AbstractFieldStorage}
+        domain = length(bases) > 0 ? get_or_build_domain(dist, bases) : nothing
+        bases = domain === nothing ? bases : domain.bases
+        layout = length(bases) > 0 ? get_layout(dist, bases, dtype) : nothing
+        initial_scales = length(bases) > 0 ? ntuple(_ -> 1.0, dist.dim) : nothing
+        bundle = domain === nothing ? nothing : transform_plan_bundle(domain, T)
+        field = new{T, S}(dist, name, bases, domain, dtype, bundle, storage,
+                          layout, initial_scales, :auto, false, 0)
+        # Install typed length-0 sentinels for 0-D fields so storage is never nothing.
+        if domain === nothing
+            set_grid_data!(field, _empty_grid(T, storage.architecture))
+            set_coeff_data!(field, _empty_coeff(T, storage.architecture))
+        end
+        return field
+    end
+end
+
+# Note: getproperty/setproperty! for ScalarField are defined later in this file.
+# They include backward-compatible :buffers → :storage mapping.
+
+mutable struct VectorField{T, S<:AbstractFieldStorage} <: Operand
+    dist::Distributor
+    coordsys::CoordinateSystem
+    name::String
+    bases::Tuple{Vararg{Basis}}
+    domain::Union{Nothing, Domain}
+    dtype::Type{T}
+
+    # Component fields
+    components::Vector{ScalarField{T, S}}
+
+    # Optional stacked component buffer for SoA access
+    component_buffer::Union{Nothing, AbstractArray}
+    buffer_layout::Union{Nothing, Symbol}
+    buffer_architecture::AbstractArchitecture
+
+    function VectorField(dist::Distributor, coordsys::CoordinateSystem, name::String="vector",
+                         bases::Tuple{Vararg{Basis}}=(), dtype::Type{T}=dist.dtype) where T
+        domain = length(bases) > 0 ? get_or_build_domain(dist, bases) : nothing
+        bases = domain === nothing ? bases : domain.bases
+
+        # Create component fields. SerialFieldStorage is now parametric, so build
+        # into an abstractly-typed vector then narrow with identity.() — all
+        # components share bases/dtype/dist, hence one concrete storage type.
+        components = ScalarField[]
+        for (i, coord_name) in enumerate(coordsys.names)
+            component_name = "$(name)_$coord_name"
+            component = ScalarField(dist, component_name, bases, dtype)
+            push!(components, component)
+        end
+        comps = identity.(components)
+        S = _component_storage_type(comps)
+
+        buffer_architecture = dist.architecture
+        new{T, S}(dist, coordsys, name, bases, domain, dtype, comps, nothing, nothing, buffer_architecture)
+    end
+end
+
+# Resolve the concrete storage type parameter from a realized component
+# container. After identity.() narrowing, every component shares one concrete
+# SerialFieldStorage{G,C}; an empty/abstract container (degenerate: no
+# coordinates) falls back to the abstract storage supertype.
+_component_storage_type(::AbstractArray{ScalarField{T, S}}) where {T, S} = S
+_component_storage_type(::AbstractArray) = SerialFieldStorage
+
+# Convenience constructor: uses dist.coordsys as default coordinate system
+"""
+    VectorField(dist, name, bases, dtype=dist.dtype)
+
+Create a VectorField using the distributor's coordinate system.
+
+This is a convenience constructor equivalent to:
+    VectorField(dist, dist.coordsys, name, bases, dtype)
+
+# Example
+```julia
+coords = CartesianCoordinates("x", "y")
+dist = Distributor(coords; dtype=Float64)
+xb = RealFourier(coords["x"]; size=64, bounds=(0.0, 2π))
+yb = RealFourier(coords["y"]; size=64, bounds=(0.0, 2π))
+
+# Simple form (recommended):
+u = VectorField(dist, "u", (xb, yb), Float64)
+
+# Explicit form (when you need a different coordinate system):
+u = VectorField(dist, coords, "u", (xb, yb), Float64)
+```
+"""
+VectorField(dist::Distributor, name::String, bases::Tuple{Vararg{Basis}}, dtype::Type=dist.dtype) =
+    VectorField(dist, dist.coordsys, name, bases, dtype)
+
+mutable struct TensorField{T, S<:AbstractFieldStorage} <: Operand
+    dist::Distributor
+    coordsys::CoordinateSystem
+    name::String
+    bases::Tuple{Vararg{Basis}}
+    domain::Union{Nothing, Domain}
+    dtype::Type{T}
+
+    # Component fields as matrix
+    components::Matrix{ScalarField{T, S}}
+
+    component_buffer::Union{Nothing, AbstractArray}
+    buffer_layout::Union{Nothing, Symbol}
+    buffer_architecture::AbstractArchitecture
+
+    function TensorField(dist::Distributor, coordsys::CoordinateSystem, name::String="tensor",
+                         bases::Tuple{Vararg{Basis}}=(), dtype::Type{T}=dist.dtype) where T
+        domain = length(bases) > 0 ? get_or_build_domain(dist, bases) : nothing
+        bases = domain === nothing ? bases : domain.bases
+
+        dim = coordsys.dim
+        # SerialFieldStorage is now parametric: build an abstractly-typed matrix
+        # then narrow with identity.() — all components share one concrete
+        # storage type (same bases/dtype/dist).
+        components = Matrix{ScalarField}(undef, dim, dim)
+        for i in 1:dim, j in 1:dim
+            component_name = "$(name)_$(coordsys.names[i])$(coordsys.names[j])"
+            components[i,j] = ScalarField(dist, component_name, bases, dtype)
+        end
+        comps = identity.(components)
+        S = _component_storage_type(comps)
+
+        buffer_architecture = dist.architecture
+        new{T, S}(dist, coordsys, name, bases, domain, dtype, comps, nothing, nothing, buffer_architecture)
+    end
+end
+
+# Convenience constructor: uses dist.coordsys as default coordinate system
+"""
+    TensorField(dist, name, bases, dtype=dist.dtype)
+
+Create a TensorField using the distributor's coordinate system.
+
+This is a convenience constructor equivalent to:
+    TensorField(dist, dist.coordsys, name, bases, dtype)
+"""
+TensorField(dist::Distributor, name::String, bases::Tuple{Vararg{Basis}}, dtype::Type=dist.dtype) =
+    TensorField(dist, dist.coordsys, name, bases, dtype)
+
+# ============================================================================
+# Operand accessors
+# ============================================================================
+#
+# `Operand` covers both the three field types and the ~45 operator nodes, and
+# only the fields carry storage. Asking "does this operand have data?" used to be
+# written as `hasfield(typeof(x), :domain)` / `:current_layout` / `:buffers` at
+# ~60 call sites. A field-presence test answers `false` for two different
+# reasons — the operand genuinely has no such thing, or the field was renamed —
+# and the second reason is silent, which is how `:buffers` came to guard
+# unreachable branches long after `ScalarField` stopped having a field by that
+# name. These accessors give the same information through dispatch, so a rename
+# is a `MethodError` at the definition rather than a branch that quietly stops
+# being taken.
+
+"""
+    operand_domain(op::Operand) -> Union{Domain, Nothing}
+
+`Domain` an operand belongs to, or `nothing` for operands that carry no data
+(operator nodes, futures). Fields may also answer `nothing`: `domain` is
+`Union{Nothing, Domain}` on all three of them.
+"""
+operand_domain(::Operand) = nothing
+operand_domain(f::ScalarField) = f.domain
+operand_domain(f::VectorField) = f.domain
+operand_domain(f::TensorField) = f.domain
+
+"""
+    operand_layout(op::Operand) -> Union{Symbol, Nothing}
+
+Current layout (`:g` or `:c`) of an operand that stores data, `nothing`
+otherwise. `ScalarField` is the only `Operand` with a layout of its own; a
+vector/tensor's layout is a property of its components.
+"""
+operand_layout(::Operand) = nothing
+operand_layout(f::ScalarField) = f.current_layout
+
+# storage_mode methods — dispatch on storage type parameter when available
+storage_mode(::ScalarField{T, <:SerialFieldStorage}) where T = SerialStorage()
+# TransposableFieldStorage dispatch is defined in transposable_field.jl (loaded later)
+storage_mode(field::ScalarField) = storage_mode(field.dist)  # fallback
+storage_mode(vf::VectorField) = storage_mode(vf.dist)
+storage_mode(tf::TensorField) = storage_mode(tf.dist)

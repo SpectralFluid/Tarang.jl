@@ -99,6 +99,26 @@ function _sp_stage_slots!(state::TimestepperState, key::Symbol, stages::Int, n::
     return v
 end
 
+# Parameter fields and BC arrays can change without a time-dependent BC flag.
+# Reuse static forcing only when this exact destination already holds it.
+function _ensure_alg_F!(alg_f, sp, bc_dynamic::Bool)
+    if bc_dynamic || !alg_F_is_static(sp) || sp.runtime.alg_F_gathered_into !== alg_f
+        gather_alg_F!(alg_f, sp)
+    end
+    return alg_f
+end
+
+# RHS values in the solve pencil are read-only and discarded. Restore their FFT
+# storage without a collective, then release the buffer's coefficient layout:
+# its grid still holds the RHS, so the next evaluation can overwrite it directly.
+function _restore_subproblem_rhs!(fields, stash, solver)
+    for (field, fft_data) in stash
+        set_coeff_data!(field, fft_data)
+    end
+    _release_rhs_buffer!(fields, solver)
+    return nothing
+end
+
 """
     WoodburySolver
 
@@ -374,6 +394,30 @@ end
 @inline _is_explicit_first_stage(stage::Int, a_ii::Real) =
     stage == 1 && abs(a_ii) < 1e-14
 
+# Pure per-mode arithmetic; every mutable buffer/factor belongs to this mode.
+function _solve_rk_local_mode!(sp, rhs, mx0, F, LX, alg_f, solution, factor,
+                               sp_idx, stage, dt, A_exp, A_imp)
+    _assign_to_buffer!(rhs, mx0)
+    for j in 1:(stage - 1)
+        if !iszero(A_exp[stage, j])
+            _sp_axpy!(rhs, dt * A_exp[stage, j], F[j][sp_idx])
+        end
+        if !iszero(A_imp[stage, j])
+            _sp_axpy!(rhs, -dt * A_imp[stage, j], LX[j][sp_idx])
+        end
+    end
+    a_ii = A_imp[stage, stage]
+    if abs(a_ii) > 1e-14
+        apply_bc_override!(rhs, alg_f, sp, dt * a_ii)
+    end
+    if factor === nothing
+        _assign_to_buffer!(solution, rhs)
+    else
+        _solve_cached_system!(solution, factor, rhs)
+    end
+    return nothing
+end
+
 """
     step_subproblem_rk!(state::TimestepperState, solver::InitialValueSolver,
                          subproblems::Tuple)
@@ -492,6 +536,10 @@ function step_subproblem_rk!(state::TimestepperState, solver::InitialValueSolver
     # scales BC F by `A^E[i,j]/a_ii` (= 1/γ for RK222 stage 2 = 2+√2 ≈ 3.414)
     # and inhomogeneous BCs would be enforced at the wrong value.
     ALG_F = _sp_slots!(state, :_sp_rk_ALG_F, n_sp)
+    solutions = _sp_slots!(state, :_sp_rk_solutions, n_sp)
+    factors = _local_mode_factor_slots!(state, n_sp)
+    threaded_modes = _thread_local_modes(solver.base.threaded_modes, subproblems,
+                                         solver.base.matsolver)
 
     # ── Solve-layout bracketing (mixed Fourier–Chebyshev distributed only) ──
     # The state needs the FFT pencil ONLY at `evaluate_rhs_buffered` (which reads
@@ -534,15 +582,7 @@ function step_subproblem_rk!(state::TimestepperState, solver::InitialValueSolver
         RHS[sp_idx] = rhs
 
         alg_f = _sp_stage_vector!(sp, :alg_f, n_eq, mx0)
-        # `alg_F_is_static` guards the skip against BC values that change
-        # through non-time channels (parameter fields, BC arrays): those read
-        # live data at each gather and must re-gather every step even though
-        # `has_time_dependent_bcs` is false.
-        if bc_dynamic || !alg_F_is_static(sp) ||
-           sp.runtime.alg_F_gathered_into !== alg_f
-            gather_alg_F!(alg_f, sp)
-        end
-        ALG_F[sp_idx] = alg_f
+        ALG_F[sp_idx] = _ensure_alg_F!(alg_f, sp, bc_dynamic)
     end
     # NO from_solve here: the pre-stage gather only READS state (MX0 = M·X_n),
     # leaving it unmodified in the solve pencil. The stage loop's first gather
@@ -571,73 +611,37 @@ function step_subproblem_rk!(state::TimestepperState, solver::InitialValueSolver
             end
         end
 
-        # Build RHS and solve per subproblem. State is ALREADY in the solve
-        # pencil (carried over from the pre-stage gather or the previous stage's
-        # F/LX gather), so no transpose here — `scatter_inputs` writes the stage
-        # solution directly in the solve pencil.
-        for (sp_idx, sp) in enumerate(subproblems)
-            sp.M_min === nothing && continue
-
-            a_ii = A_imp[i, i]
-            _is_explicit_first_stage(i, a_ii) && continue
-
-            # RHS = M*X_n + dt * Σ_{j<i}( A^E_{ij}*F_j - A^I_{ij}*L*X_j )
-            # F[j] and LX[j] contain values at stage j SOLUTION (set after stage j)
-            rhs = RHS[sp_idx]
-            _assign_to_buffer!(rhs, MX0[sp_idx])
-
-            # Exact-zero test, not a tolerance: the skip is there to avoid a
-            # pointless pass over the mode's data (ESDIRK's empty first implicit
-            # column), and the tableau entries are exact constants. See the note
-            # in `step_rk_imex!`.
-            for j in 1:(i - 1)
-                if !iszero(A_exp[i, j])
-                    _sp_axpy!(rhs, dt * A_exp[i, j], F[j][sp_idx])
-                end
-                if !iszero(A_imp[i, j])
-                    _sp_axpy!(rhs, -dt * A_imp[i, j], LX[j][sp_idx])
-                end
-            end
-
-            # Solve: (M_min + dt*a_ii*L_min) * x_sol = rhs
-            # Override BC rows with `dt*a_ii*F_alg`. For algebraic rows (M=0),
-            # the stage LHS reduces to `dt*a_ii*L_row*X = dt*a_ii*F_alg`, i.e.,
-            # `L_row*X = F_alg`, enforcing the BC at every stage regardless of
-            # accumulated history. `sp.bc_rows` lists the L_min row indices that
-            # correspond to algebraic (BC-like) equations, computed in
-            # build_matrices! from the Woodbury block classification.
-            # Vectorized (CUDA.allowscalar(false)-safe) override via
-            # `apply_bc_override!`.
-            if abs(a_ii) > 1e-14
-                apply_bc_override!(rhs, ALG_F[sp_idx], sp, dt * a_ii)
-            end
-
-            if abs(a_ii) < 1e-14
-                # No implicit diagonal — just invert M
-                x_sol = _sp_stage_vector!(sp, :sol_stage, i, size(sp.M_min, 2), RHS[sp_idx])
-                if sp.M_min !== nothing
-                    M_lu = _get_or_compute_mass_lu!(sp)
-                    if M_lu !== nothing
-                        _solve_cached_system!(x_sol, M_lu, rhs)
-                    else
-                        _assign_to_buffer!(x_sol, rhs)  # fallback
-                    end
-                else
-                    _assign_to_buffer!(x_sol, rhs)
-                end
-            else
-                x_sol = _sp_stage_vector!(sp, :sol_stage, i, size(sp.M_min, 2), RHS[sp_idx])
-                lhs_solver = _get_or_build_lhs!(sp, i, dt, a_ii)
-                if lhs_solver !== nothing
-                    _solve_cached_system!(x_sol, lhs_solver, rhs)
-                else
+        # Prepare factors and workspaces on the coordinating task: cache growth,
+        # factorization and backend discovery must finish before workers start.
+        a_ii = A_imp[i, i]
+        if !_is_explicit_first_stage(i, a_ii)
+            for (sp_idx, sp) in enumerate(subproblems)
+                sp.M_min === nothing && continue
+                solutions[sp_idx] = _sp_stage_vector!(sp, :sol_stage, i,
+                                                     size(sp.M_min, 2), RHS[sp_idx])
+                factors[sp_idx] = abs(a_ii) < 1e-14 ?
+                    _get_or_compute_mass_lu!(sp) : _get_or_build_lhs!(sp, i, dt, a_ii)
+                if factors[sp_idx] === nothing && abs(a_ii) >= 1e-14
                     @warn "step_subproblem_rk!: LHS factorization failed for sp group=$(sp.group), stage=$i; using rhs as fallback" maxlog=1
-                    _assign_to_buffer!(x_sol, rhs)
                 end
             end
 
-            # Scatter solution back to state fields
-            scatter_inputs(sp, x_sol, state_fields)
+            # Workers mutate only disjoint mode buffers and each mode's factor
+            # scratch. No field access, layout changes, lazy caches or MPI here.
+            _foreach_local_mode!(n_sp, threaded_modes) do sp_idx
+                sp = subproblems[sp_idx]
+                sp.M_min === nothing && return
+                _solve_rk_local_mode!(sp, RHS[sp_idx], MX0[sp_idx], F, LX,
+                                      ALG_F[sp_idx], solutions[sp_idx], factors[sp_idx],
+                                      sp_idx, i, dt, A_exp, A_imp)
+            end
+
+            # coeff_data! and zero-dimensional tau slots can be shared between
+            # modes, so field writes remain ordered on the coordinating task.
+            for (sp_idx, sp) in enumerate(subproblems)
+                sp.M_min === nothing && continue
+                scatter_inputs(sp, solutions[sp_idx], state_fields)
+            end
         end
 
         # Nothing reads `F[stages]` or `LX[stages]` once the tableau retires the
@@ -673,6 +677,7 @@ function step_subproblem_rk!(state::TimestepperState, solver::InitialValueSolver
         # the IMEX-RK accumulation formula gives the wrong `1/γ` scaling for
         # inhomogeneous algebraic constraints like `T(z=0) = 1`.
         F_fields = evaluate_rhs_buffered(solver, state_fields, t + dt * c_exp[i])
+        _group_rhs_coefficients!(F_fields)
         # Both the per-mode RHS gather (`gather_eqn_F!` reads F_fields' coeffs)
         # and the state re-gather (`gather_inputs!`) need solve layout. Transpose
         # state AND F_fields ONCE each, OUTSIDE the loop. F_fields are read-only
@@ -701,19 +706,7 @@ function step_subproblem_rk!(state::TimestepperState, solver::InitialValueSolver
         # State STAYS in the solve pencil (no from_solve): the next stage's gather
         # — or the final update — needs exactly this layout, and nothing reads the
         # FFT layout before then. solve_stash remains armed for the next pop.
-        # Restore F's coeff storage pointer (no transpose; solved F values are
-        # discarded, but the pencil must be the FFT pencil for the next stage's
-        # buffered RHS transform).
-        for (f, fft_pa) in _fg_F_stash
-            set_coeff_data!(f, fft_pa)
-        end
-        # `to_solve_layout!` above left the shared RHS buffer :c-flagged. The next stage's
-        # `evaluate_rhs_buffered` writes it through `ensure_layout!(out, :g)` and would pay a
-        # full distributed backward transform (PencilFFTs `ldiv!` + the coupled-DCT
-        # transposes) of coefficients it immediately overwrites. Its grid array is still the
-        # one the lazy RHS wrote (the forward transform reads grid, writes coeff), so the
-        # `:g` flag is honest. Same fix as the diagonal-IMEX steppers.
-        _release_rhs_buffer!(F_fields, solver)
+        _restore_subproblem_rhs!(F_fields, _fg_F_stash, solver)
     end
 
     # The public state is at `t + dt`, which need not be the final tableau
@@ -1083,6 +1076,14 @@ end
 
 # ── Helper: get or build LHS factorization for a stage ────────────────────────
 
+# Subproblem matrix slots are intentionally backend/type-erased. Recover their
+# concrete sparse storage before broadcasting over values on every mode/stage.
+function _update_subproblem_lhs_values!(lhs::SparseMatrixCSC, mass::SparseMatrixCSC,
+                                       linear::SparseMatrixCSC, coeff::ComplexF64)
+    lhs.nzval .= mass.nzval .+ coeff .* linear.nzval
+    return lhs
+end
+
 """
     _get_or_build_lhs!(sp, stage_idx, dt, a_ii)
 
@@ -1122,8 +1123,7 @@ function _get_or_build_lhs!(sp::Subproblem, stage_idx::Int, dt::Float64, a_ii::F
     # we can refactor via symbolic reuse below.
     LHS = if sp.M_exp !== nothing && sp.L_exp !== nothing && sp.LHS !== nothing
         coeff = ComplexF64(dt * a_ii)
-        sp.LHS.nzval .= sp.M_exp.nzval .+ coeff .* sp.L_exp.nzval
-        sp.LHS
+        _update_subproblem_lhs_values!(sp.LHS, sp.M_exp, sp.L_exp, coeff)
     elseif L !== nothing && abs(a_ii) > 1e-14
         M + dt * a_ii * L
     else

@@ -2,7 +2,7 @@
 #
 # The per-mode implicit operator picks its wavenumber array with
 #   isa(basis, RealFourier) && first_real_fourier_axis ? wavenumbers_rfft : wavenumbers_fft
-# (`_subproblem_kx`, matrices_subproblem_helpers.jl). A ComplexFourier basis lands
+# (`_subproblem_kx`, subproblem_helpers.jl). A ComplexFourier basis lands
 # in the `wavenumbers_fft` arm, which only had a RealFourier method — so ANY
 # Fourier x Chebyshev problem with a ComplexFourier axis died at solver
 # construction with `MethodError: no method matching wavenumbers_fft(::ComplexFourier)`.

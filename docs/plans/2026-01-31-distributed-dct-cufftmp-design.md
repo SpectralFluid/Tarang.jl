@@ -34,7 +34,7 @@ This document describes the design for true multi-GPU DCT (Discrete Cosine Trans
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────────┐
-│              Transform Dispatch (transform_gpu.jl)           │
+│              Transform Dispatch (gpu.jl)           │
 │  Detects: single-GPU vs distributed, Fourier vs Chebyshev   │
 └─────────────────────────────────────────────────────────────┘
                               │

@@ -1,4 +1,4 @@
-# Coverage tests for src/core/solvers/solver_compiled_rhs.jl
+# Coverage tests for src/core/solvers/compiled_rhs.jl
 #
 # Focus: evaluate_solver_expression — the interpreted RHS-expression evaluator
 # that walks a parsed operator tree (Add/Subtract/Multiply/Divide/Power/Negate/

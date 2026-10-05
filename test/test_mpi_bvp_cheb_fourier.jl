@@ -2,7 +2,7 @@
 #
 # The InitialValueProblem subproblem steppers bracket every per-mode coeff gather/scatter with the
 # Cheb-Fourier solve-layout transpose (to_solve_layout!/from_solve_layout!), but
-# the steady BVP/NonlinearBoundaryValueProblem solvers in solver_stepping.jl did NOT — so the per-mode
+# the steady BVP/NonlinearBoundaryValueProblem solvers in stepping.jl did NOT — so the per-mode
 # gather indexed the PencilFFT-output pencil (Chebyshev axis decomposed, Fourier
 # axis local) with solve-pencil index logic and produced a DimensionMismatch (or
 # wrong coefficients) at np>=2. The NonlinearBoundaryValueProblem Newton loop additionally deadlocked once

@@ -693,6 +693,18 @@ function tanh_field(operand::Operand)
     return UnaryGridFunction(operand, tanh, "tanh")
 end
 
+# These functions also populate the equation parser's namespace. Constant
+# arguments are folded to Numbers there, so evaluate them as scalar functions
+# instead of trying to construct a field operator (e.g. a wall value exp(2)).
+sin_field(value::Number) = sin(value)
+cos_field(value::Number) = cos(value)
+tan_field(value::Number) = tan(value)
+exp_field(value::Number) = exp(value)
+log_field(value::Number) = log(value)
+sqrt_field(value::Number) = sqrt(value)
+abs_field(value::Number) = abs(value)
+tanh_field(value::Number) = tanh(value)
+
 # ============================================================================
 # Copy Operator Constructor
 # ============================================================================

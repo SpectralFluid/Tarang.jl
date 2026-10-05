@@ -1,6 +1,6 @@
 using Test, Tarang, LinearAlgebra
 
-# Coverage-focused tests for src/core/basis/basis_operators.jl
+# Coverage-focused tests for src/core/basis/operators.jl
 #
 # Targets the uncovered serial-CPU lines: derivative_basis cold branches,
 # the Jacobi recurrence-conversion path (_general_jacobi_conversion, shift

@@ -1,7 +1,7 @@
 # Operators, transforms, boundary conditions, problem definitions, and system
 # assembly primitives.
 
-include("operators/operators.jl")
+include("operators/core.jl")
 include("cartesian_operators.jl")
 include("transforms.jl")
 include("boundary_conditions.jl")

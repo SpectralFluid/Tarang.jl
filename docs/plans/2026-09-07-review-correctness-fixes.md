@@ -23,7 +23,7 @@ commit unrelated edits. The three fixes are authorized by the review follow-up.
   stage evaluation preserving history, and multistep history independence.
 - [x] Run the file and verify the new assertions fail for stale layouts/data.
 - [x] Move `current_layout` into both concrete storage types in
-  `src/core/field/field_types.jl` and `src/core/transposable_field.jl`; preserve
+  `src/core/field/types.jl` and `src/core/transposable_field.jl`; preserve
   the existing public property and three-argument storage constructors.
 - [x] Update the ScalarField property shim and the direct parser layout read.
 - [x] Update solver synchronization to share complete storage and bind stage
@@ -36,7 +36,7 @@ commit unrelated edits. The three fixes are authorized by the review follow-up.
 - [x] Add and run the failing Fourier mode decay test in
   `test/test_cfl_diffusive.jl`.
 - [x] Replace the Fourier finite-difference frequency in
-  `src/extras/flow_tools/flow_tools_cfl.jl` with half the spectral Laplacian
+  `src/extras/flow_tools/cfl.jl` with half the spectral Laplacian
   radius times diffusivity; retain the conservative bounded-axis estimate.
 - [x] Update analytical CPU/MPI expectations and relevant documentation.
 - [x] Run the focused CPU and available MPI CFL tests.
@@ -74,7 +74,7 @@ Validation results:
 - Full `Pkg.test(; allow_reresolve=false)` passed: 10,899 assertions across
   169 test files, 19 reported broken/skipped, zero failures or errors. The
   pre-existing CUDA extension method-overwrite precompilation error is still
-  emitted by unchanged `distributor_core.jl` and `ext/cuda/transforms.jl`;
+  emitted by unchanged `core.jl` and `ext/cuda/transforms.jl`;
   it did not prevent the package tests from passing. CUDA hardware was not tested.
 - `git diff --check` passed. All changes remain uncommitted.
 

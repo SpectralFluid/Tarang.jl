@@ -51,7 +51,7 @@ else
     end
 
     # Forward DCT-I in the Tarang/Chebyshev convention, mirroring
-    # `_chebyshev_forward` in src/core/transforms/transform_chebyshev.jl:
+    # `_chebyshev_forward` in src/core/transforms/chebyshev.jl:
     #   REDFT00 → ×1/(N-1) → half-weight endpoints → flip odd-degree coeffs.
     function cpu_dct1_forward(x::AbstractArray{<:Real}, dim::Int)
         N = size(x, dim)

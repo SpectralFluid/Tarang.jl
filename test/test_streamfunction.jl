@@ -1,5 +1,5 @@
 """
-Test suite for src/extras/flow_tools/flow_tools_streamfunction.jl
+Test suite for src/extras/flow_tools/streamfunction.jl
 
 This module relates a 2D streamfunction ψ to velocity / vorticity. All
 expected values here are INDEPENDENT vector-calculus ground truth computed

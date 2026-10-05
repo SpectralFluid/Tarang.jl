@@ -86,7 +86,7 @@ Each block has size `(eq_dofs × var_dofs)`, e.g., `(128 × 64)` for `(u_eq, p_v
 |------|--------|----------------|
 | `src/core/pencil_system.jl` | **Create** (replaces `pencil_matrices.jl`) | PencilSystem struct, variable-centric assembly, solve, gather/scatter |
 | `src/core/timesteppers/step_pencil_rk.jl` | **Modify** | Updated to use PencilSystem |
-| `src/core/solvers/solver_types.jl` | **Modify** | Build PencilSystem from problem |
+| `src/core/solvers/types.jl` | **Modify** | Build PencilSystem from problem |
 | `src/core/pencil_matrices.jl` | **Delete** | Replaced by `pencil_system.jl` |
 | `test/test_pencil_system.jl` | **Create** | Variable-centric tests |
 
@@ -375,7 +375,7 @@ end
 
 **Files:**
 - Modify: `src/core/timesteppers/step_pencil_rk.jl`
-- Modify: `src/core/solvers/solver_types.jl`
+- Modify: `src/core/solvers/types.jl`
 
 - [ ] **Step 1: `step_pencil_rk_imex!` uses `problem.variables` for gather/scatter**
 

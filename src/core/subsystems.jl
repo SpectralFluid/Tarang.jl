@@ -2,23 +2,23 @@
 Subsystem and Subproblem classes for pencil-based matrix assembly.
 
 Split into focused sub-files:
-- subsystem_types.jl: subsystem configuration, construction, and coupling analysis
-- subsystem_methods.jl: subsystem field access and gather/scatter helpers
+- types.jl: subsystem configuration, construction, and coupling analysis
+- methods.jl: subsystem field access and gather/scatter helpers
 - subproblem_types.jl: Subproblem definitions and sizing metadata
 - subproblem_runtime.jl: runtime manifest for per-mode I/O, BC/RHS gather, and mode checks
 - subproblem_build.jl: build manifest for construction, expression helpers, and matrix assembly
 - subproblem_permutations.jl: mode-wise row/column permutations
 - subproblem_matrix_utils.jl: sparse matrix utility helpers
 - subproblem_ncc.jl: non-constant coefficient matrix builders and compatibility shims
-- subsystem_exports.jl: exports for the subsystem API
+- exports.jl: exports for the subsystem API
 """
 
-include("subsystems/subsystem_types.jl")
-include("subsystems/subsystem_methods.jl")
+include("subsystems/types.jl")
+include("subsystems/methods.jl")
 include("subsystems/subproblem_types.jl")
 include("subsystems/subproblem_runtime.jl")
 include("subsystems/subproblem_build.jl")
 include("subsystems/subproblem_permutations.jl")
 include("subsystems/subproblem_matrix_utils.jl")
 include("subsystems/subproblem_ncc.jl")
-include("subsystems/subsystem_exports.jl")
+include("subsystems/exports.jl")

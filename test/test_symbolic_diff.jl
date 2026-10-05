@@ -651,7 +651,7 @@ end
     # _get_residual_expression with lhs/rhs -> SubtractOperator(lhs, rhs).
     #
     # These are the keys `build_matrix_expressions!` actually writes
-    # (problem_matrices_build.jl). This assertion previously used "LHS"/"RHS",
+    # (build.jl). This assertion previously used "LHS"/"RHS",
     # which nothing in the package writes, so it passed while production input
     # never reached the subtraction branch at all — every Newton Jacobian was
     # built from `F` alone, dropping the implicit `L` term. The test was checking

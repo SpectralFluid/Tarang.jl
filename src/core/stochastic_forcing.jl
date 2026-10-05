@@ -6,8 +6,8 @@ the types must exist before the generation/application methods that dispatch on
 them, and the exports come last.
 """
 
-include("forcing/stochastic_forcing_types.jl")
-include("forcing/stochastic_forcing_generation.jl")
-include("forcing/stochastic_forcing_application.jl")
-include("forcing/stochastic_forcing_diagnostics.jl")
-include("forcing/stochastic_forcing_deterministic.jl")
+include("forcing/types.jl")
+include("forcing/generation.jl")
+include("forcing/application.jl")
+include("forcing/diagnostics.jl")
+include("forcing/deterministic.jl")

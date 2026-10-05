@@ -196,7 +196,8 @@ function _group_put_vara(gid::Integer, varid::Integer, start, count, data::Array
 end
 
 function group_ncwrite(data::AbstractArray, filename::String, group::String, var_name::String; start=nothing)
-    array = Array(data)
+    # The synchronous C write only reads contiguous host storage.
+    array = data isa Array ? data : Array(data)
     start_indices = start === nothing ? ones(Int, ndims(array)) : collect(Int, start)
     count_indices = collect(Int, size(array))
 

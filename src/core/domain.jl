@@ -505,7 +505,7 @@ Compute the coefficient-space shape for a domain using the shared rule
 (see the comment block above). Callable from both serial and MPI wrappers.
 """
 function _coefficient_shape_impl(domain::Domain, dtype::Type=domain.dist.dtype)
-    # Delegates to the shared layout rules (transform_layout.jl) so this shape
+    # Delegates to the shared layout rules (layout.jl) so this shape
     # and the one each transform backend produces cannot drift apart — they are
     # now computed by the same code. `layout_coefficient_shape` walks the axes
     # tracking realness, which reproduces "only the first Fourier axis is halved,

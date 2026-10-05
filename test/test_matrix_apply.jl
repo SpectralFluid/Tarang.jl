@@ -1,5 +1,5 @@
 """
-Test suite for src/core/operators/derivatives/derivatives_matrix_apply.jl
+Test suite for src/core/operators/derivatives/matrix_apply.jl
 
 Targets the axis-wise matrix-application helpers:
   - apply_matrix_along_axis(matrix, array, axis; out=nothing)   (dispatcher)
@@ -233,7 +233,7 @@ oracle(M, A, axis) = mapslices(s -> M * s, A; dims=axis)
 
     @testset "real array, complex matrix (eltype promotion)" begin
         # FIXED 2026-06-03: the auto-allocated output buffer now uses
-        # promote_type(eltype(array), eltype(matrix)) (derivatives_matrix_apply.jl),
+        # promote_type(eltype(array), eltype(matrix)) (matrix_apply.jl),
         # so a complex matrix applied to a real array returns the correct complex
         # result instead of throwing InexactError.
         M = ComplexF64[1+0im 0+1im; 0-1im 2+0im]   # 2x2

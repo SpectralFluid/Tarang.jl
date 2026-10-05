@@ -13,21 +13,19 @@
 
 using KernelAbstractions
 
-# Backend resolution goes through the package's own `architecture`/`device`
-# pair, exactly as `launch!` in `core/architectures.jl` does, and NOT through
-# `KernelAbstractions.get_backend`. The two agree at runtime — `device(CPU())`
-# is `KernelAbstractions.CPU()` and the CUDA extension's
-# `device(::GPU{CuDevice})` is `CUDABackend()`, which is what
-# `get_backend(::CuArray)` returns — but they do not agree statically:
-# `get_backend` is declared to return the abstract `KernelAbstractions.Backend`,
-# so every launch below infers as a UNION of a CPU `Kernel` and a GPU one, and
-# `Kernel{<:GPU}` has no call method until a backend package is loaded. That is
-# an unresolvable call on any CPU-only analysis (the whole package's JET
-# ratchet, and every CI run). `architecture` resolves concretely — `Array` and
-# the `AbstractArray` fallback both give `CPU()`, the extension's `CuArray`
-# method gives `GPU{CuDevice}` — so each launch is one concrete kernel object.
-# This is why the four pre-existing `@kernel` files in `src/` report clean.
-@inline _batch_backend(x::AbstractArray) = device(architecture(x))
+# Resolve through `architecture`/`device`, as `launch!` does, to keep the kernel
+# backend concrete for CPU-only inference. KA's abstract `get_backend` return
+# type can expose unresolved GPU calls when the CUDA extension is not loaded.
+@inline function _batch_backend(x::AbstractArray)
+    arch = architecture(x)
+    ensure_device!(arch)
+    return device(arch)
+end
+
+# Keep completion conservative for unknown backends. CUDA specializes this:
+# these internal kernels and subsequent broadcasts/cuBLAS calls are ordered on
+# the task's current stream. Host reads/transfers provide the completion point.
+@inline _batch_finish!(backend) = KernelAbstractions.synchronize(backend)
 
 @kernel function _batched_gather_kernel!(X, @Const(cd), @Const(starts),
                                          step_, row_offset)
@@ -49,7 +47,7 @@ function batched_gather!(X::AbstractMatrix{ComplexF64}, cd::AbstractArray,
     backend = _batch_backend(X)
     _batched_gather_kernel!(backend)(X, cd, starts, step_, row_offset;
                                      ndrange=(len, size(X, 2)))
-    KernelAbstractions.synchronize(backend)
+    _batch_finish!(backend)
     return X
 end
 
@@ -71,7 +69,7 @@ function batched_scatter!(cd::AbstractArray, X::AbstractMatrix{ComplexF64},
     backend = _batch_backend(X)
     _batched_scatter_kernel!(backend)(cd, X, starts, step_, row_offset;
                                       ndrange=(len, size(X, 2)))
-    KernelAbstractions.synchronize(backend)
+    _batch_finish!(backend)
     return cd
 end
 
@@ -103,7 +101,7 @@ function batched_spmv!(Y::AbstractMatrix{ComplexF64},
     backend = _batch_backend(Y)
     _batched_spmv_kernel!(backend)(Y, rowptr, colval, nzval, X;
                                    ndrange=size(Y))
-    KernelAbstractions.synchronize(backend)
+    _batch_finish!(backend)
     return Y
 end
 
@@ -129,7 +127,7 @@ function batched_bc_override!(RHS::AbstractMatrix{ComplexF64},
     _batched_bc_override_kernel!(backend)(RHS, ALG_F, bc_rows,
                                           ComplexF64(coeff);
                                           ndrange=(length(bc_rows), size(RHS, 2)))
-    KernelAbstractions.synchronize(backend)
+    _batch_finish!(backend)
     return RHS
 end
 
@@ -177,11 +175,11 @@ function batched_assemble_lhs!(dense::AbstractArray{ComplexF64, 3},
     backend = _batch_backend(dense)
     n, _, nmodes = size(dense)
     _batched_lhs_zero_kernel!(backend)(dense; ndrange=(n, n, nmodes))
-    KernelAbstractions.synchronize(backend)
+    _batch_finish!(backend)
     _batched_lhs_place_kernel!(backend)(dense, colptr, rowval, M_nzval, L_nzval,
                                         ComplexF64(coeff), n;
                                         ndrange=(size(M_nzval, 1), nmodes))
-    KernelAbstractions.synchronize(backend)
+    _batch_finish!(backend)
     return dense
 end
 
@@ -221,6 +219,6 @@ function batched_mass_apply!(X::AbstractMatrix{ComplexF64},
                              scale::AbstractVector{ComplexF64})
     backend = _batch_backend(X)
     _batched_mass_apply_kernel!(backend)(X, B, src, scale; ndrange=size(X))
-    KernelAbstractions.synchronize(backend)
+    _batch_finish!(backend)
     return X
 end

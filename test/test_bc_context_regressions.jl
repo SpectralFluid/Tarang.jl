@@ -23,6 +23,25 @@ function _bc_context_problem(kind, bottom, top; bounds=(0.0, 1.0), parameters=Na
     return problem, u, coords
 end
 
+@testset "boundary expressions evaluate scalar elementary functions" begin
+    xs = (0:7) .* (2pi/8)
+    zs = (1 .- cos.(pi .* (0:15) ./ 15)) ./ 2
+    for (expression, amplitude) in (("exp(2)", exp(2)), ("sin(pi/6)", 0.5),
+            ("cos(0)", 1.0), ("tan(pi/4)", 1.0), ("log(exp(2))", 2.0),
+            ("sqrt(4)", 2.0), ("abs(-2)", 2.0), ("tanh(1)", tanh(1)))
+        for spatial in (false, true)
+            rhs = spatial ? "$expression*cos(x)" : expression
+            problem, u, _ = _bc_context_problem(LinearBoundaryValueProblem,
+                "u(z=0)=$rhs", "u(z=1)=0")
+            solve!(BoundaryValueSolver(problem))
+            expected = spatial ?
+                [amplitude*cos(x)*sinh(1-z)/sinh(1) for x in xs, z in zs] :
+                [amplitude*(1-z) for x in xs, z in zs]
+            @test Array(grid_data!(u)) ≈ expected atol=2e-10
+        end
+    end
+end
+
 @testset "boundary values use custom coordinate names" begin
     disabled = dirichlet_bc("u", "z", 0.0, "sin(x)"; space_dependent=false)
     problem, _, _ = _bc_context_problem(InitialValueProblem, disabled, "u(z=1)=0")

@@ -27,7 +27,7 @@ Expected: FAIL because the extension only partially loads.
 
 **Files:**
 - Modify: `src/core/architectures.jl`
-- Modify: `src/core/transforms/transform_gpu.jl`
+- Modify: `src/core/transforms/gpu.jl`
 - Modify: `ext/TarangCUDAExt.jl`
 - Modify: `ext/cuda/architecture.jl`
 

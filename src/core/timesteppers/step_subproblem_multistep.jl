@@ -191,6 +191,7 @@ function step_subproblem_multistep!(
     # ── Step 1: compute M*X_current, L*X_current, F_current per subproblem ──
     # Write directly into ring slots — no per-step allocation.
     F_fields = evaluate_rhs_buffered(solver, state_fields, solver.sim_time)
+    _group_rhs_coefficients!(F_fields)
 
     # Solve-layout bracketing: `evaluate_rhs_buffered` above (the only op needing
     # the FFT pencil) has already run, so state enters the solve pencil ONCE here
@@ -231,17 +232,7 @@ function step_subproblem_multistep!(
 
     # State STAYS in the solve pencil for step 4's solve/scatter (no transpose
     # back — nothing between here and the scatter reads FFT-pencil state).
-    # F (read-only) is restored by pointer swap only — its solved values are
-    # discarded; the pencil must be the FFT pencil for the next step's buffered
-    # RHS transform.
-    for (f, fft_pa) in _ms_g_F
-        set_coeff_data!(f, fft_pa)
-    end
-    # `to_solve_layout!` above left the shared RHS buffer :c-flagged; the next step's
-    # `evaluate_rhs_buffered` would then pay a full distributed backward transform of
-    # coefficients it immediately overwrites. Its grid array is untouched by the forward
-    # transform, so the restored :g flag is honest. Same fix as the RK sibling.
-    _release_rhs_buffer!(F_fields, solver)
+    _restore_subproblem_rhs!(F_fields, _ms_g_F, solver)
 
     # ── Step 2: check if we have enough history to advance ──────────────────
     # Need at least one of each history type (we just pushed current, so
@@ -275,77 +266,43 @@ function step_subproblem_multistep!(
         ref = ring_get(F_rings[sp_idx], 1)  # always valid after step 1
         alg_f = ref === nothing ? zeros(ComplexF64, n) :
                                   _sp_stage_vector!(sp, :multistep_alg_f, n, ref)
-        # Static-BC ALG_F is a constant of the problem: gather once into the
-        # cached stage vector (identity-checked — a fresh `zeros` above never
-        # matches and always gathers). Time-dependent BCs are rewritten into
-        # equation_data once per step upstream, so they re-gather every step.
-        # `alg_F_is_static` additionally forces a re-gather for BC values that
-        # change through non-time channels (parameter fields, BC arrays),
-        # which `has_time_dependent_bcs` does not flag.
-        if has_time_dependent_bcs(sp.problem.bc_manager) ||
-           !alg_F_is_static(sp) ||
-           sp.runtime.alg_F_gathered_into !== alg_f
-            gather_alg_F!(alg_f, sp)
-        end
-        ALG_F[sp_idx] = alg_f
+        ALG_F[sp_idx] = _ensure_alg_F!(alg_f, sp,
+                                     has_time_dependent_bcs(sp.problem.bc_manager))
     end
 
-    # ── Step 4: build RHS and solve per subproblem ──────────────────────────
-    # State is ALREADY in the solve pencil (carried from step 1's gather), so no
-    # transpose here — `scatter_inputs` writes X_new back directly per mode.
+    # ── Step 4: prepare, solve independent modes, then scatter ─────────────
+    # Cache/factor construction is serial. Workers use only per-mode buffers;
+    # shared field writes and all pencil transposes stay on this task.
+    RHS = _sp_slots!(state, :_sp_ms_RHS, n_sp)
+    solutions = _sp_slots!(state, :_sp_ms_solutions, n_sp)
+    factors = _local_mode_factor_slots!(state, n_sp)
     for (sp_idx, sp) in enumerate(subproblems)
         sp.M_min === nothing && continue
         n = size(sp.M_min, 1)
-
-        # Use a cached rhs buffer; reused across steps, matches ring backend.
         ref = ring_get(F_rings[sp_idx], 1)
-        rhs = ref === nothing ? zeros(ComplexF64, n) :
-                                _sp_stage_vector!(sp, :multistep_rhs, n, ref)
-        fill!(rhs, zero(ComplexF64))
-
-        # Accumulate RHS = Σ_{k≥1} [c[k]*F_k - a[k]*MX_k - b[k]*LX_k]
-        # (k=1 in math maps to Julia tuple index 2; our rings are age-indexed
-        # with age 1 = current step, age 2 = one step back, etc.)
-        for k in 2:length(c)
-            ck = c[k]
-            abs(ck) < 1e-14 && continue
-            entry = ring_get(F_rings[sp_idx], k - 1)
-            entry === nothing && continue
-            _sp_axpy!(rhs, ck, entry)
-        end
-        for k in 2:length(a)
-            ak = a[k]
-            abs(ak) < 1e-14 && continue
-            entry = ring_get(MX_rings[sp_idx], k - 1)
-            entry === nothing && continue
-            _sp_axpy!(rhs, -ak, entry)
-        end
-        for k in 2:length(b)
-            bk = b[k]
-            abs(bk) < 1e-14 && continue
-            entry = ring_get(LX_rings[sp_idx], k - 1)
-            entry === nothing && continue
-            _sp_axpy!(rhs, -bk, entry)
-        end
-
-        # Override BC rows: rhs[bc] = b[0] * F_alg[bc] so that
-        # b[0]*L_row*X_new = b[0]*F_alg → L_row*X_new = F_alg.
-        # Vectorized (CUDA.allowscalar(false)-safe) via `apply_bc_override!`.
-        b0 = b[1]
-        if abs(b0) > 1e-14
-            apply_bc_override!(rhs, ALG_F[sp_idx], sp, b0)
-        end
-
-        # Solve (a[0]*M + b[0]*L) * X_new = rhs
-        a0 = a[1]
-        lhs_solver = _get_or_build_multistep_lhs!(sp, a0, b0)
-        if lhs_solver === nothing
+        RHS[sp_idx] = ref === nothing ? zeros(ComplexF64, n) :
+                                       _sp_stage_vector!(sp, :multistep_rhs, n, ref)
+        factors[sp_idx] = _get_or_build_multistep_lhs!(sp, a[1], b[1])
+        if factors[sp_idx] === nothing
             @warn "step_subproblem_multistep!: LHS factorization failed for group=$(sp.group); skipping step" maxlog=1
             continue
         end
-        x_new = _sp_stage_vector!(sp, :multistep_sol, size(sp.M_min, 2), ref)
-        _solve_cached_system!(x_new, lhs_solver, rhs)
-        scatter_inputs(sp, x_new, state_fields)
+        solutions[sp_idx] = _sp_stage_vector!(sp, :multistep_sol, size(sp.M_min, 2), ref)
+    end
+    threaded_modes = _thread_local_modes(solver.base.threaded_modes, subproblems,
+                                         solver.base.matsolver)
+    _foreach_local_mode!(n_sp, threaded_modes) do sp_idx
+        sp = subproblems[sp_idx]
+        sp.M_min === nothing && return
+        factors[sp_idx] === nothing && return
+        _solve_multistep_local_mode!(sp, RHS[sp_idx], solutions[sp_idx], factors[sp_idx],
+                                     ALG_F[sp_idx], F_rings[sp_idx], MX_rings[sp_idx],
+                                     LX_rings[sp_idx], a, b, c)
+    end
+    for (sp_idx, sp) in enumerate(subproblems)
+        sp.M_min === nothing && continue
+        factors[sp_idx] === nothing && continue
+        scatter_inputs(sp, solutions[sp_idx], state_fields)
     end
 
     # Restore state to the FFT pencil before the grid-space history push below.
@@ -354,6 +311,34 @@ function step_subproblem_multistep!(
 
     # ── Step 5: push new state to history ───────────────────────────────────
     _push_trim!(state.history, state_fields, 1)
+end
+
+function _solve_multistep_local_mode!(sp, rhs, solution, factor, alg_f,
+                                      F_ring, MX_ring, LX_ring, a, b, c)
+    fill!(rhs, zero(ComplexF64))
+    for k in 2:length(c)
+        ck = c[k]
+        abs(ck) < 1e-14 && continue
+        entry = ring_get(F_ring, k - 1)
+        entry === nothing || _sp_axpy!(rhs, ck, entry)
+    end
+    for k in 2:length(a)
+        ak = a[k]
+        abs(ak) < 1e-14 && continue
+        entry = ring_get(MX_ring, k - 1)
+        entry === nothing || _sp_axpy!(rhs, -ak, entry)
+    end
+    for k in 2:length(b)
+        bk = b[k]
+        abs(bk) < 1e-14 && continue
+        entry = ring_get(LX_ring, k - 1)
+        entry === nothing || _sp_axpy!(rhs, -bk, entry)
+    end
+    if abs(b[1]) > 1e-14
+        apply_bc_override!(rhs, alg_f, sp, b[1])
+    end
+    _solve_cached_system!(solution, factor, rhs)
+    return nothing
 end
 
 """

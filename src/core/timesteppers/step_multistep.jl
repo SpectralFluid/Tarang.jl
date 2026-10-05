@@ -31,7 +31,7 @@ function _global_multistep_solve!(state::TimestepperState, cache_key,
     if !haskey(state.timestepper_data, :lhs_cache) ||
        get(state.timestepper_data, :lhs_cache_key, nothing) != cache_key
         LHS = a0 * M_matrix + b0 * L_matrix
-        state.timestepper_data[:lhs_cache] = factorize(LHS)
+        state.timestepper_data[:lhs_cache] = _factorize_timestep_matrix(LHS)
         state.timestepper_data[:lhs_cache_key] = cache_key
     end
 
@@ -127,8 +127,8 @@ function _global_multistep_core!(state::TimestepperState, solver::InitialValueSo
     MX_current = _timestep_matvec!(state, :multistep_MX_current_vec, M_matrix, X_current)
 
     # Step 3: F(X[0]) at the current time
-    F_current = evaluate_rhs(solver, current_state, solver.sim_time)
-    F_current_vec = _timestep_fields_vector!(state, :multistep_F_current_vec, F_current)
+    F_current_vec = _timestep_global_rhs_vector!(state, :multistep_F_current_vec,
+                                                   solver, current_state, solver.sim_time)
 
     # Step 4: rotate and store history
     MX_history = state.timestepper_data[:MX_history]::Vector{Vector{ComplexF64}}

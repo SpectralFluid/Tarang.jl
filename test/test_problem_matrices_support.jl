@@ -1,5 +1,5 @@
 """
-Tests for src/core/problems/problem_matrices/problem_matrices_support.jl — the
+Tests for src/core/problems/problem_matrices/support.jl — the
 equation-inclusion / validity predicates and matrix-block helpers used during
 matrix assembly. These are pure Dict + size logic with obvious oracles.
 """

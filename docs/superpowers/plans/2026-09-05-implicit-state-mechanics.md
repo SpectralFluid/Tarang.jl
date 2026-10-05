@@ -100,12 +100,12 @@ git commit -m "test: inventory requires registered test files to be git-tracked"
 ### Task 2: An accessor never plans — `_field_transform_bundle` refuses instead of building
 
 **Files:**
-- Modify: `src/core/transforms/transform_types.jl:375-388`
+- Modify: `src/core/transforms/types.jl:375-388`
 - Modify: `src/core/module_contracts.jl` (new section after "BUFFER OWNERSHIP")
 - Test: `test/test_field_typestability.jl` (append a testset)
 
 **Interfaces:**
-- Consumes: `ScalarField.transform_bundle::Any` (set by both inner constructors in `src/core/field/field_types.jl:138,163`).
+- Consumes: `ScalarField.transform_bundle::Any` (set by both inner constructors in `src/core/field/types.jl:138,163`).
 - Produces: `_field_transform_bundle(field)` now throws `ArgumentError` when `field.transform_bundle` is not a `TransformPlanBundle`; it never calls `transform_plan_bundle`.
 
 - [x] **Step 1: Write the failing test**
@@ -136,7 +136,7 @@ Expected: FAIL — `_field_transform_bundle` returns a bundle (it rebuilt), `tra
 
 - [x] **Step 3: Replace the fallback**
 
-In `src/core/transforms/transform_types.jl` replace the tail of `_field_transform_bundle`:
+In `src/core/transforms/types.jl` replace the tail of `_field_transform_bundle`:
 
 ```julia
     bundle = field.transform_bundle
@@ -190,7 +190,7 @@ Expected: `Testing Tarang tests passed`. If any test constructs a field without 
 - [x] **Step 6: Commit**
 
 ```bash
-git add src/core/transforms/transform_types.jl src/core/module_contracts.jl test/test_field_typestability.jl
+git add src/core/transforms/types.jl src/core/module_contracts.jl test/test_field_typestability.jl
 git commit -m "fix: _field_transform_bundle refuses instead of planning collectively; document collective entry points"
 ```
 
@@ -200,8 +200,8 @@ git commit -m "fix: _field_transform_bundle refuses instead of planning collecti
 
 **Files:**
 - Modify: `src/core/gpu_distributed.jl:1474-1512` (`setup_transposable_workspace!`, `Base.close(::DistributedGPUTransform)`)
-- Modify: `src/core/distributor/distributor_core.jl:336-360` (`Base.close(dist)`)
-- Create: hook `_close_backend_plan_caches!(dist)` in `src/core/distributor/distributor_core.jl` (default no-op)
+- Modify: `src/core/distributor/core.jl:336-360` (`Base.close(dist)`)
+- Create: hook `_close_backend_plan_caches!(dist)` in `src/core/distributor/core.jl` (default no-op)
 - Modify: `ext/cuda/transforms.jl` (implement the hook; keep `clear_distributed_dct_plan_cache!`)
 - Test: `test/test_cuda_dct_cache_context.jl` (update AST guards), `test/test_transposable_field.jl` (check its `DistributedGPUTransform` usage still holds)
 
@@ -238,7 +238,7 @@ In `test/test_cuda_dct_cache_context.jl` replace the "TransposableField has no G
 and add near the other `const *_SOURCE` lines:
 
 ```julia
-const DISTRIBUTOR_SOURCE = joinpath(@__DIR__, "..", "src", "core", "distributor", "distributor_core.jl")
+const DISTRIBUTOR_SOURCE = joinpath(@__DIR__, "..", "src", "core", "distributor", "core.jl")
 ```
 
 - [x] **Step 2: Run to verify it fails**
@@ -274,7 +274,7 @@ end
 
 - [x] **Step 4: Add the hook and call it from `close(dist)`**
 
-In `src/core/distributor/distributor_core.jl`, before `Base.close(dist::Distributor)`:
+In `src/core/distributor/core.jl`, before `Base.close(dist::Distributor)`:
 
 ```julia
 """
@@ -332,7 +332,7 @@ Then `Pkg.test()` in the background; expected `Testing Tarang tests passed`.
 - [x] **Step 8: Commit**
 
 ```bash
-git add src/core/gpu_distributed.jl src/core/distributor/distributor_core.jl ext/cuda/transforms.jl test/test_cuda_dct_cache_context.jl test/test_transposable_field.jl
+git add src/core/gpu_distributed.jl src/core/distributor/core.jl ext/cuda/transforms.jl test/test_cuda_dct_cache_context.jl test/test_transposable_field.jl
 git commit -m "refactor: Distributor is the single owner of communicators and backend plan caches"
 ```
 
@@ -341,11 +341,11 @@ git commit -m "refactor: Distributor is the single owner of communicators and ba
 ### Task 4: Fold adjacent `ensure_layout!` + `get_*_data` pairs into the accessors
 
 **Files:**
-- Modify: every `src/**/*.jl` with an adjacent pair (106 sites at the start: 65 `:g`, 41 `:c`), except `src/core/field/field_layout/field_layout_access.jl`.
+- Modify: every `src/**/*.jl` with an adjacent pair (106 sites at the start: 65 `:g`, 41 `:c`), except `src/core/field/field_layout/access.jl`.
 - Modify: `test/test_layout_discipline_ratchet.jl:99` (`LAYOUT_RATCHET = 277` → the new count).
 
 **Interfaces:**
-- Consumes: `grid_data!(field) = (ensure_layout!(field, :g); get_grid_data(field))` and `coeff_data!` likewise (`src/core/field/field_layout/field_layout_access.jl:235-243`).
+- Consumes: `grid_data!(field) = (ensure_layout!(field, :g); get_grid_data(field))` and `coeff_data!` likewise (`src/core/field/field_layout/access.jl:235-243`).
 - Produces: nothing new; behaviour identical by construction.
 
 - [x] **Step 1: Record the starting count**
@@ -369,9 +369,9 @@ ACC = {"g": ("get_grid_data", "grid_data!"), "c": ("get_coeff_data", "coeff_data
 folded = 0
 for d, _, files in os.walk(ROOT):
     for f in files:
-        if not f.endswith(".jl") or f == "field_layout_access.jl":
-            continue
         p = os.path.join(d, f)
+        if not f.endswith(".jl") or os.path.relpath(p, ROOT) == os.path.join("core", "field", "field_layout", "access.jl"):
+            continue
         L = open(p).read().split("\n")
         out, i, changed = [], 0, False
         while i < len(L):

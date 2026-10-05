@@ -55,6 +55,16 @@ have added a transform.
 
 ## Memory Optimization
 
+Solver-owned timestep workspaces are allocated on first use and retained for
+later steps. Mixed-basis and global matrix solvers use their own stage buffers,
+so they do not reserve unused full-field RK workspaces. Field-based RK paths
+retain the workspace slots their stages actually request. Warm up the chosen
+solver path before measuring per-step allocations.
+
+Spatial boundary projections reuse a bounded cache of FFT plans and input
+planes. A boundary refresh still creates independently owned coefficients, so
+refreshing one boundary cannot overwrite another boundary or an older result.
+
 ### Minimize Allocations
 
 Broadcast assignment (`.=` with a dotted right-hand side) is fused and allocates nothing.
@@ -92,6 +102,23 @@ end
 
 Hoisting `get_grid_data` out of the loop and reusing `work` makes the loop body allocation
 free (measured: 0 bytes for 100 iterations).
+
+### Reuse Output Staging
+
+`NetCDFFileHandler` reuses rescaled fields and host buffers across writes. Each write
+refreshes the data; custom `postprocess` callbacks still receive a private copy.
+The default retention budget is 256 MiB and 32 entries per handler. Configure it
+when constructing the handler:
+
+```julia
+handler = NetCDFFileHandler("output/state", dist, vars;
+    staging_max_bytes=64 * 1024^2, staging_max_entries=8)
+```
+
+Larger temporary buffers can still be needed for a write, but are not retained when
+they exceed the budget. Setting either limit to zero disables retention. `close(handler)`
+releases the staging cache. Distributed rescaled fields are charged by global size so
+every rank makes the same cache decisions.
 
 ### Minimize Transforms
 
@@ -137,7 +164,7 @@ perfectly acceptable; a large prime factor is a factor-of-ten cliff.
 ### FFTW Planning
 
 Planning rigor is **not** user-tunable at present: every FFTW plan in Tarang is created
-with `flags=FFTW.MEASURE` (`src/core/transforms/transform_planning.jl`). The
+with `flags=FFTW.MEASURE` (`src/core/transforms/planning.jl`). The
 `TARANG_FFTW_RIGOR` environment variable sets a config value that nothing reads, and there
 is no `FFTW_PLANNING_RIGOR` knob at all. Do not expect to change planning rigor from
 outside the code.
@@ -248,9 +275,11 @@ between concurrent calls with distinct inputs and destinations; each active solv
 reserves its own temporary buffers, including when an interactive thread pool is
 enabled or a task yields.
 
-CPU timesteppers still visit subproblems sequentially within each MPI rank.
-Their existing parallel execution comes from FFTW, BLAS, CPU kernels, and MPI;
-increasing Julia's thread count does not parallelize every solver loop.
+CPU timesteppers can distribute independent local mode solves across Julia
+threads within each MPI rank. Automatic selection considers the local workload,
+matrix solver, and BLAS thread count; `threaded_modes=true` opts in explicitly.
+Shared field preparation and MPI calls remain on the coordinating task. See
+[Parallelism](parallelism.md) for configuration details.
 
 ## Resolution Guidelines
 

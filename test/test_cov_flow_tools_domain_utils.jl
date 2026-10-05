@@ -1,6 +1,6 @@
 using Test, Tarang, LinearAlgebra
 
-# Coverage tests for src/extras/flow_tools/flow_tools_domain_utils.jl
+# Coverage tests for src/extras/flow_tools/domain_utils.jl
 #
 # Targets get_domain_size, get_domain_bounds, get_fourier_shape.
 # The first two are intentionally duck-typed (untyped `domain` argument,

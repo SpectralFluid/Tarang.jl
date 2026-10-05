@@ -10,7 +10,7 @@
 #
 # The distributed cost is worse than the serial one: the interpreted Fourier derivative
 # copies the whole field and does a full N-D distributed FFT round-trip per derivative
-# (derivatives_fourier.jl), versus the lazy path's single-axis in-place coefficient
+# (fourier.jl), versus the lazy path's single-axis in-place coefficient
 # scaling.
 using Test
 using Tarang

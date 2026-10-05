@@ -13,6 +13,14 @@ the corresponding group of each separable dimension of the problem.
 """
 const _SubproblemRKBufferKey = Tuple{Symbol, Int}
 
+"""Fixed equation-space geometry; forcing expressions are read live by index."""
+struct _SubproblemAlgebraicBlock
+    equation::Int
+    offset::Int
+    size::Int
+    bulk::Bool
+end
+
 mutable struct SubproblemRuntimeCache
     M_backend::Any
     L_backend::Any
@@ -46,6 +54,14 @@ mutable struct SubproblemRuntimeCache
     eqn_sizes::Union{Nothing, Vector{Int}}
     eqn_raw_size::Int
     eqn_targets::Union{Nothing, Vector{Vector{Int}}}
+    algebraic_blocks::Union{Nothing, Vector{_SubproblemAlgebraicBlock}}
+    cheb_basis::Union{Nothing, JacobiBasis}
+    cheb_basis_cached::Bool
+    # Geometry is fixed for this compiled subproblem. Dynamic BC values are
+    # deliberately kept in the separately refreshed problem-level FFT cache.
+    bc_fourier_sizes::Union{Nothing, Tuple{Vararg{Int}}}
+    bc_fourier_indices::Union{Nothing, Tuple{Vararg{Int}}}
+    bc_fourier_group::Union{Nothing, Tuple}
     mass_solver::Any
     lhs_dirty::Dict{Float64, Bool}
     rk_buffers::Dict{_SubproblemRKBufferKey, AbstractVector{ComplexF64}}
@@ -81,6 +97,8 @@ SubproblemRuntimeCache() = SubproblemRuntimeCache(
     nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing,
     nothing, nothing,
     nothing, 0, nothing,
+    nothing, nothing, false,
+    nothing, nothing, nothing,
     nothing,
     Dict{Float64, Bool}(),
     Dict{_SubproblemRKBufferKey, AbstractVector{ComplexF64}}(),
@@ -350,9 +368,17 @@ subproblem_field_size(sp::Subproblem, field::TensorField) =
 # Per-subproblem equation sizing (using per-mode field sizes)
 # ---------------------------------------------------------------------------
 
-"""Get Chebyshev basis from subproblem problem variables."""
+"""Get the coupled Jacobi basis, whose identity is fixed for this compiled subproblem."""
 function _subproblem_cheb_basis_from_sp(sp::Subproblem)
-    for var in sp.problem.variables
+    sp.runtime.cheb_basis_cached && return sp.runtime.cheb_basis
+    basis = _find_subproblem_cheb_basis(sp.problem.variables)
+    sp.runtime.cheb_basis = basis
+    sp.runtime.cheb_basis_cached = true
+    return basis
+end
+
+function _find_subproblem_cheb_basis(variables::AbstractVector)
+    for var in variables
         for comp in scalar_components(var)
             for basis in comp.bases
                 if basis !== nothing && isa(basis, JacobiBasis)

@@ -1,3 +1,15 @@
+# Route large global systems before applying M⁻¹ to a dense copy of L. The
+# distributed diagonal path has already returned at each call site. Validate M
+# first so this size fallback never silently accepts an unsupported DAE.
+function _etd_oversized_fallback!(state::TimestepperState, solver::InitialValueSolver,
+                                   L_matrix, M_matrix, fallback)
+    size(L_matrix, 1) <= _ETD_DENSE_MAX_SIZE && return false
+    _get_etd_mass_factor!(state, M_matrix)
+    @warn "ETD matrix exponential exceeds the dense size limit; using $(nameof(fallback))" n=size(L_matrix, 1) maxlog=1
+    fallback(state, solver)
+    return true
+end
+
 """Return the shared ETD matrix-function cache for the current operator and `dt`."""
 function _get_etd_phi!(state::TimestepperState, L_linear, dt::Float64)
     cache = state.timestepper_data
@@ -60,6 +72,7 @@ function step_etd_rk222!(state::TimestepperState, solver::InitialValueSolver)
     end
 
     M_matrix = _get_problem_matrix(solver.problem, "M_matrix")
+    _etd_oversized_fallback!(state, solver, L_matrix, M_matrix, step_cnab2!) && return
     # L_linear = -M^{-1}*L (RHS form): converts from M*dX/dt + L*X = F
     # to the ETD form dX/dt = L_linear*X + N(X)
     L_linear, M_factor = _get_linear_operator_eff!(state, L_matrix, M_matrix)
@@ -89,8 +102,8 @@ function step_etd_rk222!(state::TimestepperState, solver::InitialValueSolver)
         mul!(a_n, exp_hL, X₀)
 
         # Stage 1 (predictor): Evaluate nonlinear term N(u_n) at current state
-        F₀ = evaluate_rhs(solver, current_state, solver.sim_time)
-        F₀_vec = _timestep_fields_vector!(state, :etd_rk2_Fraw, F₀)
+        F₀_vec = _timestep_global_rhs_vector!(state, :etd_rk2_Fraw,
+                                             solver, current_state, solver.sim_time)
         _apply_mass_inverse!(N_buf, M_factor, F₀_vec)
 
         # Predictor: c = a_n + h*φ₁(hL)*N(u_n)  — reuse diff as φ₁*N_u_n scratch
@@ -101,8 +114,8 @@ function step_etd_rk222!(state::TimestepperState, solver::InitialValueSolver)
         vector_to_fields!(temp_state, c_vec, current_state)
 
         # Stage 2 (corrector): Evaluate N(c) at predicted state
-        F_c = evaluate_rhs(solver, temp_state, solver.sim_time + dt)
-        F_c_vec = _timestep_fields_vector!(state, :etd_rk2_Fraw, F_c)
+        F_c_vec = _timestep_global_rhs_vector!(state, :etd_rk2_Fraw,
+                                              solver, temp_state, solver.sim_time + dt)
         # Reuse diff as N_c (mass-inverse applied in place); save N_u_n → N_buf
         _apply_mass_inverse!(diff, M_factor, F_c_vec)
 
@@ -187,6 +200,7 @@ function step_etd_cnab2!(state::TimestepperState, solver::InitialValueSolver)
     end
 
     M_matrix = _get_problem_matrix(solver.problem, "M_matrix")
+    _etd_oversized_fallback!(state, solver, L_matrix, M_matrix, step_cnab2!) && return
     # L_linear = -M^{-1}*L (RHS form): converts from M*dX/dt + L*X = F
     # to the ETD form dX/dt = L_linear*X + N(X)
     L_linear, M_factor = _get_linear_operator_eff!(state, L_matrix, M_matrix)
@@ -204,8 +218,8 @@ function step_etd_cnab2!(state::TimestepperState, solver::InitialValueSolver)
         X_current = _timestep_fields_vector!(state, :etd_cnab2_X_current, current_state)
 
         # Evaluate nonlinear term N(u_n) — in-place mass inverse
-        F_current = evaluate_rhs(solver, current_state, solver.sim_time)
-        F_raw = _timestep_fields_vector!(state, :etd_cnab2_Fraw, F_current)
+        F_raw = _timestep_global_rhs_vector!(state, :etd_cnab2_Fraw,
+                                             solver, current_state, solver.sim_time)
         n = length(F_raw)
         F_current_vec = _timestep_vector_buffer!(state, :etd_cnab2_Fcur, n)
         _apply_mass_inverse!(F_current_vec, M_factor, F_raw)
@@ -215,8 +229,8 @@ function step_etd_cnab2!(state::TimestepperState, solver::InitialValueSolver)
         _prepend_history_buffer!(F_history, F_current_vec, 2)
         if length(F_history) < 2 && length(state.history) >= 2
             prev_state = state.history[end-1]
-            F_prev_raw = _timestep_fields_vector!(state, :etd_cnab2_Fprev_raw,
-                                             evaluate_rhs(solver, prev_state, solver.sim_time - dt_previous))
+            F_prev_raw = _timestep_global_rhs_vector!(state, :etd_cnab2_Fprev_raw,
+                                             solver, prev_state, solver.sim_time - dt_previous)
             F_prev_vec = _timestep_vector_buffer!(state, :etd_cnab2_Fprev, n)
             _apply_mass_inverse!(F_prev_vec, M_factor, F_prev_raw)
             push!(F_history, copy(F_prev_vec))
@@ -326,6 +340,7 @@ function step_etd_sbdf2!(state::TimestepperState, solver::InitialValueSolver)
     end
 
     M_matrix = _get_problem_matrix(solver.problem, "M_matrix")
+    _etd_oversized_fallback!(state, solver, L_matrix, M_matrix, step_sbdf2!) && return
     # L_linear = -M^{-1}*L (RHS form): converts from M*dX/dt + L*X = F
     # to the ETD form dX/dt = L_linear*X + N(X)
     L_linear, M_factor = _get_linear_operator_eff!(state, L_matrix, M_matrix)
@@ -344,8 +359,8 @@ function step_etd_sbdf2!(state::TimestepperState, solver::InitialValueSolver)
         n = length(X_current)
 
         # Evaluate nonlinear term N(uₙ) at current state — in-place mass inverse
-        F_current = evaluate_rhs(solver, current_state, solver.sim_time)
-        F_raw = _timestep_fields_vector!(state, :etd_sbdf2_Fraw, F_current)
+        F_raw = _timestep_global_rhs_vector!(state, :etd_sbdf2_Fraw,
+                                             solver, current_state, solver.sim_time)
         F_current_vec = _timestep_vector_buffer!(state, :etd_sbdf2_Fcur, n)
         _apply_mass_inverse!(F_current_vec, M_factor, F_raw)
 
@@ -354,8 +369,8 @@ function step_etd_sbdf2!(state::TimestepperState, solver::InitialValueSolver)
         _prepend_history_buffer!(F_history, F_current_vec, 2)
         if length(F_history) < 2 && length(state.history) >= 2
             prev_state = state.history[end-1]
-            F_prev_raw = _timestep_fields_vector!(state, :etd_sbdf2_Fprev_raw,
-                                             evaluate_rhs(solver, prev_state, solver.sim_time - dt_previous))
+            F_prev_raw = _timestep_global_rhs_vector!(state, :etd_sbdf2_Fprev_raw,
+                                             solver, prev_state, solver.sim_time - dt_previous)
             F_prev_vec = _timestep_vector_buffer!(state, :etd_sbdf2_Fprev, n)
             _apply_mass_inverse!(F_prev_vec, M_factor, F_prev_raw)
             push!(F_history, copy(F_prev_vec))

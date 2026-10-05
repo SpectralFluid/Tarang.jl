@@ -339,15 +339,15 @@ using LinearAlgebra: I
 
 
 # Runtime map:
-#   temporal_filters_core.jl      — filter types, state updates, and shared utilities
-#   temporal_filters_imex_etd.jl  — IMEX/SBDF and ETD coefficient support
-#   temporal_filters_wave_mean.jl — horizontal means, wave-mean decomposition, forcing helpers
-#   temporal_filters_gql.jl       — GQL spectral decomposition and combined GQL+wave-mean system
+#   core.jl      — filter types, state updates, and shared utilities
+#   imex_etd.jl  — IMEX/SBDF and ETD coefficient support
+#   wave_mean.jl — horizontal means, wave-mean decomposition, forcing helpers
+#   gql.jl       — GQL spectral decomposition and combined GQL+wave-mean system
 
-include("temporal_filters/temporal_filters_core.jl")
-include("temporal_filters/temporal_filters_imex_etd.jl")
-include("temporal_filters/temporal_filters_wave_mean.jl")
-include("temporal_filters/temporal_filters_gql.jl")
+include("temporal_filters/core.jl")
+include("temporal_filters/imex_etd.jl")
+include("temporal_filters/wave_mean.jl")
+include("temporal_filters/gql.jl")
 
 # ============================================================================
 # Exports

@@ -22,7 +22,7 @@
 # `is_gpu_array(x)` is deliberately NOT counted: it interrogates an array's
 # storage, which is a separate question from which architecture a component was
 # configured for, and the two are exactly what the checked-both-ways guards in
-# les_models.jl and transform_gpu.jl exist to reconcile.
+# les_models.jl and gpu.jl exist to reconcile.
 
 using Test
 using Tarang

@@ -10,12 +10,12 @@ This file contains evaluation functions for:
 
 
 # Runtime map:
-#   operations_interpolate.jl  — interpolation evaluation and Clenshaw helpers
-#   operations_integrate.jl    — integration and averaging evaluation
-#   operations_lift_convert.jl — lift and basis-conversion evaluation
-#   operations_misc.jl         — general functions, layout conversion, components, copy, and Hilbert transform
+#   interpolate.jl  — interpolation evaluation and Clenshaw helpers
+#   integrate.jl    — integration and averaging evaluation
+#   lift_convert.jl — lift and basis-conversion evaluation
+#   misc.jl         — general functions, layout conversion, components, copy, and Hilbert transform
 
-include("operations/operations_interpolate.jl")
-include("operations/operations_integrate.jl")
-include("operations/operations_lift_convert.jl")
-include("operations/operations_misc.jl")
+include("operations/interpolate.jl")
+include("operations/integrate.jl")
+include("operations/lift_convert.jl")
+include("operations/misc.jl")

@@ -7,7 +7,7 @@
 **Tech stack:** Julia, MPI.jl, PencilArrays/PencilFFTs, FFTW, Test, TOML.
 
 - [x] Add an MPI regression for a rectangular 3D product: analytic values, unchanged inputs, repeated calls, retained memory and communication budgets. Observe failure before implementation; register in the MPI test inventory.
-- [x] Implement lifetime-aware scratch reuse and reverse truncation in `src/core/nonlinear/nonlinear_evaluation.jl`. Validate existing real/complex, slab/pencil, and mixed-basis padded-product cases.
+- [x] Implement lifetime-aware scratch reuse and reverse truncation in `src/core/nonlinear/evaluation.jl`. Validate existing real/complex, slab/pencil, and mixed-basis padded-product cases.
 - [x] Extend `scripts/benchmark_cpu_parallel.jl` and its documentation with configurable shapes, rank counts, thread counts, meshes, and an externally launched worker mode. Avoid global snapshots for large cluster cases; report distributed diagnostics and resource metrics instead. Preserve the default serial/MPI parity check for small local runs.
 - [x] Run local before/after timing and memory probes, plus benchmark smoke tests. Document measured improvements separately from estimates and pending cluster validation.
 - [x] Remove materialized 3D padding/truncation slices discovered by the allocation benchmark; validate with a failing allocation guard and CPU/device-reference round trips.

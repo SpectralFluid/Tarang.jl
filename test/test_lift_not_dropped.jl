@@ -1,6 +1,6 @@
 # Guard: the equation parser used to SILENTLY DROP a `lift` operator.
 #
-# `problem_parsing.jl`'s short-form branch called `lift(operand, n)` inside a bare `try` and,
+# `parsing.jl`'s short-form branch called `lift(operand, n)` inside a bare `try` and,
 # when basis auto-detection failed, returned the BARE OPERAND with the comment "for matrix
 # sizing the Lift is just a shape-preserving wrapper, so the operand alone is sufficient".
 #

@@ -67,6 +67,14 @@ end
 const _FIELD_POOL_OWNERS = WeakKeyDict{Any, Any}()
 const _FIELD_POOL_ACTIVE = WeakKeyDict{Any, Bool}()
 
+# A live checkout keeps its owner alive so maybe_return! can recover it. Idle
+# fields must not: the owner holds them in `available`, and a strong registry
+# value would make that cycle reachable forever despite the weak key.
+function _field_pool_owner(field)
+    owner = get(_FIELD_POOL_OWNERS, field, nothing)
+    return owner isa WeakRef ? owner.value : owner
+end
+
 # ---------------------------------------------------------------------------
 # checkout!
 # ---------------------------------------------------------------------------
@@ -136,7 +144,7 @@ function return!(pool::FieldPool, field::ScalarField)
             "Cannot return a ScalarField to the pool that was not originally " *
             "checked out from a pool (field._from_pool == false)."))
     end
-    owner = get(_FIELD_POOL_OWNERS, field, nothing)
+    owner = _field_pool_owner(field)
     if owner === nothing
         throw(ArgumentError(
             "Cannot return pooled ScalarField $(field.name) because its owning " *
@@ -170,6 +178,7 @@ function return!(pool::FieldPool, field::ScalarField)
     end
     # else: drop the field and let GC collect it
 
+    _FIELD_POOL_OWNERS[field] = WeakRef(pool)
     _FIELD_POOL_ACTIVE[field] = false
     pool.in_use -= 1
     return nothing
@@ -223,7 +232,7 @@ function prewarm!(pool::FieldPool,
     for _ in 1:count
         field = ScalarField(pool.dist, "pool_field", bases, dtype)
         field._from_pool = true
-        _FIELD_POOL_OWNERS[field] = pool
+        _FIELD_POOL_OWNERS[field] = WeakRef(pool)
         _FIELD_POOL_ACTIVE[field] = false
         # _pool_generation stays 0 — it will be incremented on first checkout
         push!(stack, field)
@@ -278,12 +287,12 @@ end
 """
     maybe_return!(field::ScalarField)
 
-If `field` was obtained from a pool (`field._from_pool == true`) and a global
-pool is active, return it to the pool.  Otherwise this is a no-op.
+If `field` was obtained from a pool (`field._from_pool == true`) and its owner
+is still alive, return it to that pool. Otherwise this is a no-op.
 """
 function maybe_return!(field::ScalarField)
     if field._from_pool
-        owner = get(_FIELD_POOL_OWNERS, field, nothing)
+        owner = _field_pool_owner(field)
         owner isa FieldPool || return nothing
         return!(owner, field)
     end
@@ -330,12 +339,20 @@ would discard a `layout=:c` result.
 """
 function _own_borrowed_field(src::ScalarField)
     owned = ScalarField(src.dist, src.name, src.bases, src.dtype)
+    owned.scales = src.scales
     layout = src.current_layout
     src_data = layout === :c ? get_coeff_data(src) : get_grid_data(src)
     if src_data !== nothing
-        ensure_layout!(owned, layout)
         dest_data = layout === :c ? get_coeff_data(owned) : get_grid_data(owned)
-        dest_data === nothing || copyto!(dest_data, src_data)
+        # Constructor buffers have base resolution. Scaled results can carry a
+        # larger grid or Fourier spectrum; own that shape as well as its data.
+        if dest_data !== nothing && size(dest_data) == size(src_data)
+            copyto!(dest_data, src_data)
+        elseif layout === :c
+            set_coeff_data!(owned, copy(src_data))
+        else
+            set_grid_data!(owned, copy(src_data))
+        end
     end
     owned.current_layout = layout
     return owned

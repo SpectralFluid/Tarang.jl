@@ -91,3 +91,60 @@ using SparseArrays
         end
     end
 end
+
+@testset "Oversized ETD systems retain the implicit fallback" begin
+    # 8192 real grid points produce 4097 Fourier coefficients, just beyond the
+    # dense matrix-function limit. A non-identity mass checks M is retained by
+    # the fallback, and changing dt exercises both multistep history branches.
+    for ts in (ETD_RK222(), ETD_CNAB2(), ETD_SBDF2())
+        domain = PeriodicDomain(8192)
+        u = ScalarField(domain, "u")
+        fill!(grid_data!(u), 1.0)
+        problem = InitialValueProblem([u])
+        add_equation!(problem, "2*dt(u) + 3*u = 0")
+        solver = InitialValueSolver(problem, ts; dt=0.01)
+        dts = (0.01, 0.015, 0.007, 0.02)
+        amplitudes = [1.0]
+        for (i, dt) in enumerate(dts)
+            # RK222 and CNAB2 fall back to CNAB2 (CNAB1 startup). SBDF2's
+            # ETDRK2 startup therefore uses CNAB1, then SBDF1 and SBDF2.
+            current = amplitudes[end]
+            expected = if !(ts isa ETD_SBDF2) || i == 1
+                current * (2 - 1.5dt) / (2 + 1.5dt)
+            elseif i == 2
+                current * 2 / (2 + 3dt)
+            else
+                w = dt / dts[i - 1]
+                a0 = (1 + 2w) / ((1 + w) * dt)
+                a1 = -(1 + w) / dt
+                a2 = w^2 / ((1 + w) * dt)
+                (-2a1 * current - 2a2 * amplitudes[end - 1]) / (2a0 + 3)
+            end
+            step!(solver, dt)
+            @test maximum(abs, grid_data!(u) .- expected) < 1e-11
+            @test solver.iteration == i
+            push!(amplitudes, expected)
+        end
+        cache = solver.timestepper_state.timestepper_data
+        @test size(Tarang._get_problem_matrix(problem, "L_matrix")) == (4097, 4097)
+        @test get(cache, :L_eff, nothing) === nothing
+        @test !haskey(cache, :L_eff_neg)
+        @test !haskey(cache, :etd_phi)
+
+        # The preflight handles identity-without-M and rejects singular M
+        # before invoking any fallback. Neither path may materialize L.
+        calls = Ref(0)
+        fallback = (_, _) -> (calls[] += 1)
+        large_L = spzeros(4097, 4097)
+        state = Tarang.TimestepperState(ts, 0.01, ScalarField[])
+        @test Tarang._etd_oversized_fallback!(state, solver, large_L, nothing, fallback)
+        @test calls[] == 1
+        @test_throws "singular mass matrix" Tarang._etd_oversized_fallback!(
+            state, solver, large_L, spzeros(4097, 4097), fallback)
+        @test calls[] == 1
+        @test get(state.timestepper_data, :L_eff, nothing) === nothing
+        # A small operator still uses ETD rather than the implicit fallback.
+        @test !Tarang._etd_oversized_fallback!(state, solver, spzeros(2, 2), nothing, fallback)
+        @test calls[] == 1
+    end
+end

@@ -2,7 +2,7 @@ using Test
 using Tarang
 
 # ============================================================================
-# Tests for src/core/field/field_data/field_data_component_buffers.jl
+# Tests for src/core/field/field_data/component_buffers.jl
 #
 # This file provides structure-of-arrays helpers that stack the components of a
 # VectorField / TensorField into a single contiguous buffer (component index as
@@ -27,7 +27,7 @@ using Tarang
 # grid-space dtype.
 # ============================================================================
 
-@testset "field_data_component_buffers.jl" begin
+@testset "component_buffers.jl" begin
 
     # Helper: fill component (1-based linear index `id`) of a grid field with a
     # distinct, position-dependent pattern so components are mutually distinct.

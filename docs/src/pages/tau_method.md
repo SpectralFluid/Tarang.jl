@@ -175,7 +175,7 @@ Here ``j`` is a Julia index: `-1` gives row `N`. This is a coefficient-space
 injection, not a physical-space boundary impulse.
 
 !!! note "Current matrix representation"
-    `src/core/operators/matrices/matrices_subproblem_operators.jl` takes `N`
+    `src/core/operators/matrices/subproblem_operators.jl` takes `N`
     from the subproblem's coupled basis and does not use `op.basis` to convert
     the lift column. At a fixed mode, passing the state basis or its first or
     second derivative basis therefore gives the same subproblem lift matrix.

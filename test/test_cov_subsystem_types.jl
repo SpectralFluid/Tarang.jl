@@ -1,5 +1,5 @@
 """
-Serial-CPU coverage tests for src/core/subsystems/subsystem_types.jl.
+Serial-CPU coverage tests for src/core/subsystems/types.jl.
 
 These pin the behavior of the Subsystem constructor and its supporting
 helpers — variable/equation range computation, matrix-group collapsing,
@@ -33,7 +33,7 @@ struct CstSolverNoBase
     problem::Tarang.Problem
 end
 
-@testset "subsystem_types.jl coverage" begin
+@testset "types.jl coverage" begin
 
     # -----------------------------------------------------------------------
     @testset "scalar_components dispatch" begin

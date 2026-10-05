@@ -43,8 +43,8 @@ mutable struct GPUChebyshevDerivPlan{T}
     const batch::Int                        # product of all other dimensions
     const work_ext::CuMatrix{T}             # (2*(n-1), batch) extension buffer
     const work_cx::CuMatrix{Complex{T}}     # (n, batch) rfft output
-    work_real::Union{Nothing, CuMatrix{T}}  # (n, batch) raw DCT-I output (deriv path)
-    work_deriv::Union{Nothing, CuMatrix{T}} # (n, batch) deriv coeffs + order>=2 ping
+    work_real::Union{Nothing, CuMatrix{T}}  # (n, batch) raw DCT-I / recurrence ping
+    work_deriv::Union{Nothing, CuMatrix{T}} # (n, batch) derivative coefficients
     work_perm::Union{Nothing, CuMatrix{T}}  # (n, batch) permuted / packed staging
     const rfft_plan::Any                    # CUFFT rfft along dim 1 of work_ext
 end
@@ -66,27 +66,11 @@ function _get_gpu_cheb_deriv_plan(n::Int, batch::Int, ::Type{T}) where {T<:Abstr
     end
 end
 
-@inline function _plan_work_real!(plan::GPUChebyshevDerivPlan{T}) where {T}
-    buf = plan.work_real
+@inline function _plan_work!(plan::GPUChebyshevDerivPlan{T}, ::Val{slot}) where {T,slot}
+    buf = getfield(plan, slot)
     buf === nothing || return buf::CuMatrix{T}
     buf = CUDA.zeros(T, plan.n, plan.batch)
-    plan.work_real = buf
-    return buf
-end
-
-@inline function _plan_work_deriv!(plan::GPUChebyshevDerivPlan{T}) where {T}
-    buf = plan.work_deriv
-    buf === nothing || return buf::CuMatrix{T}
-    buf = CUDA.zeros(T, plan.n, plan.batch)
-    plan.work_deriv = buf
-    return buf
-end
-
-@inline function _plan_work_perm!(plan::GPUChebyshevDerivPlan{T}) where {T}
-    buf = plan.work_perm
-    buf === nothing || return buf::CuMatrix{T}
-    buf = CUDA.zeros(T, plan.n, plan.batch)
-    plan.work_perm = buf
+    setfield!(plan, slot, buf)
     return buf
 end
 
@@ -158,6 +142,27 @@ complex (n, batch) matrix. ndrange = (n, batch)."""
     @inbounds cx[i, j] = Complex(re_im[i, j], re_im[i, j + batch])
 end
 
+# A column in the axis-first matrix visits the same non-axis indices as the
+# original array. `leading` is the product of dimensions before that axis.
+# Fuse that index mapping with packing, avoiding a full complex permutation.
+@kernel function _cheb_pack_permuted_reim_kernel!(out, @Const(cx), n, batch, leading)
+    i, j = @index(Global, NTuple)
+    index = 1 + (j - 1) % leading + (i - 1) * leading +
+            ((j - 1) ÷ leading) * leading * n
+    @inbounds begin
+        value = cx[index]
+        out[i, j] = real(value)
+        out[i, j + batch] = imag(value)
+    end
+end
+
+@kernel function _cheb_unpack_permuted_reim_kernel!(cx, @Const(re_im), n, batch, leading)
+    i, j = @index(Global, NTuple)
+    index = 1 + (j - 1) % leading + (i - 1) * leading +
+            ((j - 1) ÷ leading) * leading * n
+    @inbounds cx[index] = Complex(re_im[i, j], re_im[i, j + batch])
+end
+
 """
 Chebyshev coefficient → derivative coefficient recurrence.
 
@@ -204,53 +209,13 @@ One thread per COLUMN (ndrange = batch): the recurrence is serial in k.
 end
 
 # ---------------------------------------------------------------------------
-# 1-pass derivative (order = 1) on (n, batch) matrices
+# Derivatives on (n, batch) matrices: one forward/backward transform pair
 # ---------------------------------------------------------------------------
 
 """
 `out_mat === inp_mat` is allowed: the input is fully consumed by the first
 kernel (into `work_ext`) and `out_mat` is only written by the last one.
 """
-function _apply_gpu_cheb_deriv_1!(inp_mat::CuMatrix{T}, out_mat::CuMatrix{T},
-                                   scale::Float64, plan::GPUChebyshevDerivPlan{T}) where {T}
-    n     = plan.n
-    batch = plan.batch
-    M     = 2 * (n - 1)
-    arch  = Tarang.architecture(inp_mat)
-    inv_nm1 = T(1.0 / (n - 1))
-    sc_T    = T(scale)
-
-    # Step 1: fused reverse (ascending → descending CGL grid) + symmetric extension
-    launch!(arch, _dct1_reverse_ext_kernel!, plan.work_ext, inp_mat, n, batch;
-            ndrange=(M, batch))
-
-    # Step 2: batched rfft along dim 1 → DCT-I output
-    mul!(plan.work_cx, plan.rfft_plan, plan.work_ext)
-
-    # Step 3: extract real part → Chebyshev coefficients (raw)
-    work_real  = _plan_work_real!(plan)
-    work_deriv = _plan_work_deriv!(plan)
-    launch!(arch, _extract_real_kernel!, work_real, plan.work_cx, n, batch;
-            ndrange=(n, batch))
-
-    # Step 4: recurrence → derivative coefficients in work_deriv
-    launch!(arch, _cheb_coeff_to_deriv_kernel!, work_deriv, work_real,
-            n, batch, inv_nm1, sc_T; ndrange=batch)
-
-    # Step 5: symmetric extension of derivative coefficients (no reversal)
-    launch!(arch, _dct1_ext_kernel!, plan.work_ext, work_deriv, n, batch;
-            ndrange=(M, batch))
-
-    # Step 6: batched rfft again → DCT-I of derivative coefficients
-    mul!(plan.work_cx, plan.rfft_plan, plan.work_ext)
-
-    # Step 7: fused extract real + reverse back + scale by 1/2
-    launch!(arch, _dct1_extract_finalize_kernel!, out_mat, plan.work_cx, n, batch;
-            ndrange=(n, batch))
-
-    return out_mat
-end
-
 function _apply_gpu_cheb_deriv_nth!(inp_mat::CuMatrix{T}, out_mat::CuMatrix{T},
                                      scale::Float64, order::Int,
                                      plan::GPUChebyshevDerivPlan{T}) where {T}
@@ -258,29 +223,75 @@ function _apply_gpu_cheb_deriv_nth!(inp_mat::CuMatrix{T}, out_mat::CuMatrix{T},
         out_mat === inp_mat || copyto!(out_mat, inp_mat)
         return out_mat
     end
-    _apply_gpu_cheb_deriv_1!(inp_mat, out_mat, scale, plan)
-    for _ in 2:order
-        # Ping through work_deriv: the 1-pass body consumes its input entirely
-        # at Step 1 (into work_ext) BEFORE Step 4 overwrites work_deriv, so the
-        # buffer safely doubles as the higher-order input and no dedicated ping
-        # buffer is needed. Higher orders stay allocation-free.
-        ping = _plan_work_deriv!(plan)
-        copyto!(ping, out_mat)
-        _apply_gpu_cheb_deriv_1!(ping, out_mat, scale, plan)
+    workspace = (work_ext=plan.work_ext, work_cx=plan.work_cx,
+                 work_real=_plan_work!(plan, Val(:work_real)),
+                 work_deriv=_plan_work!(plan, Val(:work_deriv)),
+                 rfft_plan=plan.rfft_plan)
+    return _cheb_deriv_pipeline!(inp_mat, out_mat, scale, order, workspace,
+                                 Tarang.architecture(inp_mat))
+end
+
+# Backend-independent orchestration lets the real kernels and transform count
+# be verified with FFTW on CPU when no CUDA device is available.
+function _cheb_deriv_pipeline!(inp_mat::AbstractMatrix{T}, out_mat::AbstractMatrix{T},
+                                scale::Float64, order::Int, workspace, arch) where {T}
+    if order == 0
+        out_mat === inp_mat || copyto!(out_mat, inp_mat)
+        return out_mat
     end
+    n, batch = size(inp_mat)
+    M     = 2 * (n - 1)
+    inv_nm1 = T(1.0 / (n - 1))
+    sc_T    = T(scale)
+
+    # Step 1: fused reverse (ascending → descending CGL grid) + symmetric extension
+    launch!(arch, _dct1_reverse_ext_kernel!, workspace.work_ext, inp_mat, n, batch;
+            ndrange=(M, batch))
+
+    # Step 2: batched rfft along dim 1 → DCT-I output
+    mul!(workspace.work_cx, workspace.rfft_plan, workspace.work_ext)
+
+    # Step 3: extract real part → Chebyshev coefficients (raw)
+    work_real, work_deriv = workspace.work_real, workspace.work_deriv
+    launch!(arch, _extract_real_kernel!, work_real, workspace.work_cx, n, batch;
+            ndrange=(n, batch))
+
+    # Step 4: recurrence → derivative coefficients in work_deriv
+    launch!(arch, _cheb_coeff_to_deriv_kernel!, work_deriv, work_real,
+            n, batch, inv_nm1, sc_T; ndrange=batch)
+
+    # The first recurrence produces inverse-DCT input: normalized derivative
+    # coefficients with a doubled constant endpoint and zero highest mode.
+    # Later recurrences ignore the constant mode, so this representation can
+    # stay in coefficient space with normalization 1. Ping-pong is essential:
+    # each recurrence reads the coefficient immediately above the row it writes.
+    coeffs, spare = work_deriv, work_real
+    for _ in 2:order
+        launch!(arch, _cheb_coeff_to_deriv_kernel!, spare, coeffs,
+                n, batch, one(T), sc_T; ndrange=batch)
+        coeffs, spare = spare, coeffs
+    end
+
+    # Step 5: symmetric extension of derivative coefficients (no reversal)
+    launch!(arch, _dct1_ext_kernel!, workspace.work_ext, coeffs, n, batch;
+            ndrange=(M, batch))
+
+    # Step 6: batched rfft again → DCT-I of derivative coefficients
+    mul!(workspace.work_cx, workspace.rfft_plan, workspace.work_ext)
+
+    # Step 7: fused extract real + reverse back + scale by 1/2
+    launch!(arch, _dct1_extract_finalize_kernel!, out_mat, workspace.work_cx, n, batch;
+            ndrange=(n, batch))
+
     return out_mat
 end
 
 # ---------------------------------------------------------------------------
 # Shared permutation / packed-re-im scaffolds
 #
-# Every `axis != 1` path stages through the SAME mirror-image decomposition
-# (perm/iperm + permutedims! in/out) and every complex path through the same
-# pack-run-unpack sandwich. These used to be four inline copies, each carrying
-# its own buffer-disjointness rules in comments; one tested implementation of
-# each keeps a future variant from shipping an off-by-one on the one copy a
-# refactor missed (silent value corruption only on axis != 1 — which GPU CI
-# cannot exercise).
+# Real nonleading axes stage through a permutation buffer. Complex axes fold
+# that mapping into real/imaginary packing. Both present an axis-first real
+# matrix to the shared DCT and derivative cores.
 # ---------------------------------------------------------------------------
 
 """
@@ -300,7 +311,7 @@ function _permuted_axis_apply!(core!::F, dest::CuArray{T,N}, src::CuArray{T,N},
     iperm = invperm(perm)
     perm_shape = ntuple(i -> size(src, perm[i]), N)
 
-    work_perm = _plan_work_perm!(plan)
+    work_perm = _plan_work!(plan, Val(:work_perm))
     in_perm = reshape(work_perm, perm_shape)
     permutedims!(in_perm, src, perm)
     mat = reshape(work_perm, n, batch)
@@ -321,7 +332,7 @@ kernel fully consumes the input before `core!` runs.
 function _packed_reim_apply!(core!::F, out_mat, in_mat,
                              plan2::GPUChebyshevDerivPlan{T},
                              n::Int, batch::Int, arch) where {F, T}
-    packed = reshape(_plan_work_perm!(plan2), n, 2 * batch)
+    packed = reshape(_plan_work!(plan2, Val(:work_perm)), n, 2 * batch)
     launch!(arch, _cheb_pack_reim_kernel!, packed, in_mat, n, batch;
             ndrange=(n, 2 * batch))
     core!(packed)
@@ -333,26 +344,22 @@ end
 """
     _permuted_axis_apply_complex!(core!, dest, src, axis, plan2, arch)
 
-Complex variant of `_permuted_axis_apply!`: permutation staging goes through
-the shared count=2 DCT scratch (count=2 keeps the key disjoint from the
-count=1 users in the transform chain, which can share (shape, T)), and the
-packed-re/im sandwich runs in `plan2`'s `work_perm` via `_packed_reim_apply!`.
+Complex variant of `_permuted_axis_apply!`: pack/unpack kernels also map the
+axis-first indices, using only `plan2`'s real `work_perm`. The pack consumes the
+entire input before the unpack writes, so `dest === src` remains safe.
 """
 function _permuted_axis_apply_complex!(core!::F, dest::CuArray{Complex{T},N},
                                        src::CuArray{Complex{T},N}, axis::Int,
                                        plan2::GPUChebyshevDerivPlan{T}, arch) where {F,T,N}
     n = size(src, axis)
     batch = prod(size(src)) ÷ n
-    other_dims = ntuple(i -> i < axis ? i : i + 1, N - 1)
-    perm  = (axis, other_dims...)
-    iperm = invperm(perm)
-    perm_shape = ntuple(i -> size(src, perm[i]), N)
-
-    cscratch = get_gpu_dct_scratch(arch, perm_shape, Complex{T}, 2)[1]
-    permutedims!(cscratch, src, perm)
-    cmat = reshape(cscratch, n, batch)
-    _packed_reim_apply!(core!, cmat, cmat, plan2, n, batch, arch)
-    permutedims!(dest, reshape(cmat, perm_shape), iperm)
+    leading = stride(src, axis)
+    packed = reshape(_plan_work!(plan2, Val(:work_perm)), n, 2 * batch)
+    launch!(arch, _cheb_pack_permuted_reim_kernel!, packed, src, n, batch, leading;
+            ndrange=(n, batch))
+    core!(packed)
+    launch!(arch, _cheb_unpack_permuted_reim_kernel!, dest, packed, n, batch, leading;
+            ndrange=(n, batch))
     return dest
 end
 
@@ -459,14 +466,14 @@ end
 # Chebyshev-derivative DCT-I building blocks above.
 # ============================================================================
 #
-# The derivative path `_apply_gpu_cheb_deriv_1!` performs:
+# The first-derivative path `_apply_gpu_cheb_deriv_nth!` performs:
 #     reverse+extension → rfft → extract-real   (forward DCT-I)
 #     → recurrence (norm + endpoint half-weight + derivative + un-normalize)
 #     → extension → rfft → extract-real+reverse+½  (inverse DCT-I)
 #
 # Here we lift JUST the transform (NOT the derivative recurrence) into a plain
 # forward/backward DCT-I that matches the CPU `_chebyshev_forward` /
-# `_chebyshev_backward` convention exactly (see transform_chebyshev.jl):
+# `_chebyshev_backward` convention exactly (see chebyshev.jl):
 #
 #   forward  = REDFT00 · (1/(N-1)) · (½ at endpoints) · (odd-index sign flip)
 #   backward = (odd-index sign flip) · (×2 at endpoints) · REDFT00 · ½
@@ -524,7 +531,7 @@ DCT-I of width 2·batch (the transform is linear and real-coefficient). The
 transform axis is viewed first as an (N, batch) matrix; the cached
 `GPUChebyshevDerivPlan` supplies the symmetric-extension/rfft workspace and the
 permutation buffer. Matches the CPU Chebyshev DCT-I convention in
-`transform_chebyshev.jl` (see the comment block above for the grid-reversal ==
+`chebyshev.jl` (see the comment block above for the grid-reversal ==
 odd-flip equivalence).
 
 NOTE: this is the plain transform only — it does NOT truncate/zero-pad the

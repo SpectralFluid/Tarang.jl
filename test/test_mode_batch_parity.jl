@@ -508,6 +508,8 @@ end
     function _call_lines(path::AbstractString, needle::AbstractString)
         n = 0
         in_docstring = false
+        # Match the public function name, not a private helper with that suffix.
+        call_pattern = Regex("\\b" * replace(needle, "(" => "\\("))
         for line in eachline(path)
             # An ODD number of `"""` on a line flips the docstring state; an
             # even number (a one-line docstring) leaves it where it was.
@@ -516,7 +518,7 @@ end
                 continue
             end
             in_docstring && continue
-            occursin(needle, line) || continue
+            occursin(call_pattern, line) || continue
             startswith(lstrip(line), "function ") && continue   # the definition
             n += 1
         end

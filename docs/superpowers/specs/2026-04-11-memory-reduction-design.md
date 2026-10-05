@@ -77,7 +77,7 @@ function Base.copy(field::ScalarField)
 end
 ```
 
-**Files**: `field_data.jl`
+**Files**: `data.jl`
 
 ### 2b. Pencil IMEX: allocate shell instead of `copy(field)`
 
@@ -107,7 +107,7 @@ end
 
 Add `fields_to_vector!(buf, state)` in-place variant. Use it in `step_rk_imex!` and `_step_explicit_rk_cpu!`.
 
-**Files**: `state.jl`, `state_utils.jl` or `solver_compiled_rhs.jl`, `step_rk.jl`
+**Files**: `state.jl`, `state_utils.jl` or `compiled_rhs.jl`, `step_rk.jl`
 
 ### 2d. Symbol constants for cache keys
 
@@ -143,7 +143,7 @@ end
 
 Set it during `plan_transforms!`. `_find_pencil_plan` becomes a field access.
 
-**Files**: `distributor.jl`, `transform_planning.jl`, `transform_legendre.jl`, `transform_types.jl`
+**Files**: `distributor.jl`, `planning.jl`, `legendre.jl`, `types.jl`
 
 ### 3b. Typed TimestepperState workspace
 
@@ -181,7 +181,7 @@ struct Layout{N}
 end
 ```
 
-**Files**: `distributor.jl`, `field_types.jl`
+**Files**: `distributor.jl`, `types.jl`
 
 ## Out of Scope
 

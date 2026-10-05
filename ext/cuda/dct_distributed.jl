@@ -14,10 +14,9 @@ chosen from `axis_kind`:
 - `:chebyshev`       → `local_dct1_along_dim!` (complex DCT-I)
 - `:complex_fourier` / `:real_fourier` → `local_fft_along_dim!` (C2C FFT)
 
-Chebyshev axes need NO stored local plan — `gpu_dct1_along_dim!` builds/caches its
-`GPUChebyshevDerivPlan` internally (keyed by (n, batch, T)). Fourier axes use
-inline CUFFT plans inside `local_fft_along_dim!`. So this struct carries no
-per-axis local-plan store, only `axis_kind`.
+Chebyshev axes reuse the packed `gpu_dct1_along_dim!` workspace. Fourier plans
+and transpose intermediates are retained by this distributed plan. Execution
+is serialized, as required by its mutable pencil orientations and NCCL buffers.
 
 Transform sequence (forward, from Z-pencil grid values):
 1. transform in Z (local) → transpose Z→Y → transform in Y (local)
@@ -53,6 +52,14 @@ struct DistributedDCTPlan{T}
 
     # Work arrays for local transforms, one per pencil orientation (complex)
     work_arrays::Vector{CuArray{Complex{T}, 3}}
+    scratch::Dict{NTuple{3,Int},CuArray{Complex{T},3}}
+    fft_plans::Dict{Tuple{Int,Symbol},Any}
+end
+
+function _distributed_dct_scratch!(plan::DistributedDCTPlan{T}, shape::NTuple{3,Int}) where T
+    return get!(plan.scratch, shape) do
+        CUDA.zeros(Complex{T}, shape...)
+    end
 end
 
 """
@@ -105,7 +112,8 @@ function _build_distributed_dct_plan(pencil::PencilDecomposition,
         CUDA.zeros(Complex{T}, pencil.z_pencil_shape...)
     ]
 
-    return DistributedDCTPlan{T}(pencil, coeff_pencil, axis_kind, transpose_buffer, work_arrays)
+    return DistributedDCTPlan{T}(pencil, coeff_pencil, axis_kind, transpose_buffer, work_arrays,
+        Dict{NTuple{3,Int},CuArray{Complex{T},3}}(), Dict{Tuple{Int,Symbol},Any}())
 end
 
 """
@@ -119,7 +127,13 @@ function local_transform_along_dim!(output, input, plan::DistributedDCTPlan, dim
     if k === :chebyshev
         return local_dct1_along_dim!(output, input, dim, direction)
     elseif k === :complex_fourier || k === :real_fourier
-        return local_fft_along_dim!(output, input, dim, direction)
+        fft_plan = get!(plan.fft_plans, (dim, direction)) do
+            direction === :forward ? CUFFT.plan_fft(input, (dim,)) :
+            direction === :backward ? CUFFT.plan_ifft(input, (dim,)) :
+            throw(ArgumentError("direction must be :forward or :backward"))
+        end
+        mul!(output, fft_plan, input)
+        return output
     else
         error("unknown axis_kind $k at dim $dim")
     end
@@ -183,31 +197,45 @@ function distributed_forward_dct!(coeffs::CuArray{Complex{T}, 3}, data::CuArray,
     @assert size(coeffs) == cpencil.z_pencil_shape "Coeffs must match coeff Z-pencil (half-spectrum) shape"
 
     # Promote real grid input → Complex{T} (design decision #1).
-    cdata = eltype(data) <: Complex ? data : Complex{T}.(data)
+    cdata = if eltype(data) <: Complex
+        data
+    else
+        promoted = _distributed_dct_scratch!(plan, size(data))
+        promoted .= data
+        promoted
+    end
 
     # --- forward local transforms with Z→Y→X transposes (full-spectrum pencil) ---
     z_work = plan.work_arrays[3]
     local_transform_along_dim!(z_work, cdata, plan, 3, :forward)
 
-    y_data = transpose_z_to_y!(plan.transpose_buffer, z_work, pencil)
+    y_data = _transpose_z_to_y!(_distributed_dct_scratch!(plan, pencil.y_pencil_shape),
+                                plan.transpose_buffer, z_work, pencil)
     y_work = plan.work_arrays[2]
     local_transform_along_dim!(y_work, y_data, plan, 2, :forward)
 
-    x_data = transpose_y_to_x!(plan.transpose_buffer, y_work, pencil)
+    x_data = _transpose_y_to_x!(_distributed_dct_scratch!(plan, pencil.x_pencil_shape),
+                                plan.transpose_buffer, y_work, pencil)
     x_work = plan.work_arrays[1]
     local_transform_along_dim!(x_work, x_data, plan, 1, :forward)
 
     # RealFourier dim-1 half-spectrum truncation. dim 1 is LOCAL here (X-pencil),
     # so truncating it is correct; the result has shape == cpencil.x_pencil_shape.
-    spectral_x = plan.axis_kind[1] === :real_fourier ? _realfourier_truncate(x_work) : x_work
+    spectral_x = if plan.axis_kind[1] === :real_fourier
+        half = _distributed_dct_scratch!(plan, cpencil.x_pencil_shape)
+        @views half .= x_work[1:size(half, 1), :, :]
+        half
+    else
+        x_work
+    end
 
     # --- OUTPUT ADAPTER: transpose X→Y→Z on the COEFF-sized pencil so the dim-1
     # length the transposes split/gather is the (possibly truncated) half-spectrum,
     # not Nx. This lands the coeffs Z-local, matching the field coeff buffer. ---
     set_orientation!(cpencil, :x_pencil)
-    y_back = transpose_x_to_y!(plan.transpose_buffer, spectral_x, cpencil)
-    z_back = transpose_y_to_z!(plan.transpose_buffer, y_back, cpencil)
-    copyto!(coeffs, z_back)
+    y_back = _transpose_x_to_y!(_distributed_dct_scratch!(plan, cpencil.y_pencil_shape),
+                                plan.transpose_buffer, spectral_x, cpencil)
+    _transpose_y_to_z!(coeffs, plan.transpose_buffer, y_back, cpencil)
 
     # Reset orientations for re-entrancy (both pencils return to :z_pencil).
     set_orientation!(pencil, :z_pencil)
@@ -261,8 +289,10 @@ function distributed_backward_dct!(data::CuArray, coeffs::CuArray{Complex{T}, 3}
     # pencil (mirror of the forward output adapter). dim 1 stays the half-spectrum
     # length until it is LOCAL again in X-pencil. ---
     set_orientation!(cpencil, :z_pencil)
-    y_c = transpose_z_to_y!(plan.transpose_buffer, coeffs, cpencil)
-    x_c = transpose_y_to_x!(plan.transpose_buffer, y_c, cpencil)
+    y_c = _transpose_z_to_y!(_distributed_dct_scratch!(plan, cpencil.y_pencil_shape),
+                             plan.transpose_buffer, coeffs, cpencil)
+    x_c = _transpose_y_to_x!(_distributed_dct_scratch!(plan, cpencil.x_pencil_shape),
+                             plan.transpose_buffer, y_c, cpencil)
     # x_c now has shape == cpencil.x_pencil_shape (dim 1 = half-spectrum length).
 
     # RealFourier dim-1 Hermitian expansion: half-spectrum → full Nx. dim 1 is
@@ -274,7 +304,7 @@ function distributed_backward_dct!(data::CuArray, coeffs::CuArray{Complex{T}, 3}
     # when every transverse axis is real-kernel (Chebyshev DCT-I) or physical. A
     # ComplexFourier (or RealFourier) transverse axis needs the conjugate partner
     # at the flipped wavenumber ((N2-k2)%N2, …) — equivalently the dim-1 inverse
-    # must be the LAST distributed-backward stage (as on CPU; transform_fourier.jl
+    # must be the LAST distributed-backward stage (as on CPU; fourier.jl
     # walks transforms in reverse). Fail loudly instead of silently corrupting the
     # round-trip. The proper reorder fix needs multi-GPU verification — see
     # memory/project_gpu_ff_ffc_audit_2026_06_22.md.
@@ -287,18 +317,20 @@ function distributed_backward_dct!(data::CuArray, coeffs::CuArray{Complex{T}, 3}
               "CPU path for this layout.")
     end
     spectral_x_full = plan.axis_kind[1] === :real_fourier ?
-        _realfourier_hermitian_expand(x_c, Nx) : x_c
+        _realfourier_hermitian_expand!(_distributed_dct_scratch!(plan, pencil.x_pencil_shape), x_c) : x_c
 
     # --- inverse local transforms with X→Y→Z transposes (full-spectrum pencil) ---
     x_work = plan.work_arrays[1]
     local_transform_along_dim!(x_work, spectral_x_full, plan, 1, :backward)
 
     set_orientation!(pencil, :x_pencil)
-    y_data = transpose_x_to_y!(plan.transpose_buffer, x_work, pencil)
+    y_data = _transpose_x_to_y!(_distributed_dct_scratch!(plan, pencil.y_pencil_shape),
+                                plan.transpose_buffer, x_work, pencil)
     y_work = plan.work_arrays[2]
     local_transform_along_dim!(y_work, y_data, plan, 2, :backward)
 
-    z_data = transpose_y_to_z!(plan.transpose_buffer, y_work, pencil)
+    z_data = _transpose_y_to_z!(_distributed_dct_scratch!(plan, pencil.z_pencil_shape),
+                                plan.transpose_buffer, y_work, pencil)
     z_work = plan.work_arrays[3]
     local_transform_along_dim!(z_work, z_data, plan, 3, :backward)
 
@@ -351,7 +383,8 @@ end
 #   - local_dct1_along_dim!   : complex DCT-I along one dim (Chebyshev axes)
 #   - _realfourier_truncate / _realfourier_hermitian_expand : dim-1 RealFourier
 #     half-spectrum <-> full-spectrum (Hermitian symmetry)
-# Plan caching for the FFTs is a later task; the inline plan here is fine.
+# The distributed driver caches Fourier plans; the standalone primitive below
+# creates its own plan for callers without a DistributedDCTPlan.
 
 """
     local_fft_along_dim!(output, input, dim, direction) -> output
@@ -377,19 +410,13 @@ end
 """
     local_dct1_along_dim!(output, input, dim, direction) -> output
 
-Complex DCT-I (REDFT00) along `dim` of a 3D complex array. The real DCT-I only
-accepts real input, so the real and imaginary parts are transformed
-independently (via `gpu_dct1_along_dim!`) and recombined — exactly mirroring how
-the CPU Chebyshev transform splits complex fields (see transform_chebyshev.jl).
+Complex DCT-I (REDFT00) along `dim` of a 3D complex array. The shared
+`gpu_dct1_along_dim!` implementation packs real/imaginary parts into one cached
+batched workspace, preserving the CPU Chebyshev normalization convention.
 """
 function local_dct1_along_dim!(output::CuArray{Complex{T},3}, input::CuArray{Complex{T},3},
                                dim::Int, direction::Symbol) where {T}
-    re = real.(input); im = imag.(input)
-    ore = similar(re); oim = similar(im)
-    gpu_dct1_along_dim!(ore, re, dim, direction)
-    gpu_dct1_along_dim!(oim, im, dim, direction)
-    output .= Complex.(ore, oim)
-    return output
+    return gpu_dct1_along_dim!(output, input, dim, direction)
 end
 
 """
@@ -407,15 +434,24 @@ _realfourier_truncate(full::CuArray{Complex{T},3}) where {T} =
 Backward RealFourier dim-1 expansion: rebuild the full length-`N` spectrum along
 dim 1 from the half-spectrum via Hermitian symmetry `X[N-k+2] = conj(X[k])`.
 Batched over dims 2 and 3. The index map matches the tested CPU reference
-`Tarang._hermitian_full_from_half` in src/core/transforms/transform_gpu.jl
+`Tarang._hermitian_full_from_half` in src/core/transforms/gpu.jl
 (`full[N-k+2] = conj(half[k])` for `k = 2 … (N - M + 1)`, `M = div(N,2)+1`).
 """
 function _realfourier_hermitian_expand(half::CuArray{Complex{T},3}, N::Int) where {T}
     M = div(N, 2) + 1
     @assert size(half, 1) == M "half dim-1 length must be div(N,2)+1 = $M, got $(size(half,1))"
     full = CUDA.zeros(Complex{T}, N, size(half, 2), size(half, 3))
-    full[1:M, :, :] .= half
-    krange = 2:(N - M + 1)
-    full[N .- krange .+ 2, :, :] .= conj.(half[krange, :, :])
+    return _realfourier_hermitian_expand!(full, half)
+end
+
+function _realfourier_hermitian_expand!(full::CuArray{Complex{T},3},
+                                        half::CuArray{Complex{T},3}) where T
+    N, M = size(full, 1), size(half, 1)
+    M == div(N, 2) + 1 && size(full)[2:3] == size(half)[2:3] ||
+        throw(DimensionMismatch("Hermitian expansion shapes"))
+    @views full[1:M, :, :] .= half
+    # Reverse a contiguous view rather than allocating an integer gather and
+    # a copied half-spectrum slice. The empty range handles N == 1 or 2.
+    @views full[(M + 1):N, :, :] .= conj.(half[(N - M + 1):-1:2, :, :])
     return full
 end

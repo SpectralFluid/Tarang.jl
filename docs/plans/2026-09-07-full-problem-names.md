@@ -24,7 +24,7 @@ this rename are saved under `/private/tmp/tarang-problem-names-baseline`.
 ## 2. Rename consistently
 
 - [x] Rename concrete types, builders, signatures, and internal references in
-  `src/core/problems/problem_types.jl` and the rest of `src/`.
+  `src/core/problems/types.jl` and the rest of `src/`.
 - [x] Export only the canonical names from
   `src/api/problems.jl`, `src/api/public/quick_start.jl`, and the core exports.
 - [x] Update tests, examples, scripts, README, and current documentation.

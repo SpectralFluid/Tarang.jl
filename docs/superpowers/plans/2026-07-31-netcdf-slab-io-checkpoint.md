@@ -33,7 +33,7 @@
 | `src/core/field/field_layout/field_layout_arithmetic_io.jl` (modify) | `save_field` / `load_field!` rebuilt on the slab layer. Signatures unchanged. |
 | `src/core/solvers/solver_checkpoint.jl` (new) | `save_state` / `load_state!`. |
 | `src/core/solvers.jl` (modify) | `include("solvers/solver_checkpoint.jl")`. |
-| `src/core/solvers/solver_utils.jl` (modify) | Export `save_state`, `load_state!`. |
+| `src/core/solvers/utils.jl` (modify) | Export `save_state`, `load_state!`. |
 | `test/test_slab_io.jl` (new) | Tasks 1–2: index math and serial file round-trip. |
 | `test/test_checkpoint_restart.jl` (new) | Tasks 3–4: field I/O and solver checkpoint, serial. |
 | `test/test_mpi_checkpoint_restart.jl` (new) | Task 5: the rank-count matrix. |
@@ -707,7 +707,7 @@ Expected: all four testsets pass.
 **Files:**
 - Create: `src/core/solvers/solver_checkpoint.jl`
 - Modify: `src/core/solvers.jl`
-- Modify: `src/core/solvers/solver_utils.jl`
+- Modify: `src/core/solvers/utils.jl`
 - Modify: `test/test_checkpoint_restart.jl`
 - Modify: `docs/src/api/io.md`
 
@@ -903,13 +903,13 @@ function load_state!(solver::InitialValueSolver, path::AbstractString)
 end
 ```
 
-In `src/core/solvers.jl`, add after the `include("solvers/solver_stepping.jl")` line:
+In `src/core/solvers.jl`, add after the `include("solvers/stepping.jl")` line:
 
 ```julia
 include("solvers/solver_checkpoint.jl")
 ```
 
-In `src/core/solvers/solver_utils.jl`, add `save_state` and `load_state!` to the existing export list that already carries `solve!, proceed, run!`.
+In `src/core/solvers/utils.jl`, add `save_state` and `load_state!` to the existing export list that already carries `solve!, proceed, run!`.
 
 Then replace the hand-rolled recipe in `docs/src/api/io.md` — the section that begins "Tarang has no built-in checkpoint type" — with:
 

@@ -12,7 +12,7 @@
 
 **Files:**
 - Modify: `test/test_stochastic_forcing.jl`
-- Modify: `src/core/problems/problem_types.jl`
+- Modify: `src/core/problems/types.jl`
 
 1. Add a failing test with `IVP([u::VectorField, q::ScalarField])` proving `:q` maps to flattened index 3 and `:u_x` maps to index 1.
 2. Add a failing ambiguity test for `:u`.

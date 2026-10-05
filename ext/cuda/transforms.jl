@@ -214,13 +214,17 @@ function distributed_gpu_forward_transform!(field::ScalarField)
     # Ensure we're in Z-pencil orientation (grid space)
     set_orientation!(plan.pencil, :z_pencil)
 
-    # Allocate output. The rewritten driver lands coeffs **Z-local on the coeff
+    # Reuse compatible output. The driver lands coeffs **Z-local on the coeff
     # pencil** (complex, half-spectrum on dim 1 for a RealFourier dim-1 axis) —
     # NOT X-pencil. See distributed_forward_dct!. (This dispatch fires from
     # _gpu_forward_transform_impl! when is_distributed_gpu + needs_distributed_dct
     # + Tarang.distributed_gpu_supported all hold.)
     T = real(eltype(data))
-    coeffs = similar(data, Complex{T}, plan.coeff_pencil.z_pencil_shape...)
+    shape = plan.coeff_pencil.z_pencil_shape
+    coeffs = get_coeff_data(field)
+    if !(coeffs isa CuArray{Complex{T},3}) || size(coeffs) != shape
+        coeffs = similar(data, Complex{T}, shape...)
+    end
 
     # Perform distributed transform (resets pencil orientations internally).
     distributed_forward_dct!(coeffs, data, plan)
@@ -243,10 +247,14 @@ function distributed_gpu_backward_transform!(field::ScalarField)
     # Get local coefficient data (Z-local on the coeff pencil, complex).
     coeffs = get_coeff_data(field)
 
-    # Allocate real grid output (Z-pencil shape). The rewritten driver starts from
-    # Z-local coeffs and drives the pencils' orientations internally.
-    T = real(eltype(coeffs))
-    data = similar(coeffs, T, plan.pencil.z_pencil_shape...)
+    # Reuse the field's grid output, preserving its real or complex dtype.
+    # The driver starts from Z-local coeffs and resets pencil orientations.
+    T = field.dtype
+    shape = plan.pencil.z_pencil_shape
+    data = get_grid_data(field)
+    if !(data isa CuArray{T,3}) || size(data) != shape
+        data = similar(coeffs, T, shape...)
+    end
 
     # Perform distributed inverse transform.
     distributed_backward_dct!(data, coeffs, plan)
@@ -387,7 +395,7 @@ function _gpu_forward_transform_impl!(field::ScalarField)
         # FIRST Fourier axis is halved, and only if it is RealFourier (rfft of real
         # data). Every other axis — including a RealFourier axis that is NOT first —
         # stays full size (the CPU chain sees complex input there and runs a full
-        # C2C fft, transform_fourier.jl `_fourier_forward`). So:
+        # C2C fft, fourier.jl `_fourier_forward`). So:
         #   - R2C (multi-dim rfft: R2C on dim 1, C2C on rest) ONLY when bases[1] is
         #     RealFourier AND the grid data is real;
         #   - otherwise full multi-dim C2C, coeff shape == grid shape.
@@ -490,14 +498,18 @@ function _gpu_backward_c2c_fft!(field::ScalarField, gpu_arch::GPU, data_c::CuArr
                                 local_grid_shape::Tuple)
     coeff_T = eltype(data_c)
     plan_T = coeff_T <: Real ? Complex{coeff_T} : coeff_T
-    # C2C inverse requires complex input; promote if needed (shouldn't normally
-    # happen). Both the promoted input and the real-dtype inverse below draw from
-    # the SAME count=2 scratch set — two distinct slots, because cuFFT C2C must
-    # not run in place through `mul!`. (A count=1 request here would hand the
-    # promotion and the inverse the same buffer.)
-    scratch2 = get_gpu_dct_scratch(Tarang.architecture(data_c), local_grid_shape, plan_T, 2)
+    # Ordinary complex-to-complex inverses need no staging. Only request
+    # scratch for real input promotion or a real field's complex inverse output.
+    # When both are needed, retain distinct slots for the out-of-place FFT.
+    needs_real_output = field.dtype <: Real
+    scratch = if coeff_T <: Real || needs_real_output
+        count = coeff_T <: Real && needs_real_output ? 2 : 1
+        get_gpu_dct_scratch(Tarang.architecture(data_c), local_grid_shape, plan_T, count)
+    else
+        nothing
+    end
     if coeff_T <: Real
-        fft_input = scratch2[1]
+        fft_input = scratch[1]
         fft_input .= data_c
     else
         fft_input = data_c
@@ -508,18 +520,18 @@ function _gpu_backward_c2c_fft!(field::ScalarField, gpu_arch::GPU, data_c::CuArr
     # has an `Array{dtype}`-typed grid buffer, so storing the complex inverse in it
     # throws `TypeError: in setfield!, expected CuArray{Float64}, got CuArray{ComplexF64}`.
     # The forward promoted real grid data, so the imaginary part is roundoff: keep
-    # the real part. Mirrors the CPU `_backward_final_real!` (transform_fourier.jl)
+    # the real part. Mirrors the CPU `_backward_final_real!` (fourier.jl)
     # and `gpu_mixed_backward_transform!`'s `T <: Real` branch.
     real_T = field.dtype
     if real_T <: Real
-        scratch = scratch2[2]
-        gpu_backward_fft!(scratch, fft_input, plan)
+        inverse_output = scratch[end]
+        gpu_backward_fft!(inverse_output, fft_input, plan)
         existing_grid = get_grid_data(field)
         if existing_grid === nothing || !(existing_grid isa CuArray) ||
            eltype(existing_grid) != real_T || size(existing_grid) != local_grid_shape
             set_grid_data!(field, CUDA.zeros(real_T, local_grid_shape...))
         end
-        get_grid_data(field) .= real.(scratch)
+        get_grid_data(field) .= real.(inverse_output)
         return nothing
     end
 
@@ -641,7 +653,7 @@ function _gpu_backward_transform_impl!(field::ScalarField)
         if first_is_real && !(field.dtype <: Complex)
             # dim 1 stored as an rfft half-spectrum (forward used R2C). Classify
             # the backward path using basis metadata, mirroring the CPU detection
-            # ORDER (transform_fourier.jl `_apply_backward!`): test the R2C
+            # ORDER (fourier.jl `_apply_backward!`): test the R2C
             # interpretation FIRST — pure shape heuristics misclassify N=1/N=2,
             # where div(N,2)+1 == N — then the upsampled (scaled) half-spectrum,
             # then C2C. Anything else is ambiguous and is rejected; NEVER run a
@@ -658,7 +670,7 @@ function _gpu_backward_transform_impl!(field::ScalarField)
             base_n1 = bases[1].meta.size
             axis_len = local_coeff_shape[1]
 
-            # Classification comes from the SHARED rule (transform_layout.jl), so
+            # Classification comes from the SHARED rule (layout.jl), so
             # the device path cannot disagree with the CPU chain about which of
             # direct-irfft / upsampled-irfft / C2C a given spectrum is. Its
             # ordering also handles N=1/N=2, where rfft_len(N) == N.
@@ -904,7 +916,7 @@ function gpu_backward_fft!(output::CuArray, input::CuArray, plan::GPUFFTPlan)
         # cuFFT C2R (irfft) OVERWRITES its input buffer (same as FFTW irfft). Here `input`
         # is the field's coefficient buffer, so transforming from it directly corrupts the
         # caller's coefficients. Copy into a cached scratch first and transform from that —
-        # mirrors the CPU path (transform_fourier.jl), which copies into a cached scratch for
+        # mirrors the CPU path (fourier.jl), which copies into a cached scratch for
         # exactly this reason. (C2C inverse, below, is non-destructive — no copy needed.)
         arch = Tarang.architecture(input)
         scratch = get_gpu_dct_scratch(arch, size(input), eltype(input), 1)[1]
@@ -952,18 +964,9 @@ function get_gpu_fft_plan(arch::GPU{CuDevice}, local_size::Tuple, T::Type; real_
     end
 end
 
-# Fallback for generic GPU
-function get_gpu_fft_plan(arch::GPU, local_size::Tuple, T::Type; real_input::Bool=false)
-    device_id = _current_device_id()
-    key = (device_id, local_size, T, real_input)
-
-    lock(GPU_TRANSFORM_CACHE.lock) do
-        if !haskey(GPU_TRANSFORM_CACHE.plans, key)
-            GPU_TRANSFORM_CACHE.plans[key] = plan_gpu_fft(arch, local_size, T; real_input=real_input)
-        end
-        return GPU_TRANSFORM_CACHE.plans[key]
-    end
-end
+# Generic GPU uses the current device, matching plan_gpu_fft's fallback.
+get_gpu_fft_plan(arch::GPU, local_size::Tuple, T::Type; real_input::Bool=false) =
+    get_gpu_fft_plan(GPU{CuDevice}(CUDA.device()), local_size, T; real_input=real_input)
 
 """
     clear_gpu_transform_cache!()

@@ -1,5 +1,5 @@
 """
-Test suite for src/core/operators/tensor/tensor_misc.jl
+Test suite for src/core/operators/tensor/misc.jl
 
 Covers the three internal functions in that file:
   - Tarang.compute_grid_spacing(basis, dist, axis)

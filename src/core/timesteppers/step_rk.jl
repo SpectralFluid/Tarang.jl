@@ -252,7 +252,7 @@ function step_rk_imex!(state::TimestepperState, solver::InitialValueSolver; ts::
             else
                 lhs = get!(lhs_cache, (dt, a_ii)) do
                     try
-                        factorize(I + dt * a_ii * L_matrix)
+                        _factorize_timestep_matrix(I + dt * a_ii * L_matrix)
                     catch e
                         isa(e, SingularException) || rethrow(e)
                         _throw_imex_singular_stage(ts, s)
@@ -274,7 +274,7 @@ function step_rk_imex!(state::TimestepperState, solver::InitialValueSolver; ts::
                 # (M + dt*a*L) * X = rhs — works for both regular and singular M
                 lhs = get!(lhs_cache, (dt, a_ii)) do
                     try
-                        factorize(M_matrix + dt * a_ii * L_matrix)
+                        _factorize_timestep_matrix(M_matrix + dt * a_ii * L_matrix)
                     catch e
                         isa(e, SingularException) || rethrow(e)
                         _throw_imex_singular_stage(ts, s)
@@ -290,8 +290,7 @@ function step_rk_imex!(state::TimestepperState, solver::InitialValueSolver; ts::
         if s < stages || !skip_final_rhs
             Xs_fields = _timestep_field_state!(state, :imex_rk_stage_state, current_state)
             vector_to_fields!(Xs_fields, Xs_vec, current_state)
-            F_exp_fields = evaluate_rhs(solver, Xs_fields, t + c[s] * dt)
-            fields_to_vector!(F_exp_vecs[s], F_exp_fields)
+            _evaluate_global_rhs!(F_exp_vecs[s], state, solver, Xs_fields, t + c[s] * dt)
             mul!(F_imp_vecs[s], L_matrix, Xs_vec)
         end
     end
@@ -363,7 +362,7 @@ function _get_constrained_mass_solver!(state::TimestepperState,
        get(cache, :imex_rk_constrained_L_source, nothing) !== L_matrix
         zero_rows = _zero_mass_rows(M_matrix)
         constrained_mass = _constrained_mass_matrix(M_matrix, L_matrix, zero_rows)
-        cache[:imex_rk_constrained_mass_solver] = factorize(constrained_mass)
+        cache[:imex_rk_constrained_mass_solver] = _factorize_timestep_matrix(constrained_mass)
         cache[:imex_rk_constrained_mass_rows] = zero_rows
         cache[:imex_rk_constrained_M_source] = M_matrix
         cache[:imex_rk_constrained_L_source] = L_matrix
@@ -746,8 +745,7 @@ function _step_explicit_rk_cpu!(state::TimestepperState, solver::InitialValueSol
         end
 
         vector_to_fields!(stage_state, Y_vec, current_state)
-        F_stage = evaluate_rhs(solver, stage_state, t + c[s] * dt)
-        fields_to_vector!(F_vec, F_stage)
+        _evaluate_global_rhs!(F_vec, state, solver, stage_state, t + c[s] * dt)
         if M_factor === nothing
             copyto!(k_vecs[s], F_vec)
         else

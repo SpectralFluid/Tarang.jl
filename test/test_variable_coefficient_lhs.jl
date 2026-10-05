@@ -4,7 +4,7 @@ e.g. `dt(u) - nu_e*lap(u) = 0` where `nu_e` is a ScalarField rather than a numbe
 
 BUG THIS PINS (silent wrong answer, fixed 2026-07-20)
 -----------------------------------------------------
-`build_expression_matrix_block` (problem_matrices_spectral.jl) reduced a product of two
+`build_expression_matrix_block` (spectral.jl) reduced a product of two
 non-constant factors to a ZERO block:
 
     if _is_const_or_param(expr.left)      -> scale by the constant
@@ -16,7 +16,7 @@ A ScalarField coefficient is not `_is_const_or_param` (it has >1 grid point) and
 the global L matrix. `dt(u) - nu_e*lap(u) = 0` was assembled as `dt(u) = 0` and integrated
 as an inviscid run: the answer was exactly 1.0 (no decay) for nu_e = 0.01, 0.5 and 5.0
 alike, with zero warnings or errors. Pure-Fourier problems are affected because
-`_try_build_subproblems!` deliberately skips them (solver_types.jl:283), so the global
+`_try_build_subproblems!` deliberately skips them (types.jl:283), so the global
 matrix path is the one that runs.
 
 CONTRACT NOW PINNED

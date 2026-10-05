@@ -444,6 +444,9 @@ end
 
 Free-slip wall: zero normal derivative (Neumann BC).
 
+For a vector field this applies to every component. Use `stress_free_bc` to
+also impose zero normal velocity at an impermeable wall.
+
 # Example
 ```julia
 free_slip!(problem, "u", "z", 0.0)  # ∂u/∂z = 0 at z = 0

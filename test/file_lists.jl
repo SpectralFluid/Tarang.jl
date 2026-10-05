@@ -89,6 +89,7 @@ const TEST_FILES = [
     "test_arithmetic.jl",
     "test_distributor.jl",
     "test_decomposition_convention.jl",  # the decomposition convention was re-derived by hand at nine sites; two of them disagreed about whether a field with fewer dims than the mesh is decomposed at all
+    "test_transpose_geometry_reuse.jl",
     "test_les_models.jl",
     "test_les_models_gpu_compat.jl",   # AMD/Smagorinsky device-safety via JLArray (no GPU needed)
     "test_chebyshev.jl",
@@ -140,6 +141,13 @@ const TEST_FILES = [
     "test_gpu_timesteppers_jlarray.jl",       # every stepper on the single-GPU dispatch path via JLArray + a CPU-twin FFT: device == CPU, nominal order, loud refusals — MCNAB2/CNLF2 silently ran first-order on device
     "test_bc_value_matrix.jl",                # time-/space-dependent BCs must be enforced with the VALUE they name — only the FLAGS were tested
     "test_bc_context_regressions.jl",
+    "test_bc_projection_cache.jl",
+    "test_bc_allocation_caches.jl",
+    "test_bc_projection_memory.jl",
+    "test_3d_copy_scaling_allocations.jl",
+    "test_3d_timestep_workspaces.jl",
+    "test_subproblem_gather_caches.jl",
+    "test_cpu_local_mode_threads.jl",
     "test_stress_free_bc_regressions.jl",
     "test_gpu_boundary_regressions_jlarray.jl",
     "test_periodic_bc_marker.jl",
@@ -175,6 +183,8 @@ const TEST_FILES = [
     "test_catch_ratchet.jl",                 # bare `catch` population must not grow — every silent-wrong-value bug found so far came from one
     "test_timestepper_boundaries.jl",
     "test_field_pool.jl",
+    "test_memory_ownership_workspaces.jl",
+    "test_netcdf_staging_cache.jl",
     "test_linalg.jl",
     "test_tools_array.jl",
     "test_tools_parallel.jl",
@@ -186,6 +196,8 @@ const TEST_FILES = [
     "test_implicit_ncc_memo.jl",   # implicit-NCC build-pass memo: one build per coefficient per pass (MPI collective-count safety), invalidated when the coefficient data changes
     "test_mode_batch_signature.jl",   # batchability must be OBSERVED from built matrices, never inferred from nz/nvars — a gauge-constrained kx=0 mode batched with the rest solves the wrong system silently
     "test_mode_batch_kernels_cpu.jl",  # the real KA kernel objects on the CPU backend — the KA CPU miscompile of same-slot RMW is invisible to a reimplement-and-compare test
+    "test_gpu_solver_workspace_reuse.jl",
+    "test_gpu_transpose_metadata_cache.jl",
     "test_batched_dense_lu.jl",        # getrf_batched reports singularity in an info ARRAY and returns normally — an unchecked singular mode returns buffer contents that read as a plausible solution
     "test_mode_batch_parity.jl",       # batching must be OFF by default on CPU and never construct under MPI, or every existing run silently changes numerics
     "test_batched_mass_solve.jl",      # M_min is a 0/1 partial permutation so its pseudo-inverse is its transpose — but applying that to a genuine mass matrix is silently wrong, so the structure is verified, not assumed
@@ -210,6 +222,13 @@ const TEST_FILES = [
     "test_state_arith_layout.jl",       # axpy/linear-combination state helpers forced :g, paying a transform per operand; pins "no forced transform" AND that the coefficient-space answer matches the grid-space one
     "test_gpu_dct1_kernels_cpu.jl",       # DCT-I / Cheb-derivative kernel values AND the full FF/FC device transform drivers (2D+3D) on the KA CPU backend (FFTW standing in for cuFFT) — no GPU needed
     "test_solver_review_regressions.jl",   # malformed RHS, IMEX/ETD DAE failure policy, coeff-current derivatives, reused BCs, forcing, and schedule semantics
+    "test_solver_ordering_regressions.jl",
+    "test_spectral_review_regressions.jl",
+    "test_filter_output_review_regressions.jl",
+    "test_boundary_api_audit.jl",
+    "test_boundary_solver_audit.jl",
+    "test_boundary_spectral_audit.jl",
+    "test_boundary_stokes_audit.jl",
     "test_netcdf_integration_regressions.jl", # overwrite/append transactions and fail-closed NetCDF reconstruction
     "test_cuda_dct_cache_context.jl",      # CPU-only AST/helper guard for distributed CUDA DCT cache context and explicit communicator teardown
 ]
@@ -220,6 +239,7 @@ const TEST_FILES = [
 # TARANG_ONLY_OPTIONAL_TESTS=true (these only). The `optional-cpu-tests` CI job
 # uses the latter.
 const OPTIONAL_TEST_FILES = [
+    "test_gpu_derivative_memory_jlarray.jl",
     "test_etdrk2_convergence.jl",  # Convergence test - may be slow
     "test_end_to_end_pde.jl",      # Full PDE solve test
     "test_pencil_imex.jl",
@@ -232,6 +252,9 @@ const OPTIONAL_TEST_FILES = [
 # Single-process CUDA tests. Run with TARANG_RUN_GPU_TESTS=true on a CUDA host
 # (the JuliaGPU Buildkite pipeline sets this).
 const GPU_TEST_FILES = [
+    "test_gpu_batch_stream_ordering.jl",
+    "test_gpu_cheb_pipeline_cuda.jl",
+    "test_gpu_memory_allocations_cuda.jl",
     "test_les_models.jl",
     "test_stochastic_forcing.jl",
     "test_stochastic_checkpoint_restart.jl",
@@ -268,6 +291,7 @@ const GPU_TEST_FILES = [
 #   ./test/run_mpi_tests.sh 4
 const MPI_TEST_FILES = [
     "test_mpi_distributor.jl",
+    "test_gpu_memory_emulated.jl",
     "test_mpi_2d_backend_regressions.jl", # domain/dtype-owned plans, canonical coefficient geometry, scaling rejection, and mixed-basis parity
     "test_mpi_local_indices.jl",
     "test_mpi_field_initialization.jl",
@@ -288,6 +312,7 @@ const MPI_TEST_FILES = [
     "test_stochastic_forcing_mpi.jl",
     "test_mpi_integrate.jl",
     "test_mpi_reductions.jl",
+    "test_mpi_diagnostic_moments.jl",
     "test_mpi_cfl_diffusive.jl",             # CFL diffusive limit must use the GLOBAL max diffusivity
     "test_mpi_reduction_double_reduce.jl",   # global_sum/mean/turbulence_rms must not double-reduce PencilArray (np>=2)
     "test_mpi_fill_random_walltime.jl",      # fill_random reproducible decomp-independent + proceed() collective wall-time stop (np>=2)
@@ -299,6 +324,8 @@ const MPI_TEST_FILES = [
     "test_mpi_forcing_diag.jl",              # C4 _forcing_reduce_partial (np>=2)
     "test_mpi_unit_factor_mesh.jl",          # (1,N) mesh normalization (np>=2)
     "test_mpi_grouped_transpose_rankinv.jl", # N1 rank-invariant grouping (np>=2)
+    "test_mpi_grouped_exchange.jl",
+    "test_mpi_grouped_rhs.jl",
     "test_mpi_distributor_match_np4.jl",     # C1 coord ordering, 2x2 mesh (np==4)
     "test_mpi_distributor_remainder_np2.jl", # C3 remainder-on-last-rank (np==2)
     "test_mpi_fourier_chebyshev.jl",         # FFC: Cheb-last clear error, Cheb-first round-trip (np>=2)
@@ -311,6 +338,8 @@ const MPI_TEST_FILES = [
     "test_mpi_checkpoint_restart.jl",         # checkpoint written on N ranks loads on M and matches serial (np>=2)
     "test_mpi_cheb_fourier_ivp_nonlinear.jl", # distributed NONLINEAR Cheb-Fourier channel InitialValueProblem (advection+dealias+tau-BC+IMEX) == serial (np>=2)
     "test_mpi_cheb_fourier_3d_pencil.jl",    # 3D Cheb-Fourier on a 2-D process mesh: the fft<->solve transpose differed in TWO decomp slots and threw (np==4)
+    "test_mpi_bc_projection_cache.jl",
+    "test_cpu_local_mode_threads.jl",
     # MPI correctness fixes 2026-06-23 (see memory/project_mpi_audit_2026_06_21.md).
     "test_mpi_decomp_forcing_audit.jl",      # #1/#4 get_local_range slab; #2 forcing wavenumber placement (np>=2)
     "test_mpi_audit_2026_06_28.jl",          # dealias cutoff np-independence; apply_forcing! offset; mixed Cheb-Fourier :c DCT; over-decomp solve fails loud (np>=4)
@@ -329,6 +358,7 @@ const MPI_TEST_FILES = [
     "test_mpi_padded_dealiasing_3d_mixed.jl", # 3D Cheb-Fourier-Fourier dealiasing == serial (decomp-order alignment fix) (np>=2)
     "test_distributed_gpu_transpose.jl",
     "test_transposable_field.jl",
+    "test_transpose_geometry_reuse.jl",
     "test_mpi_transposable_parity.jl",  # distributed COEFFICIENTS must equal serial, not merely round-trip — a permutation applied by both directions is invisible to a round trip
     "test_mpi_netcdf_subcommunicator.jl",  # NetCDF handlers must use the owning Distributor communicator, never COMM_WORLD
     "test_stochastic_forcing_subcomm.jl",  # stochastic forcing RNG synchronization is scoped to the target field communicator (np>=4)
@@ -343,6 +373,7 @@ const MPI_TEST_FILES = [
 # run on the JuliaGPU Buildkite pipeline. Keep this list explicit so new CPU
 # test files do not silently sit outside the runner.
 const DISTRIBUTED_GPU_TEST_FILES = [
+    "test_gpu_memory_allocations_cuda.jl",
     "test_distributed_gpu_transpose.jl", # 2D ComplexFourier TransposableField round-trip on CUDA+MPI
     "test_distributed_dct.jl",
     "test_distributed_dispatch.jl",
