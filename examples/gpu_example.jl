@@ -71,7 +71,7 @@ end
 println("\n--- Creating Domain with Architecture ---")
 
 # Define coordinate system
-coordsys = CartesianCoordinates(2, "xy")
+coordsys = CartesianCoordinates("x", "y")
 
 # Create distributor with GPU architecture
 dist = Distributor(coordsys, device=arch)
@@ -79,8 +79,8 @@ println("Distributor architecture: $(typeof(dist.architecture))")
 
 # Define bases
 Nx, Ny = 128, 128
-x_basis = RealFourier(coordsys["x"], Nx)
-y_basis = RealFourier(coordsys["y"], Ny)
+x_basis = RealFourier(coordsys["x"]; size=Nx)
+y_basis = RealFourier(coordsys["y"]; size=Ny)
 
 # Create domain
 domain = Domain(dist, (x_basis, y_basis))
@@ -112,12 +112,12 @@ println("\n--- Setting Initial Conditions ---")
 # The field["g"] accessor returns the grid-space data (CuArray on GPU)
 
 ensure_layout!(u, :g)
-x = get_grid(domain, 1)  # x coordinates
-y = get_grid(domain, 2)  # y coordinates
+# Local grid coordinates, already on the distributor's architecture
+x, y = local_grids(dist, x_basis, y_basis)
 
-# Initialize with a simple pattern
+# Initialize with a simple pattern on the default [0, 2π) periodic domain
 # Using broadcasting works for both CPU and GPU arrays
-u["g"] .= sin.(2π .* x) .* cos.(2π .* y)
+u["g"] .= sin.(x) .* cos.(y')
 println("Initial condition set")
 
 # ============================================================================

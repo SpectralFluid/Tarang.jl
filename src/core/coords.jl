@@ -6,9 +6,6 @@ This module implements coordinate systems:
 - Coordinate: Individual coordinate within a coordinate system
 - CartesianCoordinates: Cartesian (x, y, z) coordinate system
 - DirectProduct: Direct product of coordinate systems
-- S2Coordinates: Spherical surface coordinates (azimuth, colatitude)
-- PolarCoordinates: Polar coordinates (azimuth, radius)
-- SphericalCoordinates: Full spherical coordinates (azimuth, colatitude, radius)
 """
 
 # StaticArrays, LinearAlgebra, SparseArrays already in Tarang.jl

@@ -9,6 +9,5 @@ using Tarang
         ambiguities=(broken=true,),
         piracies=true,
         persistent_tasks=false,  # skip due to MPI.Init() in __init__
-        stale_deps=(ignore=[:ArgParse],),  # ArgParse is used by scripts/merge_netcdf.jl
     )
 end

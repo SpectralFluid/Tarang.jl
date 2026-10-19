@@ -29,3 +29,6 @@ JuliaLocalPreferences.toml
 
 # Local feature workspaces created by the Superpowers worktree workflow
 .worktrees/
+
+# macOS Finder metadata
+.DS_Store

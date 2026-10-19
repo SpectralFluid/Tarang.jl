@@ -464,22 +464,69 @@ end
 end
 
 @testset "Script package boundaries" begin
+    # The merge script parses its own command line, so the library carries no
+    # CLI-only dependency.
     project = TOML.parsefile(joinpath(dirname(@__DIR__), "Project.toml"))
     deps = get(project, "deps", Dict{String, Any}())
-    @test haskey(deps, "ArgParse")
+    @test !haskey(deps, "ArgParse")
 
     merge_script = read(joinpath(dirname(@__DIR__), "scripts", "merge_netcdf.jl"), String)
     @test occursin("Pkg.activate", merge_script)
     @test occursin(r"(?m)^\s*using\s+Tarang\b", merge_script)
     @test occursin("pkgversion(Tarang)", merge_script)
     @test !occursin("Tarang.__version__", merge_script)
+    @test !occursin("ArgParse", merge_script)
     @test !occursin(r"include\(joinpath\(dirname\(@__DIR__\), \"src\", \"tools\", \"netcdf_merge\.jl\"\)\)", merge_script)
+
+    cli_path = joinpath(dirname(@__DIR__), "scripts", "merge_netcdf_cli.jl")
+    cli_script = read(cli_path, String)
+    @test occursin("merge_netcdf_cli.jl", merge_script)
+    @test !occursin(r"(?m)^\s*(using|import)\s", cli_script)
 
     legacy_merge_script = read(joinpath(dirname(@__DIR__), "scripts", "merge_file.jl"), String)
     @test occursin("merge_netcdf.jl", legacy_merge_script)
     @test occursin("deprecated", legacy_merge_script)
     @test count(occursin("function parse_arguments", source) for source in
-                (merge_script, legacy_merge_script)) == 1
+                (merge_script, legacy_merge_script, cli_script)) == 1
+
+    cli = Module(:MergeNetCDFCLI)
+    Base.include(cli, cli_path)
+    parse_cli = cli.parse_arguments
+
+    defaults = parse_cli(String[])
+    @test defaults["handlers"] == String[]
+    @test defaults["set"] == 0
+    @test defaults["output"] == ""
+    @test defaults["mode"] == "reconstruct"
+    @test !defaults["cleanup"] && !defaults["auto"] && !defaults["quiet"]
+    @test !defaults["help"] && !defaults["version"]
+
+    # Every documented spelling from the script's help and docs/netcdf_merging.md.
+    args = parse_cli(["--set=2", "--output=my_data.nc", "--mode=concat", "--cleanup",
+                  "snapshots", "analysis"])
+    @test args["set"] == 2
+    @test args["output"] == "my_data.nc"
+    @test args["mode"] == "concat"
+    @test args["cleanup"]
+    @test args["handlers"] == ["snapshots", "analysis"]
+
+    args = parse_cli(["snapshots", "--set", "3", "-o", "final.nc", "-m", "decomp"])
+    @test (args["set"], args["output"], args["mode"]) == (3, "final.nc", "decomp")
+    @test args["handlers"] == ["snapshots"]
+
+    args = parse_cli(["-cq", "-s4", "--auto"])
+    @test args["cleanup"] && args["quiet"] && args["auto"]
+    @test args["set"] == 4
+
+    @test parse_cli(["--", "--cleanup"])["handlers"] == ["--cleanup"]
+    @test parse_cli(["-h"])["help"]
+    @test parse_cli(["--version"])["version"]
+
+    @test_throws ArgumentError parse_cli(["--bogus"])
+    @test_throws ArgumentError parse_cli(["-x"])
+    @test_throws ArgumentError parse_cli(["--set=two"])
+    @test_throws ArgumentError parse_cli(["--set"])
+    @test_throws ArgumentError parse_cli(["--cleanup=yes"])
 
     @test occursin("discover_handler_sets", merge_script)
     @test occursin("for (set_number, workdir) in discover_handler_sets", merge_script)
