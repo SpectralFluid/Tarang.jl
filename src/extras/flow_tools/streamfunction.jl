@@ -73,30 +73,15 @@ function streamfunction_spectral_invert(vorticity::ScalarField, apply_gauge::Boo
     kx_grid, ky_grid = get_2d_wavenumber_grids(vorticity)
     k_squared = kx_grid.^2 .+ ky_grid.^2
 
-    # Perform spectral inversion: ψ̂ = -ω̂/k²
+    # Spectral Poisson inversion ψ̂ = -ω̂/k² as ONE broadcast over the coefficients,
+    # so a device field is never scalar-indexed. The k=0 (mean) mode is undetermined
+    # by the Poisson equation and is set to zero whether or not `apply_gauge` is
+    # requested; zero is the ∫ψ dA = 0 gauge.
     vorticity_spec = get_coeff_data(vorticity)
-    streamfunction_spec = similar(vorticity_spec)
-
-    for idx in CartesianIndices(vorticity_spec)
-        k2 = k_squared[idx]
-
-        if k2 > 1e-12  # Avoid division by zero
-            # Spectral Poisson inversion: ψ̂ = -ω̂/k²
-            streamfunction_spec[idx] = -vorticity_spec[idx] / k2
-        else
-            # Handle k=0 mode (constant/mean mode)
-            if apply_gauge
-                # Gauge condition: set mean to zero
-                streamfunction_spec[idx] = 0.0
-            else
-                # Keep arbitrary constant (may need external constraint)
-                streamfunction_spec[idx] = 0.0
-            end
-        end
-    end
-
-    # Set spectral coefficients
-    get_coeff_data(streamfunction_field) .= streamfunction_spec
+    k2 = _logical_multiplier(vorticity_spec, k_squared)
+    gauge = zero(eltype(vorticity_spec)) / one(eltype(k_squared))   # both branches one type
+    psi_spec = get_coeff_data(streamfunction_field)
+    psi_spec .= ifelse.(k2 .> 1e-12, .-vorticity_spec ./ k2, gauge)
 
     # NOTE: MPI reduction is NOT needed here.
     # Each rank computes its local spectral coefficients from local vorticity.

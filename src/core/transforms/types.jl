@@ -334,6 +334,9 @@ const SLOT_IRFFT     = 0x02
 # Complex promotion buffer for a ComplexFourier stage fed REAL data — see
 # `_apply_forward!(::FourierTransform)`.
 const SLOT_FWD_PROMOTE = 0x03
+# C2C spectrum resampled onto a scaled grid before its inverse — see
+# `_apply_backward_fourier!` (`:ifft_resampled`).
+const SLOT_BWD_RESAMPLE = 0x04
 
 @inline function _get_or_alloc_scratch!(cache::Dict, key::Tuple, shape::NTuple{N,Int}, ::Type{T}) where {N,T}
     buf = get(cache, key, nothing)

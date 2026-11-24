@@ -311,6 +311,7 @@ function compute_yx_counts_2d!(tf::TransposableField{F,T,N}) where {F,T,N}
             send_offset += send_count
             recv_offset += recv_count
         end
+        tf.counts.yx_computed[] = true
 
     elseif N == 2 && Rx > 1 && Ry > 1
         # True 2D mesh on 2D domain
@@ -346,6 +347,7 @@ function compute_yx_counts_2d!(tf::TransposableField{F,T,N}) where {F,T,N}
             send_offset += send_count
             recv_offset += recv_count
         end
+        tf.counts.yx_computed[] = true
     end
     # Note: For 2D with 1D decomposition, Y↔X is handled in Z↔Y (no separate Y↔X needed)
 end

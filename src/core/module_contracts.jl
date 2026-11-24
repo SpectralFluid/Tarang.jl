@@ -60,7 +60,6 @@ abstract type AbstractRHSPlan end
 #
 #      `_DerivativeResultPool` (16 per task) — `operators/derivatives/eval.jl`
 #      `_NL_RESULT_POOL`      ( 8) — `nonlinear/padding.jl`
-#      `_POISSON_RESULT_POOL` ( 4) — `timesteppers/state_utils.jl`
 #
 # THE CONTRACT. A rotating-pool result may be borrowed only by a caller that
 # consumes it before returning. Any caller that stores it in a container, returns
@@ -73,9 +72,7 @@ abstract type AbstractRHSPlan end
 # found only by asserting values. `evaluate_transform_multiply` therefore defaults
 # to `own=true` and makes borrowing the explicit opt-in, so a caller that forgets
 # gets a slow answer rather than a wrong one. Prefer that direction for any new
-# pooled producer. `_spectral_poisson_solve` is the exception that needs no
-# ownership call: it has a single consumer that `copy_field_data!`s the result on
-# the next line.
+# pooled producer.
 #
 # `test/test_deriv_pool_ownership.jl`, `test/test_nl_product_ownership.jl` and
 # `test/test_buffer_ownership_ratchet.jl` pin all of the above.

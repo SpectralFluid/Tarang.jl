@@ -208,7 +208,8 @@ to the right-hand side in coefficient space; `dt(u) = 0` with `F(x, y) = cos x c
 integrates exactly to `u = t·cos x cos y` on every scheme. Deterministic forcing is not
 white noise, so the multistep schemes accept it. Time-dependent deterministic forcing
 uses the scheme's stage or history time; only stochastic realizations stay fixed
-across a timestep.
+across a timestep. As for stochastic forcing, construct it with the target field's
+`architecture` — registration refuses a mismatch.
 
 **Constructor:**
 
@@ -282,6 +283,9 @@ generate_forcing!(forcing::DeterministicForcing, grid, t::Real)
 `add_stochastic_forcing!(problem, variable, forcing)` registers automatic RHS forcing.
 `variable` names a scalar field or a flattened vector/tensor component (for example
 `:u_x`). A container name such as `:u` is ambiguous and raises `ArgumentError`.
+The forcing must be constructed for the target field's architecture
+(`architecture = field.dist.architecture`; constructors default to `CPU()`): a CPU
+forcing registered on a GPU field, or the reverse, raises `ArgumentError`.
 
 One forcing realization is reused across the stages of supported one-step RK/ETD methods;
 `CNAB1` and `SBDF1` are supported first-order methods. Tarang rejects `CNAB2`, `MCNAB2`,

@@ -317,6 +317,7 @@ const MPI_TEST_FILES = [
     "test_mpi_reduction_double_reduce.jl",   # global_sum/mean/turbulence_rms must not double-reduce PencilArray (np>=2)
     "test_mpi_fill_random_walltime.jl",      # fill_random reproducible decomp-independent + proceed() collective wall-time stop (np>=2)
     "test_mpi_interp_hilbert_guard.jl",      # interpolate/Hilbert error loudly on a decomposed Fourier axis; local-axis interp works (np>=2)
+    "test_mpi_polynomial_axis_guard.jl",     # Chebyshev derivative refuses an axis split by the plain-array (GPU+MPI / use_pencil_arrays=false) slab — it used to differentiate each slab silently (np>=2)
     "test_mpi_spectral_filter.jl",
     "test_mpi_virtual_output.jl",
     # MPI correctness fixes 2026-06-21 (see memory/project_mpi_audit_2026_06_21.md).

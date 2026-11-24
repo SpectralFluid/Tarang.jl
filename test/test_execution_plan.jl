@@ -179,6 +179,31 @@ const EXPECTED_DISTRIBUTED_DIAGONAL = Set([
     @test !Tarang.supports_distributed_diagonal_imex(Tarang.CNLF2())
 end
 
+# Schemes with a SERIAL per-mode diagonal solve: the only path that reads an
+# attached `SpectralLinearOperator`, and a single GPU's path for an implicit L.
+# Every IMEX RK tableau reaches it through `step_rk_imex!`; of the multistep
+# schemes only SBDF2 has it. Before this table existed only RK222, RK443 and
+# SBDF2 were routed there, and the other schemes silently ignored the operator.
+const EXPECTED_SERIAL_DIAGONAL = Set([:RK111, :RK222, :RK443, :RKSMR, :RKGFY, :SBDF2])
+
+@testset "serial diagonal-IMEX scheme set and attached-operator consumers" begin
+    declared = Set(nameof(T) for T in Base.uniontypes(Tarang._SERIAL_DIAGONAL_IMEX_TIMESTEPPERS))
+    @test declared == EXPECTED_SERIAL_DIAGONAL
+
+    # Every scheme either reads an attached operator or is refused by the guard;
+    # there is no third, silent outcome.
+    for T in subtypes(Tarang.TimeStepper)
+        stepper = T()
+        solver = _plan_solver_fourier_1d(stepper)
+        consumed = nameof(T) in EXPECTED_SERIAL_DIAGONAL ||
+                   stepper isa Tarang._DIAGONAL_IMEX_TIMESTEPPERS
+        @test Tarang._attached_operator_consumed(solver, stepper) == consumed
+        if !consumed
+            @test_throws ArgumentError Tarang._check_attached_operator_consumed!(solver, stepper)
+        end
+    end
+end
+
 @testset "solver plan fields name a contract, not Any" begin
     # `rhs_plan` was `::Any`. Its siblings on the same struct — `evaluator`,
     # `timestepper_state` — have always been declared through an abstract

@@ -10,7 +10,7 @@
 # sources for it, in precedence order:
 #
 #   1. A `SpectralLinearOperator` attached with `set_spectral_linear_operator!`.
-#      Applied to every field, exactly as before.
+#      Applied to every spatial field, exactly as before.
 #   2. The problem's own per-equation `L` expressions, parsed into per-field
 #      diagonal Fourier multipliers by `_diagonal_Lhat_from_expr` — the same
 #      routine the MPI sibling `_get_distributed_diagonal_Lhats!` uses.
@@ -49,9 +49,13 @@ function _serial_diagonal_imex_Lmap!(state::TimestepperState, solver::InitialVal
     end
 
     lmap = if L_attached !== nothing
-        # Legacy semantics: one attached operator applies to EVERY field.
+        # Legacy semantics: one attached operator applies to EVERY spatial field.
+        # A 0-D tau variable has no modes for it to act on: broadcasting the
+        # operator against its scalar storage threw DimensionMismatch, so no
+        # problem with a gauge (`integ(ψ) = 0`) could use an attached operator.
         coeffs = L_attached.coefficients
-        DiagonalLMap(i => coeffs for i in eachindex(solver.state))
+        DiagonalLMap(i => coeffs for (i, field) in enumerate(solver.state)
+                     if !isempty(field.bases))
     else
         _diagonal_imex_Lmap_from_equations(solver, scheme)
     end

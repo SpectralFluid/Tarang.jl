@@ -367,9 +367,12 @@ end
 
 Set the spectral linear operator for diagonal IMEX methods.
 
-Attached operators are supported only on serial CPU and single-GPU paths.
-For MPI, write the implicit linear term on the equation's LHS instead; attaching
-an operator raises `ArgumentError` rather than silently omitting it.
+Attached operators are supported only on serial CPU and single-GPU paths, by the
+schemes with a per-mode diagonal solve — RK111, RK222, RK443, RKSMR, RKGFY and
+SBDF2 on a problem without per-mode subproblems (every axis Fourier). For MPI,
+another scheme, or a problem with a non-Fourier axis, write the implicit linear
+term on the equation's LHS instead; attaching an operator raises `ArgumentError`
+rather than silently omitting it.
 
 # Example
 ```julia
@@ -379,6 +382,7 @@ set_spectral_linear_operator!(solver, L)
 """
 function set_spectral_linear_operator!(solver::InitialValueSolver, L::SpectralLinearOperator)
     _check_attached_operator_distribution!(solver)
+    _check_attached_operator_consumed!(solver, solver.timestepper)
     if solver.timestepper_state !== nothing
         solver.timestepper_state.timestepper_data[:spectral_linear_operator] = L
     else
@@ -396,5 +400,35 @@ function _check_attached_operator_distribution!(solver::InitialValueSolver)
     throw(ArgumentError(
         "Attached SpectralLinearOperator objects are not supported under MPI. " *
         "Write the implicit linear term on the equation's LHS, e.g. " *
+        "dt(u) - nu*lap(u) = F. Refusing to ignore the attached operator."))
+end
+
+"""
+    _check_attached_operator_consumed!(solver, timestepper)
+
+Refuse an attached `SpectralLinearOperator` that a step of `timestepper` would
+never read. Only the per-mode diagonal paths apply one; every other scheme solves
+the equations' own operator, so it used to integrate as though nothing had been
+attached — a viscous run stepping inviscid with no error. Checked by the setter
+and again by every `step!` (an operator can also be registered as a problem
+parameter, and a problem gains subproblems only by being rebuilt).
+"""
+function _check_attached_operator_consumed!(solver::InitialValueSolver, ts::TimeStepper)
+    _attached_operator_consumed(solver, ts) && return nothing
+    scheme = nameof(typeof(ts))
+    supported = join(sort!([string(nameof(T))
+                            for T in Base.uniontypes(_SERIAL_DIAGONAL_IMEX_TIMESTEPPERS)]), ", ")
+    reason = if ts isa _SERIAL_DIAGONAL_IMEX_TIMESTEPPERS
+        "this problem has a non-Fourier axis, so $scheme solves its implicit part " *
+        "through per-mode subproblems, which read only the equations' own linear operator"
+    else
+        "$scheme has no per-mode diagonal implicit solve; it treats only the " *
+        "equations' own linear operator"
+    end
+    throw(ArgumentError(
+        "$scheme cannot apply an attached SpectralLinearOperator: $reason, so the run " *
+        "would silently integrate without it. Schemes that apply an attached operator " *
+        "per mode (serial CPU or single GPU, every axis Fourier): $supported. " *
+        "Use one of those, or write the term on the equation's LHS instead, e.g. " *
         "dt(u) - nu*lap(u) = F. Refusing to ignore the attached operator."))
 end

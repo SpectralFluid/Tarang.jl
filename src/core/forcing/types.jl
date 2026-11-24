@@ -277,7 +277,9 @@ Create a stochastic forcing configuration that works on CPU or GPU.
 - `rng::AbstractRNG`: Random number generator (default: fresh MersenneTwister per instance for thread/parallel safety)
 - `dtype::Type`: Floating point type (default: Float64)
 - `enforce_hermitian::Bool`: Enforce Hermitian symmetry (set false for complex-valued fields)
-- `architecture::AbstractArchitecture`: CPU() or GPU() (default: CPU())
+- `architecture::AbstractArchitecture`: CPU() or GPU() (default: CPU()). To register the
+  forcing on a field, use that field's `dist.architecture`; `add_stochastic_forcing!`
+  refuses a mismatch.
 
 ## Example
 

@@ -122,4 +122,43 @@ end
         peak_k = ps.k[argmax(ps.power)]
         @test isapprox(peak_k, 12.0; atol = 1.0)
     end
+
+    @testset "rfft weights and k-multipliers follow a permuted PencilArray's logical axes" begin
+        # The rfft weighting and the streamfunction inversion are broadcasts (a
+        # device density must not be scalar-indexed). PencilArrays broadcast in
+        # MEMORY order, so on a permuted pencil both must still act along LOGICAL
+        # axes. Single rank, so this runs in the serial suite.
+        PA = Tarang.PencilArrays
+        Tarang.MPI.Initialized() || Tarang.MPI.Init()
+        for (dims, perm) in (((9, 12), PA.Permutation(2, 1)),
+                             ((9, 8, 6), PA.Permutation(3, 1, 2)),
+                             ((9, 8, 6), PA.Permutation(2, 3, 1)),
+                             ((9, 8, 6), PA.NoPermutation()))
+            nd = length(dims)
+            topo = PA.MPITopology(Tarang.MPI.COMM_WORLD, ntuple(_ -> 1, nd - 1))
+            pen = PA.Pencil(topo, dims, ntuple(i -> i + 1, nd - 1); permute=perm)
+            vals = reshape(collect(1.0:prod(dims)), dims)
+            for N in (16, 17), offset in (0, 3)
+                density = PA.PencilArray{Float64}(undef, pen)
+                for I in CartesianIndices(density)
+                    density[I] = vals[I]
+                end
+                Tarang._apply_rfft_weights!(density, N, offset)
+                # Global rfft mode k = i - 1 + offset counts twice for 1 ≤ k ≤ kmax,
+                # where kmax excludes the even-N Nyquist mode.
+                kmax = iseven(N) ? N ÷ 2 - 1 : N ÷ 2
+                expected(I) = vals[I] * (1 <= I[1] - 1 + offset <= kmax ? 2.0 : 1.0)
+                @test all(density[I] == expected(I) for I in CartesianIndices(density))
+            end
+            src = PA.PencilArray{ComplexF64}(undef, pen)
+            for I in CartesianIndices(src)
+                src[I] = complex(vals[I], -vals[I])
+            end
+            k2 = reshape(collect(0.0:(prod(dims) - 1)), dims)    # logical-order host k²
+            k2d = Tarang._logical_multiplier(src, k2)
+            dest = similar(src)
+            dest .= ifelse.(k2d .> 1e-12, .-src ./ k2d, zero(ComplexF64))
+            @test all(dest[I] == (k2[I] > 1e-12 ? -src[I] / k2[I] : 0) for I in CartesianIndices(dest))
+        end
+    end
 end

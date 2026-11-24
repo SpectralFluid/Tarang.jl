@@ -439,10 +439,31 @@ function calculate_radial_energy_spectrum(velocity::VectorField, wavenumber_info
                             velocity.dist, velocity.components[1].dist.comm)
 end
 
+# Shell binning and the full-spectrum dictionaries read the density one mode at a
+# time. On a device array that is scalar indexing — an error under CUDA, and where
+# it is allowed, one transfer per mode — so a device density is copied to the host
+# ONCE and binned there; binning is cheap next to that copy. Host densities,
+# including PencilArrays (the loops rely on their logical indexing), are used as is.
+_host_density(density::AbstractArray) = _host_density(architecture(density), density)
+_host_density(::CPU, density::AbstractArray) = density
+_host_density(::GPU, density::AbstractArray) = on_architecture(CPU(), density)
+
+# A host multiplier laid out in the LOGICAL index order of `coeffs`, made ready to
+# broadcast against it: uploaded once for a device array; presented in storage
+# order for a PencilArray, whose broadcasts run in MEMORY order (perm[memory] =
+# logical, as in `_matched_forcing_view`).
+_logical_multiplier(coeffs::AbstractArray, host::AbstractArray) =
+    to_architecture(architecture(coeffs), host)
+function _logical_multiplier(coeffs::PencilArrays.PencilArray, host::AbstractArray)
+    perm = Tuple(PencilArrays.permutation(coeffs))
+    return perm === nothing ? host : PermutedDimsArray(host, perm)
+end
+
 # Shared shell averaging for kinetic energy, scalar power, and vector magnitude.
 # The caller supplies the density with its own normalization and RFFT weights.
 function _radial_spectrum(density, wavenumber_info::WavenumberInfo,
                           max_wavenumber::Real, binning::SpectrumBinning, dist, comm)
+    density = _host_density(density)
     k_magnitudes = wavenumber_info.k_magnitudes
     is_3d = wavenumber_info.kz_grid !== nothing
 
@@ -494,20 +515,15 @@ end
 
 # Double only the locally owned interior half-spectrum modes. DC and even-N
 # Nyquist modes count once; the highest odd-N mode remains an interior mode.
-function _apply_rfft_weights!(density, N::Int, offset_k::Int)
+# Applied as one broadcast of a per-row weight, so a device density is never
+# scalar-indexed and a permuted PencilArray is weighted along its logical axis 1.
+function _apply_rfft_weights!(density::AbstractArray, N::Int, offset_k::Int)
     max_interior_k = iseven(N) ? (N ÷ 2 - 1) : (N ÷ 2)
-    double_start = max(1, 2 - offset_k)
-    double_end = min(size(density, 1), max_interior_k - offset_k + 1)
-    if double_start <= double_end
-        double_range = double_start:double_end
-        # Logical indexing preserves permuted PencilArray storage: range slicing
-        # would try to construct a differently sized PencilArray and fail.
-        @inbounds for idx in CartesianIndices(density)
-            if idx[1] in double_range
-                density[idx] *= 2.0
-            end
-        end
-    end
+    n1 = size(density, 1)
+    # Local row i holds global rfft mode k = i - 1 + offset_k.
+    weights = [1 <= i - 1 + offset_k <= max_interior_k ? 2.0 : 1.0 for i in 1:n1]
+    shape = ntuple(d -> d == 1 ? n1 : 1, ndims(density))
+    density .*= _logical_multiplier(density, reshape(weights, shape))
     return density
 end
 
@@ -570,7 +586,7 @@ end
     """
 function calculate_full_energy_spectrum(velocity::VectorField, wavenumber_info::WavenumberInfo, max_wavenumber::Real)
 
-    ke_spectral = calculate_spectral_kinetic_energy(velocity)
+    ke_spectral = _host_density(calculate_spectral_kinetic_energy(velocity))
 
     # Get global index offsets for MPI with PencilArrays
     # For serial or non-PencilArrays, offsets are (0, 0, ...)
@@ -1065,6 +1081,7 @@ end
 # Scalar/vector power uses rounded physical wavenumbers. Full energy spectra
 # retain their separate global coefficient-index keys for API compatibility.
 function _full_power_spectrum(density, wavenumber_info::WavenumberInfo)
+    density = _host_density(density)
     full_spectrum = Dict{Tuple{Vararg{Int}}, Float64}()
     ndims_field = ndims(density)
 

@@ -462,9 +462,10 @@ end
 """
     _resample_axis_pairs(n_old::Int, n_new::Int) -> Vector{Tuple{UnitRange{Int}, UnitRange{Int}}}
 
-Per-axis (src_range, dst_range) copy list for spectral pad/truncate, replicating
-EXACTLY the Nyquist conventions of the CPU `Tarang.resample_1d!`
-(src/core/field/field_data/scales.jl):
+Per-axis (src_range, dst_range) copy list for spectral pad/truncate: the non-empty
+slices of the shared rule `Tarang.spectral_resample_ranges`, which the CPU
+`Tarang.resample_1d!` (src/core/field/field_data/scales.jl) follows and the
+backward transform into a scaled grid is built from:
 
 - Upsampling from even n_old: the old Nyquist bin (index n_old÷2+1) is ZEROED
   (not copied) — copying it one-sidedly would leave a non-Hermitian spectrum and
@@ -477,33 +478,9 @@ Destination ranges may overlap (the fold targets a bin inside the positive-copy
 range), so consumers must ACCUMULATE (`.+=`) into a zeroed destination.
 """
 function _resample_axis_pairs(n_old::Int, n_new::Int)
-    pairs = Tuple{UnitRange{Int}, UnitRange{Int}}[]
-    if n_old == n_new
-        push!(pairs, (1:n_old, 1:n_new))
-    elseif n_new > n_old
-        # Upsample: zero-pad high frequencies.
-        h_old = div(n_old, 2)
-        if iseven(n_old)
-            # Even n_old: copy positive freqs EXCLUDING the Nyquist (index h_old+1).
-            push!(pairs, (1:h_old, 1:h_old))
-        else
-            # Odd n_old: no Nyquist bin; copy all positive freqs.
-            push!(pairs, (1:h_old+1, 1:h_old+1))
-        end
-        n_neg = n_old - h_old - 1
-        n_neg > 0 && push!(pairs, (n_old-n_neg+1:n_old, n_new-n_neg+1:n_new))
-    else
-        # Downsample: truncate high frequencies.
-        h_new = div(n_new, 2)
-        # Positive freqs including the new Nyquist (index h_new+1).
-        push!(pairs, (1:h_new+1, 1:h_new+1))
-        # Even n_new: fold the −Nyq image into the new Nyquist bin (accumulates
-        # on top of the positive copy above).
-        iseven(n_new) && push!(pairs, (n_old-h_new+1:n_old-h_new+1, h_new+1:h_new+1))
-        n_neg = n_new - h_new - 1
-        n_neg > 0 && push!(pairs, (n_old-n_neg+1:n_old, n_new-n_neg+1:n_new))
-    end
-    return pairs
+    r = Tarang.spectral_resample_ranges(n_old, n_new)
+    return [pair for pair in ((r.pos_src, r.pos_dst), (r.neg_src, r.neg_dst),
+                              (r.fold_src, r.fold_dst)) if !isempty(pair[1])]
 end
 
 """
@@ -565,13 +542,21 @@ end
 """
     local_fft_dim!(data::CuArray, dim::Int, dfft::DistributedGPUFFT)
 
-Perform local FFT along dimension `dim` using CUFFT.
+Perform local FFT along dimension `dim` using CUFFT, on the device holding `data`.
 """
 function Tarang.local_fft_dim!(data::CuArray, dim::Int, dfft::DistributedGPUFFT)
-    # Ensure correct device context for multi-GPU (CUFFT plans are device-specific)
+    # A rank whose slab is empty (more ranks than points along an axis) has
+    # nothing to transform, and cuFFT cannot plan an empty batch. Return the
+    # empty result in the transform's element type so the rank's transpose
+    # buffers match its peers'.
+    isempty(data) && return similar(data, complex(float(eltype(data))))
+    # CUFFT plans are device-specific: run on the DATA's device. This used to be
+    # `CuDevice(dfft.config.device_id)`, i.e. the MPI rank.
+    data_device = CUDA.device(data)
+    Tarang._distributed_fft_device_id(CUDA.deviceid(data_device), dfft.config.device_id)
     prev_device = CUDA.device()
     try
-        CUDA.device!(CuDevice(dfft.config.device_id))
+        CUDA.device!(data_device)
         result = CUFFT.fft(data, (dim,))
         CUDA.synchronize()
         return result
@@ -583,13 +568,15 @@ end
 """
     local_ifft_dim!(data::CuArray, dim::Int, dfft::DistributedGPUFFT)
 
-Perform local inverse FFT along dimension `dim` using CUFFT.
+Perform local inverse FFT along dimension `dim` using CUFFT, on the device holding `data`.
 """
 function Tarang.local_ifft_dim!(data::CuArray, dim::Int, dfft::DistributedGPUFFT)
-    # Ensure correct device context for multi-GPU (CUFFT plans are device-specific)
+    isempty(data) && return similar(data, complex(float(eltype(data))))  # see local_fft_dim!
+    data_device = CUDA.device(data)
+    Tarang._distributed_fft_device_id(CUDA.deviceid(data_device), dfft.config.device_id)
     prev_device = CUDA.device()
     try
-        CUDA.device!(CuDevice(dfft.config.device_id))
+        CUDA.device!(data_device)
         result = CUFFT.ifft(data, (dim,))
         CUDA.synchronize()
         return result

@@ -237,13 +237,15 @@ ETD_CNAB2()
 ETD_SBDF2()
 ```
 
-`RK222()`, `RK443()`, and `SBDF2()` choose their internal diagonal implementation
-on GPU Fourier problems; no device-specific timestepper name is needed.
+`RK222()`, `RK443()`, `SBDF2()`, `RK111()`, `RKSMR()`, and `RKGFY()` choose their
+internal diagonal implementation on GPU Fourier problems; no device-specific
+timestepper name is needed.
 
 The ETD types use global matrix φ-functions in serial; under MPI pure-Fourier
-execution they currently share the distributed ETD-RK2 path. Diagonal IMEX
-requires a `SpectralLinearOperator` registered with
-`set_spectral_linear_operator!`.
+execution they currently share the distributed ETD-RK2 path. An attached
+`SpectralLinearOperator` (`set_spectral_linear_operator!`) is applied only by
+those six diagonal-capable schemes on all-Fourier problems; every other scheme
+refuses it with an `ArgumentError` rather than ignoring it.
 
 ### Choosing a Timestepper
 

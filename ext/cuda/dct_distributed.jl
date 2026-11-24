@@ -63,22 +63,29 @@ function _distributed_dct_scratch!(plan::DistributedDCTPlan{T}, shape::NTuple{3,
 end
 
 """
-    DistributedDCTPlan(pencil, bases::Tuple, ::Type{T})
+    DistributedDCTPlan(pencil, bases::Tuple, ::Type{T}; dtype=T)
     DistributedDCTPlan(pencil, ::Type{T})            # legacy: all-Chebyshev
 
 Create a distributed transform plan for `pencil`.
 
-The 3-arg form classifies the axes via `Tarang.axis_kinds(bases)`. The legacy
-2-arg form assumes all axes are Chebyshev (the original all-axes DCT behaviour);
-it is kept for the existing draft GPU tests.
+The 3-arg form classifies the axes with `Tarang._distributed_gpu_dct_axis_kinds(bases,
+dtype)`, i.e. from the bases AND the field element type: a RealFourier dim 1 is
+rfft-halved only for a real `dtype`; for a complex field it is a full-length C2C
+axis, exactly as Tarang sizes that field's coefficients. Bases the distributed
+path does not support are rejected here. The legacy 2-arg form assumes all axes
+are Chebyshev (the original all-axes DCT behaviour); it is kept for the existing
+draft GPU tests.
 
 # Arguments
 - `pencil`: full-spectrum pencil decomposition describing the domain layout
 - `bases`: tuple of basis objects (RealFourier / ComplexFourier / ChebyshevT)
 - `T`: real element type of the transform (e.g. Float64, Float32)
+- `dtype`: element type of the field being transformed (default `T`: a real field)
 """
-function DistributedDCTPlan(pencil::PencilDecomposition, bases::Tuple, ::Type{T}) where T
-    return _build_distributed_dct_plan(pencil, Tarang.axis_kinds(bases), T)
+function DistributedDCTPlan(pencil::PencilDecomposition, bases::Tuple, ::Type{T};
+                            dtype::Type=T) where T
+    return _build_distributed_dct_plan(
+        pencil, Tarang._distributed_gpu_dct_axis_kinds(bases, dtype), T)
 end
 
 function DistributedDCTPlan(pencil::PencilDecomposition, ::Type{T}) where T
@@ -96,8 +103,10 @@ function _build_distributed_dct_plan(pencil::PencilDecomposition,
 
     Nx, Ny, Nz = pencil.global_shape
 
-    # Coeff-sized pencil: dim 1 is the half-spectrum length for a RealFourier
-    # dim-1 axis (the framework's coeff convention), otherwise the full Nx.
+    # Coeff-sized pencil: dim 1 is the half-spectrum length for an rfft-halved
+    # (`:real_fourier`) dim-1 axis, otherwise the full Nx. The kind is resolved
+    # with the field dtype by the callers (`_distributed_gpu_dct_axis_kinds`): a
+    # complex field's RealFourier axis arrives as `:complex_fourier`.
     coeff_Nx = axis_kind[1] === :real_fourier ? (div(Nx, 2) + 1) : Nx
     coeff_pencil = build_coeff_pencil(pencil, (coeff_Nx, Ny, Nz))
 
@@ -123,6 +132,10 @@ Per-axis dispatch (design decision #2): apply the basis-appropriate local 1D
 transform along `dim` of a 3D complex array, selected by `plan.axis_kind[dim]`.
 """
 function local_transform_along_dim!(output, input, plan::DistributedDCTPlan, dim::Int, direction::Symbol)
+    # An over-decomposed mesh (more ranks than points along an axis) leaves this
+    # rank an empty block: nothing to transform, and cuFFT cannot plan an empty
+    # batch (CUFFT_INVALID_SIZE). The rank still joins every transpose around it.
+    isempty(input) && return output
     k = plan.axis_kind[dim]
     if k === :chebyshev
         return local_dct1_along_dim!(output, input, dim, direction)
@@ -352,9 +365,11 @@ end
 
 Clean up resources used by the distributed DCT plan.
 
-This function releases NCCL sub-communicators and the MPI row/column
-communicators owned by the plan's pencil, then allows work arrays to be garbage
-collected. Pencil cleanup is idempotent, so its GC finalizer remains safe.
+This function destroys the plan's NCCL sub-communicators and frees the MPI
+row/column communicators owned by its pencil, then allows work arrays to be
+garbage collected. Both teardowns are collective: every rank of the plan's
+communicator must call this at the same point, for its plans in the same order
+(`clear_distributed_dct_plan_cache!` and `close(dist)` use build order).
 
 # Arguments
 - `plan`: DistributedDCTPlan to finalize
@@ -395,6 +410,7 @@ matching the FFTW `plan_fft`/`plan_ifft` convention of the CPU Fourier path.
 """
 function local_fft_along_dim!(output::CuArray{Complex{T},3}, input::CuArray{Complex{T},3},
                               dim::Int, direction::Symbol) where {T}
+    isempty(input) && return output   # empty pencil block: cuFFT cannot plan batch 0
     if direction === :forward
         plan = CUFFT.plan_fft(input, (dim,))
         mul!(output, plan, input)

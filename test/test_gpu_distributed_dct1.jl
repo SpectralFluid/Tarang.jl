@@ -25,6 +25,17 @@ else
     nothing
 end
 
+# The multi-rank DCT-I path transposes over NCCL. Tarang does not depend on
+# NCCL.jl; it resolves the module from the session on demand, so load it here
+# when it is installed.
+const _DCT1_NCCL_LOADED = CUDA.functional() && try
+    @eval using NCCL
+    true
+catch err
+    @info "NCCL.jl unavailable; multi-rank field tests expect the clear refusal" err
+    false
+end
+
 if !CUDA.functional()
     @info "test_gpu_distributed_dct1.jl skipped: no functional CUDA device"
 else
@@ -133,22 +144,26 @@ end
 
 # ============================================================================
 # Task 9 — end-to-end field-level coverage of the distributed multi-GPU DCT-I
-# dispatch. The dispatch lives in ext/cuda/transforms.jl, gated by the runtime
-# predicate `is_distributed_gpu(arch, nprocs) && needs_distributed_dct(field)`
-# AND the layout predicate `Tarang.distributed_gpu_supported(field)`.
+# dispatch. forward_transform!/backward_transform! consult the device hook
+# `Tarang._distributed_gpu_transform!` (ext/cuda/transforms.jl) BEFORE their
+# TransposableField early return; it routes every field with
+# `Tarang._uses_distributed_gpu_dct(field)` — GPU, nprocs > 1, and bases accepted
+# by `Tarang.distributed_gpu_supported` — to distributed_gpu_forward/backward_transform!.
 #
 # WHAT THIS COVERS / WHERE IT RUNS:
 #   * nprocs == 1 (this single-process GPU CI runner — GPU_TEST_FILES, included
-#     WITHOUT mpiexec): `is_distributed_gpu` returns false (it requires nprocs>1
-#     + NCCL), so a Chebyshev-containing field round-trips through the single-GPU
-#     device transform. At 1 rank this is a *wiring + round-trip smoke test*, and (when
-#     NCCL is present) the inner block drives distributed_forward_dct! /
-#     distributed_backward_dct! directly on CuArrays at 1 rank.
-#   * nprocs == 2 (JuliaGPU Buildkite, launched under mpiexec WITH NCCL): the
-#     SAME forward_transform!/backward_transform! calls take the LIVE distributed
-#     path (distributed_gpu_forward/backward_transform!). The .buildkite GPU
-#     pipeline runs this file from DISTRIBUTED_GPU_TEST_FILES as well as the
-#     single-process GPU list, so the Distributor sees both sizes 1 and 2.
+#     WITHOUT mpiexec): the field is not routed (one rank), so a Chebyshev-containing
+#     field round-trips through the single-GPU device transform. At 1 rank this is a
+#     *wiring + round-trip smoke test*, and (when NCCL is present) the inner block
+#     drives distributed_forward_dct! / distributed_backward_dct! directly on CuArrays.
+#   * nprocs == 2 (JuliaGPU Buildkite, under mpiexec, from DISTRIBUTED_GPU_TEST_FILES):
+#     the SAME forward_transform!/backward_transform! calls take the distributed
+#     DCT-I path. It needs NCCL.jl loaded in the session (loaded above when
+#     installed; init_nccl! is not required). Without it every rank must refuse
+#     with the same error before any transpose. (This used to claim the np=2 run
+#     took this path. It did not: the TransposableField early return came first,
+#     and that path cannot store this field's RealFourier half spectrum — it
+#     raised a BoundsError on some ranks and left the others in a collective.)
 #
 # NOT GPU-VERIFIED: authored on a GPU-less machine — parse-checked only. The GPU
 # assertions are first exercised on a CUDA node.
@@ -177,11 +192,17 @@ if CUDA.functional()
         original = copy(Array(get_grid_data(field)))
 
         # Field-level round-trip: nprocs==1 uses the single-GPU device path;
-        # nprocs>1 uses the live distributed GPU path.
-        forward_transform!(field)
-        backward_transform!(field)
-        ensure_layout!(field, :g)
-        @test isapprox(Array(get_grid_data(field)), original; rtol=1e-9, atol=1e-11)
+        # nprocs>1 uses the distributed DCT-I path, or refuses on every rank
+        # (collectively, before any transpose) when NCCL.jl is not loaded.
+        @test Tarang._uses_distributed_gpu_dct(field) == (nprocs > 1)
+        if nprocs > 1 && !_DCT1_NCCL_LOADED
+            @test_throws ErrorException forward_transform!(field)
+        else
+            forward_transform!(field)
+            backward_transform!(field)
+            ensure_layout!(field, :g)
+            @test isapprox(Array(get_grid_data(field)), original; rtol=1e-9, atol=1e-11)
+        end
 
         # Cross-check coeffs vs a single-process CPU reference. Only meaningful at
         # nprocs==1, where both fields are single-rank with identical coeff layouts.

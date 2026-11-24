@@ -53,7 +53,7 @@ function _global_multistep_distributed_fallback!(state::TimestepperState,
         "and take an explicit step, which can be unstable for stiff systems. " *
         "On CPU-MPI use SBDF2 or a distributed diagonal-IMEX Runge-Kutta method. " *
         "On GPU the distributed diagonal path also declines — run single-GPU " *
-        "(RK222, RK443, or SBDF2) or CPU-MPI instead."))
+        "(RK111, RK222, RK443, RKSMR, RKGFY, or SBDF2) or CPU-MPI instead."))
 end
 
 function _prepare_global_multistep_matrices!(state::TimestepperState,

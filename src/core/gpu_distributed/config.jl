@@ -41,9 +41,12 @@ synchronize_device!(arch::AbstractArchitecture) = nothing  # no-op fallback; CUD
 # ============================================================================
 
 """
-    DistributedGPUConfig
+    DistributedGPUConfig(comm, global_shape; decomp_dim=length(global_shape),
+                         cuda_aware_mpi=false, device_id=nothing)
 
-Configuration for distributed GPU computing.
+Configuration for distributed GPU computing. `device_id` optionally names the
+CUDA device the decomposed arrays live on; by default each local transform runs
+on the device of the array it is given.
 """
 mutable struct DistributedGPUConfig <: AbstractDistributedGPUConfig
     # MPI info
@@ -51,8 +54,12 @@ mutable struct DistributedGPUConfig <: AbstractDistributedGPUConfig
     rank::Int
     size::Int
 
-    # GPU info
-    device_id::Int
+    # GPU info: the CUDA device the decomposed arrays live on, or `nothing` to
+    # follow each array's own device (see `_distributed_fft_device_id`). Never
+    # derived from the MPI rank — with one visible GPU per rank, or several
+    # nodes, `CuDevice(rank)` does not exist, and otherwise it is a different
+    # device from the one holding the data.
+    device_id::Union{Nothing, Int}
 
     # Domain decomposition
     global_shape::Tuple{Vararg{Int}}
@@ -68,19 +75,37 @@ mutable struct DistributedGPUConfig <: AbstractDistributedGPUConfig
 
     function DistributedGPUConfig(comm::MPI.Comm, global_shape::Tuple;
                                    decomp_dim::Int=length(global_shape),
-                                   cuda_aware_mpi::Bool=false)
+                                   cuda_aware_mpi::Bool=false,
+                                   device_id::Union{Nothing, Integer}=nothing)
         rank = MPI.Comm_rank(comm)
         size = MPI.Comm_size(comm)
 
         # Compute local shape (slab decomposition along decomp_dim)
         local_shape = compute_local_shape(global_shape, decomp_dim, size, rank)
 
-        # Default: use GPU with same ID as MPI rank (mod number of GPUs)
-        device_id = rank  # Will be set properly when GPU is initialized
-
-        new(comm, rank, size, device_id, global_shape, local_shape, decomp_dim,
-            cuda_aware_mpi, nothing, nothing)
+        new(comm, rank, size, device_id === nothing ? nothing : Int(device_id),
+            global_shape, local_shape, decomp_dim, cuda_aware_mpi, nothing, nothing)
     end
+end
+
+"""
+    _distributed_fft_device_id(data_device_id, configured_device_id) -> Int
+
+CUDA device a `DistributedGPUFFT` local transform runs on: the device holding
+the data, because cuFFT plans are device-specific. A `device_id` configured on
+the `DistributedGPUConfig` must name that same device; a mismatch throws rather
+than transforming on one device data owned by another. The MPI rank is never a
+device ordinal (it used to be, which failed with one visible GPU per rank or
+across nodes, and otherwise ran cuFFT away from the data).
+"""
+function _distributed_fft_device_id(data_device_id::Integer,
+                                    configured_device_id::Union{Nothing, Integer})
+    if configured_device_id !== nothing && configured_device_id != data_device_id
+        throw(ArgumentError(
+            "DistributedGPUFFT: the data lives on CUDA device $data_device_id, but its " *
+            "DistributedGPUConfig was built for device $configured_device_id."))
+    end
+    return Int(data_device_id)
 end
 
 """

@@ -145,9 +145,9 @@ function step_rk_imex!(state::TimestepperState, solver::InitialValueSolver; ts::
             error("IMEX RK ($(nameof(typeof(ts)))): the equations have a nonzero implicit " *
                   "linear operator, but no implicit-capable path exists for this " *
                   "configuration ($(fallback_reason)). Refusing to silently drop it. " *
-                  "Options: on a single GPU use RK222, RK443, or SBDF2 with a " *
-                  "SpectralLinearOperator (set_spectral_linear_operator!), move the " *
-                  "linear terms to the RHS for explicit treatment, or run on CPU.")
+                  "Options: on a single GPU use RK111, RK222, RK443, RKSMR, RKGFY, " *
+                  "or SBDF2 (per-mode diagonal solve), move the linear terms to the " *
+                  "RHS for explicit treatment, or run on CPU.")
         end
         _log_imex_rk_explicit_fallback(fallback_reason)
         _step_rk_imex_explicit_fallback!(state, solver, ts)
@@ -709,6 +709,13 @@ CPU-based explicit RK step. Used when mass matrix inversion is needed,
 which requires sparse linear solves on CPU.
 
 Uses cached LU factorization of M_matrix for efficiency.
+
+No stage solve imposes the algebraic equations here: their rows carry
+`k = F = 0`, so the pushed state kept the diagnostic variables (a
+streamfunction, a velocity) at their initial values while the evolved field
+advanced, and output and CFL read them stale. They are refreshed exactly where
+the field sibling `_step_explicit_rk_gpu!` refreshes them — inside each stage's
+RHS evaluation and, authoritatively, on the new state.
 """
 function _step_explicit_rk_cpu!(state::TimestepperState, solver::InitialValueSolver,
                                 A::AbstractMatrix, b::AbstractVector, c::AbstractVector,
@@ -720,6 +727,14 @@ function _step_explicit_rk_cpu!(state::TimestepperState, solver::InitialValueSol
 
     # Get cached mass matrix factorization (returns nothing for singular M)
     M_factor = M_matrix === nothing ? nothing : _get_mass_factor!(state, M_matrix)
+    # Without a factorization the update below takes `k = F`, which is right only
+    # for identity mass: validate the parsed operator, as the field path does,
+    # instead of integrating `2*dt(u) = f` as `dt(u) = f` next to a constraint.
+    M_factor === nothing && _check_identity_mass_operator!(state, solver)
+    # The history below holds one entry, so the push overwrites the current state
+    # in place: refuse an algebraic equation the final refresh cannot solve before
+    # any field is touched, not after.
+    _require_refreshable_constraints!(solver.problem, current_state)
 
     _ensure_coeff_layout!(current_state)
     vector_size = _fields_vector_size(current_state)
@@ -761,7 +776,9 @@ function _step_explicit_rk_cpu!(state::TimestepperState, solver::InitialValueSol
         end
     end
 
-    _push_vector_state!(state.history, Y_vec, current_state, 1)
+    new_state = _push_vector_state!(state.history, Y_vec, current_state, 1)
+    _refresh_algebraic_state!(solver.problem, new_state)
+    return nothing
 end
 
 """

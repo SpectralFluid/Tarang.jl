@@ -104,7 +104,7 @@ end
     @info "src/ `is_gpu(...)` sites: $total"
 
     # Current count. Lower it when a branch becomes a method; never raise it.
-    BACKEND_RATCHET = 50
+    BACKEND_RATCHET = 48
 
     if total > BACKEND_RATCHET
         worst = sort(collect(per_file); by = kv -> -kv[2])

@@ -384,12 +384,12 @@ call site.
 
 It used to be a separate `TimeStepper` subtype holding a field-for-field copy of
 `RK443`'s tableau. The copy was numerically identical but NOT interchangeable:
-`_serial_diagonal_imex_applicable` dispatches on `ts isa Union{RK222, RK443,
-SBDF2}`, so the twin silently lost the per-mode diagonal implicit solve. On CPU
-with an attached `SpectralLinearOperator` that meant a different execution path
-for the same scheme; on a single GPU with an implicit `L` it meant
-`_check_gpu_implicit_compatibility!` REFUSED to start a run that `RK443()` ran
-fine. A true alias cannot drift that way.
+`_serial_diagonal_imex_applicable` dispatches on the scheme type
+(`_SERIAL_DIAGONAL_IMEX_TIMESTEPPERS`), so the twin silently lost the per-mode
+diagonal implicit solve. On CPU with an attached `SpectralLinearOperator` that
+meant a different execution path for the same scheme; on a single GPU with an
+implicit `L` it meant `_check_gpu_implicit_compatibility!` REFUSED to start a run
+that `RK443()` ran fine. A true alias cannot drift that way.
 """
 const RK443_IMEX = RK443
 

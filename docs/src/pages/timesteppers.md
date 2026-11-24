@@ -138,12 +138,12 @@ silently drops an implicit operator or substitutes a lower-order scheme.
 
 | Configuration | Runs | Refuses (loudly) |
 |---|---|---|
-| Serial CPU, pure Fourier | every scheme (global-matrix path; attached diagonal operators select per-mode division) | — |
-| Serial CPU, any Chebyshev/Jacobi axis | every IMEX RK and multistep scheme through per-mode tau subproblems | ETD (singular mass matrix of a tau/DAE system) |
+| Serial CPU, pure Fourier | every scheme (global-matrix path); an attached `SpectralLinearOperator` is applied per mode by RK111/222/443, RKSMR, RKGFY, SBDF2 | an attached operator with any other scheme (`ArgumentError` naming the six) |
+| Serial CPU, any Chebyshev/Jacobi axis | every IMEX RK and multistep scheme through per-mode tau subproblems | ETD (singular mass matrix of a tau/DAE system); an attached `SpectralLinearOperator` (`ArgumentError`) |
 | MPI, pure Fourier, implicit operator on the LHS | RK111/222/443, RKSMR, RKGFY, SBDF2, ETD_* — all as per-mode *distributed diagonal IMEX/ETD* | CNAB1/2, SBDF1/3/4, MCNAB2, CNLF2 (`ArgumentError`: no distributed diagonal implementation) |
 | MPI, pure Fourier, no implicit operator | every RK and multistep scheme on the matrix-free field path at nominal order | — |
 | MPI, Chebyshev axis | the per-mode subproblem path (Chebyshev axis first) | — |
-| Single GPU, pure Fourier, implicit operator | `RK222`, `RK443`, `SBDF2` only, per-mode on device (from the equation's `L`, or an attached `SpectralLinearOperator`) | the remaining schemes (`ErrorException` naming supported schemes or "move the term to the RHS") |
+| Single GPU, pure Fourier, implicit operator | `RK111`, `RK222`, `RK443`, `RKSMR`, `RKGFY`, `SBDF2` only, per-mode on device (from the equation's `L`, or an attached `SpectralLinearOperator`) | the remaining schemes (`ErrorException` naming supported schemes or "move the term to the RHS"; `ArgumentError` for an attached operator) |
 | Single GPU, pure Fourier, no implicit operator | explicit RK, CNAB/SBDF/MCNAB2/CNLF2 field path | — |
 | Single GPU, Chebyshev axis | IMEX RK and multistep through per-mode subproblems with CUDA sparse solves, mode-batched by default | rank-deficient stage systems (e.g. duplicate tau lifts, see below); ETD |
 
@@ -426,8 +426,33 @@ each evolution equation must contain an unscaled first time derivative of its
 own field. For example, `2*dt(u) = -u` raises `ArgumentError` on these paths
 before advancing. Reformulate it as `dt(u) = -0.5*u`, or use a global-matrix or
 per-subproblem solver that applies the mass operator. Equivalent identity forms
-such as `0.5*dt(u) + 0.5*dt(u)` are accepted. Algebraic constraint rows remain
-supported through their existing state refreshes.
+such as `0.5*dt(u) + 0.5*dt(u)` are accepted. Algebraic constraint rows are
+imposed by the constraint refresh described in
+[Algebraic constraints on field and diagonal paths](@ref).
+
+### Algebraic constraints on field and diagonal paths
+
+Pure-Fourier GPU solvers, the matrix-free MPI path, and the diagonal-IMEX and
+explicit field steppers have no implicit stage solve. Their algebraic equations
+(rows without a `dt` term) are imposed by a spectral refresh of the state before
+every RHS evaluation and after every step. The refresh solves each equation
+exactly, per Fourier mode, for one algebraic variable `v` whose operator is
+diagonal in Fourier space — any sum of constant multiples of `v`, `lap(v)`,
+`fraclap(v, α)`, nested Laplacians and derivatives of `v` — plus any linear
+combination of other fields, their diagonal derivatives, and constants. A 0-D tau
+variable needs a gauge row such as `integ(v) = 0`, which fixes the mean of `v`;
+without a tau, a mode where the operator vanishes (the mean, for `lap(v)`) is set
+to zero. A vector variable is refreshed from `u - expr = 0`, e.g.
+`u - skew(grad(psi)) = 0`, and equations are solved in dependency order.
+
+Anything else — algebraic variables coupled across equations, a singular
+operator, a row that only restricts time-stepped fields such as `div(u) = 0` —
+raises `ArgumentError` naming the equation: at construction on GPU and
+matrix-free MPI solvers, on the first step otherwise. On CPU global-matrix and
+subproblem solvers the stage solve imposes every constraint; there the refresh only
+makes a state that did not come from a solve (the initial condition, or one edited
+between steps) consistent before the RHS reads it, and never writes a value it
+cannot solve exactly.
 
 Diagonal implicit operators compose nested self-Laplacians, including
 `lap(lap(u))`, with their full Fourier multiplier. A term such as `lap(v)` in

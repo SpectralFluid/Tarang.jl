@@ -598,7 +598,10 @@ or `apply_forcing!` in your time loop.
 - `variable::Symbol`: The scalar field or flattened component name whose RHS receives
   the forcing. For a vector or tensor, register a component such as `:u_x`; registering
   the container name (for example `:u`) is ambiguous and raises `ArgumentError`.
-- `forcing`: The stochastic forcing configuration
+- `forcing`: The forcing configuration (`StochasticForcing`, `SeparableStochasticForcing` or
+  `DeterministicForcing`). It must be constructed for the target field's architecture —
+  `architecture = field.dist.architecture`; the constructors default to `CPU()` — and a
+  mismatch (e.g. a CPU forcing on a GPU field) raises `ArgumentError`.
 
 ## Example
 
@@ -613,7 +616,8 @@ forcing = StochasticForcing(
     energy_injection_rate = 0.1,
     injection_metric = :vorticity_kinetic,
     k_forcing = 10.0,
-    dt = dt
+    dt = dt,
+    architecture = ω.dist.architecture,   # CPU() or GPU(): must match the field
 )
 add_stochastic_forcing!(problem, :ω, forcing)
 
@@ -653,21 +657,44 @@ function _stochastic_forcing_state_index(problem::InitialValueProblem, variable:
     throw(ArgumentError("Variable ':$variable' not found in problem variables or components"))
 end
 
+# The stepper adds a registered forcing's arrays to the target's RHS coefficients
+# in place, and a deterministic forcing's grid values are copied into a field on
+# the target's distributor, so forcing and target must share an architecture. A
+# CPU forcing on a GPU field hands host arrays to device kernels: an error under
+# CUDA, a hidden host round trip per RHS evaluation at best. The forcing cannot be
+# migrated in place (its arrays are concrete type parameters, and the caller keeps
+# the handle for diagnostics such as `work_stratonovich`), so it is refused. The
+# comparison is by architecture kind (host or device backend), not device id.
+function _check_forcing_architecture(forcing::Forcing, target_field::ScalarField)
+    forcing_arch = forcing.architecture
+    field_arch = target_field.dist.architecture
+    typeof(forcing_arch) === typeof(field_arch) && return nothing
+    throw(ArgumentError(
+        "$(nameof(typeof(forcing))) was constructed for $forcing_arch, but the field " *
+        "'$(target_field.name)' it is registered on lives on $field_arch. Construct the " *
+        "forcing with `architecture = <field>.dist.architecture` (forcing constructors " *
+        "default to CPU()).",
+    ))
+end
+
 function add_stochastic_forcing!(problem::InitialValueProblem, variable::Symbol, forcing::Forcing)
     var_idx = _stochastic_forcing_state_index(problem, variable)
 
-    if forcing isa StochasticForcingType
-        state_fields = ScalarField[]
-        for var in problem.variables
-            if isa(var, ScalarField)
-                push!(state_fields, var)
-            elseif isa(var, VectorField)
-                append!(state_fields, var.components)
-            elseif isa(var, TensorField)
-                append!(state_fields, vec(var.components))
-            end
+    state_fields = ScalarField[]
+    for var in problem.variables
+        if isa(var, ScalarField)
+            push!(state_fields, var)
+        elseif isa(var, VectorField)
+            append!(state_fields, var.components)
+        elseif isa(var, TensorField)
+            append!(state_fields, vec(var.components))
         end
-        target_field = state_fields[var_idx]
+    end
+    target_field = state_fields[var_idx]
+    # Before the RNG synchronization below, so a refused forcing is left untouched.
+    _check_forcing_architecture(forcing, target_field)
+
+    if forcing isa StochasticForcingType
         _synchronize_forcing_rng!(forcing, target_field.dist.comm)
     end
 

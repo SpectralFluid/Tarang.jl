@@ -65,7 +65,8 @@ function Base.getproperty(forcing::DeterministicForcing, name::Symbol)
 end
 
 """
-    DeterministicForcing(forcing_function, field_size; parameters=Dict())
+    DeterministicForcing(forcing_function, field_size; parameters=Dict(), dtype=Float64,
+                         architecture=CPU())
 
 Create deterministic forcing.
 
@@ -74,6 +75,8 @@ Create deterministic forcing.
 - `forcing_function`: Function(x, y, ..., t, params) → forcing value
 - `field_size`: Grid size
 - `parameters`: Dictionary passed to forcing function
+- `architecture`: Where the cached values live. To register the forcing on a field, use
+  that field's `dist.architecture`; `add_stochastic_forcing!` refuses a mismatch.
 """
 function DeterministicForcing(
     forcing_function::Function,

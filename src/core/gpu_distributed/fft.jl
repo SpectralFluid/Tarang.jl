@@ -41,6 +41,9 @@ function distributed_fft_forward!(output, input, dfft::DistributedGPUFFT)
     config = dfft.config
     ndims_data = ndims(input)
     decomp_dim = config.decomp_dim
+    # Transpose buffers and intermediates are allocated on the current device:
+    # make it the device holding the data (never one derived from the rank).
+    ensure_device!(architecture(input))
 
     # Step 1: Local FFTs on non-distributed dimensions
     current = input
@@ -72,6 +75,7 @@ function distributed_fft_backward!(output, input, dfft::DistributedGPUFFT)
     config = dfft.config
     ndims_data = ndims(input)
     decomp_dim = config.decomp_dim
+    ensure_device!(architecture(input))   # see distributed_fft_forward!
 
     current = input
 
@@ -233,8 +237,9 @@ function distributed_fft_cuda_aware!(data, dim::Int, dfft::DistributedGPUFFT, di
         dfft.transpose_recv = similar(data, buf_size)
     end
 
-    # Step 1: Pack data into send buffer
-    _gpu_pack_for_transpose!(dfft.transpose_send, data, dim, config)
+    # Step 1: Pack data into send buffer. The direction is passed explicitly: it
+    # cannot be inferred from the shape when global_n == 1 (see the CUDA override).
+    _gpu_pack_for_transpose!(dfft.transpose_send, data, dim, config; reverse=false)
 
     # CRITICAL: Synchronize GPU before MPI to ensure pack kernels have completed
     synchronize_device!(arch)
@@ -249,7 +254,7 @@ function distributed_fft_cuda_aware!(data, dim::Int, dfft::DistributedGPUFFT, di
 
     # Step 4: Unpack into transposed layout using GPU kernels
     gpu_transposed = similar(data, transposed_dims...)
-    _gpu_unpack_from_transpose!(gpu_transposed, dfft.transpose_recv, dim, config)
+    _gpu_unpack_from_transpose!(gpu_transposed, dfft.transpose_recv, dim, config; reverse=false)
 
     # Step 5: Local FFT on now-local dimension
     if direction == :forward
@@ -259,7 +264,7 @@ function distributed_fft_cuda_aware!(data, dim::Int, dfft::DistributedGPUFFT, di
     end
 
     # Step 6: Pack for reverse transpose (result has transposed_dims shape)
-    _gpu_pack_for_transpose!(dfft.transpose_send, result, dim, config)
+    _gpu_pack_for_transpose!(dfft.transpose_send, result, dim, config; reverse=true)
 
     # CRITICAL: Synchronize GPU before MPI to ensure pack kernels have completed
     synchronize_device!(arch)
@@ -276,7 +281,7 @@ function distributed_fft_cuda_aware!(data, dim::Int, dfft::DistributedGPUFFT, di
 
     # Step 8: Unpack back to original layout using GPU kernels
     output = similar(data, dims...)
-    _gpu_unpack_from_transpose!(output, dfft.transpose_recv, dim, config)
+    _gpu_unpack_from_transpose!(output, dfft.transpose_recv, dim, config; reverse=true)
 
     return output
 end
@@ -308,27 +313,31 @@ function _verify_cuda_aware_mpi()
 end
 
 """
-    _gpu_pack_for_transpose!(send_buf, data, dim, config)
+    _gpu_pack_for_transpose!(send_buf, data, dim, config; reverse=nothing)
 
 Pack data into contiguous buffer for MPI all-to-all transpose.
 Default implementation - overridden by CUDA extension for GPU data.
+`reverse` names the transpose direction (`nothing`: infer it from the shape).
 """
-function _gpu_pack_for_transpose!(send_buf, data, dim::Int, config::DistributedGPUConfig)
+function _gpu_pack_for_transpose!(send_buf, data, dim::Int, config::DistributedGPUConfig;
+                                  reverse::Union{Nothing, Bool}=nothing)
     # Default: simple copy for CPU data
     copyto!(send_buf, vec(data))
 end
 
 """
-    _gpu_unpack_from_transpose!(output, recv_buf, dim, config)
+    _gpu_unpack_from_transpose!(output, recv_buf, dim, config; reverse=nothing)
 
 Unpack received buffer into correctly-shaped output array after MPI all-to-all.
 Default implementation - overridden by CUDA extension for GPU data.
 
 For forward transpose: `dim` is the dimension being assembled (now fully local).
 For reverse transpose: `dim` is passed as-is from the caller context.
-The function determines direction from the output shape vs config.
+`reverse` names the direction; when `nothing` it is inferred from the output
+shape vs config, which is ambiguous for a decomposed axis of length 1.
 """
-function _gpu_unpack_from_transpose!(output, recv_buf, dim::Int, config::DistributedGPUConfig)
+function _gpu_unpack_from_transpose!(output, recv_buf, dim::Int, config::DistributedGPUConfig;
+                                     reverse::Union{Nothing, Bool}=nothing)
     # Default CPU implementation: copy from flat buffer
     copyto!(vec(output), recv_buf)
 end
@@ -355,7 +364,7 @@ function _compute_alltoall_counts(dims::Tuple, dim::Int, config::DistributedGPUC
     other_n = dims[other_dim]
 
     # Product of all dimensions except dim and other_dim
-    remaining = div(prod(dims), other_n * local_n)
+    remaining = _alltoall_slab_extent(dims, dim, other_dim)
 
     # Our chunk of other_dim after transpose
     chunk_other_me = div(other_n, nprocs) + (rank < mod(other_n, nprocs) ? 1 : 0)

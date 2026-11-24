@@ -290,6 +290,8 @@ Dense LU factorization on GPU using cuSOLVER.
 Efficient for small-medium dense matrices.
 
 The matrix is kept on GPU, and factorization uses CUDA's cusolverDnXgetrf.
+An exactly singular matrix (a zero pivot in `U`) throws `SingularException`
+at construction, as the CPU `DenseLUSolver` does.
 """
 struct CuDenseLU{T} <: AbstractMatSolver
     A_gpu::Any          # CuMatrix{T}
@@ -316,10 +318,23 @@ function CuDenseLU(matrix::AbstractMatrix; kwargs...)
 
     # Perform LU factorization on GPU
     # cusolverDnXgetrf computes LU factorization in-place
-    _cusolver().getrf!(A_gpu, ipiv)
+    _cudense_factor!(A_gpu, ipiv)
 
     return CuDenseLU{T}(A_gpu, nothing, ipiv, nothing, n)
 end
+
+# CUDA.jl's `CUSOLVER.getrf!` returns `(A, ipiv, info)` and raises only for
+# info < 0 (an invalid argument, via `chkargsok`). info > 0 — U[info, info] is
+# exactly zero — is an ordinary return, and ignoring it built a factor whose every
+# solve came back Inf/NaN. Raise as the CPU `DenseLUSolver` does, so the stepper's
+# singular-stage handling sees the same exception on both backends. (`getrs!`
+# reports only invalid arguments, which CUDA.jl's `chkargsok` already raises.)
+function _cudense_factor!(matrix, pivots)
+    _, _, info = _cudense_getrf!(matrix, pivots)
+    info > 0 && throw(SingularException(Int(info)))
+    return matrix
+end
+_cudense_getrf!(matrix, pivots) = _cusolver().getrf!(matrix, pivots)
 
 function MatSolvers.solve(s::CuDenseLU{T}, rhs::AbstractVector) where T
     length(rhs) == s.n || throw(DimensionMismatch("CuDenseLU right-hand side length"))
@@ -738,15 +753,23 @@ which is highly efficient for sparse matrices.
 
 # Arguments
 - `matrix`: Sparse matrix (must be SPD for convergence)
-- `tol`: Convergence tolerance (default: 1e-10)
+- `tol`: RELATIVE residual tolerance (default: 1e-10). The solve has converged when
+  the CG residual satisfies `‖r‖ ≤ tol·‖b‖` (`r` is the recursively updated
+  residual, equal to `b - A*x` in exact arithmetic). `b = 0` returns `x = 0`.
 - `maxiter`: Maximum iterations (default: 1000)
 - `preconditioner`: Preconditioner definition:
-  - `:jacobi` (default): Diagonal preconditioner, good for diagonally dominant matrices
+  - `:jacobi` (default): Diagonal preconditioner, good for diagonally dominant matrices.
+    Zero diagonal entries (|aᵢᵢ| ≤ 1e-14) are treated as 1.
   - `:ilu0`: ILU(0) via cuSPARSE, much better for ill-conditioned matrices
   - `:ic0`: IC(0) via cuSPARSE, optimal for SPD matrices (recommended for CG)
   - `:none`: No preconditioning
   - `Vector`: Explicit diagonal inverse values
   - `Function`: Custom preconditioner `(out, r) -> out = M^{-1}*r`
+
+Failure is an error, never a silently returned iterate: `solve` throws when the
+tolerance is not met within `maxiter` iterations, or when CG breaks down
+(`p'Ap` negligible relative to `‖p‖·‖Ap‖`, i.e. the operator is not
+Hermitian positive definite).
 
 # Example
 ```julia
@@ -823,7 +846,31 @@ function MatSolvers.solve!(x::AbstractVector, s::CuIterativeCG, rhs::AbstractVec
                                 s.r, s.p, s.Ap, s.z)
 end
 
+# ‖b‖ for the relative stopping tests of the iterative solvers. A non-finite norm
+# must not reach them: `Inf ≤ tol·Inf` would report x = 0 as converged.
+function _checked_rhs_norm(b, solver::AbstractString)
+    bnorm = norm(b)
+    isfinite(bnorm) || throw(ArgumentError(
+        "$solver: the right-hand side contains non-finite values (‖b‖ = $bnorm)."))
+    return bnorm
+end
+
+const _CG_OPERATOR_HINT =
+    "CG requires a Hermitian positive-definite operator; coupled Chebyshev–Fourier " *
+    "(tau) systems are non-Hermitian. Use a direct solver (CuSparseLU/CuDenseLU) or GMRES."
+
 function _cg_solve_workspace!(x, A, preconditioner, tol, maxiter, r, p, Ap, z)
+    # x = 0 on entry, so r = b.
+    bnorm = _checked_rhs_norm(r, "CuIterativeCG")
+    # b = 0 (a quiescent mode): x = 0 is exact, and iterating would divide 0 by 0.
+    iszero(bnorm) && return x
+    # Iterate on the unit right-hand side b/‖b‖ and rescale x on return, so the
+    # stopping test ‖r‖ ≤ tol is RELATIVE to ‖b‖ and the inner products, which
+    # are quadratic in the RHS amplitude, cannot underflow for a tiny ‖b‖. The
+    # previous absolute test (`norm(r) < tol`) returned x = 0 untouched whenever
+    # ‖b‖ < tol, and the error of every other solve scaled with ‖b‖.
+    r ./= bnorm
+
     # Apply preconditioner: z = M^{-1} * r
     _apply_preconditioner!(z, preconditioner, r)
 
@@ -832,6 +879,10 @@ function _cg_solve_workspace!(x, A, preconditioner, tol, maxiter, r, p, Ap, z)
 
     # rz_old = r' * z
     rz_old = dot(r, z)
+    # ‖p‖²_M from the CG recurrence ‖p_{k+1}‖²_M = r'z + |β|²‖p_k‖²_M — a free
+    # scale for the breakdown screen below.
+    pnorm2_M = abs(rz_old)
+    r_norm = one(bnorm)  # ‖r‖/‖b‖
 
     for iter in 1:maxiter
         # Ap = A * p
@@ -839,9 +890,14 @@ function _cg_solve_workspace!(x, A, preconditioner, tol, maxiter, r, p, Ap, z)
 
         # alpha = rz_old / (p' * Ap)
         pAp = dot(p, Ap)
-        if abs(pAp) < 1e-30
-            @warn "CG breakdown at iteration $iter: p'Ap ≈ 0"
-            break
+        # Zero-curvature breakdown, judged RELATIVE to |p'Ap| ≤ ‖p‖·‖Ap‖. The
+        # previous absolute |p'Ap| < 1e-30 depended on the scale of A and b (it
+        # fired for every ‖b‖ ≲ 1e-15). The two extra norms are only computed
+        # when the free ‖p‖²_M screen flags a candidate.
+        ϵ = eps(real(typeof(pAp)))
+        if abs(pAp) <= ϵ * pnorm2_M && abs(pAp) <= ϵ * norm(p) * norm(Ap)
+            error("CuIterativeCG broke down at iteration $iter: p'Ap ≈ 0 relative to " *
+                  "‖p‖·‖Ap‖. " * _CG_OPERATOR_HINT)
         end
         alpha = rz_old / pAp
 
@@ -853,8 +909,9 @@ function _cg_solve_workspace!(x, A, preconditioner, tol, maxiter, r, p, Ap, z)
 
         # Check convergence
         r_norm = norm(r)
-        if r_norm < tol
-            @debug "CG converged in $iter iterations, residual = $r_norm"
+        if r_norm <= tol
+            @debug "CG converged in $iter iterations, relative residual = $r_norm"
+            x .*= bnorm
             return x
         end
 
@@ -870,6 +927,7 @@ function _cg_solve_workspace!(x, A, preconditioner, tol, maxiter, r, p, Ap, z)
         # p = z + beta * p
         p .= z .+ beta .* p
 
+        pnorm2_M = abs(rz_new) + abs2(beta) * pnorm2_M
         rz_old = rz_new
     end
 
@@ -880,9 +938,8 @@ function _cg_solve_workspace!(x, A, preconditioner, tol, maxiter, r, p, Ap, z)
     # tau/BC rows break symmetry), so returning the last iterate would feed a
     # silently wrong solution back into the timestep. Use a direct GPU solver
     # (CuSparseLU / CuDenseLU) or GMRES for such systems.
-    error("CuIterativeCG did not converge in $(maxiter) iterations. CG requires a " *
-          "Hermitian positive-definite operator; coupled Chebyshev–Fourier (tau) " *
-          "systems are non-Hermitian. Use a direct solver (CuSparseLU/CuDenseLU) or GMRES.")
+    error("CuIterativeCG did not converge in $(maxiter) iterations (relative residual " *
+          "$(r_norm) > tol = $(tol)). " * _CG_OPERATOR_HINT)
 end
 
 _apply_preconditioner!(z, M_inv, r) = error("Unsupported preconditioner type $(typeof(M_inv))")
@@ -891,27 +948,62 @@ _apply_preconditioner!(z, M_inv, r) = error("Unsupported preconditioner type $(t
 # GPU Iterative Solver: GMRES
 # ============================================================================
 
+struct _GMRESWorkspace{V,T,R}
+    b::V
+    r::V
+    w::V
+    tmp::V
+    basis::Vector{V}
+    H::Matrix{T}    # host Hessenberg, reduced in place to triangular R by Givens rotations
+    g::Vector{T}    # host rotated residual vector; overwritten by the least-squares solution
+    cs::Vector{R}   # host Givens cosines (real)
+    sn::Vector{T}   # host Givens sines
+end
+
+function _gmres_workspace!(s, prototype)
+    ws = s.workspace
+    if ws === nothing || length(ws.b) != s.n || length(ws.basis) != s.restart + 1 ||
+       is_gpu_array(ws.b) != is_gpu_array(prototype)
+        T = eltype(s.A_csr)
+        m = s.restart
+        vec() = similar(prototype, T, s.n)
+        s.workspace = _GMRESWorkspace(vec(), vec(), vec(), vec(),
+            [vec() for _ in 1:(m+1)], zeros(T, m+1, m), zeros(T, m+1),
+            zeros(real(T), m), zeros(T, m))
+    end
+    return s.workspace
+end
+
 """
     CuIterativeGMRES <: AbstractMatSolver
 
 GMRES solver on GPU.
 Best for large non-symmetric systems.
 
-Uses restarted GMRES with configurable restart parameter.
+Uses restarted GMRES with configurable restart parameter and RIGHT
+preconditioning (`A·M⁻¹·u = b`, `x = M⁻¹·u`), so the residual GMRES minimizes
+and monitors is the true residual `b - A*x`, not the preconditioned one.
 Matrix-vector products use cuSPARSE for efficiency.
 
 # Arguments
 - `matrix`: Sparse matrix (can be non-symmetric)
-- `tol`: Convergence tolerance (default: 1e-10)
-- `maxiter`: Maximum iterations (default: 1000)
+- `tol`: RELATIVE tolerance on the true residual (default: 1e-10). The solve has
+  converged when `‖b - A*x‖ ≤ tol·‖b‖`, recomputed explicitly after every restart
+  cycle (including the last). `b = 0` returns `x = 0`.
+- `maxiter`: Maximum total iterations, i.e. Arnoldi steps over all restart cycles
+  (default: 1000)
 - `restart`: Restart parameter (default: 30)
 - `preconditioner`: Preconditioner definition:
-  - `:jacobi` (default): Diagonal preconditioner, good for diagonally dominant matrices
+  - `:jacobi` (default): Diagonal preconditioner, good for diagonally dominant matrices.
+    Zero diagonal entries (|aᵢᵢ| ≤ 1e-14, e.g. tau/boundary rows) are treated as 1.
   - `:ilu0`: ILU(0) via cuSPARSE, much better for ill-conditioned matrices
   - `:ic0`: IC(0) via cuSPARSE, for SPD matrices only (use CG instead if SPD)
   - `:none`: No preconditioning
   - `Vector`: Explicit diagonal inverse values
   - `Function`: Custom preconditioner `(out, r) -> out = M^{-1}*r`
+
+`solve` throws when the tolerance is not met within `maxiter` iterations; the
+last iterate is never returned as if it were a solution.
 
 # Example
 ```julia
@@ -922,28 +1014,6 @@ solver = CuIterativeGMRES(A; preconditioner=:jacobi, restart=50)
 solver = CuIterativeGMRES(A; preconditioner=:ilu0, tol=1e-12)
 ```
 """
-struct _GMRESWorkspace{V,T}
-    b::V
-    r::V
-    w::V
-    tmp::V
-    basis::Vector{V}
-    H::Matrix{T}
-    e1::Vector{T}
-end
-
-function _gmres_workspace!(s, prototype)
-    ws = s.workspace
-    if ws === nothing || length(ws.b) != s.n || length(ws.basis) != s.restart + 1 ||
-       is_gpu_array(ws.b) != is_gpu_array(prototype)
-        T = eltype(s.A_csr)
-        vec() = similar(prototype, T, s.n)
-        s.workspace = _GMRESWorkspace(vec(), vec(), vec(), vec(),
-            [vec() for _ in 1:(s.restart+1)], zeros(T, s.restart+1, s.restart), zeros(T, s.restart+1))
-    end
-    return s.workspace
-end
-
 mutable struct CuIterativeGMRES{T,P<:AbstractPreconditioner} <: AbstractMatSolver
     A_csr::Any              # CuSparseMatrixCSR
     preconditioner::P
@@ -956,6 +1026,8 @@ mutable struct CuIterativeGMRES{T,P<:AbstractPreconditioner} <: AbstractMatSolve
 
     function CuIterativeGMRES{T,P}(A_csr, preconditioner::P, tol::Float64, maxiter::Int,
                                     restart::Int, n::Int, prototype=nothing) where {T, P<:AbstractPreconditioner}
+        # A zero-length cycle never advances the iteration count: the solve would spin.
+        restart >= 1 || throw(ArgumentError("CuIterativeGMRES: restart must be ≥ 1, got $restart"))
         new{T,P}(A_csr, preconditioner, tol, maxiter, restart, n, nothing, prototype)
     end
 end
@@ -1000,77 +1072,120 @@ function MatSolvers.solve!(x::AbstractVector, s::CuIterativeGMRES, rhs::Abstract
     return _gmres_solve_workspace!(x, s.A_csr, s.preconditioner, s.tol, s.maxiter, s.restart, ws)
 end
 
+# Givens rotation G = [c s; -conj(s) c] (real c) with G·[f; h] = [ρ; 0], for the
+# real, non-negative subdiagonal h = H[j+1, j] of the Arnoldi Hessenberg matrix.
+@inline function _gmres_givens(f::T, h::Real) where {T<:Number}
+    iszero(h) && return one(real(T)), zero(T), f
+    af = abs(f)
+    iszero(af) && return zero(real(T)), one(T), T(h)
+    nrm = hypot(af, h)
+    phase = f / af
+    return af / nrm, phase * (h / nrm), phase * nrm
+end
+
 function _gmres_solve_workspace!(x, A, preconditioner, tol, maxiter, m, ws::_GMRESWorkspace)
     b, r, w, tmp = ws.b, ws.r, ws.w, ws.tmp
-    V, H = ws.basis, ws.H
-    # Outer iteration (restart cycles). Run until maxiter is exhausted, taking a
-    # final truncated cycle when maxiter is not a multiple of restart — otherwise
-    # maxiter < restart (div == 0) would return the zero guess without iterating.
+    V, H, g, cs, sn = ws.basis, ws.H, ws.g, ws.cs, ws.sn
+    # RIGHT preconditioning: minimize ‖b - A·M⁻¹·u‖ and set x = M⁻¹·u, so the
+    # least-squares residual |g[j+1]| is the TRUE residual ‖b - A*x‖ (in exact
+    # arithmetic). The previous left-preconditioned form stopped on ‖M⁻¹(b - A*x)‖,
+    # which cannot see rows that M⁻¹ shrinks — or, under the old zero-for-zero
+    # Jacobi rule, deleted outright: the tau/BC rows of a tau system. It then
+    # returned a wrong solution as "converged".
+    # x = 0 on entry (solve! clears it), so r = b and `tol` is relative to ‖b‖.
+    copyto!(r, b)
+    bnorm = _checked_rhs_norm(r, "CuIterativeGMRES")
+    threshold = tol * bnorm
+    rnorm = bnorm
     total_iters = 0
-    while total_iters < maxiter
+    # Outer iteration (restart cycles). The EXPLICIT residual is tested before
+    # every cycle and after the last one (b = 0 never iterates; a NaN residual
+    # from a breakdown also ends the loop). The final cycle is truncated when
+    # maxiter is not a multiple of restart, so maxiter < restart still iterates.
+    while rnorm > threshold && total_iters < maxiter
         # Cycle length: full restart, or fewer on the final truncated cycle.
         mj = min(m, maxiter - total_iters)
 
-        # r = b - A*x
-        mul!(w, A, x)
-        r .= b .- w
+        # Arnoldi process on A·M⁻¹, from v₁ = r/‖r‖
+        V[1] .= r ./ rnorm
+        fill!(g, zero(eltype(g)))
+        g[1] = rnorm
 
-        # Apply preconditioner without replacing the residual allocation.
-        _apply_preconditioner!(tmp, preconditioner, r)
-        beta = norm(tmp)
-        if beta < tol
-            @debug "GMRES converged in $total_iters iterations"
-            return x
-        end
-
-        # Arnoldi process
-        V[1] .= tmp ./ beta
-        fill!(H, zero(eltype(H)))  # host Hessenberg, reused across restart cycles
-
-        last_j = mj  # tracks the actual subspace dimension on early breakdown
+        k = 0  # subspace dimension actually built this cycle
         for j in 1:mj
-            # w = A * v_j
-            mul!(tmp, A, V[j])
+            k = j
+            total_iters += 1
 
-            # Apply preconditioner (left preconditioning)
-            _apply_preconditioner!(w, preconditioner, tmp)
+            # w = A * M^{-1} * v_j (right preconditioning)
+            _apply_preconditioner!(tmp, preconditioner, V[j])
+            mul!(w, A, tmp)
 
             # Modified Gram-Schmidt
+            colnorm2 = zero(real(eltype(H)))
             for i in 1:j
                 H[i, j] = dot(V[i], w)
                 w .-= H[i, j] .* V[i]
+                colnorm2 += abs2(H[i, j])
             end
-            H[j + 1, j] = norm(w)
+            hnext = norm(w)
 
-            if abs(H[j + 1, j]) < 1e-14
-                last_j = j  # happy breakdown: subspace is invariant at dim j
+            # Apply the previous rotations to the new column, then annihilate its
+            # subdiagonal; g holds the rotated right-hand side ‖r‖·e₁.
+            for i in 1:(j - 1)
+                hi = H[i, j]
+                H[i, j] = cs[i] * hi + sn[i] * H[i + 1, j]
+                H[i + 1, j] = -conj(sn[i]) * hi + cs[i] * H[i + 1, j]
+            end
+            cs[j], sn[j], H[j, j] = _gmres_givens(H[j, j], hnext)
+            g[j + 1] = -conj(sn[j]) * g[j]
+            g[j] = cs[j] * g[j]
+
+            # |g[j+1]| is the residual norm of this cycle's least-squares iterate.
+            # hnext ≈ 0 relative to ‖A·M⁻¹·v_j‖ is a happy breakdown: the Krylov
+            # subspace is invariant, so stop before normalizing a null vector.
+            if abs(g[j + 1]) <= threshold || j == mj ||
+               hnext <= eps(real(eltype(H))) * sqrt(colnorm2 + hnext^2)
                 break
             end
 
-            V[j + 1] .= w ./ H[j + 1, j]
+            V[j + 1] .= w ./ hnext
         end
 
-        # Solve least squares: min ||H*y - beta*e1|| over the subspace actually
-        # built. On breakdown the unfilled columns of H are zero (rank-deficient),
-        # so truncate to the (last_j+1) x last_j block — mirrors the CPU proxy.
-        H_sub = @view H[1:last_j + 1, 1:last_j]
-        e1_cpu = @view ws.e1[1:last_j + 1]
-        fill!(e1_cpu, zero(eltype(e1_cpu)))
-        e1_cpu[1] = beta
-
-        # QR factorization (small system, already on CPU)
-        y_cpu = H_sub \ e1_cpu
-
-        # Update solution: x = x + V * y (use CPU y values to avoid GPU scalar indexing)
-        for i in 1:last_j
-            axpy!(y_cpu[i], V[i], x)
+        # Back substitution R·y = g[1:k] (small triangular system, on CPU);
+        # y overwrites g.
+        for i in k:-1:1
+            acc = g[i]
+            for l in (i + 1):k
+                acc -= H[i, l] * g[l]
+            end
+            g[i] = acc / H[i, i]
         end
 
-        total_iters += mj
+        # Update solution: x = x + M⁻¹·(V * y) (CPU y values avoid GPU scalar indexing)
+        r .= g[1] .* V[1]
+        for i in 2:k
+            axpy!(g[i], V[i], r)
+        end
+        _apply_preconditioner!(tmp, preconditioner, r)
+        x .+= tmp
+
+        # Explicit true residual r = b - A*x: the convergence decision never rests
+        # on the Arnoldi recurrence alone (rounding, near-breakdown).
+        mul!(w, A, x)
+        r .= b .- w
+        rnorm = norm(r)
     end
 
-    @warn "GMRES did not converge in $(maxiter) iterations"
-    return x
+    if rnorm <= threshold
+        @debug "GMRES converged in $total_iters iterations, relative residual = $(rnorm / bnorm)"
+        return x
+    end
+    # Non-convergence is a HARD error, as for CG: the last iterate of a stalled or
+    # broken-down GMRES is not a solution, and the stepper must not consume it.
+    error("CuIterativeGMRES did not converge in $(maxiter) iterations (restart = $m): " *
+          "relative residual ‖b - A*x‖/‖b‖ = $(rnorm / bnorm) > tol = $(tol). Increase " *
+          "maxiter or restart, use a stronger preconditioner (:ilu0), or use a direct " *
+          "GPU solver (CuSparseLU/CuDenseLU).")
 end
 
 # ============================================================================
@@ -1199,14 +1314,8 @@ function _build_preconditioner(A::SparseMatrixCSC, preconditioner, T::Type)
         if preconditioner === :none
             return NoPreconditioner()
         elseif preconditioner === :jacobi
-            diag_A = diag(A)
-            diag_inv = similar(diag_A, T)
-            @inbounds for i in eachindex(diag_A)
-                d = diag_A[i]
-                diag_inv[i] = abs(d) > 1e-14 ? T(1) / T(d) : zero(T)
-            end
             # Transfer diagonal to GPU using helper
-            return DiagonalPreconditioner(_gpu_array(diag_inv, T))
+            return DiagonalPreconditioner(_gpu_array(_jacobi_diag_inv(A, T), T))
         elseif preconditioner === :ilu0
             return _build_ilu0_preconditioner(A, T)
         elseif preconditioner === :ic0
@@ -1225,6 +1334,24 @@ function _build_preconditioner(A::SparseMatrixCSC, preconditioner, T::Type)
     else
         error("Unsupported preconditioner type $(typeof(preconditioner))")
     end
+end
+
+"""
+    _jacobi_diag_inv(A, T) -> Vector{T}
+
+Host inverse diagonal for the `:jacobi` preconditioner. A (numerically) zero
+diagonal entry maps to 1, so that row passes through UNSCALED. Tau/boundary rows
+and saddle-point constraint rows have a structurally zero diagonal; mapping them
+to 0, as before, made M⁻¹ singular — those rows dropped out of the preconditioned
+system entirely and GMRES returned a wrong solution as converged.
+"""
+function _jacobi_diag_inv(A::AbstractMatrix, ::Type{T}) where {T}
+    d = Vector(diag(A))  # dense: indexing the SparseVector diag(A) is a search per entry
+    diag_inv = Vector{T}(undef, length(d))
+    @inbounds for i in eachindex(diag_inv)
+        diag_inv[i] = abs(d[i]) > 1e-14 ? T(1) / T(d[i]) : one(T)
+    end
+    return diag_inv
 end
 
 """

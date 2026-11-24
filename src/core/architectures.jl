@@ -507,6 +507,22 @@ Explicitly free GPU memory. No-op for CPU.
 unsafe_free!(::CPU, a) = nothing
 unsafe_free!(::GPU, a) = error("GPU unsafe_free! requires CUDA.jl to be loaded")
 
+"""
+    _seed_device_rng!(arch::AbstractArchitecture, seed::Integer)
+
+Seed the generator that `rand!`/`randn!` draw from for arrays on `arch`.
+`Random.seed!(seed)` reaches only the host RNG, while a device backend keeps its
+own — CUDA.jl's task-local `CUDA.default_rng()`, otherwise seeded from
+`RandomDevice` — so without this a seeded GPU fill differed on every run. A no-op
+on the host; backend extensions add their `GPU` method (CUDA: `GPU{CuDevice}`).
+The same seed still gives different values on CPU and GPU: the generators differ.
+"""
+_seed_device_rng!(::CPU, seed::Integer) = nothing
+_seed_device_rng!(arch::GPU, seed::Integer) = throw(ArgumentError(
+    "cannot seed the device RNG of $arch: no `_seed_device_rng!` method for this " *
+    "GPU backend (CUDA.jl provides it for GPU()). Seeded fills on this backend " *
+    "would not repeat; use fill_random!(...; reproducible=true) instead."))
+
 # ============================================================================
 # Kernel Launch Utilities
 # ============================================================================

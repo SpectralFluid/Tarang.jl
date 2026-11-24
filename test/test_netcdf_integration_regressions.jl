@@ -91,6 +91,31 @@ if get(ENV, "TARANG_TEST_NETCDF_OUTPUT", "1") != "0"
               collect(0:7) .* (2pi / 8)
     end
 
+    @testset "2D output scales resample every Fourier axis" begin
+        # The scaled-output backward used to refine only the first axis (a
+        # (14, 8) grid for scales=2), and an rfft axis whose base and output
+        # half-spectra share a length (7 → 6 points) needs the grid resample.
+        coords = CartesianCoordinates("x", "y")
+        dist = Distributor(coords; comm=MPI.COMM_SELF, mesh=(1,), dtype=Float64)
+        u = ScalarField(dist, "u", (RealFourier(coords["x"]; size=7, bounds=(0.0, 2pi)),
+                                    RealFourier(coords["y"]; size=8, bounds=(0.0, 2pi))),
+                        Float64)
+        f(x, y) = cos(x) * (1 + sin(2y))
+        nodes(n) = collect(0:n-1) .* (2pi / n)
+        ensure_layout!(u, :g)
+        get_grid_data(u) .= f.(nodes(7), nodes(8)')
+        h = Tarang.NetCDFFileHandler(joinpath(mktempdir(), "scaled2d"), dist, Dict("u" => u))
+        Tarang.add_task!(h, u; name="fine", scales=2)
+        Tarang.add_task!(h, u; name="coarse", scales=0.75)
+        @test Tarang.process!(h; iteration=0, sim_time=0.0)
+        file = Tarang.current_file(h)
+        @test Tarang.group_ncread(file, "vars", "fine") ≈
+              reshape(f.(nodes(14), nodes(16)'), 1, 14, 16) atol=1e-12
+        @test Tarang.group_ncread(file, "vars", "coarse") ≈
+              reshape(f.(nodes(6), nodes(6)'), 1, 6, 6) atol=1e-12
+        @test get_grid_data(u) ≈ f.(nodes(7), nodes(8)')
+    end
+
     @testset "coefficient output scales retain the spectral shape" begin
         dist, u = _serial_output_field()
         fill!(get_grid_data(u), 1.0)

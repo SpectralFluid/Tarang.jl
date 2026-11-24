@@ -2314,6 +2314,16 @@ end
 
 function _refresh_scaled_output!(cache::NetCDFStagingCache, field::ScalarField, output_scales)
     ensure_layout!(field, :g)
+    if !_rfft_rescale_resolvable(field, get_scaled_shape(field, field.scales),
+                                 get_scaled_shape(field, output_scales))
+        # The cached path below inverts coefficients formed at the field's scales
+        # on the output grid, which an rfft axis cannot do here (off-base field
+        # scales, or a half-spectrum length both grids share; see
+        # `backward_axis_op`). Resample an uncached copy in grid space instead.
+        work = copy(field)
+        set_scales!(work, output_scales)
+        return work
+    end
     source_grid = get_grid_data(field)
     key = (objectid(field), field.scales, output_scales, size(source_grid))
     entry = get(cache.rescaled, key, nothing)

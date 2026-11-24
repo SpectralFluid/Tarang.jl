@@ -3,6 +3,18 @@
 # ============================================================================
 
 """
+    _alltoall_slab_extent(dims, dim, other_dim)
+
+Product of the extents of every axis except `dim` and `other_dim`: the number of
+elements each `(dim, other_dim)` index pair carries through the all-to-all.
+Multiplied out directly — the former `prod(dims) ÷ (dims[dim] * dims[other_dim])`
+divided by zero on a rank whose block is empty (more ranks than points along an
+axis), so that rank threw a `DivideError` while its peers waited in `Alltoallv`.
+"""
+_alltoall_slab_extent(dims::Tuple, dim::Int, other_dim::Int) =
+    prod((dims[i] for i in eachindex(dims) if i != dim && i != other_dim); init=1)
+
+"""
     _compute_alltoall_counts_reverse(dims, dim, config)
 
 Send/recv counts + displacements for the REVERSE all-to-all (undoing the
@@ -28,7 +40,7 @@ function _compute_alltoall_counts_reverse(dims::Tuple, dim::Int, config::Distrib
         chunk_dim[p]   = div(global_n, nprocs) + (p - 1 < mod(global_n, nprocs) ? 1 : 0)
     end
     chunk_dim_me = chunk_dim[rank + 1]
-    remaining = div(prod(dims), dims[dim] * dims[other_dim])
+    remaining = _alltoall_slab_extent(dims, dim, other_dim)
 
     send_counts = Vector{Int}(undef, nprocs)
     recv_counts = Vector{Int}(undef, nprocs)
@@ -84,7 +96,7 @@ function mpi_alltoall_transpose(data::Array{T}, dim::Int, config::DistributedGPU
     chunk_other_me = chunk_other[rank + 1]
 
     # Compute send/recv counts
-    remaining = div(prod(dims), other_n * local_n)
+    remaining = _alltoall_slab_extent(dims, dim, other_dim)
     send_counts = Vector{Int}(undef, nprocs)
     recv_counts = Vector{Int}(undef, nprocs)
     send_displs = Vector{Int}(undef, nprocs)
@@ -150,7 +162,7 @@ function mpi_alltoall_transpose_reverse(data::Array{T}, dim::Int, config::Distri
     chunk_dim_me = chunk_dim[rank + 1]
 
     # For reverse: we split along dim (now global_n) and assemble along other_dim
-    remaining = div(prod(dims), dims[dim] * dims[other_dim])
+    remaining = _alltoall_slab_extent(dims, dim, other_dim)
 
     send_counts = Vector{Int}(undef, nprocs)
     recv_counts = Vector{Int}(undef, nprocs)

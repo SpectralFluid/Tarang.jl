@@ -6,8 +6,9 @@
 # correctly dispatch to distributed GPU transforms when:
 # 1. Running on GPU architecture
 # 2. Multiple MPI processes are available
-# 3. NCCL is available
-# 4. The field has Chebyshev bases (needs DCT)
+# 3. The field has Chebyshev bases (needs DCT) in a supported 3D layout
+# NCCL.jl is resolved on demand when the plan is built (init_nccl! is not
+# required); the integration block below needs it loaded in the session.
 
 using Test
 using MPI
@@ -42,9 +43,11 @@ end
                 arch = GPU()
 
                 if nprocs > 1
-                    # When multiple processes and NCCL is available, should return true
+                    # Multiple processes always need the distributed path; it no
+                    # longer depends on init_nccl! (NCCL is resolved when the
+                    # plan is built, and a missing NCCL is a clear error).
                     result = TarangCUDAExt.is_distributed_gpu(arch, nprocs)
-                    @test result == Tarang.nccl_available()
+                    @test result == true
                 else
                     # Single process should always return false
                     @test TarangCUDAExt.is_distributed_gpu(arch, 1) == false
@@ -107,18 +110,19 @@ end
                 end
             end
 
-            if nprocs > 1 && Tarang.nccl_available()
+            if nprocs > 1 && (Tarang.nccl_available() || Tarang._try_load_nccl())
                 @testset "Distributed GPU dispatch integration" begin
                     # This test requires actual multi-GPU setup with NCCL
                     # Only run if we have multiple processes and NCCL
 
-                    # Create a 3D Chebyshev domain for testing
+                    # Create a 3D Fourier x Chebyshev domain for testing. (An
+                    # all-Chebyshev 3D domain is rejected by GPU+MPI Domain
+                    # validation: the distributed DCT-I path needs a Fourier axis.)
                     coords = CartesianCoordinates("x", "y", "z")
                     dist = Distributor(coords; dtype=Float64, architecture=GPU())
 
-                    # Create Chebyshev bases for all dimensions
                     Nx, Ny, Nz = 32, 32, 32
-                    xb = ChebyshevT(coords["x"]; size=Nx, bounds=(0.0, 1.0))
+                    xb = ComplexFourier(coords["x"]; size=Nx, bounds=(0.0, 2π))
                     yb = ChebyshevT(coords["y"]; size=Ny, bounds=(0.0, 1.0))
                     zb = ChebyshevT(coords["z"]; size=Nz, bounds=(0.0, 1.0))
 

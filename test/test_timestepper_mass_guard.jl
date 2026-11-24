@@ -58,6 +58,31 @@ end
             Tarang._ensure_timestepper_state!(s, s.dt), s, nothing))
     end
 
+    @testset "Explicit CPU fallback beside an algebraic constraint" begin
+        # The constraint row makes the assembled M singular, so the CPU explicit RK
+        # fallback has no mass factorization and takes k = F: `2*dt(u) = -u` stepped
+        # as `dt(u) = -u` while the device refused it. With identity mass it must
+        # step and leave the constrained variable refreshed (it used to stay 0).
+        function tmg_constrained(ts, equation)
+            domain = PeriodicDomain(8)
+            u = ScalarField(domain, "u")
+            v = ScalarField(domain, "v")
+            fill!(grid_data!(u), 1.0)
+            problem = InitialValueProblem([u, v])
+            add_equation!(problem, equation)
+            add_equation!(problem, "v - u = 0")
+            return InitialValueSolver(problem, ts; dt=0.01), u, v
+        end
+        for ts in (Tarang.DiagonalIMEX_RK222(), Tarang.DiagonalIMEX_RK443())
+            solver, u, _ = tmg_constrained(ts, "2*dt(u) = -u")
+            tmg_refusal(solver, u, step!)
+            solver, u, v = tmg_constrained(ts, "dt(u) = -u")
+            step!(solver)
+            @test maximum(abs, Array(grid_data!(u)) .- exp(-0.01)) < 1e-6
+            @test Array(grid_data!(v)) ≈ Array(grid_data!(u)) atol=1e-14
+        end
+    end
+
     @testset "Coupled time derivatives are not independent identity rows" begin
         solver, u = tmg_solver(Tarang.DiagonalIMEX_RK222(), "dt(u) + dt(v) + u = 0"; fields=2)
         tmg_refusal(solver, u, step!)

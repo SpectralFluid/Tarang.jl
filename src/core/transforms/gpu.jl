@@ -18,7 +18,9 @@ Return a tuple of symbols classifying each basis in `bases`:
 - `:complex_fourier` — `ComplexFourier`
 - `:chebyshev`       — `ChebyshevT`
 
-Errors on any unrecognised basis type.
+Errors on any unrecognised basis type. This classifies the BASES only; the
+distributed DCT-I plan uses `_distributed_gpu_dct_axis_kinds(bases, dtype)`,
+which also accounts for the field dtype.
 """
 function axis_kinds(bases::Tuple)
     map(bases) do b
@@ -70,6 +72,57 @@ distributed_gpu_unsupported_reason(bases::Tuple) =
     _distributed_gpu_dct_unsupported_reason(bases)
 distributed_gpu_unsupported_reason(field) =
     _distributed_gpu_dct_unsupported_reason(field.bases)
+
+"""
+    _uses_distributed_gpu_dct(arch, nprocs, bases) -> Bool
+    _uses_distributed_gpu_dct(field) -> Bool
+
+Whether `forward_transform!`/`backward_transform!` hand the field to the dedicated
+multi-GPU DCT-I backend (TarangCUDAExt's `DistributedDCTPlan`): a GPU field spread
+over several ranks (`_uses_transpose_storage`) whose bases that backend supports
+(`distributed_gpu_supported`). Such a field carries `TransposableFieldStorage`, so
+this must be decided BEFORE the TransposableField early return, which cannot
+represent a RealFourier half spectrum. A pure function of values every rank
+shares, so all ranks take the same branch into the collective transposes.
+"""
+_uses_distributed_gpu_dct(arch::AbstractArchitecture, nprocs::Integer, bases) =
+    _uses_transpose_storage(arch, nprocs) && _distributed_gpu_dct_bases_supported(bases)
+
+_uses_distributed_gpu_dct(field) =
+    _uses_distributed_gpu_dct(field.dist.architecture, field.dist.size, field.bases)
+
+"""
+    _distributed_gpu_dct_axis_kinds(bases, dtype) -> NTuple{3,Symbol}
+
+Per-axis kinds the multi-GPU DCT-I plan executes for a field of element type
+`dtype`, read off the shared layout rules (`forward_layout`) instead of the basis
+types alone:
+- `:real_fourier`    — an rfft-halved axis (real data reaching a RealFourier
+  dim 1): the plan keeps `rfft_len(N)` modes;
+- `:complex_fourier` — a full-length C2C axis: ComplexFourier, or a RealFourier
+  axis whose input is already complex (a complex-dtype field), which Tarang
+  stores with all `N` modes;
+- `:chebyshev`       — a DCT-I axis.
+
+`axis_kinds(bases)` calls every RealFourier axis `:real_fourier`, which is right
+only for real fields; planning a complex field from it truncated dim 1 to the
+half spectrum while the field's coefficient buffer holds the full one. The plan
+cache key must use these kinds, since they fix the coefficient shape. Throws an
+`ArgumentError` for bases the path does not support.
+"""
+function _distributed_gpu_dct_axis_kinds(bases::Tuple, dtype::Type)
+    reason = _distributed_gpu_dct_unsupported_reason(bases)
+    reason === nothing || throw(ArgumentError(
+        "the distributed multi-GPU DCT-I path cannot transform these bases: $reason"))
+    ops, _, _ = forward_layout(bases, ntuple(i -> bases[i].meta.size, length(bases)), dtype)
+    return ntuple(3) do axis
+        op = ops[axis].op
+        op === :rfft ? :real_fourier :
+        op === :fft ? :complex_fourier :
+        op === :dct1_forward ? :chebyshev :
+        throw(ArgumentError("unexpected forward stage $(repr(op)) on axis $axis"))
+    end
+end
 
 # ============================================================================
 # Hermitian half-spectrum → full-spectrum expansion (1-D CPU reference)
@@ -216,6 +269,19 @@ _gpu_backward_transform_backend!(::AbstractArchitecture, ::Any) =
           "constructing GPU fields; CPU fallback is disabled.")
 
 """
+    _distributed_gpu_transform!(arch, field, direction::Symbol) -> Bool
+
+Device hook for the dedicated multi-GPU DCT-I transform. `forward_transform!`
+and `backward_transform!` call it before their TransposableField early return;
+the device package adds a `::GPU` method (more specific than this fallback, so
+it extends rather than overwrites) that transforms every field selected by
+`_uses_distributed_gpu_dct` and returns `true` — the caller then records the new
+layout. `false` means "not routed here": the field continues to the
+TransposableField or local paths. Without a device backend nothing is routed.
+"""
+_distributed_gpu_transform!(::AbstractArchitecture, ::ScalarField, ::Symbol) = false
+
+"""
     gpu_forward_transform!(field::ScalarField)
 
 GPU-specific forward transform, dispatched to the device backend.
@@ -306,6 +372,16 @@ function forward_transform!(field::ScalarField, target_layout::Symbol=:c; apply_
     _count_transform!(:forward)
 
     ensure_layout!(field, :g)  # Start in grid space
+
+    # A multi-GPU field whose layout the dedicated distributed DCT-I backend
+    # supports (`_uses_distributed_gpu_dct`) is transformed by it. This must run
+    # before the TransposableField early return below: every multi-rank GPU field
+    # has transposable storage, and that path cannot hold a RealFourier half
+    # spectrum. Same reasoning as below for dropping target_layout/apply_coupled_dct.
+    if _distributed_gpu_transform!(field.dist.architecture, field, :forward)
+        field.current_layout = :c
+        return
+    end
 
     # A distributed GPU field transforms by explicit transposes. PencilFFTs is
     # CPU-only and the local transform chain would compute a per-rank FFT of a

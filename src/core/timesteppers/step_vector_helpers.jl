@@ -83,7 +83,9 @@ function _evaluate_global_rhs!(dest::AbstractVector{ComplexF64},
         end
     end
     _update_registered_forcings!(solver, t, solver.dt, DeterministicForcingType)
-    _refresh_algebraic_state!(solver.problem, fields)
+    # The global stage solve imposes the constraints; this refresh only repairs a
+    # state that did not come out of it (exact solves only, never authoritative).
+    _refresh_algebraic_state!(solver.problem, fields; authoritative=false)
     sync_state_to_problem!(solver.problem, fields)
     try
         for (eq, (offset, n, targets)) in zip(solver.problem.equation_data, layout.rows)
