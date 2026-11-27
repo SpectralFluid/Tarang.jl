@@ -40,7 +40,7 @@ end
 
 function _sg_complex_reference(a, b, dims)
     shape = size(a)
-    padded_shape = ntuple(d -> d in dims ? 2cld(ceil(Int, 1.5shape[d]), 2) : shape[d], ndims(a))
+    padded_shape = ntuple(d -> d in dims ? 2cld(3shape[d] ÷ 2 + 1, 2) : shape[d], ndims(a))
     pa = zeros(Complex{real(eltype(a))}, padded_shape)
     pb = similar(pa)
     Tarang._pad_spectral!(pa, fft(a, dims), shape, padded_shape, dims)

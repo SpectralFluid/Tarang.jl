@@ -49,24 +49,21 @@ function local_grid(basis::Basis, dist, scale; move_to_arch::Bool=true)
     global_size = length(native_grid)
     local_elements = local_indices(dist, axis + 1, global_size)
     local_grid_data = native_grid[local_elements]
-
-    # Map to problem coordinates
-    # For FourierBasis, _native_grid already returns grid in problem coordinates
-    # so we skip the COV transformation (which would incorrectly rescale)
-    local_grid_result = if isa(basis, FourierBasis)
-        local_grid_data
-    elseif basis.meta.COV !== nothing
-        problem_coord(basis.meta.COV, local_grid_data)
-    else
-        _problem_coord_fallback(basis, local_grid_data)
-    end
+    local_grid_result = _basis_grid_in_problem_coords(basis, local_grid_data)
 
     # Move to distributor's architecture (GPU or CPU) for efficient broadcasting
     if move_to_arch
-        return on_architecture(dist.architecture, local_grid_result)
+        return _coordinate_array(dist.architecture, dist.dtype, local_grid_result)
     else
         return local_grid_result
     end
+end
+
+# Fourier grids are already expressed in problem coordinates.
+_basis_grid_in_problem_coords(::FourierBasis, native_grid) = native_grid
+function _basis_grid_in_problem_coords(basis::Basis, native_grid)
+    return basis.meta.COV === nothing ? _problem_coord_fallback(basis, native_grid) :
+                                        problem_coord(basis.meta.COV, native_grid)
 end
 
 function _problem_coord_fallback(basis::Basis, native_grid)

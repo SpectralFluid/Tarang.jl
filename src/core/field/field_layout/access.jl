@@ -113,8 +113,21 @@ function set_local_data!(field_data::PencilArrays.PencilArray, values)
 end
 
 function set_local_data!(field_data::AbstractArray, values)
-    field_data .= values
+    field_data .= _values_for_storage(field_data, values)
     return field_data
+end
+
+# Device kernels accept only device arrays and bits values: CUDA, ROCm and Metal
+# all reject a host Array argument, and Metal has no Float64. Host data is
+# converted to the storage eltype on the host and uploaded once; a scalar takes
+# the storage eltype. Host storage and device-resident values pass through.
+_values_for_storage(::AbstractArray, values) = values
+_values_for_storage(field_data::AbstractArray, value::Number) =
+    is_gpu_array(field_data) ? convert(eltype(field_data), value) : value
+function _values_for_storage(field_data::AbstractArray, values::AbstractArray)
+    (is_gpu_array(field_data) && !is_gpu_array(values)) || return values
+    host = convert(AbstractArray{eltype(field_data)}, values)
+    return on_architecture(architecture(field_data), host)
 end
 
 # Data access and manipulation

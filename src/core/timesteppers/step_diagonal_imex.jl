@@ -31,6 +31,43 @@ Keys are `solver.state` indices; each value broadcasts against that field's
 coefficient array. An EMPTY map means the problem is purely explicit."""
 const DiagonalLMap = Dict{Int, AbstractArray}
 
+# Validate before any stage writes or history rotation. A singular mode may
+# belong to just one MPI rank, so all ranks must agree before the next FFT.
+function _check_diagonal_denominators!(state, operators, a0, shifts)
+    # Equation-derived multipliers belong to the solver. Reuse a successful
+    # check at fixed dt. An attached operator exposes mutable coefficients and
+    # must be checked even if the caller kept the same array and timestep.
+    data = state.timestepper_data
+    cacheable = get(data, :sdi_Lmap_src, nothing) === nothing
+    checked = get(data, :checked_diagonal_denominators, nothing)
+    if cacheable && checked !== nothing && checked.operators === operators &&
+       checked.a0 == a0 && checked.shifts == shifts
+        return nothing
+    end
+    fields = last(state.history)
+    _collectively(first(fields).dist, "diagonal implicit solve") do
+        for (i, Lhat) in operators, shift in shifts
+            T = real(eltype(Lhat))
+            a, b = T(a0), T(shift)
+            invalid = any(Lhat) do λ
+                d = a + b * λ
+                iszero(d) || !isfinite(d)
+            end
+            invalid && throw(ArgumentError(
+                "Singular or nonfinite implicit denominator for field $(fields[i].name) at this timestep."))
+        end
+    end
+    cacheable && (data[:checked_diagonal_denominators] = (; operators, a0, shifts))
+    return nothing
+end
+
+function _check_rk_diagonals!(state, operators, dt, AI)
+    shifts = unique(dt * AI[i, i] for i in axes(AI, 1) if !iszero(AI[i, i]))
+    _check_diagonal_denominators!(state, operators, 1.0, shifts)
+end
+
+_sbdf2_a0(w) = (1.0 + 2.0 * w) / (1.0 + w)
+
 """
     _serial_diagonal_imex_Lmap!(state, solver, scheme) -> DiagonalLMap
 
@@ -198,7 +235,7 @@ function _serial_rk_imex_combine!(dest, base, Fs::Tuple, Ys::Tuple,
         if Lhat !== nothing && !iszero(implicit[j])
             # Preserve ((-dt*a)*Lhat)*Y from the former AXPY kernel. Computing
             # Lhat*Y first can overflow even when the weighted result is finite.
-            scaled_L = Base.Broadcast.broadcasted(*, implicit[j], Lhat)
+            scaled_L = Base.Broadcast.broadcasted(*, real(eltype(Lhat))(implicit[j]), Lhat)
             terms = (terms..., Base.Broadcast.broadcasted(*, scaled_L, coeff_data!(Ys[j])))
             weights = (weights..., 1.0)
         end
@@ -211,7 +248,7 @@ function _serial_rk_imex_combine!(dest, base, Fs::Tuple, Ys::Tuple,
     dest.current_layout = :c
     target = get_coeff_data(dest)
     if Lhat !== nothing && !iszero(gamma)
-        denominator = Base.Broadcast.broadcasted(+, 1, Base.Broadcast.broadcasted(*, gamma, Lhat))
+        denominator = Base.Broadcast.broadcasted(+, 1, Base.Broadcast.broadcasted(*, real(eltype(Lhat))(gamma), Lhat))
         _rk_combine_arrays_divide!(target, src, terms, weights, denominator)
     else
         _rk_combine_arrays!(target, src, terms, weights)
@@ -230,6 +267,7 @@ function _step_diagonal_imex_rk_impl!(state::TimestepperState, solver::InitialVa
     b_imp = ts.b_implicit
     c = ts.c_explicit
     stages = ts.stages
+    _check_rk_diagonals!(state, Lmap, dt, AI)
 
     # Pooled per-stage storage: Y sets occupy workspace sets 1..stages, F sets
     # stages+1..2·stages (see `_workspace_count`). The F sets used to be fresh
@@ -256,7 +294,7 @@ function _step_diagonal_imex_rk_impl!(state::TimestepperState, solver::InitialVa
                 Tuple(Y_stages[j][k] for j in 1:(s-1)),
                 Tuple(dt * AE[s, j] for j in 1:(s-1)),
                 Tuple(-dt * AI[s, j] for j in 1:(s-1)), Lhat,
-                abs(AI[s, s]) > 1e-14 ? dt * AI[s, s] : 0.0)
+                dt * AI[s, s])
         end
         # The last stage's F is read by nothing when the tableau retires the
         # weighted update (see `_rk_final_stage_rhs_unused`) — the exit below
@@ -362,10 +400,13 @@ function step_diagonal_imex_sbdf2!(state::TimestepperState, solver::InitialValue
     iteration = state.timestepper_data[:ddi_sbdf2_iteration]::Int
     F_history = state.timestepper_data[:ddi_sbdf2_F_history]::Vector{Vector{ScalarField}}
 
+    startup = iteration == 0 || length(state.history) < 2
+    dt_prev = get_previous_timestep(state)
+    _check_diagonal_denominators!(state, Lmap, startup ? 1.0 : _sbdf2_a0(dt / dt_prev), (dt,))
     F_n = evaluate_rhs(solver, current_state, t)
     _group_rhs_coefficients!(F_n)
 
-    if iteration == 0 || length(state.history) < 2
+    if startup
         # Startup runs once: the copies below allocate, but every steady step
         # reuses the storage they seed via the recycle keys.
         new_state = copy_state(current_state)
@@ -381,8 +422,6 @@ function step_diagonal_imex_sbdf2!(state::TimestepperState, solver::InitialValue
         X_n = current_state
         X_nm1 = state.history[end-1]
         F_nm1 = F_history[end]
-
-        dt_prev = length(state.dt_history) >= 2 ? state.dt_history[end-1] : dt
 
         # Recycle the state dropped from the last history trim instead of a
         # fresh `copy_state` per step (the same pooling the RK sibling above
@@ -517,7 +556,7 @@ pure-Fourier basis (caller then leaves the field to the explicit fallback).
 function _diagonal_Lhat_from_expr(L_expr, field::ScalarField)
     cd = coeff_data!(field)
     cd === nothing && return nothing
-    # L̂ is ComplexF64: Laplacian/fractional/damping terms are real (−k², k²^α, const),
+    # L̂ is complex: Laplacian/fractional/damping terms are real (−k², k²^α, const),
     # but first-derivative terms contribute imaginary (ik)^order multipliers.
     # Allocate on the field's own device (via similar_zeros): compute_wavenumber_squared_grid
     # returns a device array on GPU, and the accumulation `@. Lhat += coeff*(-k2)` broadcasts
@@ -525,11 +564,11 @@ function _diagonal_Lhat_from_expr(L_expr, field::ScalarField)
     # equation-derived diagonal-IMEX operator build on a single GPU instead of throwing.
     lc = _local_coeff(cd)
     (L_expr === nothing || is_zero_expression(L_expr)) &&
-        return similar_zeros(lc, ComplexF64, size(lc)...)
+        return similar_zeros(lc, complex(eltype(lc)), size(lc)...)
 
     k2grid = compute_wavenumber_squared_grid(field)
     k2 = _local_coeff(k2grid)
-    Lhat = similar_zeros(k2, ComplexF64, size(k2)...)
+    Lhat = similar_zeros(k2, complex(eltype(k2)), size(k2)...)
     _accumulate_diagonal_L!(Lhat, k2, L_expr, 1.0, field) || return nothing
     return Lhat
 end
@@ -537,7 +576,7 @@ end
 """Accumulate the diagonal Fourier-space contribution of a linear operator
 expression into `Lhat` over the |k|² grid `k2`. Returns false on a term that is
 not diagonal in a pure-Fourier basis."""
-function _accumulate_diagonal_L!(Lhat, k2, expr, sgn::Float64, field::ScalarField)
+function _accumulate_diagonal_L!(Lhat, k2, expr, sgn::Number, field::ScalarField)
     if isa(expr, AddOperator)
         return _accumulate_diagonal_L!(Lhat, k2, expr.left, sgn, field) &&
                _accumulate_diagonal_L!(Lhat, k2, expr.right, sgn, field)
@@ -569,40 +608,41 @@ function _accumulate_diagonal_L!(Lhat, k2, expr, sgn::Float64, field::ScalarFiel
     end
 end
 
-"""Extract a real scalar from a `Number` or `ConstantOperator`; `nothing` otherwise."""
-_as_diagonal_scalar(x) = x isa Number ? Float64(x) :
-                         (isa(x, ConstantOperator) ? Float64(x.value) : nothing)
+_as_diagonal_scalar(x) = x isa Number ? x : (x isa ConstantOperator ? x.value : nothing)
+
+# A workspace field has the name, distributor and bases of its original component.
+_diagonal_self(op::ScalarField, field::ScalarField) =
+    op === field || (op.name == field.name && op.dist === field.dist && op.bases === field.bases)
+_diagonal_self(op::VectorField, field::ScalarField) =
+    any(component -> _diagonal_self(component, field), op.components)
+_diagonal_self(op, field::ScalarField) = false
 
 """Multiplier of an operator's operand relative to the field being stepped.
 The common bare-self operand is the scalar identity; composed operands use a
 device-matching scratch array. A cross-field or non-diagonal operand fails
 instead of being silently replaced by the stepped field."""
 function _diagonal_operand_multiplier(template, k2, operand, field::ScalarField)
-    if operand isa ScalarField
-        # `field` may be a workspace stand-in for the stepped variable rather
-        # than the variable object the equation was parsed against, so identity
-        # falls back to the name. Require the structure to match too: a
-        # parameter or coefficient field that merely shares a name is a
-        # cross-field term and must decline, not fold itself into the diagonal.
-        same = operand === field ||
-               (operand.name == field.name &&
-                operand.dist === field.dist &&
-                operand.bases === field.bases)
-        return same ? 1.0 : nothing
+    if operand isa Union{ScalarField,VectorField}
+        return _diagonal_self(operand, field) ? one(eltype(k2)) : nothing
     end
     multiplier = similar_zeros(template, eltype(template), size(template)...)
     _accumulate_diagonal_L!(multiplier, k2, operand, 1.0, field) || return nothing
     return multiplier
 end
 
-function _accumulate_diagonal_term!(Lhat, k2, coeff::Float64, op, field::ScalarField)
+function _accumulate_diagonal_term!(Lhat, k2, coeff::Number, op, field::ScalarField)
+    if field.dtype <: Real && !isreal(coeff)
+        throw(ArgumentError("An imaginary implicit coefficient requires a complex field ($(field.name))."))
+    end
+    coeff = isreal(coeff) ? eltype(k2)(real(coeff)) : eltype(Lhat)(coeff)
     if isa(op, FractionalLaplacian)
         operand_multiplier = _diagonal_operand_multiplier(Lhat, k2, op.operand, field)
         operand_multiplier === nothing && return false
-        α = op.α
+        α = eltype(k2)(op.α)
         if α < 0
             # Match the inverse fractional Laplacian's zero-mean convention.
-            @. Lhat += coeff * ifelse(k2 > 1e-14, k2 ^ α, 0.0) * operand_multiplier
+            threshold = eltype(k2)(1e-14)
+            @. Lhat += coeff * ifelse(k2 > threshold, k2 ^ α, 0) * operand_multiplier
         else
             @. Lhat += coeff * k2 ^ α * operand_multiplier
         end
@@ -614,27 +654,17 @@ function _accumulate_diagonal_term!(Lhat, k2, coeff::Float64, op, field::ScalarF
         # ∇²(∇²u) has multiplier (+k⁴), while ∇²(v) is cross-field coupling.
         @. Lhat += coeff * (-k2) * operand_multiplier
         return true
-    elseif isa(op, ScalarField)
-        # A bare field in L is a constant damping term μ·u ONLY when it is the
-        # field being stepped. A DIFFERENT field is a coupling term (e.g.
-        # `dt(u) + v = 0`), which is not a per-mode multiplier on u at all —
-        # folding it in as a constant would silently integrate a different
-        # equation. Mirrors the `is_self` guard on `Differentiate` below.
-        (op === field || op.name == field.name) || return false
+    elseif op isa Union{ScalarField,VectorField}
+        # A damping term contributes only to its own field or vector component.
+        _diagonal_self(op, field) || return false
         @. Lhat += coeff   # constant (e.g. linear damping μ·ζ)
         return true
     elseif isa(op, Differentiate)
-        # First/higher derivative of the time-stepped field itself is diagonal in
-        # Fourier space: multiplier (i·k_axis)^order. Only diagonal when the
-        # derivative acts on THIS field (a derivative of another variable is a
-        # coupling term, not representable as a scalar diagonal L̂).
-        operand = op.operand
-        is_self = operand === field ||
-                  (isa(operand, ScalarField) && operand.name == field.name)
-        is_self || return false
+        multiplier = _diagonal_operand_multiplier(Lhat, k2, op.operand, field)
+        multiplier === nothing && return false
         ikgrid = _diagonal_deriv_grid(field, op.coord, op.order)
         ikgrid === nothing && return false
-        @. Lhat += coeff * ikgrid
+        @. Lhat += coeff * ikgrid * multiplier
         return true
     end
     return false
@@ -655,44 +685,14 @@ function _diagonal_deriv_grid(field::ScalarField, coord::Coordinate, order::Int)
     basis = bases[axis]
     isa(basis, Union{RealFourier, ComplexFourier}) || return nothing
 
-    k_axis = if isa(basis, RealFourier)
-        _axis_uses_rfft(_field_transform_bundle(field), axis) ?
-            wavenumbers_rfft(basis) : wavenumbers_fft(basis)
-    else
-        wavenumbers(basis)
-    end
-
-    lc = _local_coeff(cd)
-    # Device-matching (see _diagonal_Lhat_from_expr): the reshape-broadcast of the
-    # 1-D wavenumber multiplier below accumulates into `out`, so on GPU it must live
-    # on the field's device — mirrors compute_wavenumber_squared_grid.
-    out = similar_zeros(lc, ComplexF64, size(lc)...)
-    if isa(cd, PencilArrays.PencilArray)
-        local_axes = PencilArrays.pencil(cd).axes_local
-        # Tuple(NoPermutation()) is `nothing`, NOT identity — guard before findfirst.
-        _perm_raw = Tuple(PencilArrays.permutation(cd))
-        perm_tuple = _perm_raw === nothing ? ntuple(identity, ndims(out)) : _perm_raw
-        lr = axis <= length(local_axes) ? local_axes[axis] : (1:length(k_axis))
-        ik = ComplexF64.((im .* Float64.(k_axis[lr])) .^ order)
-        paxis = findfirst(==(axis), perm_tuple)
-        paxis === nothing && (paxis = axis)
-        shp = ntuple(i -> i == paxis ? length(ik) : 1, ndims(out))
-        out .+= reshape(ik, shp...)
-    else
-        ik = ComplexF64.((im .* Float64.(k_axis)) .^ order)
-        # `out` lives on the field's device (similar_zeros above) but `ik` is a
-        # host Vector — broadcasting a host array into a CuArray kernel fails
-        # (non-isbits argument). Upload the 1-D multiplier first, mirroring
-        # add_wavenumber_squared_contribution! (fractional_laplacian.jl).
-        # Without this, any DiagonalIMEX GPU problem whose implicit L contains a
-        # derivative-of-self term (dt(u) + β*d(u,x) = …) died with an opaque
-        # GPU kernel-compilation error. (The PencilArray branch above keeps the
-        # host broadcast: PencilArrays are CPU-only in this framework.)
-        ik_dev = copy_to_device(ik, out)
-        shp = ntuple(i -> i == axis ? length(ik) : 1, ndims(out))
-        out .+= reshape(ik_dev, shp...)
-    end
-    return out
+    # Apply the same multiplier as the RHS to a unit coefficient grid. The
+    # coefficient wrapper carries the local mode ranges and axis permutation.
+    factors = similar(cd, complex(eltype(cd)))
+    fill!(factors, one(eltype(factors)))
+    uses_rfft = _axis_uses_rfft(_field_transform_bundle(field), axis)
+    _apply_spectral_derivative_distributed!(factors, basis, axis, order, field.dist;
+                                            uses_rfft, real_field=field.dtype <: Real)
+    return _local_coeff(factors)
 end
 
 """Build (and cache) the per-time-stepped-field diagonal L̂ operators."""
@@ -733,7 +733,8 @@ end
 # type-stable and allocation-free regardless of the abstract `_local_coeff`
 # return type or the `Dict` value type at the call site.
 @inline function _ddi_sbdf1_update!(d::AbstractArray, Lhat::AbstractArray, dt::Float64)
-    @inbounds @. d /= (1.0 + dt * Lhat)
+    h = real(eltype(d))(dt)
+    @inbounds @. d /= (1 + h * Lhat)
     return d
 end
 
@@ -743,9 +744,10 @@ end
     # Variable-dt SBDF2 (w = dtₙ/dtₙ₋₁): BDF2 implicit on the linear operator,
     # AB2 extrapolation of the nonlinear term. Reduces to the constant-dt scheme
     # (3/2, 2, -1/2, 2, -1) at w=1. Correct under CFL-adaptive timestepping.
-    a0 = (1.0 + 2.0 * w) / (1.0 + w)
-    a2 = w * w / (1.0 + w)
-    @inbounds @. d = ((1.0 + w) * dn - a2 * dnm1 + dt * ((1.0 + w) * fn - w * fnm1)) / (a0 + dt * Lhat)
+    T = real(eltype(d))
+    a0, a2 = T(_sbdf2_a0(w)), T(w * w / (1 + w))
+    h, ratio, plus = T(dt), T(w), T(1 + w)
+    @inbounds @. d = (plus * dn - a2 * dnm1 + h * (plus * fn - ratio * fnm1)) / (a0 + h * Lhat)
     return d
 end
 
@@ -755,9 +757,10 @@ dotting a `get_coeff_data(field)` call inside `@.` is what crashed this branch."
 @inline function _ddi_sbdf2_update_noL!(d::AbstractArray, dn::AbstractArray, dnm1::AbstractArray,
                                         fn::AbstractArray, fnm1::AbstractArray,
                                         dt::Float64, w::Float64)
-    a0 = (1.0 + 2.0 * w) / (1.0 + w)
-    a2 = w * w / (1.0 + w)
-    @inbounds @. d = ((1.0 + w) * dn - a2 * dnm1 + dt * ((1.0 + w) * fn - w * fnm1)) / a0
+    T = real(eltype(d))
+    a0, a2 = T(_sbdf2_a0(w)), T(w * w / (1 + w))
+    h, ratio, plus = T(dt), T(w), T(1 + w)
+    @inbounds @. d = (plus * dn - a2 * dnm1 + h * (plus * fn - ratio * fnm1)) / a0
     return d
 end
 
@@ -782,10 +785,13 @@ function step_distributed_diagonal_imex_sbdf2!(state::TimestepperState, solver::
     iteration = state.timestepper_data[:dd_imex_iter]::Int
     Fhist = state.timestepper_data[:dd_imex_Fhist]::Vector{Vector{ScalarField}}
 
+    startup = iteration == 0 || length(state.history) < 2
+    dt_prev = get_previous_timestep(state)
+    _check_diagonal_denominators!(state, Lhats, startup ? 1.0 : _sbdf2_a0(dt / dt_prev), (dt,))
     F_n = evaluate_rhs(solver, current_state, t)
     _group_rhs_coefficients!(F_n)
 
-    if iteration == 0 || length(state.history) < 2
+    if startup
         # SBDF1 startup: (1 + dt·L̂) X_new = X_n + dt·F_n
         new_state = copy_state(current_state)
         axpy_state!(dt, F_n, new_state)
@@ -801,7 +807,6 @@ function step_distributed_diagonal_imex_sbdf2!(state::TimestepperState, solver::
         _ddirk_push_recycle!(state, new_state)
         _ddi_sbdf2_push_fhist!(state, Fhist, F_n, length(F_n))
     else
-        dt_prev = length(state.dt_history) >= 2 ? state.dt_history[end-1] : dt
         w = dt / dt_prev   # variable-dt SBDF2 ratio (handles CFL-adaptive dt)
         X_n = current_state
         X_nm1 = state.history[end-1]
@@ -889,65 +894,60 @@ end
     return d
 end
 
-"""
-    step_distributed_diagonal_etd_rk222!(state, solver)
-
-ETDRK2 (Cox-Matthews 2002) with the linear operator treated diagonally per
-Fourier mode, for MPI pure-Fourier problems. Each time-stepped field is
-propagated as `Xₙ₊₁ = c + dt·φ₂⊙(N(c) − N(Xₙ))`, `c = exp(z)⊙Xₙ + dt·φ₁⊙N(Xₙ)`,
-with `z = -dt·L̂` element-wise. Algebraic variables are refreshed between stages.
-"""
-function step_distributed_diagonal_etd_rk222!(state::TimestepperState, solver::InitialValueSolver)
-    current_state = state.history[end]
+"""Apply ETD-RK2 or variable-step exponential AB2 to the local Fourier modes."""
+function _step_distributed_diagonal_etd!(state::TimestepperState, solver::InitialValueSolver,
+                                         multistep::Bool)
+    current = last(state.history)
     dt = state.dt
     t = solver.sim_time
     Lhats = _get_distributed_diagonal_Lhats!(state, solver)
     phis = _get_distributed_diagonal_phi!(state, dt, Lhats)
 
-    # N(Xₙ) must survive the corrector's second evaluate_rhs (which reuses buffers).
-    # Reuse a persistent 1-slot cache + coeff-copy instead of copy_state every step;
-    # only φ-fields (those read by the predictor/corrector) are written.
-    n_fields = length(current_state)
-    _Nn_src = evaluate_rhs(solver, current_state, t)
-    _group_rhs_coefficients!(_Nn_src)
-    N_n = _ddetd_nn_cache!(state, current_state, n_fields)
-    @inbounds for i in 1:n_fields
-        haskey(phis, i) || continue
-        fr = _Nn_src[i]
-        _ddirk_copy!(_local_coeff(get_coeff_data(N_n[i])), _local_coeff(coeff_data!(fr)))
-        N_n[i].current_layout = :c
-    end
-    _release_rhs_buffer!(_Nn_src, solver)   # N(Xₙ) is now in the cache; free the shared buffer
-                                            # before the corrector's evaluate_rhs reuses it.
-
-    # Predictor: c = exp(z)⊙Xₙ + dt·φ₁⊙N(Xₙ). `pred` reuses the history-dropped
-    # field-set (ETD is one-step — reads only history[end]=current_state — so the
-    # recycled set is provably not live) instead of a fresh copy_state.
-    pred = _ddirk_acquire_xnew!(state, current_state, n_fields)
-    for (i, field) in enumerate(pred)
-        haskey(phis, i) || continue
-        ensure_layout!(field, :c); ensure_layout!(current_state[i], :c); ensure_layout!(N_n[i], :c)
-        expz, ph1, _ = phis[i]
-        _ddetd_predictor!(_local_coeff(get_coeff_data(field)),
-                          _local_coeff(get_coeff_data(current_state[i])),
-                          expz, ph1, _local_coeff(get_coeff_data(N_n[i])), dt)
+    N = _timestep_field_state!(state, :dd_etd_current_N, current)
+    rhs = evaluate_rhs(solver, current, t)
+    try
+        _group_rhs_coefficients!(rhs)
+        for i in keys(phis)
+            _ddirk_copy!(_local_coeff(coeff_data!(N[i])), _local_coeff(coeff_data!(rhs[i])))
+        end
+    finally
+        _release_rhs_buffer!(rhs, solver)
     end
 
-    # Corrector: Xₙ₊₁ = c + dt·φ₂⊙(N(c) − N(Xₙ)), written in place into `pred`.
-    # evaluate_rhs refreshes pred's algebraic state internally (no separate refresh).
-    N_c = evaluate_rhs(solver, pred, t + dt)
-    _group_rhs_coefficients!(N_c)
-    for (i, field) in enumerate(pred)
-        haskey(phis, i) || continue
-        ensure_layout!(field, :c); ensure_layout!(N_c[i], :c); ensure_layout!(N_n[i], :c)
-        _, _, ph2 = phis[i]
-        _ddetd_corrector!(_local_coeff(get_coeff_data(field)), ph2,
-                          _local_coeff(get_coeff_data(N_c[i])),
-                          _local_coeff(get_coeff_data(N_n[i])), dt)
+    candidate = _ddirk_acquire_xnew!(state, current, length(current))
+    for (i, (E, phi1, _)) in phis
+        _ddetd_predictor!(_local_coeff(coeff_data!(candidate[i])),
+                          _local_coeff(coeff_data!(current[i])), E, phi1,
+                          _local_coeff(coeff_data!(N[i])), dt)
     end
-    _release_rhs_buffer!(N_c, solver)   # corrector RHS consumed; free the shared buffer
-    _refresh_algebraic_state!(solver.problem, pred)
-    _ddirk_push_recycle!(state, pred)
+
+    previous = get(state.timestepper_data, :dd_etd_previous_N, nothing)
+    use_history = multistep && previous !== nothing
+    if use_history
+        newer, older = N, previous
+        weight = dt * (dt / get_previous_timestep(state))
+    else
+        state.current_substep = 2
+        newer, older = evaluate_rhs(solver, candidate, t + dt), N
+        weight = dt
+    end
+    try
+        use_history || _group_rhs_coefficients!(newer)
+        for (i, (_, _, phi2)) in phis
+            _ddetd_corrector!(_local_coeff(coeff_data!(candidate[i])), phi2,
+                              _local_coeff(coeff_data!(newer[i])),
+                              _local_coeff(coeff_data!(older[i])), weight)
+        end
+    finally
+        use_history || _release_rhs_buffer!(newer, solver)
+    end
+    _refresh_algebraic_state!(solver.problem, candidate)
+    _ddirk_push_recycle!(state, candidate)
+    if multistep
+        state.timestepper_data[:dd_etd_current_N] = _timestep_field_state!(state, :dd_etd_previous_N, N)
+        state.timestepper_data[:dd_etd_previous_N] = N
+    end
+    return nothing
 end
 
 # ============================================================================
@@ -977,6 +977,7 @@ function step_distributed_diagonal_imex_rk!(state::TimestepperState, solver::Ini
     S = ts.stages
     AE = ts.A_explicit; AI = ts.A_implicit
     bE = ts.b_explicit; bI = ts.b_implicit; cc = ts.c_explicit
+    _check_rk_diagonals!(state, Lhats, dt, AI)
 
     n_fields = length(X_n)
     Ys = Vector{Vector{ScalarField}}(undef, S)   # stage states (workspace-backed)
@@ -1152,23 +1153,6 @@ function _ddirk_push_recycle!(state::TimestepperState, X_new)
     return state.history
 end
 
-"""Persistent single field-set holding N(Xₙ) across the ETD corrector's second
-`evaluate_rhs` (which reuses buffers), reused every step in place of
-`copy_state(evaluate_rhs(...))`. Mirrors `_ddirk_fs_cache!` with one set; the
-caller writes only φ-fields, non-φ slots are never read. (Re)built on missing set
-or field-count change."""
-function _ddetd_nn_cache!(state::TimestepperState, template, n_fields::Int)
-    cache = get!(() -> Vector{ScalarField}[],
-                 state.timestepper_data, :_ddetd_Nn)::Vector{Vector{ScalarField}}
-    if isempty(cache) || length(cache[1]) != n_fields
-        for f in template
-            isempty(f.bases) || ensure_layout!(f, :c)
-        end
-        empty!(cache)
-        push!(cache, copy_state(template))
-    end
-    return cache[1]
-end
 
 """Push a copy of `F_n` onto the rolling-2 SBDF2 `Fhist`, reusing the field-set
 dropped from `Fhist` on the previous step (stashed under `:_ddi_sbdf2_frec`) in

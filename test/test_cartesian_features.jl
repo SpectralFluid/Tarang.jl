@@ -170,68 +170,20 @@ end
 
 # -----------------------------------------------------------------------
 @testset "CNLF2 variable timestep" begin
-    # Test that the coefficient formulas are correct for constant dt (w1=1)
-    @testset "Constant dt coefficients reduce to standard CNLF" begin
-        dt = 0.01
-        w1 = 1.0  # constant dt
+    h = 0.01
+    @test Tarang._cnlf2_coefs(h, h) ==
+          ((1/(2h), 0.0, -1/(2h)), (0.5, 0.0, 0.5), (0.0, 1.0, 0.0))
 
-        # CNLF2 coefficients
-        a1 = 1.0 / ((1.0 + w1) * dt)
-        a2 = (w1 - 1.0) / dt
-        a3 = -w1^2 / ((1.0 + w1) * dt)
-
-        b1 = 1.0 / (2.0 * w1)
-        b2 = (1.0 - 1.0 / w1) / 2.0
-        b3 = 1.0 / 2.0
-
-        # For w1=1: a1 = 1/(2*dt), a2 = 0, a3 = -1/(2*dt)
-        @test isapprox(a1, 1.0 / (2.0 * dt); atol=1e-14)
-        @test isapprox(a2, 0.0; atol=1e-14)
-        @test isapprox(a3, -1.0 / (2.0 * dt); atol=1e-14)
-
-        # For w1=1: b1 = 0.5, b2 = 0, b3 = 0.5
-        @test isapprox(b1, 0.5; atol=1e-14)
-        @test isapprox(b2, 0.0; atol=1e-14)
-        @test isapprox(b3, 0.5; atol=1e-14)
-    end
-
-    @testset "Variable dt coefficients (w1=2)" begin
-        dt = 0.01
-        w1 = 2.0  # dt_current = 2*dt_previous
-
-        a1 = 1.0 / ((1.0 + w1) * dt)
-        a2 = (w1 - 1.0) / dt
-        a3 = -w1^2 / ((1.0 + w1) * dt)
-
-        b1 = 1.0 / (2.0 * w1)
-        b2 = (1.0 - 1.0 / w1) / 2.0
-        b3 = 1.0 / 2.0
-
-        # Verify coefficients satisfy consistency: a1 + a2 + a3 = 0
-        # (mass matrix terms must cancel for steady state)
-        @test isapprox(a1 + a2 + a3, 0.0; atol=1e-14)
-
-        # Verify b coefficients sum to 1 (for implicit consistency)
-        @test isapprox(b1 + b2 + b3, 1.0; atol=1e-14)
-    end
-
-    @testset "Coefficient consistency for arbitrary w1" begin
-        dt = 0.01
-        for w1 in [0.5, 0.8, 1.0, 1.5, 2.0, 3.0]
-            a1 = 1.0 / ((1.0 + w1) * dt)
-            a2 = (w1 - 1.0) / dt
-            a3 = -w1^2 / ((1.0 + w1) * dt)
-
-            b1 = 1.0 / (2.0 * w1)
-            b2 = (1.0 - 1.0 / w1) / 2.0
-            b3 = 1.0 / 2.0
-
-            # Mass conservation: a1 + a2 + a3 = 0
-            @test isapprox(a1 + a2 + a3, 0.0; atol=1e-13) broken=(false)
-
-            # Implicit consistency: b1 + b2 + b3 = 1
-            @test isapprox(b1 + b2 + b3, 1.0; atol=1e-13)
-        end
+    for ratio in (0.5, 0.8, 1.0, 1.5, 2.0, 3.0)
+        k = h / ratio
+        a, b, c = Tarang._cnlf2_coefs(h, k)
+        # The outer difference and both quadratures must reproduce a linear
+        # function on [−k,h]. F is known only at t=0 and t=−k.
+        @test a == (1/(k+h), 0.0, -1/(k+h))
+        @test sum(b) ≈ 1
+        @test sum(c) ≈ 1
+        @test b[1]*h - b[3]*k ≈ (h-k)/2 atol=1e-15
+        @test -c[3]*k ≈ (h-k)/2 atol=1e-15
     end
 end
 

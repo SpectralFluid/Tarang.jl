@@ -44,9 +44,9 @@ synchronize_device!(arch::AbstractArchitecture) = nothing  # no-op fallback; CUD
     DistributedGPUConfig(comm, global_shape; decomp_dim=length(global_shape),
                          cuda_aware_mpi=false, device_id=nothing)
 
-Configuration for distributed GPU computing. `device_id` optionally names the
-CUDA device the decomposed arrays live on; by default each local transform runs
-on the device of the array it is given.
+Configuration for distributed GPU computing. Local transforms use the device that owns each array.
+An explicit `device_id` is zero-based. The historical `cuda_aware_mpi` keyword
+indicates that MPI can exchange buffers for the selected backend.
 """
 mutable struct DistributedGPUConfig <: AbstractDistributedGPUConfig
     # MPI info
@@ -102,7 +102,7 @@ function _distributed_fft_device_id(data_device_id::Integer,
                                     configured_device_id::Union{Nothing, Integer})
     if configured_device_id !== nothing && configured_device_id != data_device_id
         throw(ArgumentError(
-            "DistributedGPUFFT: the data lives on CUDA device $data_device_id, but its " *
+            "DistributedGPUFFT: the data lives on GPU device $data_device_id, but its " *
             "DistributedGPUConfig was built for device $configured_device_id."))
     end
     return Int(data_device_id)

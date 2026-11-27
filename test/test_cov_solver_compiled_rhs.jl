@@ -22,8 +22,7 @@ struct _BareExpr end
 
 # ---------------------------------------------------------------------------
 # Helpers to build a simple serial Fourier field and seed grid data.
-# RealFourier with a small size keeps us on the un-padded grid-multiply path
-# (the spectral dealiased product only kicks in for prod(size) > 64).
+# Disable padding to exercise the pointwise grid-multiply path.
 #
 # CRITICAL: field arithmetic (a + b, a * b) requires the operands to share the
 # SAME basis object — two separately-constructed RealFourier bases are NOT == .
@@ -31,7 +30,7 @@ struct _BareExpr end
 # ---------------------------------------------------------------------------
 const _COORDS = T.CartesianCoordinates("x")
 const _DIST = T.Distributor(_COORDS; mesh=(1,), dtype=Float64)
-const _XB = T.RealFourier(_COORDS["x"]; size=8, bounds=(0.0, 2pi))
+const _XB = T.RealFourier(_COORDS["x"]; size=8, bounds=(0.0, 2pi), dealias=1.0)
 
 function make_field(name; dtype=Float64)
     f = T.ScalarField(_DIST, name, (_XB,), dtype)

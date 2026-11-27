@@ -46,6 +46,29 @@ function msrev_mpi_run(stepper, dts)
 end
 
 @testset "MPI multistep review regressions" begin
+@testset "An inconsistent mode rejects the step on every rank" begin
+    coords = CartesianCoordinates("z", "x")
+    dist = Distributor(coords; comm=MSREV_COMM, dtype=Float64)
+    zb = ChebyshevT(coords["z"]; size=8, bounds=(0.0, 1.0))
+    xb = RealFourier(coords["x"]; size=12, bounds=(0.0, 2π))
+    domain = Domain(dist, (zb, xb))
+    for (ts, rejected_dt) in ((SBDF1(), 1.0), (RK111(), 1.0), (RKSMR(), 6.0))
+        u = ScalarField(domain, "u")
+        fill!(parent(grid_data!(u)), 1)
+        problem = InitialValueProblem([u])
+        add_equation!(problem, "dt(u) - u = 0")
+        solver = InitialValueSolver(problem, ts; dt=0.25)
+        @test_throws Exception step!(solver, rejected_dt)
+        @test solver.iteration == 0
+        @test solver.sim_time == 0.0
+        @test maximum(abs, parent(grid_data!(u)) .- 1) < 1e-12
+        step!(solver, 0.25)
+        expected = ts isa RKSMR ? prod((1 + 0.25a)/(1 - 0.25b)
+            for (a, b) in zip((29/96, -3/40, 1/6), (37/160, 5/24, 1/6))) : 4/3
+        @test maximum(abs, parent(grid_data!(u)) .- expected) < 1e-12
+    end
+end
+
 @testset "MPI MCNAB2/CNLF2 subproblem order" begin
     for ts in (Tarang.MCNAB2(), Tarang.CNLF2())
         coarse = msrev_mpi_run(ts, fill(0.1, 10))

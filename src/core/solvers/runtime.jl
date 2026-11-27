@@ -6,6 +6,16 @@
 # sync public variables, then advance solver clocks/statistics.
 # -----------------------------------------------------------------------------
 
+"""Return a timestep that advances the Float64 simulation clock to a finite time."""
+@inline function _checked_timestep(dt::Real, t::Float64)
+    h = Float64(dt)
+    isfinite(h) && h > 0 || throw(ArgumentError("dt must be finite and positive, got $dt"))
+    target = t + h
+    isfinite(target) && target > t ||
+        throw(ArgumentError("dt=$h cannot advance the simulation clock from t=$t to a finite later time"))
+    return h
+end
+
 """
     _refresh_step_boundary_conditions!(solver, dt)
 

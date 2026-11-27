@@ -163,12 +163,7 @@ function step_rk_imex!(state::TimestepperState, solver::InitialValueSolver; ts::
     M_factor = has_mass ? _get_mass_factor!(state, M_matrix) : nothing
     M_is_singular = has_mass && M_factor === nothing
     zero_mass_rows = if M_is_singular
-        cached = get(state.timestepper_data, :imex_rk_zero_mass_rows, nothing)
-        if cached === nothing || cached[1] !== M_matrix
-            cached = (M_matrix, _zero_mass_rows(M_matrix))
-            state.timestepper_data[:imex_rk_zero_mass_rows] = cached
-        end
-        cached[2]
+        _global_zero_mass_rows!(state, M_matrix)
     else
         Int[]
     end
@@ -243,8 +238,7 @@ function step_rk_imex!(state::TimestepperState, solver::InitialValueSolver; ts::
         a_ii = A_imp[s, s]
         if M_is_singular && abs(a_ii) >= 1e-14
             _refresh_bcs_for_stage!(solver, t + ts.c_implicit[s] * dt)
-            _apply_global_algebraic_rhs!(rhs_vec, solver.problem, zero_mass_rows)
-            rhs_vec[zero_mass_rows] .*= dt * a_ii
+            _apply_global_algebraic_rhs!(rhs_vec, state, solver.problem, zero_mass_rows, dt * a_ii)
         end
         if !has_mass
             if abs(a_ii) < 1e-14
@@ -349,7 +343,7 @@ function _solve_constrained_mass_update!(dest::AbstractVector{ComplexF64},
     lhs_solver, zero_rows = _get_constrained_mass_solver!(state, M_matrix, L_matrix)
     constrained_rhs = _timestep_vector_buffer!(state, :imex_rk_constrained_rhs, length(rhs))
     copyto!(constrained_rhs, rhs)
-    _apply_global_algebraic_rhs!(constrained_rhs, solver.problem, zero_rows)
+    _apply_global_algebraic_rhs!(constrained_rhs, state, solver.problem, zero_rows, 1.0)
     _rk_ldiv!(dest, lhs_solver, constrained_rhs)
     return dest
 end
@@ -360,7 +354,7 @@ function _get_constrained_mass_solver!(state::TimestepperState,
     cache = state.timestepper_data
     if get(cache, :imex_rk_constrained_M_source, nothing) !== M_matrix ||
        get(cache, :imex_rk_constrained_L_source, nothing) !== L_matrix
-        zero_rows = _zero_mass_rows(M_matrix)
+        zero_rows = _global_zero_mass_rows!(state, M_matrix)
         constrained_mass = _constrained_mass_matrix(M_matrix, L_matrix, zero_rows)
         cache[:imex_rk_constrained_mass_solver] = _factorize_timestep_matrix(constrained_mass)
         cache[:imex_rk_constrained_mass_rows] = zero_rows
@@ -368,19 +362,6 @@ function _get_constrained_mass_solver!(state::TimestepperState,
         cache[:imex_rk_constrained_L_source] = L_matrix
     end
     return cache[:imex_rk_constrained_mass_solver], cache[:imex_rk_constrained_mass_rows]::Vector{Int}
-end
-
-function _zero_mass_rows(M::AbstractMatrix)
-    rows = Int[]
-    for i in axes(M, 1)
-        row_max = zero(real(eltype(M)))
-        for j in axes(M, 2)
-            row_max = max(row_max, abs(M[i, j]))
-            row_max > 1e-14 && break
-        end
-        row_max <= 1e-14 && push!(rows, i)
-    end
-    return rows
 end
 
 function _zero_mass_columns(M::AbstractMatrix)
@@ -444,47 +425,58 @@ function _augmented_constrained_mass_matrix(M::AbstractMatrix,
     return constrained
 end
 
-# Write the target value of each algebraic constraint into its RHS slot. After
-# the row-swap, a zero-M row enforces `L_row * X = value`; this fills in `value`
-# from each equation's F term (constraints default to 0, e.g. div(u)=0).
+# The implicit matrix has scale*L on its zero-M rows. Replace the stage or
+# multistep history there with the constraint target at the new state.
 function _apply_global_algebraic_rhs!(rhs::AbstractVector{ComplexF64},
+                                      state::TimestepperState,
                                       problem::Problem,
-                                      zero_rows::Vector{Int})
+                                      zero_rows::Vector{Int},
+                                      scale::Float64)
     isempty(zero_rows) && return rhs
-    fill!(view(rhs, zero_rows), zero(ComplexF64))
+    for row in zero_rows
+        rhs[row] = 0
+    end
 
-    isempty(problem.equation_data) && return rhs
-
-    zero_row_set = Set(zero_rows)
     offset = 0
-    for eq_data in problem.equation_data
-        eq_size = compute_field_size(eq_data)
-        if eq_size <= 0
-            continue
-        end
-
-        M_expr = get(eq_data, "M", nothing)
-        is_alg = M_expr === nothing || _is_zero_m_term(M_expr)
-        if is_alg
-            value = _global_algebraic_rhs_value(eq_data)
-            if value != 0
-                eq_size == 1 || throw(ArgumentError(
-                    "Legacy global IMEX RK cannot project a nonzero algebraic " *
-                    "right-hand side across $eq_size spectral coefficients. " *
-                    "Use the per-subproblem path or rewrite the constraint as " *
-                    "homogeneous; refusing to broadcast one scalar into every " *
-                    "coefficient and return a plausible wrong field."))
-                @inbounds for local_row in 1:eq_size
-                    row = offset + local_row
-                    if row in zero_row_set
-                        rhs[row] = value
-                    end
+    for equation in problem.equation_data
+        n = equation.equation_size
+        if n > 0 && _is_zero_m_term(equation.mass)
+            value = _global_algebraic_rhs_value(equation)
+            if !iszero(value)
+                unit = n == 1 ? (1.0,) : _global_algebraic_rhs_unit!(state, equation)
+                first_row = searchsortedfirst(zero_rows, offset + 1)
+                last_row = searchsortedlast(zero_rows, offset + n)
+                for i in first_row:last_row
+                    row = zero_rows[i]
+                    rhs[row] = (scale * value) * unit[row - offset]
                 end
             end
         end
-        offset += eq_size
+        offset += n
     end
     return rhs
+end
+
+function _global_algebraic_rhs_unit!(state::TimestepperState, equation::EquationIR)
+    units = get!(() -> IdDict{EquationIR,Vector{ComplexF64}}(),
+                 state.timestepper_data, :global_algebraic_rhs_units)
+    return get!(units, equation) do
+        n = equation.equation_size
+        for variable in get(equation, "equation_variables", ())
+            components = scalar_components(variable)
+            if _coeff_space_dofs(variable) == n
+                return ComplexF64.(vcat((vec(_unit_constant_coefficients(c)) for c in components)...))
+            end
+            for component in components
+                if _coeff_space_dofs(component) == n
+                    return ComplexF64.(vec(_unit_constant_coefficients(component)))
+                end
+            end
+        end
+        throw(ArgumentError("Global IMEX cannot project a nonzero algebraic right-hand side " *
+                            "onto the $n coefficient rows of `$(get(equation, "equation_string", ""))`. " *
+                            "Use a per-subproblem solve or a constraint with a supported row layout."))
+    end
 end
 
 function _global_algebraic_rhs_value(eq_data)
@@ -500,7 +492,7 @@ function _global_algebraic_rhs_value(eq_data)
         return ComplexF64(_extract_scalar(F_expr))
     else
         throw(ArgumentError(
-            "Legacy global IMEX RK cannot evaluate algebraic right-hand side " *
+            "Global IMEX cannot evaluate algebraic right-hand side " *
             "$(repr(F_expr)). Use a homogeneous constraint, a numeric scalar " *
             "row, or the per-subproblem path; refusing to enforce it as zero."))
     end
@@ -603,13 +595,15 @@ end
 
 function _rk_combine_arrays!(dest, base, terms::Tuple, weights::Tuple)
     length(terms) == length(weights) || throw(DimensionMismatch("RK weights and stages"))
-    dest .= ((x, values...) -> _rk_weighted_value(x, weights, values)).(base, terms...)
+    native_weights = map(real(eltype(dest)), weights)
+    dest .= ((x, values...) -> _rk_weighted_value(x, native_weights, values)).(base, terms...)
     return dest
 end
 
 function _rk_combine_arrays_divide!(dest, base, terms::Tuple, weights::Tuple, denominator)
     length(terms) == length(weights) || throw(DimensionMismatch("RK weights and stages"))
-    dest .= ((x, d, values...) -> _rk_weighted_value(x, weights, values) / d).(base, denominator, terms...)
+    native_weights = map(real(eltype(dest)), weights)
+    dest .= ((x, d, values...) -> _rk_weighted_value(x, native_weights, values) / d).(base, denominator, terms...)
     return dest
 end
 

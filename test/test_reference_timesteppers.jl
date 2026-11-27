@@ -1,6 +1,12 @@
 using Test
 using Tarang
 
+isdefined(@__MODULE__, :check_fourier_timestepper_cases) ||
+    include(joinpath(@__DIR__, "timestepper_fourier_cases.jl"))
+@testset "CPU Fourier timestepper regressions" begin
+    check_fourier_timestepper_cases(CPU())
+end
+
 @testset "Documented timestepper stability limits" begin
     @testset "RKGFY has Crank-Nicolson stiff amplification" begin
         for h in (0.1, 10.0, 1.0e4)

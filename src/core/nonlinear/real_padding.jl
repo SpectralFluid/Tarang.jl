@@ -12,6 +12,7 @@ mutable struct RealPaddedDealiasingWorkspace{R,C,PF,PB,SF,SB} <: AbstractNonline
     padded2::R
     padded_spectrum::C
     spectrum::C
+    extended_grid::Union{Nothing,R}
     plan_forward::PF
     plan_backward::PB
     plan_spec_forward::SF
@@ -21,7 +22,7 @@ mutable struct RealPaddedDealiasingWorkspace{R,C,PF,PB,SF,SB} <: AbstractNonline
 end
 
 # The workspace owns these input spectra and permits inverse FFTs to destroy
-# them. CUDA specializes these hooks to avoid its normal input-preservation copy.
+# them. cuFFT and rocFFT can skip their usual input-preservation copy.
 _plan_padded_inverse(forward, spectrum, n, dims) = plan_irfft(spectrum, n, dims)
 _padded_inverse!(dst, plan, src) = mul!(dst, plan, src)
 _padded_plan_spectrum(forward, arch, ::Type{T}, shape) where T = zeros(arch, Complex{T}, shape...)
@@ -54,20 +55,17 @@ end
 function _get_real_padded_workspace!(ev, bases, ::Type{T}) where T
     key = (hash(bases), T, hash(:real_padded), _padded_architecture_key(ev.dist.architecture))
     haskey(ev.pencil_transforms, key) && return ev.pencil_transforms[key]
-    dims = findall(b -> b isa Union{RealFourier,ComplexFourier}, collect(bases))
+    shape, padded, dims, cosine_dims = _product_fft_layout(bases, ev.dealiasing_factor)
     isempty(dims) && return nothing
-    shape = map(b -> b.meta.size, bases)
-    (length(shape) > 3 || minimum(shape[d] for d in dims) <= 4) && return nothing
-    padded = ntuple(length(shape)) do d
-        d in dims ? 2cld(ceil(Int, _axis_dealias_factor(bases[d], ev.dealiasing_factor)*shape[d]), 2) : shape[d]
-    end
+    length(shape) > 3 && return nothing
     rdim = first(dims)
     half(s) = ntuple(d -> d == rdim ? s[d] ÷ 2 + 1 : s[d], length(s))
     arch = ev.dist.architecture
     a, b = zeros(arch, T, padded...), zeros(arch, T, padded...)
     original = zeros(arch, T, shape...)
     pf, pb, sf, sb, ps, s = _real_padded_fft_plans(arch, a, original, half(padded), half(shape), dims)
-    ws = RealPaddedDealiasingWorkspace(shape, padded, dims, a, b, ps, s, pf, pb, sf, sb, arch, nothing)
+    extended = isempty(cosine_dims) ? nothing : original
+    ws = RealPaddedDealiasingWorkspace(shape, padded, dims, a, b, ps, s, extended, pf, pb, sf, sb, arch, nothing)
     ev.pencil_transforms[key] = ws
     return ws
 end
@@ -97,42 +95,58 @@ end
     @inbounds out[I...] = valid ? weight * src[J...] : zero(eltype(out))
 end
 
-# Fold all Nyquist images. Negative reduced-axis frequencies are implicit:
-# reflecting that axis requires conjugating and reflecting EVERY Fourier axis.
+# Gather a coefficient while folding downsampled Nyquist planes. A nonzero
+# rdim identifies the reduced axis of a real FFT, zero denotes a full spectrum.
+# When a grid axis grows, its old even Nyquist is dropped by the grid-resize
+# convention. Nonlinear padding has a separate splitting convention.
+@inline function _resized_fourier_coefficient(src, I, dstshape, srcshape, fourier, rdim)
+    modes = I
+    folds = 0
+    for d in 1:length(I)
+        fourier[d] || continue
+        k = I[d] - 1
+        if d != rdim && k > dstshape[d] ÷ 2
+            k -= dstshape[d]
+        end
+        if dstshape[d] > srcshape[d] && abs(k) > (srcshape[d] - 1) ÷ 2
+            return zero(eltype(src))
+        end
+        if srcshape[d] > dstshape[d] && iseven(dstshape[d]) && k == dstshape[d] ÷ 2
+            folds |= 1 << (d - 1)
+        end
+        modes = Base.setindex(modes, k, d)
+    end
+
+    total = zero(eltype(src))
+    images = folds
+    while true
+        # A negative frequency on the reduced axis lives in the conjugate
+        # half. Reflect every Fourier axis to address it in stored memory.
+        reflect = rdim != 0 && !iszero(images & (1 << (rdim - 1)))
+        J = I
+        for d in 1:length(I)
+            fourier[d] || continue
+            k = iszero(images & (1 << (d - 1))) ? modes[d] : -modes[d]
+            k = reflect ? -k : k
+            J = Base.setindex(J, k < 0 ? srcshape[d] + k + 1 : k + 1, d)
+        end
+        @inbounds value = src[J...]
+        total += reflect ? conj(value) : value
+        iszero(images) && break
+        images = (images - 1) & folds
+    end
+    return total
+end
+
 @kernel function _truncate_real_spectrum_kernel!(out, @Const(src), shape, padded, fourier, rdim)
     I = @index(Global, NTuple)
-    total = zero(eltype(out))
-    for mask in 0:((1 << length(shape)) - 1)
-        K = I
-        valid = true
-        for d in 1:length(shape)
-            negative = !iszero(mask & (1 << (d - 1)))
-            if fourier[d]
-                k = I[d] - 1
-                if d != rdim && k > shape[d] ÷ 2
-                    k -= shape[d]
-                end
-                split = iseven(shape[d]) && k == shape[d] ÷ 2 && padded[d] > shape[d]
-                valid &= !negative || split
-                K = Base.setindex(K, negative ? -k : k, d)
-            else
-                valid &= !negative
-            end
-        end
-        if valid
-            reflect = K[rdim] < 0
-            J = I
-            for d in 1:length(shape)
-                if fourier[d]
-                    k = reflect ? -K[d] : K[d]
-                    J = Base.setindex(J, k < 0 ? padded[d] + k + 1 : k + 1, d)
-                end
-            end
-            @inbounds value = src[J...]
-            total += reflect ? conj(value) : value
-        end
-    end
-    @inbounds out[I...] = total
+    @inbounds out[I...] = _resized_fourier_coefficient(src, I, shape, padded, fourier, rdim)
+end
+
+@kernel function _resize_grid_spectrum!(out, @Const(src), dstshape, srcshape, scale, rdim)
+    I = @index(Global, NTuple)
+    fourier = ntuple(_ -> true, Val(length(I)))
+    @inbounds out[I...] = scale * _resized_fourier_coefficient(src, I, dstshape, srcshape, fourier, rdim)
 end
 
 function _real_pad!(ws, src)
@@ -169,6 +183,10 @@ function _real_operand_spectrum!(ws, field)
     else
         ensure_layout!(field, :g)
         src = on_architecture(ws.arch, get_local_data(get_grid_data(field)))
+        if ws.extended_grid !== nothing
+            _extend_lobatto_grid!(ws.arch, ws.extended_grid, src)
+            src = ws.extended_grid
+        end
         mul!(ws.spectrum, ws.plan_spec_forward, src)
     end
     return ws.spectrum
@@ -201,8 +219,10 @@ function evaluate_padded_multiply(a::ScalarField, b::ScalarField, ev::NonlinearE
         return result
     end
     dst = get_local_data(grid_data!(result))
-    _padded_inverse!(dst, ws.plan_spec_backward, ws.spectrum)
-    dst .*= scale
+    grid = something(ws.extended_grid, dst)
+    _padded_inverse!(grid, ws.plan_spec_backward, ws.spectrum)
+    values = _lobatto_grid_view(grid, dst)
+    @. dst = values * scale
     result.current_layout = :g
     ensure_layout!(result, result_layout)
     return result

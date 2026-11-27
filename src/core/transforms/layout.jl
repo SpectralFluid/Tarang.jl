@@ -311,8 +311,7 @@ end
 Index map carrying a full FFT spectrum formed on `n_src` uniform points to the
 spectrum the same field has on `n_dst` points, as `(pos_src, pos_dst)`,
 `(neg_src, neg_dst)` and `(fold_src, fold_dst)` slices (empty when unused). This is
-THE resampling rule: the backward transform into a scaled grid and the device grid
-resample (`_resample_axis_pairs`) are built from it, and the CPU grid resample
+the full-spectrum convention used for backward transforms and grid resizing. The CPU grid resample
 `resample_1d!` follows it.
 
 - Upsampling from even `n_src` DROPS the source Nyquist bin: it stands for both

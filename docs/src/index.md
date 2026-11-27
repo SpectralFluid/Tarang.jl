@@ -31,7 +31,7 @@
 <div style="background: white; border: 1px solid #e2e8f0; border-radius: 12px; padding: 1.5rem;">
     <h3 style="color: #7c3aed; margin-top: 0;">GPU Acceleration</h3>
     <ul style="margin: 0; padding-left: 1.25rem; color: #475569;">
-        <li>Native CUDA support with cuFFT</li>
+        <li>NVIDIA cuFFT and AMD rocFFT</li>
         <li>KernelAbstractions.jl backend</li>
         <li>Automatic CPU/GPU dispatch</li>
     </ul>
@@ -112,11 +112,11 @@ julia --project=. -e 'using Pkg; Pkg.add("MPI"); using MPI; MPI.install_mpiexecj
 On native Windows, launch through `MPI.mpiexec()` as shown in the
 [installation guide](getting_started/installation.md).
 
-GPU support is the one opt-in: CUDA is a weak dependency loaded through a package extension, so
-add it only if you want it.
+GPU support is optional. Install AMDGPU.jl for AMD ROCm or CUDA.jl for NVIDIA.
 
 ```bash
 julia --project=@v#.# -e 'using Pkg; Pkg.add("CUDA")' # enables TarangCUDAExt
+julia --project=@v#.# -e 'using Pkg; Pkg.add("AMDGPU")' # enables TarangAMDGPUExt
 ```
 
 ### 1D Diffusion
@@ -244,9 +244,7 @@ field = ScalarField(domain, "u")
 forward_transform!(field)   # Uses cuFFT automatically
 ```
 
-`device` is the only line that changes: the same script with `device=CPU()` runs on the CPU, and
-`dtype=Float32` gives `ComplexF32` coefficients either way. `GPU()` needs CUDA.jl loaded — without
-it the constructor throws rather than silently falling back.
+For AMD, load `using Tarang, AMDGPU` and pass `device=GPU(backend=:amdgpu)` to the same domain constructor. Use `device=CPU()` for a CPU run. All three backends produce `ComplexF32` Fourier coefficients for `dtype=Float32`.
 
 ---
 

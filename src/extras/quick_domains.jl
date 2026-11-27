@@ -30,9 +30,10 @@ domain = PeriodicDomain(64, 64, 64; L=(1.0, 1.0, 1.0))
 domain = PeriodicDomain(256, 256; device=GPU())
 ```
 """
-function PeriodicDomain(N::Integer...; L=nothing, dtype::Type=Float64,
+function PeriodicDomain(N::Integer...; L=nothing,
                         device::Union{AbstractArchitecture, Nothing}=nothing,
-                        arch::AbstractArchitecture=CPU(), dealias::Real=3/2)
+                        arch::AbstractArchitecture=CPU(),
+                        dtype::Type=_default_field_dtype(something(device, arch)), dealias::Real=3/2)
     arch = device !== nothing ? device : arch
     ndim = length(N)
     if ndim < 1 || ndim > 3
@@ -71,8 +72,8 @@ domain = ChebyshevDomain(64)
 domain = ChebyshevDomain(64, 64; bounds=((0.0, 1.0), (0.0, 2.0)))
 ```
 """
-function ChebyshevDomain(N::Integer...; bounds=nothing, dtype::Type=Float64,
-                         arch::AbstractArchitecture=CPU(), dealias::Real=1.0)
+function ChebyshevDomain(N::Integer...; bounds=nothing, arch::AbstractArchitecture=CPU(),
+                         dtype::Type=_default_field_dtype(arch), dealias::Real=1.0)
     ndim = length(N)
     if ndim < 1 || ndim > 3
         throw(ArgumentError("ChebyshevDomain supports 1D, 2D, or 3D (got $(ndim)D)"))
@@ -107,7 +108,7 @@ T = ScalarField(domain, "T")
 ```
 """
 function ChannelDomain(Nx::Integer, Nz::Integer; Lx::Real=2π, Lz::Real=2.0,
-                       dtype::Type=Float64, arch::AbstractArchitecture=CPU(),
+                       arch::AbstractArchitecture=CPU(), dtype::Type=_default_field_dtype(arch),
                        dealias::Real=3/2)
     coords = CartesianCoordinates("x", "z")
     dist = Distributor(coords; dtype=dtype, architecture=arch)
@@ -123,12 +124,14 @@ end
 """
     ChannelDomain3D(Nx, Ny, Nz; Lx=4π, Ly=2π, Lz=2.0, ...)
 
-Create a 3D channel domain: periodic in x,y (Fourier), bounded in z (Chebyshev).
+Create a 3D channel periodic in x and y, with Chebyshev walls at `-Lz/2` and `Lz/2`.
 """
 function ChannelDomain3D(Nx::Integer, Ny::Integer, Nz::Integer;
                          Lx::Real=4π, Ly::Real=2π, Lz::Real=2.0,
-                         dtype::Type=Float64, arch::AbstractArchitecture=CPU(),
+                         arch::AbstractArchitecture=CPU(), dtype::Type=_default_field_dtype(arch),
                          dealias::Real=3/2)
+    half_height = Float64(Lz) / 2
+    isfinite(half_height) && half_height > 0 || throw(ArgumentError("Lz must be positive and finite"))
     coords = CartesianCoordinates("x", "y", "z")
     dist = Distributor(coords; dtype=dtype, architecture=arch)
 
@@ -136,7 +139,7 @@ function ChannelDomain3D(Nx::Integer, Ny::Integer, Nz::Integer;
                           dealias=Float64(dealias), dtype=dtype)
     y_basis = RealFourier(coords["y"]; size=Int(Ny), bounds=(0.0, Float64(Ly)),
                           dealias=Float64(dealias), dtype=dtype)
-    z_basis = ChebyshevT(coords["z"]; size=Int(Nz), bounds=(-1.0, 1.0),
+    z_basis = ChebyshevT(coords["z"]; size=Int(Nz), bounds=(-half_height, half_height),
                          dealias=Float64(dealias), dtype=dtype)
 
     return Domain(dist, (x_basis, y_basis, z_basis))
@@ -268,7 +271,7 @@ function set!(field::ScalarField, f::Function)
     meshgrid = create_meshgrid(domain; on_device=false)
     # Extract arrays in basis order (meshgrid is a Dict{String, Array})
     grids = Tuple(meshgrid[b.meta.element_label] for b in domain.bases)
-    data = f.(grids...)
+    data = field.dtype.(f.(grids...))
     get_grid_data(field) .= to_architecture(field.dist.architecture, data)
     return field
 end
@@ -279,7 +282,9 @@ end
 Set all grid points to a constant value.
 """
 function set!(field::ScalarField, value::Number)
-    grid_data!(field) .= value
+    # fill! converts `value` to the storage eltype on the host; a broadcast would
+    # send a Float64 into the kernel, which Metal cannot compile.
+    fill!(grid_data!(field), value)
     return field
 end
 

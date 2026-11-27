@@ -263,12 +263,9 @@ struct CNLF2 <: TimeStepper
     The explicit leapfrog part is unstable for negative real eigenvalues;
     dissipative terms must be treated implicitly.
 
-    Variable dt: the stepper generalizes the stencils with exact nonuniform
-    Lagrange weights (Wang 2008 eqn 2.11) and stays 2nd order through smooth or
-    isolated dt changes. RAPIDLY ALTERNATING dt degrades it toward 1st order —
-    the leapfrog parasitic mode has amplification |−w₁²| per step (w₁ = dt
-    ratio), only marginally stable when the ratio oscillates. Prefer CNAB2 or
-    SBDF2 under aggressive adaptive stepping.
+    On unequal steps, integrate the implicit term by the trapezoidal rule over
+    the full two-step interval. The explicit term is the linear interpolant of
+    the two most recent right-hand sides evaluated at the interval midpoint.
     """
     stages::Int
     implicit_coefficient::Float64

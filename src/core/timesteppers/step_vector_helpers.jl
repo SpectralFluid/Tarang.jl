@@ -116,7 +116,7 @@ function _evaluate_global_rhs!(dest::AbstractVector{ComplexF64},
                 forcing = get(solver.problem.stochastic_forcings, i, nothing)
                 if forcing !== nothing
                     cd = coeff_data!(fields[i])
-                    values = _matched_forcing_view(forcing, cd)
+                    values = _field_forcing_view(forcing, fields[i], cd)
                     values === nothing && throw(ArgumentError("Forcing size doesn't match RHS"))
                     view(dest, row:row + length(values) - 1) .+= vec(get_local_data(values))
                 end

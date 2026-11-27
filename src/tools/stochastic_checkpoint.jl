@@ -3,7 +3,7 @@
 using Serialization
 
 const _STOCHASTIC_CHECKPOINT_VAR = "__tarang_stochastic_state"
-const _STOCHASTIC_CHECKPOINT_VERSION = 1
+const _STOCHASTIC_CHECKPOINT_VERSION = 2
 _stochastic_checkpoint_julia() = "$(VERSION.major).$(VERSION.minor)"
 
 function _checkpoint_forcings(solver)
@@ -59,6 +59,28 @@ function _write_stochastic_checkpoint!(path, payload)
     return nothing
 end
 
+# Version 1 normalized the whole spectrum with a single scale accumulated in
+# the forcing dtype. A restart keeps its cached draw and RNG. Future draws use
+# the corrected scale. All other configuration and the spectral shape must match.
+function _matches_stochastic_config(saved, forcing, version)
+    current = _forcing_checkpoint_config(forcing)
+    isequal(saved, current) && return true
+    old, new = saved.spectrum, current.spectrum
+    T = eltype(new)
+    version == 1 && T in (Float16, Float32) && eltype(old) === T &&
+        size(old) == size(new) && isequal(merge(saved, (; spectrum=new)), current) ||
+        return false
+    old_rate = _forcing_spectrum_rate(old, forcing.wavenumbers, forcing.injection_metric)
+    old_rate > 0 || return false
+    scale = sqrt(Float64(forcing.energy_injection_rate) / old_rate)
+    isfinite(scale) && scale > 0 || return false
+    # Both arrays were independently rounded back to T, including subnormals.
+    atol = Float64(nextfloat(zero(T))) * max(1, scale)
+    return all(eachindex(new)) do j
+        isapprox(scale * old[j], Float64(new[j]); rtol=4eps(T), atol)
+    end
+end
+
 # Run before restoring any field, and inside the collective metadata preflight.
 # Realizations and RNGs are replicated on every rank, so a byte-identical payload
 # in every slab both detects mixed checkpoints and permits changing rank counts.
@@ -66,6 +88,7 @@ function _prepare_stochastic_restart(solver, src::SlabSource)
     forcings = _checkpoint_forcings(solver)
     reference = nothing
     presence = nothing
+    version = nothing
     for file in src.files
         attrs = netcdf_file_info(file).gatts
         present = haskey(attrs, "stochastic_forcing_version")
@@ -73,8 +96,12 @@ function _prepare_stochastic_restart(solver, src::SlabSource)
             "load_state!: stochastic forcing metadata is missing from some checkpoint slabs")
         presence = present
         present || continue
-        attrs["stochastic_forcing_version"] == _STOCHASTIC_CHECKPOINT_VERSION || error(
+        slab_version = attrs["stochastic_forcing_version"]
+        slab_version in (1, _STOCHASTIC_CHECKPOINT_VERSION) || error(
             "load_state!: unsupported stochastic forcing checkpoint version in '$file'")
+        version === nothing || version == slab_version || error(
+            "load_state!: stochastic forcing checkpoint versions differ across slabs")
+        version = slab_version
         get(attrs, "stochastic_forcing_julia", nothing) == _stochastic_checkpoint_julia() || error(
             "load_state!: stochastic RNG restart requires the same Julia major/minor version as the writer")
         payload = ncread(file, _STOCHASTIC_CHECKPOINT_VAR)
@@ -96,7 +123,7 @@ function _prepare_stochastic_restart(solver, src::SlabSource)
         "load_state!: registered stochastic forcing fields do not match the checkpoint")
     return map(snapshots) do snapshot
         forcing = forcings[snapshot.name]
-        isequal(snapshot.config, _forcing_checkpoint_config(forcing)) || error(
+        _matches_stochastic_config(snapshot.config, forcing, version) || error(
             "load_state!: stochastic forcing configuration differs for field '$(snapshot.name)'")
         snapshot.rng isa Random.MersenneTwister || error("load_state!: unsupported forcing RNG")
         host = snapshot.cached_forcing

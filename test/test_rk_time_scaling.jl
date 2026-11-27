@@ -72,3 +72,35 @@ end
         end
     end
 end
+
+@testset "Global RK retains small nonzero linear coefficients" begin
+    for (mass, rate, dt) in ((1.0, 1.0, 1.0), (1.0, 1e-15, 1e15), (1e-15, 1e-15, 1.0))
+        u = ScalarField(PeriodicDomain(8), "u")
+        set!(u, 1.0)
+        problem = InitialValueProblem([u])
+        add_parameters!(problem; mass, rate)
+        add_equation!(problem, "mass*dt(u) + rate*u = 0")
+        solver = InitialValueSolver(problem, RK111(); dt)
+        step!(solver)
+        @test grid_data!(u) ≈ fill(0.5, 8) atol=1e-13
+    end
+end
+
+@testset "Bounded IVPs retain nonzero equation and multistep coefficients" begin
+    for ts in (RK111(), SBDF1()), scale in (1.0, 1e-13)
+        u = ScalarField(ChebyshevDomain(8), "u")
+        set!(u, 1.0)
+        problem = InitialValueProblem([u])
+        add_parameters!(problem; scale)
+        add_equation!(problem, "scale*dt(u) + scale*u = 0")
+        solver = InitialValueSolver(problem, ts; dt=1.0)
+        step!(solver)
+        @test grid_data!(u) ≈ fill(0.5, 8) atol=1e-13
+    end
+    u = ScalarField(ChebyshevDomain(8), "u")
+    set!(u, 1.0)
+    problem = InitialValueProblem([u])
+    add_equation!(problem, "dt(u) = 0")
+    step!(InitialValueSolver(problem, SBDF1(); dt=1e15))
+    @test grid_data!(u) ≈ ones(8) atol=1e-13
+end

@@ -338,6 +338,7 @@ Layout-preserving, unlike `copy_field_data!`, which forces both sides to `:g` an
 would discard a `layout=:c` result.
 """
 function _own_borrowed_field(src::ScalarField)
+    is_transposable_storage(src) && return copy(src)
     owned = ScalarField(src.dist, src.name, src.bases, src.dtype)
     owned.scales = src.scales
     layout = src.current_layout

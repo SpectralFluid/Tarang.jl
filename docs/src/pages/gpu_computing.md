@@ -1,33 +1,49 @@
 # GPU Computing
 
-Tarang uses CUDA.jl through a Julia package extension. Load CUDA before creating
-GPU fields:
+Tarang uses CUDA.jl for NVIDIA GPUs, AMDGPU.jl for AMD ROCm GPUs and Metal.jl for Apple silicon. Install the package for your hardware in the environment where you run Tarang. On AMD, select the backend explicitly with
 
 ```julia
-using CUDA
-using Tarang
-
-@assert CUDA.functional()
+using Tarang, AMDGPU
+@assert has_amdgpu()
+arch = GPU(backend=:amdgpu, device_id=0)
 ```
 
 ## Quick start
 
-Choose the architecture on the `Distributor`; fields and solvers inherit it.
+On NVIDIA, load `using Tarang, CUDA` and use `arch = GPU(backend=:cuda)`. Device IDs start at zero. `GPU()` tries CUDA, AMDGPU and Metal in that order. Fields and solvers inherit the architecture from their distributor.
 
 ```julia
 coords = CartesianCoordinates("x", "y")
-dist = Distributor(coords; dtype=Float64, device=GPU())
+dist = Distributor(coords; device=arch)
 
 xb = RealFourier(coords["x"]; size=256, bounds=(0.0, 2π))
 yb = RealFourier(coords["y"]; size=256, bounds=(0.0, 2π))
 domain = Domain(dist, (xb, yb))
 u = ScalarField(domain, "u")
 
-u["g"] .= CUDA.rand(Float64, size(u["g"])...)
+copyto!(get_grid_data(u), rand(dist.dtype, size(get_grid_data(u))))
 forward_transform!(u)
 backward_transform!(u)
 
-@assert get_grid_data(u) isa CuArray
+@assert architecture(get_grid_data(u)) == arch
+```
+
+On Apple silicon, install Metal.jl in the same environment as Tarang. Keep that environment separate from CUDA.jl 5 and AMDGPU.jl 2.4–2.8 because their compiler dependencies conflict with Metal.jl 1.11. Metal fields default to `Float32`. Use `ComplexF32` with complex Fourier fields. Each Metal distributor uses one MPI rank. Apple GPUs have no `Float64`: Tarang converts its own constants, scalar arithmetic (`2.0 * u` stays `Float32`) and forcing functions, which run on the host, but your own broadcasts into device arrays must use `Float32` values, for example `get_grid_data(u) .+= 1f0` rather than `.+= 1.0`.
+
+```julia
+using Tarang, Metal
+@assert has_metal()
+arch = GPU(backend=:metal)
+domain = PeriodicDomain(64, 64; device=arch)
+u = ScalarField(domain, "u")
+set!(u, (x, y) -> sin(x) * cos(y))
+coeff_data!(u)
+```
+
+Metal uses MPSGraph FFTs and the shared Chebyshev kernels. To check the Metal device and numerical results against FFTW and analytical solutions, run the hardware tests from a checkout.
+
+```bash
+julia --project=. test/run_metal_ci.jl --require-device
 ```
 
 Use `CPU()` instead of `GPU()` to construct a CPU simulation.
@@ -68,11 +84,33 @@ Current single-GPU transform support is:
 | Real or complex Fourier | Device FFT |
 | 2D Fourier × Chebyshev | Device FFT plus DCT-I, including scaled grids |
 | 3D Fourier × Chebyshev | Device FFT plus DCT-I for supported layouts |
-| Same-size pure Chebyshev, up to 3D | Device DCT-I |
-| Legendre transforms or scaled pure-Chebyshev transforms | Explicitly unsupported |
+| Pure Chebyshev, up to 3D | Device DCT-I, including scaled grids |
+| Legendre transforms | Explicitly unsupported |
+
+AMD uses rocFFT for Fourier transforms and the shared device kernels for Chebyshev DCT-I transforms and derivatives. Run the AMD validation from a checkout in an environment containing Tarang and AMDGPU.
+
+```bash
+julia --project=. test/run_amdgpu_ci.jl --require-device
+```
+
+The flag requires an actual ROCm device. Without it, the runner also works on a CPU machine and checks extension loading and the FFT axis layouts against FFTW. Launch the same runner with two or more MPI ranks to check the distributed pencil transforms.
 
 Unsupported basis and layout combinations fail before entering the CPU
 transform chain.
+
+On CUDA, AMDGPU and Metal, field transforms reuse plans and scratch buffers
+within each distributor, Julia task and GPU queue. Closing the distributor drops
+its references to these resources. During a resolution sweep, call
+`clear_gpu_workspaces!(dist)` between transforms to release cached scratch while
+keeping the fields usable. The backend's memory pool may retain released memory.
+
+Real periodic grid resizes use real FFTs and store only the independent half of
+each spectrum. A resize and its reverse reuse the same pair of workspaces.
+`set_scales!` still allocates the field's new grid whenever its shape changes.
+
+CUDA async real inverse FFTs keep a cuFFT plan per Julia task and stream.
+The input coefficients are preserved. CUDA.jl versions that expose a plan-owned
+half-spectrum buffer can reuse that buffer for repeated calls.
 
 ### Complete 2D Fourier--Chebyshev path
 
@@ -94,14 +132,9 @@ This command prints CUDA device information and fails if CUDA is unavailable,
 scalar indexing is attempted, a CPU/GPU value comparison fails, or the warmed
 InitialValueProblem step performs a fresh device allocation.
 
-The current boundary of this validation is deliberate:
-
-- scaled pure-Chebyshev fields remain unsupported on the device;
-- multi-rank 2D FC execution is not part of the single-GPU path (use the
-  separately documented distributed interfaces for supported 3D layouts); and
-- transform scratch is cached per device and shape for serial use. Run one
-  transforming Julia task at a time on each CUDA device; concurrent same-shape
-  transforms can share scratch and are not supported yet.
+The 2D validation runs on one GPU. For supported multi-rank 3D layouts,
+use the distributed interfaces below. Concurrent transforms need separate
+fields because a transform mutates its field's data and layout.
 
 ## 2D time stepping and solves
 
@@ -121,23 +154,23 @@ The full per-architecture table is in
 [Time Steppers](timesteppers.md#Where-each-scheme-runs).
 
 Fourier–Chebyshev IVPs use per-mode coupled subproblems, batched across Fourier
-modes by default on the device (`batched_modes=false` opts out). With GPU fields,
-`matsolver=:auto`, `:gpu`, and `:hybrid` resolve to the concrete CUDA sparse
-solver; CPU-only solvers are rejected and solver failures are not retried on
-CPU. A rank-deficient per-mode system — duplicate tau lifts, an under-constrained
-mode — is a factorization error on the device, not a least-squares fallback.
+modes by default on CUDA and ROCm (`batched_modes=false` opts out). Metal solves one Fourier mode at a time. With GPU fields,
+`matsolver=:auto`, `:gpu`, and `:hybrid` select a backend-specific solver. Individual mode solves use `:cuda_sparse` on NVIDIA and `:rocm_dense` on AMD. On Metal, `:metal_dense` factors the equivalent real single-precision system with pivoted LU in Metal Performance Shaders. It retains the factors in native row-major layout and reuses the solve buffers for subsequent right-hand sides of the same shape. The AMD solver uses rocSOLVER for dense LU and rocSPARSE for sparse matrix products.
+
+Some stage matrices are rank deficient by construction. An incompressible problem with an even-sized `RealFourier` axis has one: at the Nyquist mode ∂x vanishes, so no equation fixes the constant part of the pressure. The CPU solves such a mode with sparse QR and keeps the undetermined unknowns at zero. On a GPU the free unknowns are found once on the host and pinned, and the mode is factored on the device, giving the same solution for a consistent right-hand side. The device does not check consistency. A matrix that is singular for any other reason still raises a factorization error.
 
 Most of this is covered without hardware: `test/test_gpu_timesteppers_jlarray.jl`
 drives all twenty schemes on the single-GPU dispatch path using `JLArray` device
 fields and a CPU stand-in for cuFFT (see
 [Testing](testing.md#Testing-GPU-paths-without-a-GPU)).
 
-Linear GPU boundary-value solves select the CUDA sparse solver automatically.
+Linear GPU boundary-value solves select the field's device solver automatically.
 Their right-hand side and solution buffers stay on the field's device backend.
 An explicit solver selection is also supported:
 
 ```julia
-solver = BoundaryValueSolver(problem; matsolver=:cuda_sparse)
+solver = BoundaryValueSolver(problem; matsolver=:rocm_dense)  # AMD
+solver = BoundaryValueSolver(problem; matsolver=:metal_dense) # Apple
 ```
 
 GPU NonlinearBoundaryValueProblem and EigenvalueProblem solves are not device-native yet and raise an unsupported
@@ -148,7 +181,7 @@ operation error.
 Assign one device to each MPI rank before allocating fields:
 
 ```julia
-using MPI
+using Tarang, CUDA, MPI
 
 MPI.Init()
 comm = MPI.COMM_WORLD
@@ -161,12 +194,14 @@ coords = CartesianCoordinates("x", "y", "z")
 dist = Distributor(coords; comm=comm, dtype=ComplexF64, device=arch)
 ```
 
-Distributed GPU communication requires CUDA-aware MPI. Tarang raises an error
-when device buffers cannot be passed directly; it does not stage them through
-host memory.
+The example above uses CUDA-aware MPI. AMD uses ROCm-aware MPI for all distributed transposes. When a scheduler exposes one GPU per rank, each rank can use device ID zero. When all GPUs on a node are visible, use the node-local rank as the device ID.
+
+ROCm-aware MPI is detected with `MPI.has_rocm()` (Open MPI 5 and later) or `MPICH_GPU_SUPPORT_ENABLED=1` (Cray MPICH on Frontier and LUMI). Set `TARANG_ROCM_AWARE_MPI=1` to assert it for another MPI library, or `0` to refuse it.
 
 ```julia
-@assert check_cuda_aware_mpi()
+node = MPI.Comm_split_type(comm, MPI.COMM_TYPE_SHARED, MPI.Comm_rank(comm))
+arch = GPU(backend=:amdgpu, device_id=MPI.Comm_rank(node))
+MPI.free(node)
 ```
 
 Pure complex-Fourier domains transform through the ordinary call. A field on a
@@ -207,7 +242,7 @@ Fourier–Chebyshev layouts. It requires at least one Fourier and one Chebyshev
 axis. `RealFourier` is allowed only on the first axis and cannot be combined
 with another Fourier axis. Other layouts, including pure Chebyshev, are rejected.
 `forward_transform!` and `backward_transform!` select this path automatically
-for such fields. Its transposes run over NCCL: load NCCL.jl (`using NCCL`) on
+for such fields. AMD transposes exchange ROCArray buffers through MPI. NVIDIA uses NCCL for this path. Load NCCL.jl (`using NCCL`) on
 every rank before the first transform (calling `init_nccl!` is not required).
 Without it every rank raises the same error before any communication starts.
 The NCCL communicators belong to the cached transform plans; `close(dist)` destroys
@@ -246,8 +281,7 @@ passing `arch` makes the launch target explicit.
 
 ## Memory and profiling
 
-Tarang uses CUDA.jl's memory pool. Prefer preallocated work arrays and use
-CUDA.jl directly for inspection and profiling:
+Each backend manages its own device memory pool. On AMD, `AMDGPU.versioninfo()` reports the active devices and available ROCm libraries. On NVIDIA, CUDA.jl provides memory and profiling tools.
 
 ```julia
 CUDA.memory_status()

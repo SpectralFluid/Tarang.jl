@@ -132,6 +132,7 @@ end
 
 function evaluate_scalar_laplacian(operand::ScalarField, layout::Symbol)
     result = ScalarField(operand.dist, "lap_$(operand.name)", operand.bases, operand.dtype)
+    preset_scales!(result, operand.scales)
     ensure_layout!(result, layout)
 
     if layout == :g
@@ -162,14 +163,7 @@ function evaluate_vector_laplacian(operand::VectorField, layout::Symbol)
                         operand.bases, operand.dtype)
 
     for (i, comp) in enumerate(operand.components)
-        lap_comp = evaluate_scalar_laplacian(comp, layout)
-
-        ensure_layout!(result.components[i], layout)
-        if layout == :g
-            copyto!(get_grid_data(result.components[i]), get_grid_data(lap_comp))
-        else
-            copyto!(get_coeff_data(result.components[i]), get_coeff_data(lap_comp))
-        end
+        result.components[i] = evaluate_scalar_laplacian(comp, layout)
     end
 
     return result

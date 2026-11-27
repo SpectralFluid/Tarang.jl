@@ -68,8 +68,8 @@ domain = ChannelDomain(256, 64; Lx=4.0, Lz=1.0)
 domain = ChannelDomain3D(64, 64, 32; Lx=4π, Ly=2π)
 ```
 
-`ChannelDomain3D` fixes its Chebyshev axis to `[-1, 1]`; it accepts an `Lz` keyword but
-ignores it. If you need a different wall separation, build the domain explicitly.
+`ChannelDomain3D` centers its walls at `z = -Lz/2` and `z = Lz/2`.
+The default `Lz=2` gives the interval `[-1, 1]`.
 
 Both channel constructors put the Chebyshev axis **last**, so they are **serial-only**:
 under MPI they fail at construction with the "reorder your bases" error described in

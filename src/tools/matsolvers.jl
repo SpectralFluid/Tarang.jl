@@ -569,6 +569,7 @@ struct SPQRSolver{T, F, Q, R} <: AbstractMatSolver
     rank::Int
     m::Int
     n::Int
+    r_norm::Float64   # ‖R₁₁‖_F, the scale of A for the consistency check
     workspace_pool::_SolverWorkspacePool
 end
 
@@ -577,7 +578,9 @@ function SPQRSolver(matrix::SparseMatrixCSC; kwargs...)
     A = SparseMatrixCSC{T, Int}(matrix)
     qr_factor = qr(A)
     rnk = rank(qr_factor)
-    r_factor = UpperTriangular(qr_factor.R[Base.OneTo(rnk), Base.OneTo(rnk)])
+    R11 = qr_factor.R[Base.OneTo(rnk), Base.OneTo(rnk)]
+    r_norm = Float64(norm(nonzeros(R11)))
+    r_factor = UpperTriangular(R11)
     q_adjoint = adjoint(qr_factor.Q)
     inv_cpiv = isempty(qr_factor.cpiv) ? Int[] : invperm(qr_factor.cpiv)
     rpivinv = Vector{Int}(qr_factor.rpivinv)
@@ -590,7 +593,7 @@ function SPQRSolver(matrix::SparseMatrixCSC; kwargs...)
          for _ in 1:Base.Threads.nthreads()],
         [Vector{T}(undef, Int(rnk))
          for _ in 1:Base.Threads.nthreads()],
-        Int(rnk), size(qr_factor, 1), size(qr_factor, 2),
+        Int(rnk), size(qr_factor, 1), size(qr_factor, 2), r_norm,
         _SolverWorkspacePool(Base.Threads.nthreads()))
 end
 
@@ -634,7 +637,8 @@ function solve(s::SPQRSolver{T}, rhs::AbstractMatrix) where T
     return result
 end
 
-function solve!(dest::AbstractVector, s::SPQRSolver{T}, rhs::AbstractVector) where T
+function solve!(dest::AbstractVector, s::SPQRSolver{T}, rhs::AbstractVector;
+                require_consistent::Bool=false, warn_inconsistent::Bool=false) where T
     length(rhs) == s.m ||
         throw(DimensionMismatch("SPQR rhs length $(length(rhs)) does not match matrix rows $(s.m)"))
     length(dest) == s.n ||
@@ -653,6 +657,24 @@ function solve!(dest::AbstractVector, s::SPQRSolver{T}, rhs::AbstractVector) whe
             rank_rhs[i] = q_rhs[i]
         end
         ldiv!(s.r_factor, rank_rhs)
+
+        if (require_consistent || warn_inconsistent) && s.rank < s.m
+            # In Q coordinates the trailing entries are exactly the part of the
+            # RHS outside the column space, including for a zero matrix. Compare
+            # it with what rounding leaves behind, eps·(‖A‖‖x‖ + ‖b‖) with
+            # ‖A‖_F = ‖R‖_F: scaling by ‖b‖ alone rejected consistent systems
+            # whose RHS is small next to the matrix terms (the Nyquist pressure
+            # mode of a Rayleigh–Bénard run, residual ~1e-12·‖b‖).
+            residual = norm(view(q_rhs, s.rank + 1:s.m))
+            scale = s.r_norm * norm(view(rank_rhs, 1:s.rank)) + norm(rhs)
+            tolerance = 32 * max(s.m, s.n) * eps(real(T)) * scale
+            if residual > tolerance
+                message = "Inconsistent implicit timestep system (rank $(s.rank)/$(s.m), " *
+                          "residual $residual exceeds $tolerance)"
+                require_consistent && throw(ArgumentError(message))
+                @warn message * ". Using the least-squares solution." maxlog=1
+            end
+        end
 
         @inbounds for i in 1:s.rank
             x[i] = rank_rhs[i]
@@ -695,5 +717,57 @@ end
 
 register_solver("spqr", SPQRSolver)
 register_solver("qr", SPQRSolver)
+
+"""
+    pin_free_columns(A::SparseMatrixCSC) -> Union{Nothing, NamedTuple}
+
+Make a rank-deficient square system factorable by a solver without a
+rank-revealing mode (the GPU LU solvers) while keeping the solution
+[`SPQRSolver`](@ref) returns.
+
+Sparse QR identifies the free columns `J` — the non-pivot columns its basic
+solution sets to zero — and the left null space `Y` of `A`. Each free column is
+replaced by a scaled unit vector on one of the rows `R`, chosen so that `Y[R, :]`
+is nonsingular; the patched matrix is then nonsingular. For a consistent
+right-hand side its solution is the basic solution: the unknowns in `J` come out
+zero (to rounding) and the rest solve the original equations. For an
+inconsistent one the unknowns in `J` absorb the residual instead of raising, so
+callers that can afford the check should prefer `SPQRSolver`.
+
+Returns `nothing` when `A` has full numerical rank, otherwise
+`(matrix, free_columns, rows)`.
+"""
+function pin_free_columns(A::SparseMatrixCSC)
+    m, n = size(A)
+    m == n || throw(DimensionMismatch("pin_free_columns needs a square matrix, got $m×$n"))
+    T = promote_type(eltype(A), ComplexF64)
+    B = SparseMatrixCSC{T, Int}(A)
+    F = qr(B)
+    r = rank(F)
+    r < n || return nothing
+    d = n - r
+    free = F.cpiv[(r + 1):n]
+    # Columns r+1:m of Q span the left null space of A[prow, :]; F.rpivinv maps
+    # them back to the original row order.
+    Y = zeros(T, m, d)
+    e = zeros(T, m)
+    for k in 1:d
+        fill!(e, zero(T))
+        e[r + k] = one(T)
+        q = F.Q * e
+        Y[:, k] .= view(q, F.rpivinv)
+    end
+    rows = qr(Matrix(transpose(Y)), ColumnNorm()).p[1:d]
+    # Matching the matrix's own scale keeps the patched system well conditioned.
+    scale = maximum(abs, nonzeros(B); init=zero(real(T)))
+    iszero(scale) && (scale = one(real(T)))
+    pinned = copy(B)
+    for (j, i) in zip(free, rows)
+        nonzeros(pinned)[nzrange(pinned, j)] .= zero(T)
+        pinned[i, j] = scale
+    end
+    dropzeros!(pinned)
+    return (matrix=pinned, free_columns=free, rows=rows)
+end
 
 end # module

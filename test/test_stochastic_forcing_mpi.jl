@@ -3,6 +3,7 @@ using Random
 using MPI
 using PencilArrays
 using Tarang
+include("stochastic_forcing_layout_cases.jl")
 
 if !MPI.Initialized()
     MPI.Init()
@@ -66,6 +67,15 @@ rank == 0 && println("=" ^ 60)
     global_sum = MPI.Allreduce(local_sum, MPI.SUM, comm)
 
     @test global_sum > 0
+    # A bad grid on one rank must reject registration on every rank before
+    # seed synchronization. The existing registration and the candidate RNG survive.
+    candidate = StochasticForcing(; field_size=(rank == 0 ? N+1 : N, N))
+    rng = copy(candidate.rng)
+    @test_throws Exception add_stochastic_forcing!(problem, :q, candidate)
+    @test problem.stochastic_forcings[1] === forcing && candidate.rng == rng
+    close(dist)
 end
+
+check_distributed_forcing_slabs(CPU(), comm)
 
 rank == 0 && println("MPI stochastic forcing tests completed")

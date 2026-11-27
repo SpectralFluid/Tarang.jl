@@ -22,6 +22,8 @@ machine — parse/skip-verified only; assertions first exercised on a GPU node.
 
 using Test
 using Tarang
+isdefined(@__MODULE__, :check_fourier_timestepper_cases) ||
+    include(joinpath(@__DIR__, "timestepper_fourier_cases.jl"))
 try
     using CUDA
 catch
@@ -35,6 +37,9 @@ if !_HAS_CUDA_TS
     end
 else
     CUDA.allowscalar(false)
+    @testset "CUDA Fourier timestepper regressions" begin
+        check_fourier_timestepper_cases(GPU())
+    end
     _gpu_grid(u) = Array(Tarang.get_grid_data(u))
 
     function _gpu_fourier_field(N)

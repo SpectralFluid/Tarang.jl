@@ -16,10 +16,9 @@ using Tarang: CPU, GPU, launch!, KernelOperation, workgroup_size, architecture,
         @test arch isa CPU
     end
 
-    @testset "GPU type without CUDA" begin
+    @testset "GPU architecture type" begin
         @test GPU <: Tarang.AbstractSerialArchitecture
-        # GPU() should error without CUDA loaded
-        @test_throws ErrorException GPU()
+        @test_throws ArgumentError GPU(backend=:unknown)
     end
 
     # ========================================================================

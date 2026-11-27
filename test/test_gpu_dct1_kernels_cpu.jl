@@ -2,7 +2,7 @@
 Value tests for the GPU DCT-I / Chebyshev-derivative kernels AND for the full
 Fourier-Fourier / Fourier-Chebyshev device transform drivers — WITHOUT a GPU.
 
-The kernels in `ext/cuda/cheb_deriv.jl` are KernelAbstractions kernels, so the
+The kernels in `ext/gpu/cheb_deriv.jl` are KernelAbstractions kernels, so the
 very same kernel objects the CUDA path launches on a `CUDABackend()` also run on
 `KernelAbstractions.CPU()` over plain `Array`s (CUDA.jl loads fine on machines
 with no NVIDIA GPU). Only the cuFFT `mul!` is device-specific; FFTW's
@@ -460,7 +460,7 @@ end
 #
 # The PRODUCTION override from ext/cuda/transpose_kernels.jl runs here on host
 # arrays together with the PRODUCTION `gpu_dct1_along_dim!` (and its permutation /
-# packed re-im helpers and plan cache) from ext/cuda/cheb_deriv.jl: CuArray ===
+# packed re-im helpers and plan cache) from ext/gpu/cheb_deriv.jl: CuArray ===
 # Array, kernels on the KA CPU backend, FFTW's rfft standing in for cuFFT's. Only
 # device plumbing is shimmed, so this needs no CUDA.jl. The override used to undo
 # `gpu_dct1_along_dim!`'s odd-degree flip to match a CPU reference that lacked it;
@@ -499,7 +499,13 @@ end
 ensure_device!(arch) = nothing
 get_gpu_dct_scratch(arch, shape, T, count; purpose=:default) = [zeros(T, shape) for _ in 1:count]
 const _ROOT = dirname(@__DIR__)
-include(joinpath(_ROOT, "ext", "cuda", "cheb_deriv.jl"))
+const DeviceArray = Array
+const DeviceMatrix = Matrix
+const DeviceRuntime = CUDA
+const DeviceFFT = CUFFT
+_current_device_id() = 0
+_transform_cache(cache) = cache
+include(joinpath(_ROOT, "ext", "gpu", "cheb_deriv.jl"))
 
 # Production override, renamed so it never extends the real `Tarang.dct_in_dim!`.
 function _find_override(ex)
@@ -550,7 +556,7 @@ end # GPUDctInDimEmulation
 end
 
 # ── Scaled backward through the REAL staged device driver (host emulation) ───
-# `ext/cuda/mixed_transforms.jl` and `_gpu_backward_staged!` (ext/cuda/transforms.jl)
+# `ext/gpu/mixed_transforms.jl` and `_gpu_backward_staged!` (ext/cuda/transforms.jl)
 # run verbatim on host arrays; only cuFFT, the DCT-I kernels, device scratch and
 # device ids are stubbed (the kernels are pinned above). This covers the step the
 # replays above cannot see: base coefficients left by a scale change resampled
@@ -616,22 +622,12 @@ function gpu_dct1_along_dim!(out, input, dim, direction)
     return out
 end
 const ROOT = dirname(@__DIR__)
-include(joinpath(ROOT, "ext/cuda/mixed_transforms.jl"))
-function _definition(ex, name)
-    ex isa Expr || return nothing
-    if ex.head === :function
-        sig = ex.args[1]
-        sig isa Expr && sig.head === :where && (sig = sig.args[1])
-        sig isa Expr && sig.head === :call && sig.args[1] === name && return ex
-    end
-    for arg in ex.args
-        found = _definition(arg, name)
-        found === nothing || return found
-    end
-    return nothing
-end
-Core.eval(@__MODULE__, _definition(Meta.parseall(read(joinpath(ROOT, "ext/cuda/transforms.jl"),
-                                                     String)), :_gpu_backward_staged!))
+const DeviceArray = Array
+const NativeDevice = CuDevice
+const DeviceRuntime = CUDA
+_transform_cache(cache) = cache
+_dct_cache_device_id(arch) = 0
+include(joinpath(ROOT, "ext/gpu/mixed_transforms.jl"))
 end
 
 @testset "Scaled transforms through the staged device driver (host emulation)" begin

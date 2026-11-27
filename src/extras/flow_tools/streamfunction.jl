@@ -78,10 +78,14 @@ function streamfunction_spectral_invert(vorticity::ScalarField, apply_gauge::Boo
     # by the Poisson equation and is set to zero whether or not `apply_gauge` is
     # requested; zero is the ∫ψ dA = 0 gauge.
     vorticity_spec = get_coeff_data(vorticity)
-    k2 = _logical_multiplier(vorticity_spec, k_squared)
-    gauge = zero(eltype(vorticity_spec)) / one(eltype(k_squared))   # both branches one type
+    # k² is built in Float64 on the host; upload it in the widest precision the
+    # device supports (Float64, or Float32 on Metal), with a matching threshold.
+    R = _widest_real_type(vorticity_spec)
+    k2 = _logical_multiplier(vorticity_spec, convert(AbstractArray{R}, k_squared))
+    gauge = zero(eltype(vorticity_spec)) / one(R)   # both branches one type
+    threshold = R(1e-12)
     psi_spec = get_coeff_data(streamfunction_field)
-    psi_spec .= ifelse.(k2 .> 1e-12, .-vorticity_spec ./ k2, gauge)
+    psi_spec .= ifelse.(k2 .> threshold, .-vorticity_spec ./ k2, gauge)
 
     # NOTE: MPI reduction is NOT needed here.
     # Each rank computes its local spectral coefficients from local vorticity.
@@ -115,23 +119,8 @@ function get_2d_wavenumber_grids(field::ScalarField)
     coeff_data = coeff_data!(field)
     local_nx, local_ny = size(coeff_data)[1:2]
 
-    # CRITICAL FIX: Get global shape and local offsets for MPI
-    # For distributed data, wavenumber indices must account for rank's offset in global spectrum
-    use_mpi = field.dist.use_pencil_arrays && field.dist.size > 1
-    if use_mpi
-        # Get global shape for proper wavenumber indexing
-        global_shape = _get_global_coeff_shape_internal(field)
-        global_nx, global_ny = global_shape[1:2]
-
-        # Get this rank's offset in global wavenumber space
-        offsets = _get_pencil_array_offsets_internal(field)
-        offset_x, offset_y = offsets[1:2]
-    else
-        global_nx, global_ny = local_nx, local_ny
-        offset_x, offset_y = 0, 0
-    end
-
-    # Generate wavenumber grids based on basis types
+    global_nx, global_ny = _get_global_coeff_shape_internal(field)
+    offset_x, offset_y = _get_pencil_array_offsets_internal(field)
     bases = field.bases
     bundle = _field_transform_bundle(field)
 
@@ -176,24 +165,12 @@ Internal helper to get global coefficient shape. Similar to _get_global_coeff_sh
 but works with ScalarField directly.
 """
 function _get_global_coeff_shape_internal(field::ScalarField)
-    coeff_data = get_coeff_data(field)
-    if coeff_data === nothing
-        error("_get_global_coeff_shape_internal: coefficient data is nothing")
+    coeff = get_coeff_data(field)
+    field.dist.size == 1 && return size(coeff)
+    if field.dist.use_pencil_arrays
+        return Tuple(PencilArrays.size_global(coeff))
     end
-
-    if field.dist.use_pencil_arrays && field.dist.size > 1
-        try
-            if applicable(PencilArrays.size_global, coeff_data)
-                return Tuple(PencilArrays.size_global(coeff_data))
-            end
-        catch err
-            # A layout with no global size declines with MethodError; the local-shape
-            # fallback below then applies. Any other exception is a real fault in the
-            # decomposition and must not be read as "no global size available".
-            err isa MethodError || rethrow()
-        end
-    end
-    return size(coeff_data)
+    return ntuple(d -> _coeff_axis_global_size(field, d), ndims(coeff))
 end
 
 """
@@ -203,30 +180,14 @@ Internal helper to get PencilArray offsets. Similar to _get_pencil_array_offsets
 but works with ScalarField directly.
 """
 function _get_pencil_array_offsets_internal(field::ScalarField)
-    coeff_data = get_coeff_data(field)
-    if coeff_data === nothing
-        error("_get_pencil_array_offsets_internal: coefficient data is nothing")
+    coeff = get_coeff_data(field)
+    field.dist.size == 1 && return ntuple(_ -> 0, ndims(coeff))
+    if field.dist.use_pencil_arrays
+        return map(r -> first(r) - 1, PencilArrays.range_local(coeff))
     end
-
-    if field.dist.use_pencil_arrays && field.dist.size > 1
-        try
-            if hasproperty(coeff_data, :pencil)
-                # Use the PUBLIC exported `range_local` — `PencilArrays.axes_local`
-                # is a PRIVATE struct field, not a callable, so calling it raised
-                # UndefVarError and crashed every distributed scalar spectrum.
-                # (Same fix as _get_pencil_array_offsets in spectra.jl.)
-                axes = PencilArrays.range_local(coeff_data)
-                return Tuple(first(ax) - 1 for ax in axes)
-            elseif applicable(PencilArrays.range_local, coeff_data)
-                axes = PencilArrays.range_local(coeff_data)
-                return Tuple(first(ax) - 1 for ax in axes)
-            end
-        catch e
-            # CRITICAL: Don't silently fall back - error for MPI runs
-            error("_get_pencil_array_offsets_internal: failed to get offsets for MPI data: $e")
-        end
-    end
-    return Tuple(zeros(Int, ndims(coeff_data)))
+    # Explicit transposes return coefficients to the unpermuted grid decomposition.
+    shape = _get_global_coeff_shape_internal(field)
+    return ntuple(d -> first(local_indices(field.dist, d, shape[d])) - 1, ndims(coeff))
 end
 
 """

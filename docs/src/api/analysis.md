@@ -410,8 +410,8 @@ ps.bin_counts                           # modes per bin
 ps = power_spectrum(T; max_wavenumber=8, radial_average=true)
 ```
 
-Pass `radial_average=false` to get the unbinned spectrum as a `Dict{Tuple,Float64}` keyed by mode
-index, and `binning=LogBinning(bins_per_decade=8)` (or `LinearBinning()`, `CustomBinning([…])`) to
+Pass `radial_average=false` to get the unbinned spectrum as a dictionary keyed by physical wavenumber
+tuples such as `(kx, ky)`, and `binning=LogBinning(bins_per_decade=8)` (or `LinearBinning()`, `CustomBinning([…])`) to
 change the bin layout. Plot `ps.power` against `ps.k` on log-log axes with your plotting package of
 choice to compare against a `k^(-5/3)` reference.
 

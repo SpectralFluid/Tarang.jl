@@ -36,9 +36,9 @@ end
         # The backends are dispatched (::GPU beats Tarang's
         # ::AbstractArchitecture fallback), so "is the backend wired?" is a
         # method-table question, not a `Ref` that may still hold `nothing`.
-        @test hasmethod(Tarang._gpu_device, Tuple{Int})
+        @test which(Tarang._gpu_device, Tuple{Val{:cuda},Int}).module === ext
         for f in (Tarang._gpu_forward_transform_backend!, Tarang._gpu_backward_transform_backend!)
-            m = which(f, Tuple{Tarang.GPU, Tarang.ScalarField})
+            m = which(f, Tuple{Tarang.GPU{CUDA.CuDevice}, Tarang.ScalarField})
             @test m.module === ext          # the ext's method wins, not the error fallback
         end
 
@@ -53,6 +53,11 @@ end
 
         # has_cuda() now reflects CUDA.functional() rather than a stale false
         @test Tarang.has_cuda() == CUDA.functional()
+        real_grid = CUDA.CuMatrix{Float32}
+        @test which(Tarang.gpu_resample_grid_data!,
+                    Tuple{real_grid,real_grid,NTuple{2,Int},NTuple{2,Int}}).module === ext
+        @test which(Tarang._padded_plan_spectrum,
+                    Tuple{CUDA.CUFFT.CuFFTPlan,Tarang.GPU{CUDA.CuDevice},Type{Float32},NTuple{2,Int}}).module === ext
 
         # A seeded fill_random!(...; reproducible=false) reaches CUDA.jl's native
         # generator — `CUDA.default_rng()`, the one randn!/rand! on a CuArray draw

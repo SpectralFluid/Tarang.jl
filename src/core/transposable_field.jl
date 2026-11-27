@@ -139,7 +139,6 @@ Sets up buffers, counts, and communicators for distributed transpose operations.
 """
 function TransposableField(field::ScalarField; topology=nothing)
     dist = field.dist
-    arch = dist.architecture
 
     # Validate before the first collective (the topology split below): the basis
     # families, then the fixed-shape buffer rule, which rejects an rfft-halved
@@ -158,6 +157,13 @@ function TransposableField(field::ScalarField; topology=nothing)
         size(field["g"])
     end
 
+    return _build_transpose_workspace(field, gshape, topology; check_field_grid=true)
+end
+
+# Padded grid products use the same transpose geometry at intermediate resolutions.
+function _build_transpose_workspace(field::ScalarField, gshape, topology; check_field_grid=false)
+    dist = field.dist
+    arch = dist.architecture
     N = length(gshape)
 
     # TransposableField is designed for multi-dimensional distributed
@@ -177,6 +183,8 @@ function TransposableField(field::ScalarField; topology=nothing)
         create_topology_2d(dist.comm, Rx, Ry)
     elseif dist.mesh !== nothing && length(dist.mesh) >= 2
         create_topology_2d(dist.comm, dist.mesh[1], dist.mesh[2])
+    elseif dist.size > 1 && dist.mesh !== nothing && length(dist.mesh) == 1
+        create_topology_2d(dist.comm, dist.mesh[1], 1)
     elseif dist.size > 1
         # Auto-determine topology
         Rx, Ry = auto_topology(dist.size, N)
@@ -209,7 +217,7 @@ function TransposableField(field::ScalarField; topology=nothing)
         comms = TransposeComms(topo)
         local_shapes = compute_local_shapes_2d(gshape, topo)
 
-        if dist.size > 1
+        if dist.size > 1 && check_field_grid
             field_shape = size(field["g"])
             expected_shape = local_shapes[ZLocal]
             if field_shape != expected_shape

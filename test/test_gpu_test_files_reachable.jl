@@ -58,7 +58,7 @@ const _TESTDIR = @__DIR__
 end
 
 @testset "invalid MPI CUDA override propagates" begin
-    repository_root = normpath(joinpath(_TESTDIR, ".."))
+    project = dirname(Base.active_project())
     code = raw"""
         using Tarang
 
@@ -84,7 +84,7 @@ end
         end
     """
     output = IOBuffer()
-    command = `$(Base.julia_cmd()) --startup-file=no --project=$repository_root -e $code`
+    command = `$(Base.julia_cmd()) --startup-file=no --project=$project -e $code`
     process = run(
         pipeline(ignorestatus(command), stdout=output, stderr=output),
     )

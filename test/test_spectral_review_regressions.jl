@@ -1,7 +1,74 @@
 using Test
 using Tarang
 
+include("cartesian_basis_cases.jl")
+
 @testset "Spectral review regressions" begin
+    @testset "Cartesian basis products and operators" begin
+        check_cartesian_products(CPU(), Float64, Tarang.MPI.COMM_SELF)
+        check_cartesian_operators(CPU(), Float64)
+        for height in (0, -1, Inf)
+            @test_throws ArgumentError ChannelDomain3D(4, 5, 6; Lz=height)
+        end
+    end
+    @testset "Real Nyquist derivative on the second Fourier axis" begin
+        domain = PeriodicDomain(8, 8)
+        q = ScalarField(domain, "q")
+        x, y = local_grids(domain.dist, domain.bases...)
+        initial = cos.(x) .* cos.(4 .* y')
+        grid_data!(q) .= initial
+        dy = evaluate(Differentiate(q, domain.dist.coordsys["y"], 1), :g)
+        @test maximum(abs, grid_data!(dy)) < 1e-13
+        coord_y = domain.dist.coordsys["y"]
+        dyy = evaluate(Differentiate(Differentiate(q, coord_y, 1), coord_y, 1), :g)
+        @test grid_data!(dyy) ≈ -16 .* initial atol=1e-12
+        problem = InitialValueProblem([q])
+        add_equation!(problem, "dt(q) = d(q,y)")
+        solver = InitialValueSolver(problem, SBDF1(); dt=0.1)
+        rhs = only(Tarang.evaluate_rhs(solver, solver.state, 0.0))
+        @test maximum(abs, grid_data!(rhs)) < 1e-13
+        step!(solver)
+        @test grid_data!(q) ≈ initial atol=1e-13
+
+        for dtype in (Float64, ComplexF64)
+            field = ScalarField(domain.dist, "f", domain.bases, dtype)
+            grid_data!(field) .= initial
+            coeff = coeff_data!(field)
+            coord = domain.dist.coordsys["y"]
+            for order in (1, 2)
+                expected = dtype <: Real && isodd(order) ? 0.0 : (-4im)^order
+                matrix = Tarang._spectral_differentiate(field, coord, order, length(coeff), length(coeff))
+                factors = Tarang._diagonal_deriv_grid(field, coord, order)
+                @test matrix * vec(coeff) ≈ expected .* vec(coeff) atol=1e-12
+                @test factors .* coeff ≈ expected .* coeff atol=1e-12
+            end
+        end
+    end
+
+    @testset "Polynomial derivative uses every basis and the current grid" begin
+        coords = CartesianCoordinates("x", "z")
+        dist = Distributor(coords)
+        bx = ChebyshevT(coords["x"]; size=8, bounds=(-1.0, 1.0))
+        bz = Legendre(coords["z"]; size=8, bounds=(-1.0, 1.0))
+        f = ScalarField(dist, "f", (bx, bz), Float64)
+        x, z = local_grids(dist, bx, bz)
+        grid_data!(f) .= x .* z'
+        for layout in (:g, :c)
+            df = evaluate(Differentiate(f, coords["x"], 1), layout)
+            @test df.current_layout === layout
+            @test maximum(abs, grid_data!(df) .- z') < 1e-12
+        end
+
+        zcoords = CartesianCoordinates("z")
+        zdist = Distributor(zcoords)
+        basis = ChebyshevU(zcoords["z"]; size=8, bounds=(-1.0, 1.0))
+        g = ScalarField(zdist, "g", (basis,), Float64)
+        grid_data!(g) .= vec(local_grid(basis, zdist, 1.0)).^2
+        set_scales!(g, 1.5)
+        dg = evaluate(Differentiate(g, zcoords["z"], 1), :g)
+        @test grid_data!(dg) ≈ 2 .* vec(local_grid(basis, zdist, 1.5)) atol=1e-12
+    end
+
     @testset "Convert preserves stored-basis normalization" begin
         coords = CartesianCoordinates("z")
         dist = Distributor(coords)

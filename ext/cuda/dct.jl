@@ -60,13 +60,7 @@ function plan_gpu_fft_dim(arch::GPU{CuDevice}, full_size::Tuple, T::Type, dim::I
         # Real-to-complex FFT along specified dimension
         dummy_in = CUDA.zeros(T, full_size...)
         plan = CUFFT.plan_rfft(dummy_in, (dim,))
-
-        # Output size: dimension `dim` becomes N/2 + 1
-        out_size = ntuple(i -> i == dim ? div(full_size[i], 2) + 1 : full_size[i], ndims)
-        dummy_out = CUDA.zeros(complex_T, out_size...)
-        iplan = CUFFT.plan_irfft(dummy_out, full_size[dim], (dim,))
-
-        return GPUFFTPlanDim(plan, iplan, full_size, dim, true)
+        return GPUFFTPlanDim(plan, inv(plan), full_size, dim, true)
     else
         # Complex-to-complex FFT along specified dimension
         dummy = CUDA.zeros(complex_T, full_size...)
@@ -96,29 +90,15 @@ end
 
 Execute inverse FFT along a specific dimension.
 
-For an R2C (`is_real`) plan the inverse is a cuFFT C2R (irfft), which OVERWRITES
-its input buffer. By default, copy `input` into a cached scratch first so the
-caller's coefficient buffer is never corrupted — mirrors `gpu_backward_fft!`
-(transforms.jl) and the async `_gpu_ifft_exec!` (batched_fft.jl). A caller
-passing a buffer that is already dead (e.g. `gpu_mixed_backward_transform!`,
-whose input at this stage is ping-pong scratch) sets `destroy_input=true` to
-skip that full-array defensive copy. C2C inverse is non-destructive — the flag
-is irrelevant there.
-
-Uses the shared per-(device,shape,eltype) scratch cache, so serial single-GPU
-use (one transform at a time per device) is the supported pattern.
+The cuFFT inverse preserves the input by default. Mixed transforms pass
+`destroy_input=true` when their scratch spectrum can be consumed directly.
 """
 function gpu_ifft_dim!(output::CuArray, input::CuArray, plan::GPUFFTPlanDim;
                        destroy_input::Bool=false)
-    if plan.is_real && !destroy_input
-        arch = Tarang.architecture(input)
-        scratch = get_gpu_dct_scratch(arch, size(input), eltype(input), 1)[1]
-        copyto!(scratch, input)
-        mul!(output, plan.iplan, scratch)
-    else
-        mul!(output, plan.iplan, input)
+    if plan.is_real && destroy_input
+        return Tarang._padded_inverse!(output, plan.iplan, input)
     end
-    return output
+    return mul!(output, plan.iplan, input)
 end
 
 # ── Shared plan-cache lock and device identity ──────────────────────────────
@@ -155,7 +135,7 @@ function get_gpu_dct_scratch(arch::GPU, shape::NTuple{N,Int}, ::Type{T}, count::
     key = purpose === :default ? base_key : (base_key..., purpose)
     buffers = lock(_GPU_DCT_PLAN_CACHE_LOCK) do
         get!(() -> CuArray{T,N}[CUDA.zeros(T, shape...) for _ in 1:count],
-             _GPU_DCT_SCRATCH_CACHE, key)
+             _transform_cache(_GPU_DCT_SCRATCH_CACHE), key)
     end
     return buffers::Vector{CuArray{T,N}}   # function barrier: type-stable downstream
 end
@@ -163,6 +143,6 @@ end
 """Clear all cached GPU DCT scratch buffers (thread-safe)."""
 function clear_gpu_dct_scratch_cache!()
     lock(_GPU_DCT_PLAN_CACHE_LOCK) do
-        empty!(_GPU_DCT_SCRATCH_CACHE)
+        empty!(_transform_cache(_GPU_DCT_SCRATCH_CACHE))
     end
 end

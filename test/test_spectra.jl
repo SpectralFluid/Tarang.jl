@@ -10,17 +10,19 @@ using Test
 using Tarang
 
 # Build a 2D periodic scalar field and fill its grid via f(x, y).
-function _mode_field(f)
+function _mode_field(f; shape=(16, 16), periods=(2π, 2π))
     coords = CartesianCoordinates("x", "y")
     dist = Distributor(coords; mesh=(1, 1), dtype=Float64)
-    xb = RealFourier(coords["x"]; size=16, bounds=(0.0, 2π))
-    yb = RealFourier(coords["y"]; size=16, bounds=(0.0, 2π))
+    nx, ny = shape
+    lx, ly = periods
+    xb = RealFourier(coords["x"]; size=nx, bounds=(0.0, lx))
+    yb = RealFourier(coords["y"]; size=ny, bounds=(0.0, ly))
     u = ScalarField(dist, "u", (xb, yb), Float64)
     ensure_layout!(u, :g)
-    xs = collect(range(0, 2π, length=17))[1:16]
-    ys = collect(range(0, 2π, length=17))[1:16]
+    xs = range(0, lx, length=nx + 1)[1:nx]
+    ys = range(0, ly, length=ny + 1)[1:ny]
     gd = Tarang.get_grid_data(u)
-    for i in 1:16, j in 1:16
+    for i in 1:nx, j in 1:ny
         gd[i, j] = f(xs[i], ys[j])
     end
     return u
@@ -57,6 +59,34 @@ end
         peak = argmax(ps.power)
         @test _bin_containing(ps, 2) == peak
         @test ps.power[peak] / sum(ps.power) > 0.99
+    end
+
+    @testset "odd full FFT axes include both signs of the highest mode" begin
+        field = _mode_field((x, y) -> cos(2y); shape=(8, 5))
+        ps = Tarang.power_spectrum(field)
+        @test argmax(ps.power) == _bin_containing(ps, 2)
+        full = Tarang.power_spectrum(field; radial_average=false)
+        @test length(full) == 25
+        @test full[(0.0, 2.0)] > 0
+        @test full[(0.0, -2.0)] ≈ full[(0.0, 2.0)]
+    end
+
+    @testset "full spectrum retains distinct fractional wavenumbers" begin
+        field = _mode_field((x, y) -> 1 + cos(x / 4); shape=(8, 8), periods=(8π, 2π))
+        full = Tarang.power_spectrum(field; radial_average=false)
+        @test length(full) == length(get_coeff_data(field))
+        @test full[(0.0, 0.0)] > 0
+        @test full[(0.25, 0.0)] ≈ full[(0.0, 0.0)] / 2
+    end
+
+    @testset "full spectrum uses the actual scaled rfft size" begin
+        field = _mode_field((x, y) -> 0.0; shape=(8, 5))
+        preset_scales!(field, (1.5, 1.0))
+        x = 2π .* (0:11) ./ 12
+        grid_data!(field) .= reshape(1 .+ cos.(5 .* x), :, 1)
+        full = Tarang.power_spectrum(field; radial_average=false)
+        @test length(full) == 7 * 5
+        @test full[(5.0, 0.0)] ≈ full[(0.0, 0.0)] / 2
     end
 
     @testset "high x-mode above N/4 is retained, not truncated" begin
@@ -121,6 +151,17 @@ end
         # peak power sits in the bin containing the physical wavenumber 12
         peak_k = ps.k[argmax(ps.power)]
         @test isapprox(peak_k, 12.0; atol = 1.0)
+    end
+
+    @testset "Complex fields on RealFourier bases use full-spectrum weights" begin
+        domain = PeriodicDomain(8, 8; dtype=ComplexF64)
+        u = VectorField(domain, "u")
+        x = vec(local_grid(first(domain.bases), domain.dist, 1.0))
+        grid_data!(u[1]) .= cis.(x)
+        fill!(grid_data!(u[2]), 0)
+        total = sum(abs2, coeff_data!(u[1]))
+        @test sum(values(energy_spectrum(u; radial_average=false))) ≈ total / 2
+        @test sum(values(power_spectrum(u[1]; radial_average=false))) ≈ total
     end
 
     @testset "rfft weights and k-multipliers follow a permuted PencilArray's logical axes" begin

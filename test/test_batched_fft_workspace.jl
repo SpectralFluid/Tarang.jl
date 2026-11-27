@@ -3,6 +3,24 @@ using Tarang
 using FFTW
 using CUDA
 
+@testset "Asynchronous real inverse plans follow stream and grid shape" begin
+    ext = Base.get_extension(Tarang, :TarangCUDAExt)
+    cache = Tarang._gpu_workspace_cache(ext._ASYNC_REAL_INVERSES)
+    for n in (8, 9, 8)
+        data = reshape(Float32.(1:3n), n, 3)
+        spectrum = rfft(data)
+        inverse(key) = ext._async_real_inverse!(cache, (key,), spectrum, size(data),
+                                                (1,2), inv(Float32(length(data))))
+        first_stream = inverse(1)
+        @test inverse(1) === first_stream
+        @test inverse(2) !== first_stream
+        @test first_stream * copy(spectrum) ≈ data
+        @test length(cache) == 2
+    end
+    ext.clear_gpu_transform_cache!()
+    @test isempty(cache)
+end
+
 @testset "Packed FFT workspace reuses buffers and preserves inputs" begin
     ext = Base.get_extension(Tarang, :TarangCUDAExt)
     for shape in ((7,), (8,5)), real_input in (false, true)

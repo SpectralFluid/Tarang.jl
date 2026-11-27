@@ -29,6 +29,9 @@ using Printf
 using Random
 using LinearAlgebra
 
+isdefined(@__MODULE__, :check_fourier_timestepper_cases) ||
+    include(joinpath(@__DIR__, "timestepper_fourier_cases.jl"))
+
 const _GTJ_OK = try
     @eval using JLArrays
     @eval using GPUArrays
@@ -126,6 +129,7 @@ end
         @test_skip "JLArrays not available"
     else
         GPUArrays.allowscalar(false)
+        check_fourier_timestepper_cases(_GTJ_ARCH)
 
         gtj_grid(u) = (ensure_layout!(u, :g); Array(Tarang.get_grid_data(u)))
 
@@ -188,14 +192,6 @@ end
             end
         end
 
-        # Which schemes are the same arithmetic on both architectures for an
-        # explicit problem. ETD_* legitimately substitute (with a warning) an RK/
-        # multistep step when there is no linear operator, so they are checked for
-        # accuracy but not bit parity.
-        parity_exact = (RK111(), RK222(), RK443(), RKSMR(), Tarang.RKGFY(),
-                        CNAB1(), CNAB2(), SBDF1(), SBDF2(), SBDF3(), SBDF4(),
-                        Tarang.MCNAB2(), Tarang.CNLF2(), diagonal...)
-
         @testset "explicit nonlinear problem: device == CPU, and startup-limited order" begin
             # dt(u) = -u², u0 ≡ 1 → 1/(1+t). Spatially exact, so the error is the
             # time-discretization error alone.
@@ -214,12 +210,10 @@ end
                 # MCNAB2/CNLF2 used to fall to CNAB1 (rate 1) on every device step.
                 @test rate > order - 0.5
 
-                if any(p -> typeof(p) === typeof(ts), parity_exact)
-                    dts = fill(0.01, 20)
-                    dev, _ = gtj_run(_GTJ_ARCH, "dt(u) = -u*u", ts, dts, x -> 1 + 0.1cos(x))
-                    cpu, _ = gtj_run(CPU(), "dt(u) = -u*u", ts, dts, x -> 1 + 0.1cos(x))
-                    @test maximum(abs, dev .- cpu) < 1e-12
-                end
+                dts = fill(0.01, 20)
+                dev, _ = gtj_run(_GTJ_ARCH, "dt(u) = -u*u", ts, dts, x -> 1 + 0.1cos(x))
+                cpu, _ = gtj_run(CPU(), "dt(u) = -u*u", ts, dts, x -> 1 + 0.1cos(x))
+                @test maximum(abs, dev .- cpu) < 1e-12
             end
         end
 

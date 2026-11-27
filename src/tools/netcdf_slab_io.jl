@@ -49,14 +49,16 @@ function slab_overlap(src_start::AbstractVector{<:Integer}, src_count::AbstractV
     return (src_offset = src_offset, dst_offset = dst_offset, extent = extent)
 end
 
+const _SlabEntry = NamedTuple{(:file, :start, :count, :dim_lengths, :leading_indices),
+    Tuple{String, Vector{Int}, Vector{Int}, Vector{Int}, Vector{Int}}}
+
 """
 A set of NetCDF files holding slabs of one or more global arrays.
 
-`entries[var]` lists every stored piece of `var` as `(file, start, count,
-dim_lengths)` with 0-based `start`. `dim_lengths` is the full shape of the
-variable AS STORED, in Julia (column-major) order; it can be longer than
-`count` — see `read_local_slab!`. `global_shape[var]` is the shape the pieces
-tile.
+`entries[var]` lists every stored piece of `var` with 0-based spatial `start`
+and the full stored `dim_lengths` in Julia order. `leading_indices` selects
+records in any axes before the spatial slab. `global_shape[var]` is the shape
+the pieces tile.
 
 A variable counts as a slab only if it carries all three of the `start`, `count`
 and `global_shape` attributes. That rule is what lets a directory written by
@@ -65,7 +67,7 @@ no slab metadata and are skipped.
 """
 struct SlabSource
     files::Vector{String}
-    entries::Dict{String, Vector{NamedTuple{(:file, :start, :count, :dim_lengths), Tuple{String, Vector{Int}, Vector{Int}, Vector{Int}}}}}
+    entries::Dict{String, Vector{_SlabEntry}}
     global_shape::Dict{String, Vector{Int}}
 end
 
@@ -74,11 +76,19 @@ end
 Accepts a file, a file without its `.nc` suffix, or a directory of `*.nc` slabs
 (with or without the suffix on the directory name)."""
 function _slab_files(path::AbstractString)
-    stem = endswith(path, ".nc") ? String(path[1:end-3]) : String(path)
+    stem = endswith(path, ".nc") ? chop(path; tail=3) : String(path)
     dir = isdir(path) ? String(path) : (isdir(stem) ? stem : nothing)
     with_nc = endswith(path, ".nc") ? String(path) : string(path, ".nc")
     file = (isfile(path) && !isdir(path)) ? String(path) :
            (isfile(with_nc) ? with_nc : nothing)
+
+    # During a directory replacement, the complete previous generation stays
+    # readable until the new directory has its public name.
+    if dir === nothing && file === nothing
+        retired = joinpath(string(stem, ".tarang-publish"), "previous")
+        dir = isdir(retired) ? retired : nothing
+        file = isfile(retired * ".nc") ? retired * ".nc" : nothing
+    end
 
     dir_files = dir === nothing ? String[] :
                 sort(filter(f -> endswith(f, ".nc"), readdir(dir; join = true)))
@@ -149,10 +159,10 @@ function open_slab_source(path::AbstractString)
         "open_slab_source: no NetCDF files found at '$path'. Expected a .nc file or a " *
         "directory containing *.nc slab files.")
 
-    EntryT = NamedTuple{(:file, :start, :count, :dim_lengths), Tuple{String, Vector{Int}, Vector{Int}, Vector{Int}}}
-    entries = Dict{String, Vector{EntryT}}()
+    entries = Dict{String, Vector{_SlabEntry}}()
     gshape = Dict{String, Vector{Int}}()
     gshape_file = Dict{String, String}()
+    records = Dict{String, Tuple{Vector{Int}, Bool, Union{Nothing, Int}}}()
 
     for file in files
         info = netcdf_file_info(file)
@@ -177,11 +187,34 @@ function open_slab_source(path::AbstractString)
                       "must agree on the shape they tile; the directory mixes files from " *
                       "different resolutions or different runs.")
             end
-            push!(get!(() -> EntryT[], entries, name),
+
+            dim_lengths = collect(Int, v.dim_lengths)
+            lead = max(0, length(dim_lengths) - length(st))
+            leading_indices = dim_lengths[1:lead]
+            committed = lead == 0 ? nothing : _global_integer_attribute(info, "committed_writes")
+            tracked = committed !== nothing
+            if lead > 0
+                last_record = something(committed, leading_indices[1])
+                kind = tracked ? "committed" : "stored"
+                0 < last_record <= leading_indices[1] || error(
+                    "open_slab_source: '$name' in '$file' has no readable $kind record " *
+                    "(latest $kind record $last_record, stored length $(leading_indices[1])).")
+                leading_indices[1] = last_record
+            end
+            committed_total = tracked ? _global_integer_attribute(info, "committed_total_writes") : nothing
+            record = (leading_indices, tracked, committed_total)
+            if haskey(records, name) && records[name] != record
+                error("open_slab_source: '$name' has inconsistent latest records in " *
+                      "'$file' and '$(gshape_file[name])'. All slabs must agree on the " *
+                      "record index and commit metadata.")
+            end
+
+            push!(get!(() -> _SlabEntry[], entries, name),
                   (file = file, start = st, count = ct,
-                   dim_lengths = collect(Int, v.dim_lengths)))
+                   dim_lengths = dim_lengths, leading_indices = leading_indices))
             gshape[name] = gs
             gshape_file[name] = file
+            records[name] = record
         end
     end
 
@@ -190,10 +223,8 @@ end
 
 """1-based `start`/`count` for reading overlap `ov` out of slab entry `e`.
 
-The slab metadata describes the trailing dimensions of the stored variable. Any
-leading dimensions it does not describe (`NetCDFFileHandler`'s unlimited
-`sim_time` axis) are read at their LAST index with extent 1, so the caller gets
-the most recent write and can reshape the singleton away."""
+The slab metadata describes the trailing dimensions. `open_slab_source`
+selects the record indices for any leading dimensions."""
 function _slab_read_indices(e, ov, varname::AbstractString)
     lead = length(e.dim_lengths) - length(e.start)
     lead == 0 && return (ov.src_offset .+ 1, collect(Int, ov.extent))
@@ -201,7 +232,7 @@ function _slab_read_indices(e, ov, varname::AbstractString)
         "read_local_slab!: '$varname' in '$(e.file)' is stored with " *
         "$(length(e.dim_lengths)) dimension(s) but its slab metadata describes " *
         "$(length(e.start)). The start/count attributes do not match the variable.")
-    return (vcat(e.dim_lengths[1:lead], ov.src_offset .+ 1),
+    return (vcat(e.leading_indices, ov.src_offset .+ 1),
             vcat(fill(1, lead), collect(Int, ov.extent)))
 end
 
@@ -225,10 +256,10 @@ leading unlimited `sim_time` dimension, while `build_layout_metadata` stamps
 `start`/`count`/`global_shape` covering only the component and spatial dims
 (`netcdf_output.jl`). The stored variable is then one rank higher than its own
 slab metadata describes. Those extra dimensions are always LEADING in Julia
-order (`write_task_data!` writes `reshape(data, 1, size(data)...)`), so this
-reads the LAST index along each of them — the most recent write in the file —
-and drops the resulting singleton dimensions. Without that padding the
-`start`/`count` vectors handed to NetCDF are shorter than the variable's rank,
+order (`write_task_data!` writes `reshape(data, 1, size(data)...)`). Read the
+latest committed record when commit metadata is present, or the last stored
+record for legacy files, and drop the resulting singleton dimensions. Without
+padding, the `start`/`count` vectors handed to NetCDF are shorter than the variable's rank,
 which the C layer reads past the end of: sometimes `NetCDF: Index exceeds
 dimension bound`, sometimes plausible garbage.
 """

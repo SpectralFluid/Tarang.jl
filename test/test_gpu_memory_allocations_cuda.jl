@@ -24,6 +24,42 @@ else
     CUDA.device!(local_rank % length(CUDA.devices()))
     CUDA.allowscalar(false)
     const _GM_EXT = Base.get_extension(Tarang,:TarangCUDAExt)
+    include("gpu_workspace_cases.jl")
+    # Early CUDA.jl 5 releases copy C2R input inside the library on every call.
+    # Check Tarang's reuse on all releases and the native byte counter when the
+    # cuFFT plan provides persistent input-preservation storage.
+    reusable_real_fft = hasproperty(CUDA.CUFFT.plan_rfft(CUDA.zeros(Float32, 8)), :buffer)
+    check_gpu_workspace_cases(GPU(backend=:cuda, device_id=Int(CUDA.deviceid(CUDA.device()))), _GM_EXT,
+                              () -> CUDA.alloc_stats.alloc_bytes; reusable_real_fft)
+    @testset "Asynchronous real inverses preserve coefficients across streams" begin
+        grids = ntuple(i -> randn(MersenneTwister(i), Float32, 16, 9), 2)
+        coefficients = map(rfft, grids)
+        inputs = map(CUDA.CuArray, coefficients)
+        outputs = map(g -> CUDA.zeros(Float32, size(g)...), grids)
+        streams = (CUDA.CuStream(), CUDA.CuStream())
+        arch = Tarang.architecture(first(inputs))
+        plan = _GM_EXT.plan_gpu_fft(arch, size(first(grids)), Float32; real_input=true)
+        function run_inverses!()
+            for i in eachindex(streams)
+                _GM_EXT.gpu_ifft_async!(outputs[i], inputs[i], plan; stream=streams[i])
+            end
+            foreach(CUDA.synchronize, streams)
+        end
+        CUDA.synchronize()
+        run_inverses!()
+        before = CUDA.alloc_stats.alloc_bytes
+        run_inverses!()
+        if hasproperty(plan.plan, :buffer)
+            @test CUDA.alloc_stats.alloc_bytes == before
+            @test plan.plan.buffer === plan.iplan.p.buffer
+            batch = _GM_EXT.get_batched_fft_plan(arch, size(first(grids)), Float32, 2; real_input=true)
+            @test batch.packed_output === batch.plan.buffer === batch.iplan.p.buffer
+        end
+        @test all(i -> Array(outputs[i]) ≈ grids[i], eachindex(grids))
+        @test all(i -> Array(inputs[i]) == coefficients[i], eachindex(inputs))
+        _GM_EXT.clear_gpu_transform_cache!()
+        @test isempty(Tarang._gpu_workspace_cache(_GM_EXT._ASYNC_REAL_INVERSES))
+    end
     @testset "GPU C2C avoids unused staging grids" begin
         coords=CartesianCoordinates("x","y")
         dist=Distributor(coords;dtype=ComplexF64,device=GPU(),comm=MPI.COMM_SELF)

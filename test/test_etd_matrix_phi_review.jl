@@ -2,6 +2,7 @@ using Test
 using Tarang
 using LinearAlgebra
 using SparseArrays
+using Random: MersenneTwister
 
 @testset "ETD matrix phi functions preserve singular couplings" begin
     @testset "nilpotent Jordan blocks" begin
@@ -146,5 +147,32 @@ end
         # A small operator still uses ETD rather than the implicit fallback.
         @test !Tarang._etd_oversized_fallback!(state, solver, spzeros(2, 2), nothing, fallback)
         @test calls[] == 1
+    end
+end
+
+@testset "Oversized ETD-RK2 preserves each stochastic increment" begin
+    domain = PeriodicDomain(8192)  # 4097 coefficients, beyond the dense ETD limit
+    try
+        function forced_solver(ts)
+            u = ScalarField(domain, "u")
+            set!(u, 0.0)
+            p = InitialValueProblem([u])
+            add_equation!(p, "2*dt(u) + 3*u = 0")
+            f = StochasticForcing(; field_size=(8192,), spectrum_type=:band,
+                                  k_forcing=2, dk_forcing=0.25, rng=MersenneTwister(145))
+            add_stochastic_forcing!(p, :u, f)
+            return InitialValueSolver(p, ts; dt=0.125), u
+        end
+        s, u = forced_solver(ETD_RK222())
+        reference, v = forced_solver(RK222())
+        for h in (0.125, 0.125, 0.075, 0.1)
+            step!(s, h)
+            step!(reference, h)
+            @test maximum(abs, grid_data!(v)) > 0
+            @test grid_data!(u) ≈ grid_data!(v) atol=1e-12 rtol=1e-12
+        end
+        @test !haskey(s.timestepper_state.timestepper_data, :etd_phi)
+    finally
+        close(domain.dist)
     end
 end

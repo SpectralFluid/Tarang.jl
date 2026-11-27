@@ -62,6 +62,10 @@ run!(solver; stop_iteration=100, progress=false)
 diagnose(solver)
 ```
 
+The initial and subsequent timesteps must be finite and positive. `step!` also
+requires `sim_time + dt` to be finite and strictly later than `sim_time` in
+Float64. It checks this before updating boundary conditions, forcing, or history.
+
 ### Internal solver build path
 
 At solver construction, `InitialValueSolver(problem, timestepper; dt=...)` runs several build stages in order:
@@ -241,8 +245,9 @@ ETD_SBDF2()
 internal diagonal implementation on GPU Fourier problems; no device-specific
 timestepper name is needed.
 
-The ETD types use global matrix φ-functions in serial; under MPI pure-Fourier
-execution they currently share the distributed ETD-RK2 path. An attached
+Serial CPU ETD uses global matrix φ-functions. On a distributed CPU Fourier grid,
+`ETD_RK222` applies its two-stage update per mode. `ETD_CNAB2` and `ETD_SBDF2`
+use that update for startup and then use variable-step exponential Adams–Bashforth. An attached
 `SpectralLinearOperator` (`set_spectral_linear_operator!`) is applied only by
 those six diagonal-capable schemes on all-Fourier problems; every other scheme
 refuses it with an `ArgumentError` rather than ignoring it.

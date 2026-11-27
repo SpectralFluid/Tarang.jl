@@ -12,6 +12,10 @@ Subproblems are identified by their group multi-index, which identifies
 the corresponding group of each separable dimension of the problem.
 """
 const _SubproblemRKBufferKey = Tuple{Symbol, Int}
+const _SubproblemVector = Union{AbstractVector{ComplexF64}, AbstractVector{ComplexF32}}
+
+# Existing matrix solvers use double precision unless the backend selects another type.
+_subproblem_eltype(::AbstractArchitecture) = ComplexF64
 
 """Fixed equation-space geometry; forcing expressions are read live by index."""
 struct _SubproblemAlgebraicBlock
@@ -30,15 +34,15 @@ mutable struct SubproblemRuntimeCache
     bc_rows_device::Union{Nothing, AbstractVector{Int}}
     pre_right_pinv_indices::Union{Nothing, Vector{Int}}
     pre_left_indices::Union{Nothing, Vector{Int}}
-    compress_variable_space::Union{Nothing, AbstractVector{ComplexF64}}
-    expand_variable_space::Union{Nothing, AbstractVector{ComplexF64}}
-    compress_equation_space::Union{Nothing, AbstractVector{ComplexF64}}
-    gather_inputs_raw::Union{Nothing, AbstractVector{ComplexF64}}
-    scatter_inputs_expanded::Union{Nothing, AbstractVector{ComplexF64}}
-    gather_outputs_raw::Union{Nothing, AbstractVector{ComplexF64}}
-    gather_eqn_F_raw::Union{Nothing, AbstractVector{ComplexF64}}
-    gather_alg_F_raw::Union{Nothing, AbstractVector{ComplexF64}}
-    gather_alg_F_raw_cpu::Union{Nothing, Vector{ComplexF64}}
+    compress_variable_space::Union{Nothing, _SubproblemVector}
+    expand_variable_space::Union{Nothing, _SubproblemVector}
+    compress_equation_space::Union{Nothing, _SubproblemVector}
+    gather_inputs_raw::Union{Nothing, _SubproblemVector}
+    scatter_inputs_expanded::Union{Nothing, _SubproblemVector}
+    gather_outputs_raw::Union{Nothing, _SubproblemVector}
+    gather_eqn_F_raw::Union{Nothing, _SubproblemVector}
+    gather_alg_F_raw::Union{Nothing, _SubproblemVector}
+    gather_alg_F_raw_cpu::Union{Nothing, Vector{ComplexF32}, Vector{ComplexF64}}
     # The exact destination vector the last `gather_alg_F!` filled. Static-BC
     # steppers skip the (host rebuild + H2D upload) re-gather when their cached
     # stage vector is IDENTICALLY this object — identity, not a flag, so a
@@ -64,7 +68,7 @@ mutable struct SubproblemRuntimeCache
     bc_fourier_group::Union{Nothing, Tuple}
     mass_solver::Any
     lhs_dirty::Dict{Float64, Bool}
-    rk_buffers::Dict{_SubproblemRKBufferKey, AbstractVector{ComplexF64}}
+    rk_buffers::Dict{_SubproblemRKBufferKey, _SubproblemVector}
     # Per-(subproblem,field) memo of the per-mode DOF count and coeff-select index.
     # Both depend only on the field's bases + this subproblem's mode group + the
     # (step-invariant) coeff layout, so they are recomputed identically every step —
@@ -88,7 +92,7 @@ mutable struct SubproblemRuntimeCache
     # dropping every lift(tau) term from any history rebuilt by scatter→re-gather
     # (the per-mode IMEX LX stage history). Keyed by objectid(field); only state
     # fields that are actually scattered into ever get an entry.
-    zero_dim_stash::Dict{UInt, AbstractVector{ComplexF64}}
+    zero_dim_stash::Dict{UInt, _SubproblemVector}
 end
 
 SubproblemRuntimeCache() = SubproblemRuntimeCache(
@@ -101,11 +105,11 @@ SubproblemRuntimeCache() = SubproblemRuntimeCache(
     nothing, nothing, nothing,
     nothing,
     Dict{Float64, Bool}(),
-    Dict{_SubproblemRKBufferKey, AbstractVector{ComplexF64}}(),
+    Dict{_SubproblemRKBufferKey, _SubproblemVector}(),
     Dict{UInt, Int}(),
     Dict{UInt, Any}(),
     Dict{UInt, Union{Nothing, Tuple{Int, Int, Int}}}(),
-    Dict{UInt, AbstractVector{ComplexF64}}(),
+    Dict{UInt, _SubproblemVector}(),
 )
 
 # Cap for the per-field memo Dicts (field_size_cache / coeff_index_cache) so a long

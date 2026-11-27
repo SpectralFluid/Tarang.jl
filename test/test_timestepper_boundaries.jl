@@ -368,21 +368,16 @@ end
     @test maximum(abs, Array(get_grid_data(dae_u)) .- (1 - exp(-1))) < 2e-6
     @test maximum(abs, Array(get_grid_data(dae_v))) < 1e-12
 
-    bad_u = ScalarField(dae_domain, "bad_u")
-    bad_v = ScalarField(dae_domain, "bad_v")
-    bad_problem = InitialValueProblem([bad_u, bad_v])
-    add_equation!(bad_problem, "dt(bad_u) + bad_u + bad_v = 0")
-    add_equation!(bad_problem, "bad_v = 1")
-    bad_ivp = InitialValueSolver(bad_problem, RK222(); dt=0.01)
-    algebraic_error = try
-        step!(bad_ivp)
-        nothing
-    catch err
-        err
-    end
-    @test algebraic_error isa ArgumentError
-    @test occursin("cannot project a nonzero algebraic right-hand side",
-                   sprint(showerror, algebraic_error))
+    fixed_u = ScalarField(dae_domain, "fixed_u")
+    fixed_v = ScalarField(dae_domain, "fixed_v")
+    set!(fixed_v, 1.0)
+    fixed_problem = InitialValueProblem([fixed_u, fixed_v])
+    add_equation!(fixed_problem, "dt(fixed_u) + fixed_u + fixed_v = 0")
+    add_equation!(fixed_problem, "fixed_v = 1")
+    fixed_ivp = InitialValueSolver(fixed_problem, RK222(); dt=0.01)
+    step!(fixed_ivp)
+    @test grid_data!(fixed_v) ≈ ones(8) atol=1e-12
+    @test maximum(abs, grid_data!(fixed_u) .- expm1(-0.01)) < 1e-7
 end
 
 @testset "Subproblem RK final update preserves moving nonlinear boundary constraints" begin

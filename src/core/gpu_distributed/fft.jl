@@ -147,7 +147,7 @@ function distributed_fft_dim!(data, dim::Int, dfft::DistributedGPUFFT, direction
     if config.cuda_aware_mpi
         return distributed_fft_cuda_aware!(data, dim, dfft, direction)
     else
-        error("Distributed GPU FFT requires CUDA-aware MPI; CPU staging fallback is disabled.")
+        error("Distributed GPU FFT requires GPU-aware MPI; CPU staging fallback is disabled.")
     end
 end
 
@@ -158,7 +158,7 @@ Distributed FFT with CPU staging for MPI communication.
 """
 function distributed_fft_staged!(data, dim::Int, dfft::DistributedGPUFFT, direction::Symbol)
     is_gpu_array(data) && error(
-        "CPU-staged distributed FFT is disabled for GPU data; use CUDA-aware MPI.")
+        "Distributed FFTs on device arrays require GPU-aware MPI.")
     config = dfft.config
     arch = architecture(data)
 
@@ -211,10 +211,9 @@ function distributed_fft_cuda_aware!(data, dim::Int, dfft::DistributedGPUFFT, di
     end
 
     # Verify CUDA-aware MPI is actually available
-    if !_verify_cuda_aware_mpi()
+    if !_verify_device_aware_mpi(arch)
         config.cuda_aware_mpi = false
-        _CUDA_AWARE_MPI_VERIFIED[] = false  # Update global cache to match
-        error("Distributed GPU FFT requires verified CUDA-aware MPI; CPU staging fallback is disabled.")
+        error("Distributed GPU FFT requires verified GPU-aware MPI; CPU staging fallback is disabled.")
     end
 
     comm = config.comm
@@ -293,6 +292,8 @@ Runtime verification that CUDA-aware MPI actually works.
 Performs a small test transfer to verify functionality.
 """
 const _CUDA_AWARE_MPI_VERIFIED = Ref{Union{Nothing, Bool}}(nothing)
+
+_verify_device_aware_mpi(::AbstractArchitecture) = _verify_cuda_aware_mpi()
 
 function _verify_cuda_aware_mpi()
     _CUDA_AWARE_MPI_VERIFIED[] !== nothing && return _CUDA_AWARE_MPI_VERIFIED[]

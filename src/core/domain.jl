@@ -693,7 +693,7 @@ function integration_weights(domain::Domain; on_device::Bool=true)
 
         # Move to device if requested; `to_architecture` is the identity on CPU.
         if on_device
-            w = to_architecture(arch, w)
+            w = _coordinate_array(arch, domain.dist.dtype, w)
         end
 
         # Cache the weights
@@ -766,7 +766,7 @@ function get_grid_coordinates(domain::Domain; on_device::Bool=true)
 
         # Move to device if requested; `to_architecture` is the identity on CPU.
         if on_device
-            coord_values = to_architecture(arch, coord_values)
+            coord_values = _coordinate_array(arch, domain.dist.dtype, coord_values)
         end
 
         domain.grid_coordinates[cache_key] = coord_values

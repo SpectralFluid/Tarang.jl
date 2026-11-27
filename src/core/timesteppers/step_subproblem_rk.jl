@@ -37,12 +37,13 @@
             dest[i] += a * src[i]
         end
     else
-        dest .+= a .* src
+        weight = a isa Real ? real(eltype(dest))(a) : eltype(dest)(a)
+        dest .+= weight .* src
     end
     return dest
 end
 
-_subproblem_vector_slots(n::Int) = Vector{AbstractVector{ComplexF64}}(undef, n)
+_subproblem_vector_slots(n::Int, ::Type{T}=ComplexF64) where T = Vector{AbstractVector{T}}(undef, n)
 
 function _subproblem_stage_vector_slots(stages::Int, n_sp::Int)
     return [_subproblem_vector_slots(n_sp) for _ in 1:stages]
@@ -77,21 +78,23 @@ function _cached_state_fields!(state::TimestepperState, problem)
 end
 
 """Reusable length-`n` slot container cached under `key`; rebuilt only if `n` changed."""
-function _sp_slots!(state::TimestepperState, key::Symbol, n::Int)
-    v = get!(() -> Vector{AbstractVector{ComplexF64}}(undef, n),
-             state.timestepper_data, key)::Vector{AbstractVector{ComplexF64}}
+function _sp_slots!(state::TimestepperState, key::Symbol, n::Int,
+                    ::Type{T}=_subproblem_eltype(first(last(state.history)).dist.architecture)) where T
+    v = get!(() -> _subproblem_vector_slots(n, T),
+             state.timestepper_data, key)::Vector{AbstractVector{T}}
     length(v) == n || resize!(v, n)
     return v
 end
 
 """Reusable `stages × n` nested slot container cached under `key`."""
-function _sp_stage_slots!(state::TimestepperState, key::Symbol, stages::Int, n::Int)
-    v = get!(() -> [Vector{AbstractVector{ComplexF64}}(undef, n) for _ in 1:stages],
-             state.timestepper_data, key)::Vector{Vector{AbstractVector{ComplexF64}}}
+function _sp_stage_slots!(state::TimestepperState, key::Symbol, stages::Int, n::Int,
+                          ::Type{T}=_subproblem_eltype(first(last(state.history)).dist.architecture)) where T
+    v = get!(() -> [_subproblem_vector_slots(n, T) for _ in 1:stages],
+             state.timestepper_data, key)::Vector{Vector{AbstractVector{T}}}
     length(v) == stages || resize!(v, stages)
     @inbounds for s in 1:stages
         if !isassigned(v, s)
-            v[s] = Vector{AbstractVector{ComplexF64}}(undef, n)
+            v[s] = _subproblem_vector_slots(n, T)
         elseif length(v[s]) != n
             resize!(v[s], n)
         end
@@ -303,25 +306,40 @@ end
 # into a caller-provided buffer to avoid per-solve allocation.
 _solve_cached_system(lhs_solver::WoodburySolver, rhs::AbstractVector{ComplexF64}) =
     _woodbury_solve(lhs_solver, rhs)
-_solve_cached_system(lhs_solver::MatSolvers.AbstractMatSolver, rhs::AbstractVector{ComplexF64}) =
+_solve_cached_system(lhs_solver::MatSolvers.AbstractMatSolver, rhs::_SubproblemVector) =
     MatSolvers.solve(lhs_solver, rhs)
-_solve_cached_system(lhs_solver, rhs::AbstractVector{ComplexF64}) = lhs_solver \ rhs
+_solve_cached_system(lhs_solver, rhs::_SubproblemVector) = lhs_solver \ rhs
 
 function _solve_cached_system!(dest::AbstractVector{ComplexF64}, lhs_solver::WoodburySolver,
                                rhs::AbstractVector{ComplexF64})
     _woodbury_solve!(dest, lhs_solver, rhs)
     return dest
 end
-function _solve_cached_system!(dest::AbstractVector{ComplexF64},
+function _solve_cached_system!(dest::_SubproblemVector,
                                lhs_solver::MatSolvers.AbstractMatSolver,
-                               rhs::AbstractVector{ComplexF64})
+                               rhs::_SubproblemVector)
     MatSolvers.solve!(dest, lhs_solver, rhs)
     return dest
 end
-function _solve_cached_system!(dest::AbstractVector{ComplexF64}, lhs_solver,
-                               rhs::AbstractVector{ComplexF64})
+function _solve_cached_system!(dest::_SubproblemVector, lhs_solver, rhs::_SubproblemVector)
     _assign_to_buffer!(dest, lhs_solver \ rhs)
     return dest
+end
+
+_solve_implicit_stage!(dest, factor, rhs, sp) = _solve_cached_system!(dest, factor, rhs)
+
+# A stage matrix that is singular only at this step size (dt·λ = 1 for some mode)
+# has no solution for a generic right-hand side, so an inconsistent one rejects
+# the step. One that is singular at every step size is a gauge or degenerate tau
+# mode the formulation leaves undetermined (the RealFourier Nyquist pressure mode,
+# a too-coarse first-order tau system); its least-squares solution is the
+# intended one, so an inconsistency there is reported once instead. A per-mode
+# residual cannot draw this line itself: a negligible residual in a nearly empty
+# mode (~1e-21 absolute) is ~1e-6 of that mode's own scale.
+function _solve_implicit_stage!(dest, factor::MatSolvers.SPQRSolver, rhs, sp)
+    _structurally_rank_deficient(sp) &&
+        return MatSolvers.solve!(dest, factor, rhs; warn_inconsistent=true)
+    return MatSolvers.solve!(dest, factor, rhs; require_consistent=true)
 end
 
 function _subproblem_operator(sp::Subproblem, which::Symbol, data::AbstractVector)
@@ -329,20 +347,6 @@ function _subproblem_operator(sp::Subproblem, which::Symbol, data::AbstractVecto
     matrix === nothing && return nothing
     return _subproblem_backend_matrix!(sp, matrix, which, data)
 end
-
-_apply_subproblem_operator!(dest::AbstractVector, ::Nothing, x::AbstractVector) =
-    (fill!(dest, zero(eltype(dest))); dest)
-function _apply_subproblem_operator!(dest::AbstractVector, op::AbstractMatrix,
-                                     x::AbstractVector)
-    if !is_gpu_array(dest) && !is_gpu_array(x)
-        mul!(dest, op, x)
-    else
-        _assign_to_buffer!(dest, op * x)
-    end
-    return dest
-end
-_apply_subproblem_operator!(dest::AbstractVector, op, x::AbstractVector) =
-    (_assign_to_buffer!(dest, op * x); dest)
 
 """
     _sp_stage_vector!(sp, kind, [stage,] n, [like]) -> Vector{ComplexF64}
@@ -362,7 +366,7 @@ function _sp_stage_vector!(sp::Subproblem, kind::Symbol, stage::Int, n::Int,
     if cached !== nothing && length(cached) == n && is_gpu_array(cached) == is_gpu_array(like)
         return cached
     end
-    buffer = similar_zeros(like, ComplexF64, n)
+    buffer = similar_zeros(like, _subproblem_eltype(sp.dist.architecture), n)
     sp.runtime.rk_buffers[key] = buffer
     return buffer
 end
@@ -373,7 +377,7 @@ function _sp_stage_vector!(sp::Subproblem, kind::Symbol, stage::Int, n::Int)
     if cached !== nothing && length(cached) == n
         return cached
     end
-    buffer = zeros(sp.dist.architecture, ComplexF64, n)
+    buffer = zeros(sp.dist.architecture, _subproblem_eltype(sp.dist.architecture), n)
     sp.runtime.rk_buffers[key] = buffer
     return buffer
 end
@@ -394,6 +398,38 @@ end
 @inline _is_explicit_first_stage(stage::Int, a_ii::Real) =
     stage == 1 && abs(a_ii) < 1e-14
 
+# Stage scatters write into the public fields. Keep X_n in solve-layout order
+# so a failure in a later stage can undo every earlier scatter on every rank.
+function _gather_rk_start!(dest, sp, fields)
+    # Compression can remove columns (for example inactive tau coefficients).
+    # Retain the original entries even when a successful solve would discard them.
+    nraw = sp.pre_right_pinv === nothing ? length(dest) : size(sp.pre_right_pinv, 2)
+    raw = _sp_stage_vector!(sp, :rk_start_raw, nraw, dest)
+    _gather_subproblem_raw!(raw, sp, fields)
+    return compress_variable_space!(dest, sp, raw)
+end
+
+function _rk_stage_transaction!(solve_stage!, fields, subproblems, stash, dist, batch_plan=nothing)
+    try
+        _collectively(solve_stage!, dist, "implicit Runge–Kutta stage")
+    catch err
+        if batch_plan !== nothing
+            for ws in batch_plan.workspaces
+                _batched_scatter_raw!(ws, fields, ws.X0_raw)
+            end
+        end
+        modes = batch_plan === nothing ? eachindex(subproblems) : batch_plan.leftovers
+        for idx in modes
+            sp = subproblems[idx]
+            sp.M_min === nothing && continue
+            _scatter_subproblem_raw(sp, sp.runtime.rk_buffers[(:rk_start_raw, 0)], fields)
+        end
+        from_solve_layout!(stash, dist)
+        rethrow(err)
+    end
+    return nothing
+end
+
 # Pure per-mode arithmetic; every mutable buffer/factor belongs to this mode.
 function _solve_rk_local_mode!(sp, rhs, mx0, F, LX, alg_f, solution, factor,
                                sp_idx, stage, dt, A_exp, A_imp)
@@ -409,8 +445,8 @@ function _solve_rk_local_mode!(sp, rhs, mx0, F, LX, alg_f, solution, factor,
     a_ii = A_imp[stage, stage]
     if abs(a_ii) > 1e-14
         apply_bc_override!(rhs, alg_f, sp, dt * a_ii)
-    end
-    if factor === nothing
+        _solve_implicit_stage!(solution, factor, rhs, sp)
+    elseif factor === nothing
         _assign_to_buffer!(solution, rhs)
     else
         _solve_cached_system!(solution, factor, rhs)
@@ -461,11 +497,9 @@ function step_subproblem_rk!(state::TimestepperState, solver::InitialValueSolver
     state_fields = _cached_state_fields!(state, problem)
 
     # Distributor handle for the mixed Fourier–Chebyshev solve-layout transpose.
-    # All subproblems share one Distributor. `to_solve_layout!`/`from_solve_layout!`
-    # are no-ops when this is `nothing`, serial, or has no `pencil_solve` (i.e.
-    # pure-Fourier / non-distributed runs), so the bracketed clusters below cost
-    # nothing outside the distributed mixed-basis case.
-    dist = length(subproblems) >= 1 ? subproblems[1].dist : nothing
+    # Obtain the communicator from the fields so even a rank with no local
+    # modes participates in the stage decision and solve-layout transposes.
+    dist = first(state_fields).dist
 
     # Ensure all state fields are in coefficient space
     for f in state_fields
@@ -576,7 +610,7 @@ function step_subproblem_rk!(state::TimestepperState, solver::InitialValueSolver
         n_var = size(sp.M_min, 2)
         mx0 = _sp_stage_vector!(sp, :mx0, n_eq)
         rhs = _sp_stage_vector!(sp, :rhs, n_var)
-        x0_pre = gather_inputs!(rhs, sp, state_fields)
+        x0_pre = _gather_rk_start!(rhs, sp, state_fields)
         _apply_subproblem_operator!(mx0, _subproblem_operator(sp, :M, x0_pre), x0_pre)
         MX0[sp_idx] = mx0
         RHS[sp_idx] = rhs
@@ -615,25 +649,24 @@ function step_subproblem_rk!(state::TimestepperState, solver::InitialValueSolver
         # factorization and backend discovery must finish before workers start.
         a_ii = A_imp[i, i]
         if !_is_explicit_first_stage(i, a_ii)
-            for (sp_idx, sp) in enumerate(subproblems)
-                sp.M_min === nothing && continue
-                solutions[sp_idx] = _sp_stage_vector!(sp, :sol_stage, i,
-                                                     size(sp.M_min, 2), RHS[sp_idx])
-                factors[sp_idx] = abs(a_ii) < 1e-14 ?
-                    _get_or_compute_mass_lu!(sp) : _get_or_build_lhs!(sp, i, dt, a_ii)
-                if factors[sp_idx] === nothing && abs(a_ii) >= 1e-14
-                    @warn "step_subproblem_rk!: LHS factorization failed for sp group=$(sp.group), stage=$i; using rhs as fallback" maxlog=1
+            _rk_stage_transaction!(state_fields, subproblems, solve_stash, dist) do
+                for (sp_idx, sp) in enumerate(subproblems)
+                    sp.M_min === nothing && continue
+                    solutions[sp_idx] = _sp_stage_vector!(sp, :sol_stage, i,
+                                                         size(sp.M_min, 2), RHS[sp_idx])
+                    factors[sp_idx] = abs(a_ii) < 1e-14 ?
+                        _get_or_compute_mass_lu!(sp) : _get_or_build_lhs!(sp, i, dt, a_ii)
                 end
-            end
 
-            # Workers mutate only disjoint mode buffers and each mode's factor
-            # scratch. No field access, layout changes, lazy caches or MPI here.
-            _foreach_local_mode!(n_sp, threaded_modes) do sp_idx
-                sp = subproblems[sp_idx]
-                sp.M_min === nothing && return
-                _solve_rk_local_mode!(sp, RHS[sp_idx], MX0[sp_idx], F, LX,
-                                      ALG_F[sp_idx], solutions[sp_idx], factors[sp_idx],
-                                      sp_idx, i, dt, A_exp, A_imp)
+                # Workers mutate only disjoint mode buffers and each mode's factor
+                # scratch. No field access, layout changes, lazy caches or MPI here.
+                _foreach_local_mode!(n_sp, threaded_modes) do sp_idx
+                    sp = subproblems[sp_idx]
+                    sp.M_min === nothing && return
+                    _solve_rk_local_mode!(sp, RHS[sp_idx], MX0[sp_idx], F, LX,
+                                          ALG_F[sp_idx], solutions[sp_idx], factors[sp_idx],
+                                          sp_idx, i, dt, A_exp, A_imp)
+                end
             end
 
             # coeff_data! and zero-dimensional tau slots can be shared between
@@ -1145,7 +1178,7 @@ function _get_or_build_lhs!(sp::Subproblem, stage_idx::Int, dt::Float64, a_ii::F
     # defines `refactor!` — CPU `SparseLUSolver`, GPU `CuSparseLU`
     # (Float64 via cusolverRF). Detected via `hasmethod` so the check is
     # independent of whether CUDA.jl is loaded.
-    if cached !== nothing && is_dirty &&
+    if cached !== nothing && is_dirty && !_gpu_lhs_pinned(sp, a_ii) &&
        hasmethod(MatSolvers.refactor!, Tuple{typeof(cached), typeof(LHS)})
         try
             MatSolvers.refactor!(cached, LHS)
@@ -1180,12 +1213,20 @@ function _get_or_build_lhs!(sp::Subproblem, stage_idx::Int, dt::Float64, a_ii::F
         return lhs_solver
     catch err
         if _gpu_subproblem_execution(sp)
+            pinned = _gpu_singular_factorization(sp, solver_type, LHS, solver_kwargs,
+                                                 "IMEX stage $stage_idx system")
+            if pinned !== nothing
+                sp.LHS_solvers[a_ii] = pinned
+                _mark_gpu_lhs_pinned!(sp, a_ii)
+                return pinned
+            end
             error("GPU subproblem factorization failed for group=$(sp.group), " *
                   "stage=$stage_idx; CPU sparse/dense fallback is disabled. " *
                   "Original error: $(sprint(showerror, err))")
         end
         # Rank-deficient stage system. Legitimate for a pressure gauge mode of an
-        # incompressible problem (the kx=0 mode of Rayleigh–Bénard reaches here),
+        # incompressible problem (the RealFourier Nyquist mode of Rayleigh–Bénard,
+        # where ∂x vanishes and the pressure constant is undetermined, reaches here),
         # where the least-squares solve is the intended treatment. NOT safe for two
         # tau variables lifted to the same mode under a moving boundary condition
         # (exponentially unstable, 2026-09-05 audit) — that formulation is refused
@@ -1195,11 +1236,9 @@ function _get_or_build_lhs!(sp::Subproblem, stage_idx::Int, dt::Float64, a_ii::F
             try
                 qr_solver = MatSolvers.solver_instance(MatSolvers.SPQRSolver, LHS)
                 sp.LHS_solvers[a_ii] = qr_solver
-                @warn "step_subproblem_rk!: the IMEX stage system (M + dt·a·L) at stage " *
-                      "$stage_idx for subproblem group=$(sp.group) is singular " *
-                      "($(sprint(showerror, err))); solving it in the least-squares sense " *
-                      "with sparse QR. Expected for a pressure/gauge mode; otherwise check " *
-                      "the tau/boundary rows of that Fourier mode." maxlog=1
+                @warn "step_subproblem_rk!: singular IMEX stage $stage_idx for subproblem " *
+                      "group=$(sp.group) ($(sprint(showerror, err))). Using sparse QR " *
+                      "to solve compatible pressure/gauge modes and reject inconsistent stages." maxlog=1
                 return qr_solver
             catch qr_err
                 @debug "step_subproblem_rk!: sparse QR fallback also failed for group=$(sp.group), stage=$stage_idx" exception=qr_err
@@ -1240,6 +1279,9 @@ function _get_or_compute_mass_lu!(sp::Subproblem)
         return mass_solver
     catch err
         if _gpu_subproblem_execution(sp)
+            # No pinning here: a tau/BC mass matrix has empty algebraic rows, so
+            # its right-hand side is inconsistent by construction and the pinned
+            # solution would differ from the CPU's least-squares one.
             error("GPU mass-matrix factorization failed for group=$(sp.group); " *
                   "CPU sparse fallback is disabled. Original error: " *
                   "$(sprint(showerror, err))")

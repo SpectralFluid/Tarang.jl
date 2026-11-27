@@ -473,7 +473,7 @@ Cause: the `apply_bc_override!` DAE path in `step_subproblem_rk!` isn't firing f
 Causes and fixes:
 - Timestep too large → reduce `cfl.safety` to 0.2–0.3 (`CFL` is mutable, so you can set the field directly)
 - Insufficient resolution → bump `Nz` up
-- Missing dealiasing → `dealias` is a **padding factor**, so `3/2` is the 3/2 rule and any value `≤ 1` switches dealiasing off. It only acts on Fourier axes; the factor passed to `zbasis` is ignored.
+- For quadratic nonlinearities, use `dealias=3/2` on both the periodic Fourier basis and the wall-normal ChebyshevT basis. A value `≤ 1` switches padding off on that axis.
 
 ### Simulation not converging to a steady state
 

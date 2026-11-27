@@ -420,6 +420,19 @@ end
     throw(ArgumentError("Unknown vector cache key: $which"))
 end
 
+_subproblem_sparse_matrix(data, matrix) = _gpu_sparse_csr(matrix, eltype(matrix))
+
+_apply_subproblem_operator!(dest::AbstractVector, ::Nothing, x::AbstractVector) =
+    (fill!(dest, zero(eltype(dest))); dest)
+function _apply_subproblem_operator!(dest::AbstractVector, op::AbstractMatrix, x::AbstractVector)
+    arch = architecture(x)
+    architecture(dest) == arch || error("Subproblem input and output must reside on the same device.")
+    input = arch isa GPU && Base.mightalias(dest, x) ? copy(x) : x
+    return mul!(dest, op, input)
+end
+_apply_subproblem_operator!(dest::AbstractVector, op, x::AbstractVector) =
+    (_assign_to_buffer!(dest, op * x); dest)
+
 function _subproblem_backend_matrix!(sp::Subproblem, matrix, which::Symbol, data::AbstractVector)
     matrix === nothing && return nothing
     if !is_gpu_array(data)
@@ -428,7 +441,7 @@ function _subproblem_backend_matrix!(sp::Subproblem, matrix, which::Symbol, data
     field = _subproblem_backend_field(which)
     cached = getfield(sp.runtime, field)
     cached !== nothing && return cached
-    backend = _gpu_sparse_csr(matrix, eltype(matrix))
+    backend = _subproblem_sparse_matrix(data, matrix)
     setfield!(sp.runtime, field, backend)
     return backend
 end
@@ -462,22 +475,19 @@ end
 
 Override the algebraic-constraint rows of `rhs` with `coeff * alg_f[bc_rows]`.
 
-GPU path: ONE fused broadcast over index views — gather, scale, and scatter in
-a single kernel, zero per-call allocation. (The previous form,
-`rhs[bc_rows] = c .* alg_f[bc_rows]`, allocated a gather temporary and launched
-twice; a prior docstring also promised a `_bc_override_scratch!` cache that
-never existed.) The `bc_rows` index vector is materialized on the correct
-device by `_bc_rows_device` and cached on the subproblem to avoid per-step
-host→device transfers. CPU path: scalar loop, zero allocation. Both stay on
-`rhs`'s device, so this is safe under `CUDA.allowscalar(false)`.
+The GPU kernel reads cached row indices and writes directly into the stage
+buffer. The CPU updates the same rows in a scalar loop.
 """
 function apply_bc_override!(rhs::AbstractVector, alg_f::AbstractVector,
                             sp::Subproblem, coeff)
     isempty(sp.bc_rows) && return rhs
-    c = ComplexF64(coeff)
+    c = eltype(rhs)(coeff)
     if is_gpu_array(rhs)
+        checkbounds(axes(rhs, 1), sp.bc_rows)
+        checkbounds(axes(alg_f, 1), sp.bc_rows)
         bc_rows = _bc_rows_device(sp, rhs)
-        @views rhs[bc_rows] .= c .* alg_f[bc_rows]
+        launch!(rhs, _batched_bc_override_kernel!, rhs, alg_f, bc_rows, c;
+                ndrange=(length(bc_rows), 1))
     else
         # CPU path — scalar loop, zero allocation. For small bc_rows counts
         # (typical: 5–20) this is faster than broadcast-gather anyway.
@@ -525,7 +535,7 @@ function _subproblem_selection_indices!(sp::Subproblem, matrix::Union{Nothing, S
     return indices
 end
 
-function _assign_to_buffer!(dest::AbstractVector{ComplexF64}, src)
+function _assign_to_buffer!(dest::_SubproblemVector, src)
     dest_gpu = is_gpu_array(dest)
     src_gpu = is_gpu_array(src)
     dest_gpu == src_gpu || error(
@@ -534,17 +544,9 @@ function _assign_to_buffer!(dest::AbstractVector{ComplexF64}, src)
     if dest_gpu
         architecture(dest) == architecture(src) || error(
             "Subproblem gather buffers and field data must reside on the same GPU device.")
-        if eltype(src) <: Complex
-            dest .= src
-        else
-            dest .= ComplexF64.(src)
-        end
+        dest .= src
     else
-        if eltype(src) <: Complex
-            copyto!(dest, src)
-        else
-            copyto!(dest, ComplexF64.(src))
-        end
+        copyto!(dest, src)
     end
     return dest
 end
@@ -584,16 +586,16 @@ function _subproblem_cached_vector!(sp::Subproblem, which::Symbol, n::Int;
     end
 
     buffer = if like === nothing
-        zeros(sp.dist.architecture, ComplexF64, n)
+        zeros(sp.dist.architecture, _subproblem_eltype(sp.dist.architecture), n)
     else
-        similar_zeros(like, ComplexF64, n)
+        similar_zeros(like, _subproblem_eltype(sp.dist.architecture), n)
     end
     setfield!(sp.runtime, field, buffer)
     return buffer
 end
 
 """Extract per-mode coefficients from all fields into a flat vector (no permutation)."""
-function _gather_subproblem_raw!(buffer::AbstractVector{ComplexF64}, sp::Subproblem, fields::Vector)
+function _gather_subproblem_raw!(buffer::_SubproblemVector, sp::Subproblem, fields::Vector)
     kx_global = _kx_index_global(sp)
     offset = 0
     for field in fields
@@ -664,7 +666,7 @@ once per field, per subproblem, per gather AND scatter, per stage. That made thi
 @inline _is_zero_dim_field(field::ScalarField) = isempty(field.bases)
 
 """Zero a slice of the buffer without materializing a `view` wrapper."""
-@inline function _zero_buffer_range!(buffer::AbstractVector{ComplexF64}, offset::Int, n::Int)
+@inline function _zero_buffer_range!(buffer::_SubproblemVector, offset::Int, n::Int)
     @inbounds for i in 1:n
         buffer[offset + i] = ComplexF64(0)
     end
@@ -694,7 +696,7 @@ function _stash_missing_field!(sp::Subproblem, field::ScalarField,
     stash = get(sp.runtime.zero_dim_stash, key, nothing)
     if stash === nothing || length(stash) != n ||
        is_gpu_array(stash) != is_gpu_array(data)
-        stash = similar_zeros(data, ComplexF64, n)
+        stash = similar_zeros(data, eltype(data), n)
         sp.runtime.zero_dim_stash[key] = stash
     end
     if !is_gpu_array(data)
@@ -706,7 +708,7 @@ function _stash_missing_field!(sp::Subproblem, field::ScalarField,
 end
 
 """Fill `buffer[offset+1:offset+n]` from the stash; `false` if nothing stashed."""
-function _restore_missing_field!(buffer::AbstractVector{ComplexF64}, offset::Int,
+function _restore_missing_field!(buffer::_SubproblemVector, offset::Int,
                                  n::Int, sp::Subproblem, field::ScalarField)
     stash = get(sp.runtime.zero_dim_stash, objectid(field), nothing)
     (stash === nothing || length(stash) != n ||
@@ -719,7 +721,7 @@ function _restore_missing_field!(buffer::AbstractVector{ComplexF64}, offset::Int
     return true
 end
 
-function _gather_field_raw!(buffer::AbstractVector{ComplexF64}, offset::Int, field::ScalarField, kx_global::Int, sp::Subproblem)
+function _gather_field_raw!(buffer::_SubproblemVector, offset::Int, field::ScalarField, kx_global::Int, sp::Subproblem)
     cd_raw = coeff_data!(field)
     if cd_raw === nothing || isempty(cd_raw)
         n = subproblem_field_size(sp, field)
@@ -727,7 +729,7 @@ function _gather_field_raw!(buffer::AbstractVector{ComplexF64}, offset::Int, fie
             if buffer isa Vector{ComplexF64}
                 _zero_buffer_range!(buffer, offset, n)
             else
-                fill!(view(buffer, offset + 1 : offset + n), ComplexF64(0))   # GPU-safe
+                fill!(view(buffer, offset + 1 : offset + n), zero(eltype(buffer)))   # GPU-safe
             end
         end
         return offset + n
@@ -760,7 +762,7 @@ function _gather_field_raw!(buffer::AbstractVector{ComplexF64}, offset::Int, fie
         if kx_local >= 1 && kx_local <= length(cd)
             _assign_to_buffer!(dest, view(cd, kx_local:kx_local))
         else
-            fill!(dest, ComplexF64(0))
+            fill!(dest, zero(eltype(dest)))
         end
         return offset + 1
     else
@@ -784,7 +786,7 @@ function _gather_field_raw!(buffer::AbstractVector{ComplexF64}, offset::Int, fie
 
         idxt = _subproblem_coeff_index(cd, field, sp)
         if idxt === nothing
-            fill!(view(buffer, offset + 1:offset + n), ComplexF64(0))   # mode not on this rank (MPI)
+            fill!(view(buffer, offset + 1:offset + n), zero(eltype(buffer)))   # mode not on this rank (MPI)
         else
             _assign_to_buffer!(view(buffer, offset + 1:offset + n), vec(view(cd, idxt...)))
         end
@@ -792,7 +794,7 @@ function _gather_field_raw!(buffer::AbstractVector{ComplexF64}, offset::Int, fie
     end
 end
 
-function _gather_field_raw!(buffer::AbstractVector{ComplexF64}, offset::Int, field::VectorField, kx_global::Int, sp::Subproblem)
+function _gather_field_raw!(buffer::_SubproblemVector, offset::Int, field::VectorField, kx_global::Int, sp::Subproblem)
     for comp in field.components
         offset = _gather_field_raw!(buffer, offset, comp, kx_global, sp)
     end
@@ -964,7 +966,7 @@ function _compute_strided_index(cd::AbstractArray, field::ScalarField, sp::Subpr
 end
 
 """Copy a strided run of `cd` into `buffer` — no views, no dynamic dispatch."""
-@inline function _gather_strided!(buffer::AbstractVector{ComplexF64}, offset::Int,
+@inline function _gather_strided!(buffer::_SubproblemVector, offset::Int,
                                   cd::AbstractArray, start::Int, step_::Int, len::Int)
     if buffer isa Vector{ComplexF64} && cd isa Array{ComplexF64}
         @inbounds for i in 1:len
@@ -1006,11 +1008,7 @@ function _compress_subproblem_space!(dest::AbstractVector, sp::Subproblem,
             _select_copy!(dest, raw, indices)
         else
             pre = _subproblem_backend_matrix!(sp, matrix, which, raw)
-            if !is_gpu_array(dest) && !is_gpu_array(raw) && pre isa AbstractMatrix
-                mul!(dest, pre, raw)
-            else
-                _assign_to_buffer!(dest, pre * raw)
-            end
+            _apply_subproblem_operator!(dest, pre, raw)
         end
     else
         _assign_to_buffer!(dest, raw)
@@ -1040,11 +1038,7 @@ function expand_variable_space!(dest::AbstractVector, sp::Subproblem, data::Abst
             _scatter_copy!(dest, data, indices)
         else
             pre = _subproblem_backend_matrix!(sp, sp.pre_right, :pre_right, data)
-            if !is_gpu_array(dest) && !is_gpu_array(data) && pre isa AbstractMatrix
-                mul!(dest, pre, data)
-            else
-                _assign_to_buffer!(dest, pre * data)
-            end
+            _apply_subproblem_operator!(dest, pre, data)
         end
     else
         _assign_to_buffer!(dest, data)

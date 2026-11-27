@@ -8,7 +8,7 @@
 # once and never reads it back. The KernelAbstractions CPU backend wraps kernel
 # bodies in an ivdep/no-alias workitem loop, which licenses reordering of
 # same-slot read-modify-writes around inner loops — that miscompiled the
-# Chebyshev recurrence kernel in `ext/cuda/cheb_deriv.jl`. Accumulation is done
+# Chebyshev recurrence kernel in `ext/gpu/cheb_deriv.jl`. Accumulation is done
 # into a register and stored once, never into the output slot in a loop.
 
 using KernelAbstractions

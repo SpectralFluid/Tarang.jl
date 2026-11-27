@@ -144,13 +144,18 @@ The default for `RealFourier` and `ComplexFourier`:
 basis = RealFourier(x; size=128, dealias=3/2)
 ```
 
-Nonlinear products are evaluated on a grid padded to `ceil(3/2 * 128) = 192` points and
-truncated back to the 128-mode representation. Under MPI the equivalent 2/3-rule
-truncation is applied instead: modes with `|k| > N / (2 * dealias)` are zeroed.
+Nonlinear products are evaluated on an oversampled grid and projected back
+onto the original 128 modes. The working FFT length includes room to keep
+Nyquist products from aliasing into the retained modes. Distributed Cartesian
+products use the same projection along locally owned pencils.
+
+On an even grid, a real field represents its Nyquist bin as a cosine. A complex
+field assigns the bin to frequency `-N/2`. Squaring a unit Nyquist mode therefore
+leaves a constant `1/2` in a real field and projects to zero in a complex field.
 
 ### 2/1 Rule
 
-For highly nonlinear problems (padded grid of 256 points at `size=128`):
+For a padded grid of 256 points at `size=128`:
 
 ```julia
 basis = RealFourier(x; size=128, dealias=2.0)
@@ -166,7 +171,8 @@ basis = RealFourier(x; size=128, dealias=1.0)
 
 ### Cutoffs at `size = 32`
 
-Retained modes per axis, from `min(floor(N / (2*dealias)), (N-1) ÷ 3)`:
+The explicit Fourier cutoff filter retains modes through
+`min(floor(N / (2*dealias)), (N-1) ÷ 3)` on each filtered axis:
 
 | `dealias` | Cutoff | Effect |
 |-----------|--------|--------|
@@ -175,8 +181,9 @@ Retained modes per axis, from `min(floor(N / (2*dealias)), (N-1) ÷ 3)`:
 | `1.0` | – | Dealiasing off |
 | `2/3` | – | Dealiasing **off** — `2/3` is a factor below 1, not the 2/3 rule |
 
-Chebyshev/Legendre axes ignore `dealias` (no cutoff is applied on a non-Fourier axis);
-passing it there is harmless but does nothing.
+Set `dealias=3/2` on a `ChebyshevT` basis to evaluate quadratic products on a
+larger Lobatto grid and project them back to the original polynomial degrees.
+The ChebyshevT default is `1`. Legendre products use the original nodes.
 
 ## Multi-Dimensional Domains
 

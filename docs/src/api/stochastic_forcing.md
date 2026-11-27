@@ -287,6 +287,12 @@ The forcing must be constructed for the target field's architecture
 (`architecture = field.dist.architecture`; constructors default to `CPU()`): a CPU
 forcing registered on a GPU field, or the reverse, raises `ArgumentError`.
 
+For stochastic forcing, `field_size` must equal the target's global physical grid
+size on every axis, including the Chebyshev axis for separable forcing. Registration
+starts a common random stream on the field's communicator and discards any draw
+previewed beforehand. Generate a preview after registration to reuse it on the
+first timestep at the same time and timestep size.
+
 One forcing realization is reused across the stages of supported one-step RK/ETD methods;
 `CNAB1` and `SBDF1` are supported first-order methods. Tarang rejects `CNAB2`, `MCNAB2`,
 `CNLF2`, `SBDF2`, `SBDF3`, `SBDF4`, `ETD_CNAB2`, and
@@ -316,6 +322,17 @@ Equivalent to `rhs .+= generate_forcing!(forcing, t, substep)` when the shapes m
 they do not, the forcing is first sliced to the region `rhs` covers — the leading half-spectrum for
 a real-FFT `rhs`, and this rank's local wavenumber block for a distributed `PencilArray` `rhs`. If
 no such slice exists, an `ArgumentError` is thrown.
+
+For manual application on a distributed GPU, use the same seed and draw sequence
+on every rank and pass the field itself as
+`apply_forcing!(rhs_field, forcing, t, substep)`. The field supplies the global
+wavenumber ranges owned by the rank. Registered solver forcing uses these ranges
+automatically. Pass the field to `store_prevsol!`, `work_stratonovich`, `work_ito`,
+and `instantaneous_power` to compute work and power across its communicator.
+
+When restarting a version 1 Float32 forcing checkpoint, Tarang preserves the
+saved draw and RNG state. Newly generated draws use the corrected spectrum
+normalization.
 
 ---
 

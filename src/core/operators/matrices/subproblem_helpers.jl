@@ -23,7 +23,7 @@ always returned the FIRST Fourier wavenumber, so the y-derivative was wrongly
 built with kx — yielding an implicit operator like −kx²−kx²+Dz² instead of
 −(kx²+ky²)+Dz² for a 3D x,y-periodic + z-Chebyshev Laplacian.
 """
-function _subproblem_kx(sp, coord_name::AbstractString)
+function _subproblem_kx(sp, coord_name::AbstractString; derivative_order::Int=0)
     key = "n" * coord_name
     haskey(sp.group_dict, key) || return 0.0
     n = sp.group_dict[key]
@@ -50,6 +50,10 @@ function _subproblem_kx(sp, coord_name::AbstractString)
     end
 
     fourier_basis === nothing && return 0.0
+    N = fourier_basis.meta.size
+    if fb_dtype <: Real && isodd(derivative_order) && iseven(N) && n == N ÷ 2
+        return 0.0
+    end
     # `n` is the 0-based COEFFICIENT index along this axis; its physical wavenumber
     # depends on the storage layout. Only the first RealFourier axis is rfft (modes
     # 0..N/2, all non-negative); every other Fourier axis is full fft (index n>N/2
@@ -114,7 +118,7 @@ function _subproblem_diff_matrix(sp, coord_name::String, order::Int, Nz::Int)
             if basis.meta.element_label == coord_name
                 if isa(basis, FourierBasis)
                     # Fourier coordinate: use (im*kx)^order * I
-                    kx = _subproblem_kx(sp, coord_name)
+                    kx = _subproblem_kx(sp, coord_name; derivative_order=order)
                     coeff = (im * kx)^order
                     return sparse(ComplexF64(coeff) * I, Nz, Nz)
                 elseif isa(basis, JacobiBasis)
@@ -140,7 +144,7 @@ function _subproblem_diff_matrix(sp, coord_name::String, order::Int, Nz::Int)
                     end
                     if basis.meta.element_label == coord_name
                         if isa(basis, FourierBasis)
-                            kx = _subproblem_kx(sp, coord_name)
+                            kx = _subproblem_kx(sp, coord_name; derivative_order=order)
                             coeff = (im * kx)^order
                             return sparse(ComplexF64(coeff) * I, Nz, Nz)
                         elseif isa(basis, JacobiBasis)

@@ -20,7 +20,8 @@ Follows fill_random API for familiar usage.
 - `scale`: Scale factor to multiply random values
 - `reproducible`: If true (default), generates identical global random field regardless
   of MPI decomposition. Each grid point gets a deterministic random value based on its
-  global index. If false, uses rank-local seeding (faster but MPI-dependent).
+  global index. Seeded vector components draw from disjoint counters. If false,
+  uses rank-local seeding (faster but MPI-dependent).
 
 A complex `"normal"` fill has unit total variance (each component N(0, 1/2)), as
 `randn(ComplexF64)`. With `reproducible=false`, `seed` seeds the host RNG and, for a
@@ -42,6 +43,11 @@ function fill_random!(field::ScalarField, layout::String="g";
                       distribution::String="normal",
                       scale::Real=1.0,
                       reproducible::Bool=true)
+    return _fill_random!(field, layout, seed, distribution, scale, reproducible, (0, 1))
+end
+
+function _fill_random!(field::ScalarField, layout::String, seed, distribution::String,
+                       scale::Real, reproducible::Bool, stream::Tuple{Int,Int})
     ensure_layout!(field, Symbol(layout))
     data = layout == "g" ? get_grid_data(field) : get_coeff_data(field)
 
@@ -49,41 +55,48 @@ function fill_random!(field::ScalarField, layout::String="g";
         # Reproducible mode: global index-based seeding — produces identical results
         # regardless of MPI decomposition, INCLUDING np=1 (must use the SAME algorithm
         # as np>1, else the serial result diverges from the distributed one).
-        _fill_random_reproducible!(data, field, layout, seed, distribution, scale)
+        _fill_random_reproducible!(data, field, layout, seed, distribution, scale, stream)
     else
         # Standard mode: rank-local seeding (original behavior)
         if seed !== nothing
-            Random.seed!(seed)
+            component_seed = seed + stream[1] * 1000003
+            Random.seed!(component_seed)
             # `Random.seed!` reaches only the host RNG; a device array draws from
             # the backend's own generator.
-            _seed_device_rng!(field.dist.architecture, seed)
+            _seed_device_rng!(field.dist.architecture, component_seed)
         end
-
-        if distribution == "normal" || distribution == "standard_normal"
-            randn!(data)
-        elseif distribution == "uniform"
-            rand!(data)
-            data .-= 0.5  # Center around zero
-            data .*= 2.0  # Scale to [-1, 1]
-        else
-            throw(ArgumentError("Unknown distribution: $distribution. Use 'normal' or 'uniform'."))
-        end
-
-        data .*= scale
+        _fill_random_local!(data, distribution, scale)
     end
 
     return field
 end
 
-"""
-    _fill_random_reproducible!(data, field, layout, seed, distribution, scale)
+# Rank-local draw from the array's own generator (the backend RNG for device
+# arrays). Constants use the widest precision the device supports, so CPU and
+# CUDA results are unchanged and a Float32-only device (Metal) never receives a
+# Float64 kernel argument.
+function _fill_random_local!(data::AbstractArray, distribution::String, scale::Real)
+    W = _widest_real_type(data)
+    if distribution == "normal" || distribution == "standard_normal"
+        _randn_device!(data)
+    elseif distribution == "uniform"
+        rand!(data)
+        data .= (data .- W(0.5)) .* W(2)   # centre on zero, scale to [-1, 1]
+    else
+        throw(ArgumentError("Unknown distribution: $distribution. Use 'normal' or 'uniform'."))
+    end
+    data .*= W(scale)
+    return data
+end
 
-Fill data array with reproducible random values using global index-based seeding.
-Produces identical results regardless of MPI decomposition.
-
-Uses a simple but effective approach: generates random values point-by-point
-using a hash of (seed, global_indices) as the per-point seed.
 """
+    _randn_device!(data)
+
+`randn!` for field storage. A backend whose library lacks complex normals
+(rocRAND) adds a method that draws the real and imaginary parts separately.
+"""
+_randn_device!(data::AbstractArray) = randn!(data)
+
 @inline function _field_random_splitmix64(x::UInt64)
     z = x + UInt64(0x9e3779b97f4a7c15)
     z = xor(z, z >> 30) * UInt64(0xbf58476d1ce4e5b9)
@@ -96,9 +109,12 @@ end
     return T(bits >> 11) * T(1.1102230246251565e-16)
 end
 
+# Interleave vector counters to keep them disjoint, even for grids of different sizes.
+@inline _field_random_counter(global_index, stream) = global_index * stream[2] + stream[1]
+
 @kernel function _fill_reproducible_random_kernel!(data, seed::UInt64,
                                                      offsets, global_sizes,
-                                                     normal::Bool, scale)
+                                                     normal::Bool, scale, stream)
     i = @index(Global, Linear)
     if i <= length(data)
         linear_local = i - 1
@@ -114,7 +130,7 @@ end
 
         ET = eltype(data)
         RT = typeof(real(zero(ET)))
-        counter = UInt64(global_linear + 1)
+        counter = UInt64(_field_random_counter(global_linear, stream) + 1)
         u1 = _field_random_uniform(seed, 2counter - 1, RT)
         u2 = _field_random_uniform(seed, 2counter, RT)
         if normal
@@ -148,35 +164,32 @@ end
 function _fill_random_reproducible_device!(arch::AbstractArchitecture,
                                             data::AbstractArray, seed::Int,
                                             offsets::Tuple, global_sizes::Tuple,
-                                            distribution::String, scale::Real)
+                                            distribution::String, scale::Real,
+                                            stream::Tuple{Int,Int}=(0, 1))
     normal = distribution == "normal" || distribution == "standard_normal"
     (normal || distribution == "uniform") || throw(ArgumentError(
         "Unknown distribution: $distribution. Use 'normal' or 'uniform'."))
     seed_bits = reinterpret(UInt64, Int64(seed))
     launch!(arch, _fill_reproducible_random_kernel!, data, seed_bits,
-            offsets, global_sizes, normal, eltype(data)(scale);
+            offsets, global_sizes, normal, eltype(data)(scale), stream;
             ndrange=length(data))
     return data
 end
 
+"""Fill a scalar field from global indices, independently of MPI decomposition."""
 function _fill_random_reproducible!(data::AbstractArray, field::ScalarField,
                                     layout::String, seed::Int,
-                                    distribution::String, scale::Real)
+                                    distribution::String, scale::Real,
+                                    stream::Tuple{Int,Int}=(0, 1))
     dist = field.dist
 
     # Get global shape from domain
     if field.domain === nothing
         # No domain info - fall back to standard random fill
-        Random.seed!(seed)
-        _seed_device_rng!(dist.architecture, seed)
-        if distribution == "normal" || distribution == "standard_normal"
-            randn!(data)
-        elseif distribution == "uniform"
-            rand!(data)
-            data .-= 0.5
-            data .*= 2.0
-        end
-        data .*= scale
+        component_seed = seed + stream[1] * 1000003
+        Random.seed!(component_seed)
+        _seed_device_rng!(dist.architecture, component_seed)
+        _fill_random_local!(data, distribution, scale)
         return
     end
 
@@ -221,26 +234,25 @@ function _fill_random_reproducible!(data::AbstractArray, field::ScalarField,
     # MethodError here instead of falling through to the host method.
     return _fill_random_global_indexed!(dist.architecture, data, seed,
                                         global_offsets, global_sizes,
-                                        distribution, scale)
+                                        distribution, scale, stream)
 end
 
 function _fill_random_global_indexed!(arch::GPU, data::AbstractArray, seed::Int,
                                       global_offsets::Tuple, global_sizes::Tuple,
-                                      
-                                      distribution::String, scale::Real)
+                                      distribution::String, scale::Real,
+                                      stream::Tuple{Int,Int}=(0, 1))
     _fill_random_reproducible_device!(arch, data, seed, global_offsets,
-                                      global_sizes, distribution, scale)
+                                      global_sizes, distribution, scale, stream)
     return nothing
 end
 
 function _fill_random_global_indexed!(::CPU, cpu_data::AbstractArray, seed::Int,
                                       global_offsets::Tuple, global_sizes::Tuple,
-                                      
-                                      distribution::String, scale::Real)
+                                      distribution::String, scale::Real,
+                                      stream::Tuple{Int,Int}=(0, 1))
     ndims_data = ndims(cpu_data)
 
     # Fill each point using deterministic RNG based on global index
-    # Use a simple hash: seed + linear_global_index
     for I in CartesianIndices(cpu_data)
         # Compute global linear index using column-major ordering
         global_idx = 0
@@ -252,7 +264,7 @@ function _fill_random_global_indexed!(::CPU, cpu_data::AbstractArray, seed::Int,
         end
 
         # Use deterministic seed for this point
-        point_seed = seed + global_idx
+        point_seed = seed + _field_random_counter(global_idx, stream)
         Random.seed!(point_seed)
 
         T = eltype(cpu_data)
@@ -279,11 +291,8 @@ function fill_random!(field::VectorField, layout::String="g";
                       scale::Real=1.0,
                       reproducible::Bool=true)
     for (i, component) in enumerate(field.components)
-        # Use different seed for each component to get uncorrelated noise
-        # Multiply by large prime to ensure non-overlapping seed ranges
-        comp_seed = seed !== nothing ? seed + (i - 1) * 1000003 : nothing
-        fill_random!(component, layout; seed=comp_seed, distribution=distribution,
-                     scale=scale, reproducible=reproducible)
+        stream = (i - 1, length(field.components))
+        _fill_random!(component, layout, seed, distribution, scale, reproducible, stream)
     end
     return field
 end

@@ -47,7 +47,22 @@ julia --project=. test/run_mpi_ci.jl 4      # all MPI tests at 4 ranks
 
 ### GPU
 
-GPU tests need an NVIDIA GPU and run on JuliaGPU Buildkite CI (see
+On Apple silicon, install Metal.jl alongside Tarang and run the numerical tests on the GPU. The hardware flag makes an unavailable device a test failure.
+
+```sh
+julia --project=. test/run_metal_ci.jl --require-device
+```
+
+For AMD, install AMDGPU.jl alongside Tarang and run the ROCm validation in that environment.
+
+```sh
+julia --project=. test/run_amdgpu_ci.jl --require-device
+mpiexec -n 2 julia --project=. test/run_amdgpu_ci.jl --require-device
+```
+
+The second command requires ROCm-aware MPI. CPU-only CI runs the same script without the flag to check dispatch, FFT layouts, and MPI pencil decomposition.
+
+CUDA tests use an NVIDIA GPU and run on JuliaGPU Buildkite CI (see
 [Continuous Integration](#Continuous-Integration)). To run them locally on a
 CUDA host:
 

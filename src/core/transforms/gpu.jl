@@ -262,10 +262,10 @@ function _gpu_forward_transform_backend! end
 function _gpu_backward_transform_backend! end
 
 _gpu_forward_transform_backend!(::AbstractArchitecture, ::ScalarField) =
-    error("GPU forward transform backend is unavailable. Load CUDA.jl before " *
+    error("GPU forward transform backend is unavailable. Load CUDA.jl, AMDGPU.jl or Metal.jl before " *
           "constructing GPU fields; CPU fallback is disabled.")
 _gpu_backward_transform_backend!(::AbstractArchitecture, ::Any) =
-    error("GPU backward transform backend is unavailable. Load CUDA.jl before " *
+    error("GPU backward transform backend is unavailable. Load CUDA.jl, AMDGPU.jl or Metal.jl before " *
           "constructing GPU fields; CPU fallback is disabled.")
 
 """
@@ -280,6 +280,8 @@ layout. `false` means "not routed here": the field continues to the
 TransposableField or local paths. Without a device backend nothing is routed.
 """
 _distributed_gpu_transform!(::AbstractArchitecture, ::ScalarField, ::Symbol) = false
+
+_device_complex_fft_plans!(a, dims) = (plan_fft!(a, dims), plan_ifft!(a, dims))
 
 """
     gpu_forward_transform!(field::ScalarField)
@@ -303,7 +305,7 @@ function _gpu_forward_transform!(arch::GPU, field::ScalarField)
               "$(repr(field.name)) stores $(typeof(data_g)). Refusing CPU fallback.")
     end
 
-    handled = _gpu_forward_transform_backend!(arch, field)::Bool
+    handled = _with_gpu_workspace(_gpu_forward_transform_backend!, field.dist, arch, field)::Bool
     handled || _raise_unsupported_gpu_transform(field, :forward)
     return true
 end
@@ -330,7 +332,7 @@ function _gpu_backward_transform!(arch::GPU, field)
     end
 
     # See gpu_forward_transform! — the backend is a dispatched method.
-    handled = _gpu_backward_transform_backend!(arch, field)::Bool
+    handled = _with_gpu_workspace(_gpu_backward_transform_backend!, field.dist, arch, field)::Bool
     handled || _raise_unsupported_gpu_transform(field, :backward)
     return true
 end

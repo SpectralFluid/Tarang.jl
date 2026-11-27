@@ -15,7 +15,14 @@ function build_matrices!(sp::Subproblem, names, solver)
     dtype = sp.dtype
 
     # Get solver config
-    config = hasfield(typeof(solver), :config) ? solver.config : SolverConfig()
+    config = if hasfield(typeof(solver), :config)
+        solver.config
+    elseif problem isa InitialValueProblem
+        # Scaling an evolution equation must preserve both its mass and linear terms.
+        SolverConfig(entry_cutoff=0.0)
+    else
+        SolverConfig()
+    end
     ncc_cutoff = config.ncc_cutoff
     max_ncc_terms = config.max_ncc_terms
     entry_cutoff = config.entry_cutoff
@@ -91,7 +98,7 @@ function build_matrices!(sp::Subproblem, names, solver)
         end
 
         # Build sparse matrix with entry cutoff filter
-        if !isempty(data)
+        if entry_cutoff > 0 && !isempty(data)
             significant = abs.(data) .>= entry_cutoff
             data = data[significant]
             rows = rows[significant]

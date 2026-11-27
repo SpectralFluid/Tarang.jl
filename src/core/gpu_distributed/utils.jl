@@ -22,7 +22,7 @@ function check_cuda_aware_mpi()
     if haskey(ENV, "TARANG_CUDA_AWARE_MPI")
         val = uppercase(strip(ENV["TARANG_CUDA_AWARE_MPI"]))
         if val in ("1", "TRUE", "YES")
-            @info "CUDA-aware MPI enabled via TARANG_CUDA_AWARE_MPI environment variable"
+            @info "CUDA-aware MPI enabled via TARANG_CUDA_AWARE_MPI environment variable" maxlog=1
             return true
         elseif val in ("0", "FALSE", "NO")
             return false
@@ -72,6 +72,23 @@ function check_cuda_aware_mpi()
     return false
 end
 
+_device_aware_mpi(::AbstractArchitecture) = check_cuda_aware_mpi()
+
+# MPI has its own execution context. Finish pending writes before handing it
+# a buffer, including when the operation itself is nonblocking.
+function _prepare_mpi_device_buffers!(buffers)
+    previous = nothing
+    for a in buffers
+        is_gpu_array(a) || continue
+        arch = architecture(a)
+        arch == previous && continue
+        _device_aware_mpi(arch) || error("MPI communication on $arch requires GPU-aware MPI.")
+        synchronize(arch)
+        previous = arch
+    end
+    return nothing
+end
+
 """
     setup_distributed_gpu!(dist::Distributor)
 
@@ -89,11 +106,11 @@ function setup_distributed_gpu!(dist)
     end
 
     # Check for CUDA-aware MPI
-    cuda_aware = check_cuda_aware_mpi()
+    cuda_aware = _device_aware_mpi(dist.architecture)
 
     @info "Setting up distributed GPU computing"
     @info "  MPI processes: $(dist.size)"
-    @info "  CUDA-aware MPI: $(cuda_aware)"
+    @info "  GPU-aware MPI: $(cuda_aware)"
 
     # Create distributed GPU config
     # Will be populated when domain is created

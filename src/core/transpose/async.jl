@@ -184,8 +184,8 @@ function wait_transpose!(tf::TransposableField{F,T,N}) where {F,T,N}
     # GPU communication reaches this point only after the CUDA-aware MPI guard.
     recv_buf = tf.buffers.recv_buffer_2
 
-    used_async && is_gpu(arch) && !check_cuda_aware_mpi() && error(
-        "Asynchronous GPU transpose completed without CUDA-aware MPI; CPU staging is disabled.")
+    used_async && is_gpu(arch) && !_device_aware_mpi(arch) && error(
+        "Asynchronous GPU transpose completed without GPU-aware MPI; CPU staging is disabled.")
 
     # Unpack based on destination layout
     unpack_start = time()

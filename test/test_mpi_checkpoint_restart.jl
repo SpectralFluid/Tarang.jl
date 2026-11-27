@@ -181,6 +181,90 @@ MPI.Barrier(COMM)
 # place, a real failure fails the SAME testset on every rank at once, so they
 # either all reach this `finally` together or none of them do.
 try
+    @testset "A failed write on one rank preserves every published slab (rank=$RANK)" begin
+        solver, _ = _build(RK222(), 0.02)
+        step!(solver)
+        path = joinpath(CHK_ROOT, "preserved")
+        slab = save_state(solver, path)
+        original = read(slab)
+        expected = copy(parent(grid_data!(only(solver.state))))
+        clock = (solver.sim_time, solver.iteration, solver.dt)
+        step!(solver)
+        field = only(solver.state)
+        saved_name = field.name
+        if RANK == NP - 1
+            field.name = "invalid/netcdf/name"
+        end
+        failed = try
+            save_state(solver, path)
+            false
+        catch
+            true
+        finally
+            field.name = saved_name
+        end
+        @test _agree(failed)
+        @test _agree(isfile(slab) && read(slab) == original)
+        # A failed serial overwrite must also leave the distributed generation
+        # available, including the high-rank slabs a serial writer would retire.
+        serial_failed = true
+        if RANK == 0
+            serial, _ = _build(RK222(), 0.02; comm=MPI.COMM_SELF)
+            only(serial.state).name = "invalid/netcdf/name"
+            serial_failed = try
+                save_state(serial, path)
+                false
+            catch
+                true
+            end
+        end
+        @test _agree(serial_failed)
+        @test _agree(isfile(slab) && read(slab) == original)
+        load_state!(solver, path)
+        @test _agree((solver.sim_time, solver.iteration, solver.dt) == clock)
+        @test _agree(parent(grid_data!(field)) == expected)
+    end
+
+    @testset "rank-local checkpoint failure leaves all solver fields intact (rank=$RANK)" begin
+        source, _ = _build(RK222(), 0.02)
+        field = source.state[1]
+        path = joinpath(CHK_ROOT, "missing_later_slab")
+        written = save_state(source, path)
+        if RANK != NP - 1
+            global_shape, local_shape, local_start = Tarang._field_slab_geometry(field)
+            Tarang.write_local_slab(written, "v", fill(9.0, local_shape...), local_start, global_shape)
+        end
+        MPI.Barrier(COMM)
+
+        u = ScalarField(field.domain, "u")
+        v = ScalarField(field.domain, "v")
+        fill!(parent(get_grid_data(u)), 2.0)
+        fill!(parent(get_grid_data(v)), 3.0)
+        problem = InitialValueProblem([u, v])
+        add_equation!(problem, "dt(u) + u = 0")
+        add_equation!(problem, "dt(v) + v = 0")
+        target = InitialValueSolver(problem, RK222(); dt=0.25)
+        step!(target)
+        before = map(target.state) do f
+            ensure_layout!(f, :c)
+            copy(parent(get_coeff_data(f)))
+        end
+        history = target.timestepper_state
+        clock = (target.sim_time, target.iteration, target.dt)
+
+        failed = try
+            load_state!(target, path)
+            false
+        catch err
+            err isa ErrorException
+        end
+        @test _agree(failed)
+        @test _agree((target.sim_time, target.iteration, target.dt) == clock)
+        @test _agree(target.timestepper_state === history)
+        @test _agree(all(f -> f.current_layout === :c, target.state))
+        @test _agree(parent.(get_coeff_data.(target.state)) == before)
+    end
+
     @testset "stochastic checkpoint preserves the next draw across rank counts (rank=$RANK)" begin
         function forced_build(; comm=COMM, seed=42)
             solver, _ = _build(RK222(), 0.02; comm)

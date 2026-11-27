@@ -2,23 +2,6 @@
 # NCCL-based Transpose for Pencil Decomposition
 # ============================================================================
 
-# Binary search helpers for GPU kernels (shared with transpose_kernels.jl)
-# Find which rank owns index `idx` given cumulative prefix sums.
-@inline function _gpu_find_rank(idx::Int, prefix_sums, nranks::Int)
-    lo = 1
-    hi = nranks
-    @inbounds while lo < hi
-        mid = (lo + hi) >>> 1
-        if idx <= prefix_sums[mid]
-            hi = mid
-        else
-            lo = mid + 1
-        end
-    end
-    @inbounds offset = lo > 1 ? prefix_sums[lo - 1] : 0
-    return lo - 1, offset  # 0-based rank
-end
-
 @inline function _gpu_find_rank_1based(idx::Int, prefix_sums, nranks::Int)
     # Kernel pack/unpack code needs a 1-based rank for indexing Julia arrays
     # such as `chunk_sizes` and `displs`.
@@ -450,7 +433,7 @@ end
 # rank is fixed by `counts`/`displs`/`nranks`, none of which they took, so both
 # degenerated to a flat copy — correct only at nranks == 1 and silently wrong for
 # every real decomposition. Use `gpu_pack_for_transpose!` /
-# `gpu_unpack_from_transpose!` (ext/cuda/transpose_kernels.jl), which take the
+# `gpu_unpack_from_transpose!` (ext/gpu/transpose.jl), which take the
 # decomposition, or the `transpose_*_to_*!` drivers that wrap them.
 
 # ============================================================================

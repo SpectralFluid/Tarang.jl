@@ -13,6 +13,8 @@
   <a href="https://github.com/JuliaTesting/Aqua.jl"><img src="https://raw.githubusercontent.com/JuliaTesting/Aqua.jl/master/badge.svg" alt="Aqua QA"></a>
   <a href="https://github.com/aviatesk/JET.jl"><img src="https://img.shields.io/badge/JET.jl-tested-blue.svg" alt="JET"></a>
   <a href="https://cuda.juliagpu.org/stable/"><img src="https://img.shields.io/badge/GPU-CUDA-76B900.svg" alt="CUDA GPU support"></a>
+  <a href="https://amdgpu.juliagpu.org/stable/"><img src="https://img.shields.io/badge/GPU-ROCm-AD172B.svg" alt="AMD ROCm GPU support"></a>
+  <a href="https://metal.juliagpu.org/stable/"><img src="https://img.shields.io/badge/GPU-Metal-555555.svg" alt="Apple Metal GPU support"></a>
   <a href="https://juliaparallel.org/MPI.jl/stable/"><img src="https://img.shields.io/badge/MPI-enabled-2F6DB3.svg" alt="MPI support"></a>
   <a href="https://spectralfluid.github.io/Tarang.jl/stable"><img src="https://img.shields.io/badge/docs-stable-blue.svg" alt="Documentation"></a>
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License: MIT"></a>
@@ -44,7 +46,16 @@ project's `Project.toml` or `Manifest.toml`:
 julia --project=@v#.# -e 'using Pkg; Pkg.add("CUDA")'
 ```
 
-Requires Julia 1.10 or later. GPU support requires an NVIDIA GPU with CUDA. MPI requires OpenMPI or MPICH.
+For an AMD GPU, install AMDGPU.jl in the Julia environment where you run Tarang.
+
+```julia
+using Pkg
+Pkg.add("AMDGPU")
+```
+
+On Apple silicon, install the optional backend with `Pkg.add("Metal")`.
+
+Tarang requires Julia 1.10 or later. GPU execution uses NVIDIA CUDA, AMD ROCm or Apple Metal. MPI requires OpenMPI or MPICH.
 
 ## Quick Start
 
@@ -136,12 +147,41 @@ field = ScalarField(domain, "u")
 forward_transform!(field)   # Uses cuFFT automatically
 ```
 
+On AMD, the same field and solver APIs use ROCm.
+
+```julia
+using Tarang, AMDGPU
+
+arch = GPU(backend=:amdgpu, device_id=0)
+domain = PeriodicDomain(512, 512; device=arch, dtype=Float32)
+field = ScalarField(domain, "u")
+forward_transform!(field)
+```
+
+Apple silicon uses single-precision fields and supports a single MPI rank.
+
+```julia
+using Tarang, Metal
+
+arch = GPU(backend=:metal)
+domain = PeriodicDomain(128, 128; device=arch)  # Float32 on Metal
+u = ScalarField(domain, "u")
+set!(u, (x, y) -> sin(x) * cos(y))
+coeff_data!(u)  # MtlArray{ComplexF32}
+```
+
 ```bash
-# Single GPU
+# NVIDIA example on one GPU
 julia --project=. examples/gpu_example.jl
 
-# Multi-GPU with MPI (4 GPUs)
+# NVIDIA example with MPI and four GPUs
 mpiexec -n 4 julia --project=. examples/gpu_example.jl
+
+# AMD ROCm hardware validation
+julia --project=. test/run_amdgpu_ci.jl --require-device
+
+# Apple Metal hardware validation
+julia --project=. test/run_metal_ci.jl --require-device
 ```
 
 ### MPI

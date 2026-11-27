@@ -498,6 +498,16 @@ function csr_pattern(A::SparseMatrixCSC)
     return (copy(tagged_t.colptr), copy(tagged_t.rowval), copy(tagged_t.nzval))
 end
 
+# True when some column of `M + c*L` is identically zero for every `c`.
+function _has_empty_column(M::SparseMatrixCSC, L::Union{Nothing, SparseMatrixCSC})
+    for j in axes(M, 2)
+        all(iszero, view(nonzeros(M), nzrange(M, j))) || continue
+        (L === nothing || all(iszero, view(nonzeros(L), nzrange(L, j)))) && return true
+    end
+    return false
+end
+_has_empty_column(M, L) = false
+
 """
     should_batch_modes(base, sps, indices; is_gpu, nprocs) -> Bool
 
@@ -531,6 +541,8 @@ function should_batch_modes(base, sps, indices::Vector{Int};
     length(indices) >= 2 || return false
 
     sp1 = sps[indices[1]]
+    # ModeBatch stores ComplexF64 operators and factors. Other precisions use per-mode LU.
+    sp1.dist === nothing || _subproblem_eltype(sp1.dist.architecture) === ComplexF64 || return false
     # `mode_batch_bytes` needs the built matrices to size the batch, and
     # `build_mode_batch` needs all four. A bucket from `bucket_subproblems`
     # always has them (`batch_signature` returns `0x0` otherwise); a
@@ -541,6 +553,17 @@ function should_batch_modes(base, sps, indices::Vector{Int};
      sp1.L_exp === nothing) && return false
 
     _mode_batch_supported_layout(sp1) || return false
+
+    # A column empty in both M and L (the pressure constant at a RealFourier
+    # Nyquist mode, where ∂x vanishes) leaves every stage matrix singular, which
+    # a batched dense LU rejects. Buckets share one sparsity pattern, so the whole
+    # bucket stays on the per-mode loop, whose GPU path pins the free unknowns.
+    if _has_empty_column(sp1.M_min, sp1.L_min)
+        @info("Batched mode solve declined for a bucket whose stage matrices have an " *
+              "empty column (an undetermined unknown); those modes use the per-mode loop.",
+              maxlog=1)
+        return false
+    end
 
     n = size(LHS, 1)
     bytes = mode_batch_bytes(sp1, length(indices))

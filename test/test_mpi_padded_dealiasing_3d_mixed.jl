@@ -11,6 +11,7 @@ using MPI
 MPI.Initialized() || MPI.Init()
 using Tarang
 using PencilArrays
+include("cartesian_basis_cases.jl")
 
 const comm = MPI.COMM_WORLD
 const rank = MPI.Comm_rank(comm)
@@ -27,6 +28,7 @@ const SUMSQ_REF = 49.79384474046044
 const MAX_REF   = 1.5333421886891991
 
 @testset "Distributed 3D Cheb-Fourier-Fourier dealiasing == serial (np=$nprocs)" begin
+    check_cartesian_products(CPU(), Float64, comm)
     coords = CartesianCoordinates("z", "y", "x")          # Chebyshev FIRST
     dist = Distributor(coords)
     zb = ChebyshevT(coords["z"]; size=Nz, bounds=(0.0, 1.0))

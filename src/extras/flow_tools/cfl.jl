@@ -376,11 +376,14 @@ function compute_timestep(cfl::CFL)
 end
 
 # Function barrier specializes broadcasts on the concrete CPU/device arrays.
+# `grid_spacing` returns Float64; dividing in the buffer's precision keeps a
+# Float32 device kernel free of double arithmetic (which Metal cannot run).
 function _cfl_frequency_component!(dst, src, spacing, accumulate::Bool)
+    dx = convert(real(eltype(dst)), spacing)
     if accumulate
-        @. dst += abs(src) / spacing
+        @. dst += abs(src) / dx
     else
-        @. dst = abs(src) / spacing
+        @. dst = abs(src) / dx
     end
     return dst
 end

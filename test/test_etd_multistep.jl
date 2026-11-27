@@ -44,6 +44,35 @@ end
     end
 end
 
+@testset "An error in the interpreted ETD predictor restores public fields" begin
+    dom = PeriodicDomain(8)
+    try
+        for ts in (ETD_RK222(), ETD_CNAB2(), ETD_SBDF2())
+            u = ScalarField(dom, "u")
+            set!(u, 1.0)
+            fail = Ref(true)
+            p = InitialValueProblem([u])
+            guarded = Tarang.GeneralFunction(u, v -> begin
+                fail[] && v > 1.05 && error("RHS unavailable at predictor")
+                1.0
+            end, "guarded")
+            add_parameters!(p; guarded)
+            add_equation!(p, "dt(u) = guarded")
+            s = InitialValueSolver(p, ts; dt=0.1)
+            s.rhs_plan = nothing
+            @test_throws "RHS unavailable at predictor" step!(s)
+            @test (s.iteration, s.sim_time) == (0, 0.0)
+            @test all(isone, grid_data!(u))
+            @test all(isone, grid_data!(only(s.state)))
+            fail[] = false
+            step!(s)
+            @test maximum(abs, grid_data!(u) .- 1.1) < 1e-14
+        end
+    finally
+        close(dom.dist)
+    end
+end
+
 @testset "ETD phi cache follows replacement linear operators" begin
     state = Tarang.TimestepperState(ETD_RK222(), 0.1, ScalarField[])
     L1 = ComplexF64[-1 0; 0 -2]

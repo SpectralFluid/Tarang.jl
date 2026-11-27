@@ -44,6 +44,7 @@ import Tarang: ensure_device!
 using Random
 using MPI
 import CUDA
+import AbstractFFTs, LinearAlgebra
 using CUDA: CUDABackend, CuArray, CuDevice, CuMatrix, CuVector, device!, synchronize as cuda_sync
 using CUDA: CuStream, default_stream, @sync
 using CUDA.CUFFT
@@ -51,15 +52,25 @@ using CUDA.CUBLAS
 import KernelAbstractions
 using KernelAbstractions: @kernel, @index, @Const
 
+# Bind the shared spectral transform code to the CUDA array and FFT APIs.
+using CUDA: CuArray as DeviceArray, CuMatrix as DeviceMatrix, CuDevice as NativeDevice
+const DeviceRuntime = CUDA
+const DeviceFFT = CUFFT
+Tarang._gpu_workspace_queue(::GPU{CuDevice}) = CUDA.stream()
+_transform_cache(cache) = Tarang._gpu_workspace_cache(cache; task_local=false)
+
 # Include sub-modules in dependency order
 include("cuda/config.jl")
 include("cuda/memory.jl")
 include("cuda/architecture.jl")
 include("cuda/dct.jl")
-include("cuda/cheb_deriv.jl")
-include("cuda/mixed_transforms.jl")
+include("gpu/fft_plans.jl")
+include("gpu/resample.jl")
+include("gpu/cheb_deriv.jl")
+include("gpu/mixed_transforms.jl")
 include("cuda/kernels.jl")
 include("cuda/pencil.jl")
+include("gpu/transpose.jl")
 include("cuda/nccl_transpose.jl")  # NCCL-based transpose for pencil decomposition
 include("cuda/dct_distributed.jl")  # Distributed DCT for multi-GPU Chebyshev transforms
 include("cuda/transforms.jl")
@@ -104,7 +115,7 @@ export compute_transpose_counts!, finalize_nccl_transpose!
 # GPUDCTPlanDim, the even-odd reorder kernels and their twiddle kernels) has
 # been removed. Tarang's Chebyshev basis is DCT-**I** (REDFT00) on the
 # Gauss-Lobatto grid; that transform is `gpu_dct1_along_dim!` in
-# ext/cuda/cheb_deriv.jl, which the mixed and distributed drivers both call.
+# ext/gpu/cheb_deriv.jl, which the mixed and distributed drivers both call.
 
 # Distributed DCT (multi-GPU Chebyshev transforms)
 export DistributedDCTPlan

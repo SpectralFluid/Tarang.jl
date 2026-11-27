@@ -29,7 +29,11 @@ end
     u = ScalarField(dist, "u", (xb, yb), Float64)
     ensure_layout!(u, :g)
     gd = get_grid_data(u)
-    (gd isa PencilArrays.PencilArray ? parent(gd) : gd) .= 1.0
+    samples = PencilArrays.global_view(gd)
+    for I in CartesianIndices(samples)
+        x, y = (2π / 16) .* (Tuple(I) .- 1)
+        samples[I] = cos(x+y) + sin(x)*cos(8y)
+    end
 
     # Confirm a Fourier axis really is decomposed under MPI.
     ensure_layout!(u, :c)
@@ -43,6 +47,14 @@ end
     # a silent partial value. (Distributed interpolation is not yet supported in general;
     # the point here is that it FAILS LOUDLY rather than returning garbage.)
     @test_throws Exception Tarang.evaluate_interpolate(interpolate(u, coords["x"], 1.2), :g)
+
+    # At half a y grid spacing the real Nyquist cosine vanishes. Every rank
+    # receives the same x slice, including its phase in the half spectrum.
+    y0 = π / 16
+    expected = cos.((2π / 16) .* (0:15) .+ y0)
+    slice = interpolate(u, coords["y"], y0)
+    @test evaluate(slice, :g) ≈ expected atol=2e-13
+    @test evaluate(slice, :c) ≈ Tarang.FFTW.rfft(expected) atol=2e-12
 
     # Hilbert on a decomposed Fourier axis must not silently produce a wrong field.
     @test_throws Exception Tarang.evaluate(Tarang.hilbert(u), :g)

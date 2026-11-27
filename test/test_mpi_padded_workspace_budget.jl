@@ -22,8 +22,10 @@ const NP = MPI.Comm_size(COMM)
     ev = Tarang.NonlinearEvaluator(dist; dealiasing_factor=1.5)
     buffers = nothing
     for rep in 1:4
-        parent(ug) .= rep .* sin.(3 .* x) .+ cos.(y) .+ 0 .* z
-        parent(vg) .= cos.(2 .* x) .+ sin.(z) .+ 0 .* y
+        # Exercise independent operand magnitudes in the packed MPI transform.
+        su, sv = ((1.0, 1.0), (1e-100, 1e100), (1e100, 1e-100), (0.0, 1e100))[rep]
+        parent(ug) .= su .* (rep .* sin.(3 .* x) .+ cos.(y) .+ 0 .* z)
+        parent(vg) .= sv .* (cos.(2 .* x) .+ sin.(z) .+ 0 .* y)
         before_u, before_v = copy(parent(ug)), copy(parent(vg))
         product = Tarang.evaluate_transform_multiply(u, v, ev; result_layout=:g)
         # The fifth x harmonic is resolved; filtering it away would fail this.
@@ -37,8 +39,7 @@ const NP = MPI.Comm_size(COMM)
         else
             ws = only(values(Tarang._PADDED_DIST_WS_CACHE))
             retained = sum(prod(PencilArrays.size_global(PencilArrays.pencil(b))) for b in ws.buffers)
-            # Previously 43 full complex grids. Reuse spent buffers and reverse the
-            # truncation sweep to retain at most 16, including simultaneously live operands.
+            # Count all retained complex storage, including the padded product.
             @test retained <= 16 * prod(ns)
             if buffers !== nothing
                 @test length(buffers) == length(ws.buffers)
@@ -47,7 +48,9 @@ const NP = MPI.Comm_size(COMM)
             buffers = copy(ws.buffers)
             @test hasproperty(ws, :transpose_count)
             if hasproperty(ws, :transpose_count)
-                @test ws.transpose_count == 6
+                # Both real operands share the two padding transposes. Two more
+                # transposes return the truncated product to its original layout.
+                @test ws.transpose_count == (iszero(su) ? 0 : 4)
                 @test ws.transpose_elements <= 12 * prod(ns)
                 @test !any(ws.in_use)
             end

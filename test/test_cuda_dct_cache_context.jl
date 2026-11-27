@@ -338,6 +338,7 @@ end
     Core.eval(h, quote
         import Tarang
         using Tarang: GPU
+        struct CuDevice end
         using MPI
         const DISTRIBUTED_DCT_PLAN_CACHE = Dict{Tuple,Any}()
         const DISTRIBUTED_DCT_PLAN_BUILD_ORDER = Tuple[]
@@ -404,7 +405,7 @@ end
     dist = Distributor(CartesianCoordinates("x"); comm=MPI.COMM_SELF)
     mine = getfield(h, :_distributed_dct_comm_token)(dist.comm)
     build!([key(1, mine, 0) => :m1, key(2, :other, 0) => :o2, key(3, mine, 0) => :m3])
-    getfield(h, :close_hook)(dist, Tarang.GPU{Nothing}(nothing))
+    getfield(h, :close_hook)(dist, Tarang.GPU(h.CuDevice()))
     @test finalized == [:m1, :m3]
     @test collect(keys(cache)) == [key(2, :other, 0)]
     @test build_order == [key(2, :other, 0)]

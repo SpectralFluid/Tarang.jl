@@ -424,7 +424,7 @@ mutable struct CuSparseLU{T} <: AbstractMatSolver
     n::Int
     rhs_buffer::Any
     solution_buffer::Any
-    temp_buffer::Any
+    temp_buffer::Any    # RF scratch uses the same storage that QR uses for its RHS.
 end
 
 function _host_csr(A::SparseMatrixCSC{T,<:Integer}) where T
@@ -554,10 +554,10 @@ function CuSparseLU(matrix::SparseMatrixCSC; tol::Real=1e-12, reorder::Bool=true
         try
             rf = _build_cusolver_rf(A; tol=tol)
             n = size(A, 1)
+            work = _gpu_zeros(Float64, n)
             return CuSparseLU{Float64}(
                 A_csr, rf, :rf, Float64(tol), reorder, n,
-                _gpu_zeros(Float64, n), _gpu_zeros(Float64, n),
-                _gpu_zeros(Float64, n),
+                work, _gpu_zeros(Float64, n), work,
             )
         catch err
             @warn "CuSparseLU: RF setup failed, falling back to sparse QR" exception=(err, catch_backtrace()) maxlog=1
@@ -568,9 +568,10 @@ function CuSparseLU(matrix::SparseMatrixCSC; tol::Real=1e-12, reorder::Bool=true
     A_csr = _gpu_sparse_csr(matrix, Tq)
     qr_factor = _build_sparse_qr(A_csr, Tq, tol)
     n = size(matrix, 1)
+    work = _gpu_zeros(Tq, n)
     return CuSparseLU{Tq}(
         A_csr, qr_factor, :qr, Float64(tol), reorder, n,
-        _gpu_zeros(Tq, n), _gpu_zeros(Tq, n), _gpu_zeros(Tq, n),
+        work, _gpu_zeros(Tq, n), work,
     )
 end
 
@@ -586,8 +587,7 @@ function _cusparse_buffers!(s::CuSparseLU{T}) where T
         (s.rhs_buffer = _gpu_zeros(T, s.n))
     _valid_cusparse_buffer(s.solution_buffer, T, s.n) ||
         (s.solution_buffer = _gpu_zeros(T, s.n))
-    _valid_cusparse_buffer(s.temp_buffer, T, s.n) ||
-        (s.temp_buffer = _gpu_zeros(T, s.n))
+    s.temp_buffer = s.rhs_buffer
     return s.rhs_buffer, s.solution_buffer, s.temp_buffer
 end
 
@@ -601,18 +601,17 @@ function MatSolvers.solve!(dest::AbstractVector, s::CuSparseLU{T},
     ))
 
     b_gpu, x_gpu, temp = _cusparse_buffers!(s)
-    copyto!(b_gpu, rhs)
-
     if s.backend === :rf
         rf = s.factor::CuSparseRF{Float64}
         # cusolverRfSolve(handle, P, Q, nrhs, Temp, ldt, XF, ldxf): `XF` holds the RHS on
         # input and the solution on output; `Temp` is pure scratch. The old call passed
         # the RHS as `Temp` (clobbered) and an UNINITIALIZED buffer as `XF`, so the solve
         # read garbage. Put the RHS in XF (x_gpu) and give it a separate scratch buffer.
-        copyto!(x_gpu, b_gpu)
+        copyto!(x_gpu, rhs)
         _cusolver().cusolverRfSolve(rf.handle, rf.P, rf.Q, Cint(1),
                                       temp, Cint(rf.n), x_gpu, Cint(rf.n))
     else
+        copyto!(b_gpu, rhs)
         _cusolver().spqr_solve(s.factor, b_gpu, x_gpu)
     end
     copyto!(dest, x_gpu)
@@ -804,7 +803,7 @@ end
 function CuIterativeCG(matrix::AbstractMatrix;
                        tol::Real=1e-10,
                        maxiter::Int=1000,
-                       preconditioner::Symbol=:jacobi,
+                       preconditioner=:jacobi,   # Symbol, vector of diagonal inverses, function or nothing
                        kwargs...)
     if !CUDA_AVAILABLE[]
         error("CUDA not available. Use CPU solver instead.")
@@ -1036,7 +1035,7 @@ function CuIterativeGMRES(matrix::AbstractMatrix;
                           tol::Real=1e-10,
                           maxiter::Int=1000,
                           restart::Int=30,
-                          preconditioner::Symbol=:jacobi,
+                          preconditioner=:jacobi,   # Symbol, vector of diagonal inverses, function or nothing
                           kwargs...)
     if !CUDA_AVAILABLE[]
         error("CUDA not available. Use CPU solver instead.")

@@ -25,6 +25,7 @@ CUDABackend() = KernelAbstractions.CPU()
 const uploads = Ref(0)
 _to_gpu(x::Vector{Int}) = (uploads[] += 1; copy(x))
 const _GPU_DCT_SCRATCH_CACHE = Dict{Tuple,Any}()
+_transform_cache(cache) = cache
 const _GPU_DCT_PLAN_CACHE_LOCK = ReentrantLock()
 _dct_cache_device_id(arch) = 0
 
@@ -45,9 +46,10 @@ function definition(ex, name)
     nothing
 end
 const root = dirname(@__DIR__)
-const source = Meta.parseall(read(joinpath(root,"ext/cuda/transpose_kernels.jl"),String))
-const nccl_source = Meta.parseall(read(joinpath(root,"ext/cuda/nccl_transpose.jl"),String))
-Core.eval(@__MODULE__, definition(nccl_source, :_gpu_find_rank))
+const DeviceRuntime = CUDA
+const DeviceArray = Array
+const source = Meta.parseall(read(joinpath(root,"ext/gpu/transpose.jl"),String))
+Core.eval(@__MODULE__, definition(source, :_gpu_find_rank))
 for name in (:pack_for_transpose_kernel_2d!, :pack_for_transpose_kernel_3d!,
              :unpack_from_transpose_kernel_2d!, :unpack_from_transpose_kernel_3d!,
              :_validated_chunk_size, :_gpu_transpose_chunk_plan,

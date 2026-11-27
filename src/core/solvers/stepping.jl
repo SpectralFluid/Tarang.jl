@@ -21,14 +21,36 @@ that survived is the rotating result pools, whose contract is documented in
 `src/core/module_contracts.jl`; `checkout_or_alloc` consequently always
 allocates, which is the intended behaviour, not a fallback.
 """
-function step!(solver::InitialValueSolver, dt::Float64=solver.dt)
+function step!(solver::InitialValueSolver, dt::Real=solver.dt)
+    dt = _checked_timestep(dt, solver.sim_time)
     start_time = time()
 
     _refresh_step_boundary_conditions!(solver, dt)
+    previous_state = solver.timestepper_state
+    previous_dt = solver.dt
+    previous_state_dt = previous_state === nothing ? previous_dt : previous_state.dt
+    previous_length = previous_state === nothing ? 0 : length(previous_state.dt_history)
+    oldest_dt = previous_length == 0 ? previous_dt : first(previous_state.dt_history)
     ts_state = _ensure_timestepper_state!(solver, dt)
+    accepted_state = last(ts_state.history)
 
-    # Call existing timestepper step function from timesteppers.jl
-    step!(ts_state, solver)
+    try
+        step!(ts_state, solver)
+    catch step_error
+        # The current step is recorded before dispatch so multistep formulas
+        # can read it alongside accepted steps. Remove it if dispatch fails.
+        solver.dt = previous_dt
+        if previous_state === nothing
+            solver.timestepper_state = nothing
+        else
+            _restore_timestep_history!(previous_state, previous_state_dt, previous_length, oldest_dt)
+        end
+        # An interpreted RHS can bind the public field handles to its predictor.
+        # On the first step those handles also belong to the original solver.state.
+        solver.state = accepted_state
+        _alias_state_to_problem!(solver.problem, accepted_state)
+        rethrow(step_error)
+    end
 
     step_time = time() - start_time
     _sync_solver_from_timestepper!(solver)
@@ -158,10 +180,7 @@ function run!(solver::InitialValueSolver;
     while proceed(solver)
         # Adaptive timestep from a CFL controller, if supplied — lets CFL-driven
         # runs use run! too (no manual while-loop just to call compute_timestep).
-        if cfl !== nothing
-            solver.dt = compute_timestep(cfl)
-        end
-        step!(solver)
+        step!(solver, cfl === nothing ? solver.dt : compute_timestep(cfl))
 
         # Auto-process registered output handlers. Each handler gates its own
         # cadence (sim_dt/iter/wall_dt) via should_write, so this is a no-op on
@@ -279,9 +298,12 @@ function _bvp_lhs_solver(sp::Subproblem)
     try
         return MatSolvers.solver_instance(st, sp.L_min)
     catch err
-        _gpu_subproblem_execution(sp) && error(
-            "GPU BVP factorization with $(st) failed; CPU SPQR/dense fallback is disabled. " *
-            "Original error: $(sprint(showerror, err))")
+        if _gpu_subproblem_execution(sp)
+            pinned = _gpu_singular_factorization(sp, st, sp.L_min, (;), "boundary-value system")
+            pinned !== nothing && return pinned
+            error("GPU BVP factorization with $(st) failed; CPU SPQR/dense fallback is disabled. " *
+                  "Original error: $(sprint(showerror, err))")
+        end
         try
             return MatSolvers.solver_instance(MatSolvers.SPQRSolver, sp.L_min)
         catch qr_err
@@ -386,7 +408,7 @@ function _solve_bvp_per_subproblem!(solver::BoundaryValueSolver)
         # Override the M-gated target cache with the BVP bulk-equation targets.
         sp.runtime.eqn_targets = bvp_targets
         n_eq = size(sp.L_min, 1)
-        rhs = zeros(sp.dist.architecture, ComplexF64, n_eq)
+        rhs = zeros(sp.dist.architecture, _subproblem_eltype(sp.dist.architecture), n_eq)
         gather_eqn_F!(rhs, sp, solver, pde_F, state)
         alg_f = similar(rhs)
         gather_alg_F!(alg_f, sp)

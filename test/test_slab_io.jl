@@ -280,6 +280,48 @@ end
     @test Array(get_grid_data(v)) == second_write
 end
 
+@testset "time-series slabs select a common latest record" begin
+    function write_record_slab(path, offset, values; committed=nothing, total=nothing)
+        Tarang.nccreate(path, "u", "sim_time", length(values), "x", 2;
+                        t=Tarang.NetCDF.NC_DOUBLE)
+        Tarang.ncwrite(repeat(values, 1, 2), path, "u")
+        Tarang.ncputatt(path, "u", Dict("start" => [offset], "count" => [2],
+                                       "global_shape" => [4]))
+        committed === nothing || Tarang.ncputatt(path, "global", Dict("committed_writes" => committed))
+        total === nothing || Tarang.ncputatt(path, "global", Dict("committed_total_writes" => total))
+    end
+
+    mktempdir() do dir
+        left, right = joinpath.(dir, ("u_p0.nc", "u_p1.nc"))
+        write_record_slab(left, 0, [1.0, 100.0]; committed=1, total=5)
+        write_record_slab(right, 2, [2.0, 200.0, 300.0]; committed=1, total=5)
+        dest = zeros(4)
+        Tarang.read_local_slab!(dest, Tarang.open_slab_source(dir), "u", [0])
+        @test dest == [1.0, 1.0, 2.0, 2.0]
+
+        Tarang.ncputatt(right, "global", Dict("committed_total_writes" => 6))
+        @test_throws ErrorException Tarang.open_slab_source(dir)
+        Tarang.ncputatt(right, "global", Dict("committed_writes" => 2, "committed_total_writes" => 5))
+        @test_throws ErrorException Tarang.open_slab_source(dir)
+        for invalid_count in (0, -1, 4)
+            Tarang.ncputatt(right, "global", Dict("committed_writes" => invalid_count))
+            @test_throws ErrorException Tarang.open_slab_source(right)
+        end
+    end
+
+    mktempdir() do dir
+        left, right = joinpath.(dir, ("u_p0.nc", "u_p1.nc"))
+        write_record_slab(left, 0, [1.0, 10.0])
+        write_record_slab(right, 2, [2.0, 20.0])
+        dest = zeros(4)
+        Tarang.read_local_slab!(dest, Tarang.open_slab_source(dir), "u", [0])
+        @test dest == [10.0, 10.0, 20.0, 20.0]
+
+        Tarang.ncputatt(right, "global", Dict("committed_writes" => 2))
+        @test_throws ErrorException Tarang.open_slab_source(dir)
+    end
+end
+
 @testset "write_local_slab refuses complex data" begin
     dir = mktempdir()
     path = joinpath(dir, "complex.nc")

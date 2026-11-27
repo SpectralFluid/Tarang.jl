@@ -64,4 +64,62 @@ using Tarang
         bv = ChebyshevV(coords["z"]; size = 12, bounds = (-1.0, 1.0))
         @test roundtrip_err(bv, z -> 1 + 2z - 0.5z^2) < 1e-9
     end
+
+    @testset "Scaled collocation matrices" begin
+        polynomial(z) = 1 + 0.3z - 0.07z^2
+        for basis in (Legendre(coords["z"]; size=7, bounds=(1.0, 4.0)),
+                      ChebyshevU(coords["z"]; size=7, bounds=(1.0, 4.0)),
+                      ChebyshevV(coords["z"]; size=7, bounds=(1.0, 4.0)),
+                      Jacobi(coords["z"]; size=7, bounds=(1.0, 4.0), a=0.25, b=0.75))
+            ref = ScalarField(dist, "reference", (basis,), Float64)
+            ref["g"] .= polynomial.(Tarang.local_grid(basis, dist, 1.0))
+            reference_coefficients = copy(ref["c"])
+
+            for scale in (1.4, 0.5), start in (:g, :c, :preset)
+                field = copy(ref)
+                target_grid = Tarang.local_grid(basis, dist, scale)
+                if start === :preset
+                    Tarang.preset_scales!(field, scale)
+                    field.current_layout = :g
+                    field["g"] .= polynomial.(target_grid)
+                else
+                    ensure_layout!(field, start)
+                    Tarang.set_scales!(field, scale)
+                end
+
+                @test size(field["g"]) == Tarang.get_scaled_shape(field) == size(target_grid)
+                @test field["g"] ≈ polynomial.(target_grid) atol=1e-10
+                @test field["c"] ≈ reference_coefficients atol=1e-10
+            end
+
+            # Modes beyond the coarse grid's resolution cannot alias into the
+            # retained modes on the way to the grid and back.
+            coarse = copy(ref)
+            fill!(coarse["c"], 0)
+            coarse["c"][5] = 1.0
+            Tarang.set_scales!(coarse, 0.5)
+            @test all(iszero, coarse["g"])
+            @test all(iszero, coarse["c"])
+        end
+    end
+
+    @testset "Scaled Legendre with a Fourier axis" begin
+        mixed_coords = CartesianCoordinates("x", "z")
+        mixed_dist = Distributor(mixed_coords; mesh=(1,), dtype=Float64)
+        xb = RealFourier(mixed_coords["x"]; size=8)
+        zb = Legendre(mixed_coords["z"]; size=7, bounds=(1.0, 4.0))
+        field = ScalarField(mixed_dist, "mixed", (xb, zb), Float64)
+
+        profile(z) = z + 0.1z^2
+        x, z = local_grids(mixed_dist, xb, zb; scales=1.0)
+        field["g"] .= sin.(x) .* transpose(profile.(z))
+        scales = (1.5, 0.5)
+        Tarang.set_scales!(field, scales)
+        xs, zs = local_grids(mixed_dist, xb, zb; scales)
+        expected = sin.(xs) .* transpose(profile.(zs))
+        @test size(field["g"]) == (12, 4)
+        @test field["g"] ≈ expected atol=1e-10
+        @test size(field["c"]) == (7, 7)
+        @test field["g"] ≈ expected atol=1e-10
+    end
 end

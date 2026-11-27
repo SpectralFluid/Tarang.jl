@@ -144,11 +144,17 @@ silently drops an implicit operator or substitutes a lower-order scheme.
 | MPI, pure Fourier, no implicit operator | every RK and multistep scheme on the matrix-free field path at nominal order | — |
 | MPI, Chebyshev axis | the per-mode subproblem path (Chebyshev axis first) | — |
 | Single GPU, pure Fourier, implicit operator | `RK111`, `RK222`, `RK443`, `RKSMR`, `RKGFY`, `SBDF2` only, per-mode on device (from the equation's `L`, or an attached `SpectralLinearOperator`) | the remaining schemes (`ErrorException` naming supported schemes or "move the term to the RHS"; `ArgumentError` for an attached operator) |
-| Single GPU, pure Fourier, no implicit operator | explicit RK, CNAB/SBDF/MCNAB2/CNLF2 field path | — |
-| Single GPU, Chebyshev axis | IMEX RK and multistep through per-mode subproblems with CUDA sparse solves, mode-batched by default | rank-deficient stage systems (e.g. duplicate tau lifts, see below); ETD |
+| Single GPU, pure Fourier, no implicit operator | explicit RK, CNAB/SBDF/MCNAB2/CNLF2, and all three ETD schemes operate directly on fields | — |
+| Single GPU, Chebyshev axis | IMEX RK and multistep through per-mode subproblems. CUDA and ROCm can batch modes. Metal uses single-precision LU for each mode. | rank-deficient stage systems (e.g. duplicate tau lifts, see below); ETD |
 
 The field and diagonal paths in this table require identity mass; see
 [Mass operators on field and diagonal paths](@ref).
+
+With zero linear operator, `ETD_RK222` uses Heun's predictor and corrector.
+`ETD_CNAB2` and `ETD_SBDF2` on a single GPU use that startup once and then apply
+variable-step Adams–Bashforth with the previous accepted right-hand side.
+The Fourier diagonal IMEX solvers reject a step if any mode has a zero or
+nonfinite implicit denominator. Under MPI this rejection applies to every rank.
 
 For `RK222`, `RK443`, and `SBDF2`, MPI CPU problems whose state consists entirely
 of spatial Fourier fields skip global sparse matrix assembly at construction.
@@ -157,11 +163,9 @@ rank-local Fourier multipliers. This avoids retaining unused global matrices.
 Mixed-basis problems, states containing zero-dimensional fields, and other
 schemes retain their existing construction paths.
 
-Two degradations are announced with a warning rather than refused, because the
-result is still correct: serial `ETD_*` above 4096 coefficients falls back to
-CNAB2 (the operator stays implicit — see the serial size limit under ETD below), and
-the three ETD types share one distributed per-mode ETD-RK2 implementation under
-MPI.
+Above 4096 coefficients, serial CPU ETD selects an implicit fallback before
+building the dense matrix functions. The choice depends on the scheme and on
+whether white-noise forcing is registered.
 
 `RK222()`, `RK443()`, and `SBDF2()` select internal diagonal solves on GPU Fourier
 problems. CPU matrix and subproblem paths retain the same numerical scheme.
@@ -210,7 +214,7 @@ This per-stage refresh (gated on `has_time_dependent_bcs`, so it's free when BCs
 
 RK dispatch via `step_rk_imex!` → `step_subproblem_rk!` is the obvious path, but `CNAB1`/`CNAB2`/`SBDF1..4` also dispatch through the subproblem path whenever `problem.compiled.subproblems` is available. The dispatch happens inside each `step_<scheme>!` function: it computes the scheme's `(a, b, c)` coefficient tuples and calls the generic `step_subproblem_multistep!(state, solver, sps, a, b, c)`.
 
-This means every IMEX stepper that supports the subproblem path gets DAE-correct BC handling automatically. The global-matrix path is still used when subproblem decomposition is unavailable, including pure-periodic/global systems. Inhomogeneous tau BCs should use the subproblem path; the global multistep path does not carry those algebraic BC values through the same override machinery.
+Every IMEX stepper that supports the subproblem path enforces these boundary values automatically. The global-matrix path also enforces numeric algebraic targets when it can project them onto the equation's coefficient rows. For example, a periodic system with `v - u = 2` satisfies that constraint at the end of each IMEX step. Use the subproblem path for inhomogeneous tau boundary conditions with field-valued data.
 
 !!! warning "Give each tau variable its own lift"
     Write `lift(tau1, basis, -1) + lift(tau2, basis, -2)`, not two lifts to the same
@@ -221,9 +225,10 @@ This means every IMEX stepper that supports the subproblem path gets DAE-correct
     exponentially unstable — fine for a few dozen steps, then growing without
     bound while the boundary values stayed exact.) A lift *inside* a derivative
     operator, as in `div(grad(b) + ez*lift(tau1, b, -1)) + lift(tau2, b, -1)`, is
-    a different row and is fine. A genuinely singular mode that is not a duplicate
-    lift — the pressure-gauge mode of an incompressible problem — is still solved
-    in the least-squares sense, now with a warning naming the mode.
+    a different row and is fine. For a rank-deficient CPU stage such as a
+    pressure-gauge mode, sparse QR checks that the right-hand side is in the
+    matrix's column space to roundoff. An inconsistent stage rejects the step
+    and restores the accepted field values.
 
 ### Why not just always use the override
 
@@ -352,27 +357,10 @@ ETD methods use phi functions defined as:
 \phi_2(z) = \frac{e^z - 1 - z}{z^2}
 ```
 
-Scalar arguments use a Taylor expansion near zero (`|z| < 1e-8`), where the `e^z − 1 − z`
-numerator cancels catastrophically against the `z^2` denominator.
-
-For the matrix case, `phi_functions_matrix(L, dt)` computes all three at once from the assembled
-`L_matrix`, choosing its method by the operator norm `‖dt·L‖`:
-
-| `‖dt·L‖` | method |
-|---|---|
-| `< 1e-8` | Taylor series |
-| `< 50` | dense matrix exponential plus stable φ solves, with an eigendecomposition fallback when `z` is singular (the `k=0` mode of a pure diffusion operator makes it so) |
-| `≥ 50` | Krylov approximation, column by column, via `ExponentialUtilities.phiv` |
-
-Matrix ETD is rejected above size 4096 because it requires dense O(n²) storage — see the serial
-size limit below.
-
-The Krylov branch announces itself with `Warning: Matrix is large or stiff (norm=...), using
-Krylov approximation`. It is not an error — a stiff `L` is the whole point of ETD, so any useful
-ETD run will trip it (the 1-D heat example below has `‖dt·L‖ ≈ 269` and still reproduces the
-analytic solution to 8 digits).
-
-The result is cached and only recomputed when `dt` changes.
+Scalar arguments use a Taylor expansion for `|z| < 0.01` to avoid cancellation
+near zero. For a global matrix, `phi_functions_matrix(L, dt)` computes all three
+functions together by scaling and squaring. The cache is reused for the same
+operator and timestep.
 
 ### When to Use ETD
 
@@ -403,16 +391,13 @@ ordering, and the stepper will silently propagate the wrong operator.
 
 ### Size limit (serial)
 
-In serial the exponential is taken of the **dense global** matrix, so the cost is O(n³) in the
-total number of coefficients. Above `n = 4096` degrees of freedom the phi-function builder
-refuses, and the stepper emits
-
-> `Warning: ETD-RK222 failed: ArgumentError("ETD matrix exponential requires dense O(n²) storage
-> but n=8193 is too large ..."), falling back to CNAB2 (keeps the linear operator implicit)`
-
-and carries on with CNAB2, which keeps the linear operator implicit (it does not drop to an
-explicit scheme). If you asked for ETD and see that warning, you are not getting ETD —
-reduce the resolution or switch to SBDF2.
+Global matrix functions use O(n²) storage. Above 4096 coefficients the serial
+CPU solver warns and selects an implicit method before allocating the dense
+matrices. With deterministic forcing, `ETD_RK222` and `ETD_CNAB2` use CNAB2,
+and `ETD_SBDF2` uses SBDF2 after startup. With registered white noise,
+`ETD_RK222` uses one-step IMEX RK222 so each draw contributes to exactly one
+timestep. An error in a forcing callback or RHS evaluation propagates to the
+caller and rejects the attempted step.
 
 ETD also refuses tau / DAE formulations outright: a boundary-condition row has no time
 derivative, so the mass matrix is singular and `-M⁻¹L` does not exist
@@ -466,10 +451,10 @@ matrix exponential cannot run on distributed field vectors, so the distributed p
 Fourier mode with its own scalar exponential and never forms a global matrix (verified: a 128×128
 Fourier heat problem, 8320 coefficients, steps at np=2 with no fallback).
 
-The trade-off is that **all three** exported ETD types (`ETD_RK222`, `ETD_CNAB2`, `ETD_SBDF2`)
-dispatch to the same distributed per-mode ETD-RK2 implementation on that path — the distinction
-between the exponential-RK and the exponential-multistep variants is lost. If that distinction
-matters to you, use the serial global-matrix path.
+`ETD_RK222` evaluates a predictor and corrector on each step. `ETD_CNAB2` and
+`ETD_SBDF2` take one ETD-RK2 startup step, then retain the most recent accepted
+nonlinear term on each rank. Subsequent steps use exponential Adams–Bashforth
+with the current-to-previous timestep ratio and one new RHS evaluation.
 
 ### Example: 1D Heat Equation with ETD
 

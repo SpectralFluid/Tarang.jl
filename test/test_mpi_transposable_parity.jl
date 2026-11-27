@@ -89,7 +89,7 @@ end
         @test maximum(abs, Tarang.get_grid_data(field) .- original; init=0.0) < 1e-10
     end
 
-    @testset "3D mesh=$mesh" for mesh in (NP == 4 ? ((2, 2), (4, 1), (1, 4)) : ((NP, 1),))
+    @testset "3D mesh=$mesh" for mesh in (NP == 4 ? ((2, 2), (4, 1), (1, 4), (NP,)) : ((NP, 1), (NP,)))
         Nx, Ny, Nz = 8, 6, 4
         coords = CartesianCoordinates("x", "y", "z")
         dist = Distributor(coords; comm=COMM, mesh=mesh, dtype=ComplexF64,
@@ -115,6 +115,119 @@ end
 
         distributed_backward_transform!(tf)
         @test maximum(abs, Tarang.get_grid_data(field) .- original; init=0.0) < 1e-10
+        close(tf)
+        if NP > 1
+            marked = ScalarField(field, Tarang.TransposableFieldStorage(CPU(),
+                                 get_grid_data(field), get_coeff_data(field)))
+            x = reshape((2π/Nx) .* (ox .- 1), :, 1, 1)
+            y = reshape((2π/Ny) .* (oy .- 1), 1, :, 1)
+            z = reshape((2π/Nz) .* (0:Nz-1), 1, 1, :)
+            grid_data!(marked) .= cis.(3 .* x .+ 2 .* y) .+ cis.(z)
+            # Four complex z modes span -2 through +1. The +2 square is
+            # outside that band and only the cross term survives projection.
+            expected = 2 .* cis.(3 .* x .+ 2 .* y .+ z)
+            delta = maximum(abs, grid_data!(marked * marked) .- expected; init=0.0)
+            @test MPI.Allreduce(delta, MPI.MAX, COMM) < 1e-11
+        end
+        close(dist)
+    end
+
+    if NP >= 2
+        @testset "Padded Chebyshev and signed Fourier modes on transposed pencils" begin
+            nz, nx, ny = 13, 12, 7
+            mesh = NP == 4 ? (2, 2) : (NP, 1)
+            coords = CartesianCoordinates("z", "x", "y")
+            dist = Distributor(coords; comm=COMM, mesh, dtype=ComplexF64, use_pencil_arrays=false)
+            try
+                bases = (ChebyshevT(coords["z"]; size=nz, dealias=1.5),
+                         ComplexFourier(coords["x"]; size=nx), ComplexFourier(coords["y"]; size=ny))
+                base = ScalarField(dist, "a", bases)
+                a = ScalarField(base, Tarang.TransposableFieldStorage(CPU(), get_grid_data(base), get_coeff_data(base)))
+                b, out = copy(a), copy(a)
+                iz, ix = block_ranges(mesh, nz, nx)
+                polynomial = cospi.(10 .* (iz .- 1) ./ (nz - 1))
+                x = reshape(2π .* (ix .- 1) ./ nx, 1, :, 1)
+                y = reshape(2π .* (0:ny-1) ./ ny, 1, 1, :)
+                grid_data!(a) .= im .* polynomial .* cis.(-6 .* x .+ y)
+                grid_data!(b) .= polynomial .* cis.(x)
+                expected = (im/2) .* cis.(-5 .* x .+ y)
+                Tarang._dealiased_lazy_product!(out, a, b)
+                err = maximum(abs, grid_data!(out) .- expected; init=0.0)
+                @test MPI.Allreduce(err, MPI.MAX, COMM) < 2e-12
+            finally
+                close(dist)
+            end
+        end
+
+        @testset "Padded Fourier products and spectra, mesh=$mesh" for mesh in
+            (NP == 4 ? ((4, 1), (1, 4), (2, 2)) : ((NP, 1), (1, NP)))
+            nx, ny = 12, 10
+            coords = CartesianCoordinates("x", "y")
+            dist = Distributor(coords; comm=COMM, mesh, dtype=ComplexF64, use_pencil_arrays=false)
+            bases = (ComplexFourier(coords, "x", nx), ComplexFourier(coords, "y", ny))
+            base = ScalarField(dist, "f", bases)
+            f = ScalarField(base, Tarang.TransposableFieldStorage(CPU(),
+                            get_grid_data(base), get_coeff_data(base)))
+            g = copy(f)
+            ox, oy = block_ranges(mesh, nx, ny)
+            x = (2π/nx) .* (ox .- 1)
+            y = (2π/ny) .* (oy .- 1)'
+            grid_data!(f) .= cis.(-5 .* x)
+            spectrum = power_spectrum(f; radial_average=false)
+            peak = get(spectrum, (-5.0, 0.0), 0.0)
+            @test MPI.Allreduce(peak, MPI.SUM, COMM) ≈ (nx*ny)^2
+            square = f * f
+            @test Tarang.is_transposable_storage(square)
+            @test MPI.Allreduce(maximum(abs, grid_data!(square); init=0.0), MPI.MAX, COMM) < 1e-11
+
+            # Both axes have an out-of-band product. The cross terms remain
+            # resolvable even on ranks whose padded and original slabs differ.
+            grid_data!(f) .= cis.(-5 .* x) .+ cis.(4 .* y)
+            grid_data!(g) .= cis.(4 .* x) .+ cis.(3 .* y)
+            expected = cis.(-x) .+ cis.(-5 .* x .+ 3 .* y) .+ cis.(4 .* x .+ 4 .* y)
+            error = maximum(abs, grid_data!(f * g) .- expected; init=0.0)
+            @test MPI.Allreduce(error, MPI.MAX, COMM) < 1e-11
+            close(dist)
+        end
+
+        @testset "Fourier derivatives of Z-local arrays" begin
+            Nx, Ny, Nz = 3NP + 1, 5, 4
+            coords = CartesianCoordinates("x", "y", "z")
+            dist = Distributor(coords; comm=COMM, mesh=(NP,), dtype=ComplexF64,
+                               use_pencil_arrays=false)
+            bases = (ComplexFourier(coords, "x", Nx), ComplexFourier(coords, "y", Ny),
+                     ComplexFourier(coords, "z", Nz))
+            base_field = ScalarField(dist, "distributed_derivative", bases)
+            # Exercise the ordinary array dispatch with the same storage layout
+            # as a multi-GPU field, using host arrays for local MPI CI.
+            buffers = Tarang.TransposableFieldStorage(CPU(), Tarang.get_grid_data(base_field),
+                                                       Tarang.get_coeff_data(base_field))
+            field = ScalarField(base_field, buffers)
+            x = local_grids(dist, bases...)[1]
+            field["g"] .= @. 0.3cis(x) + cis(-2x)
+            expected = @. 0.3im * cis(x) - 2im * cis(-2x)
+
+            result = copy(field)
+            Tarang.evaluate_fourier_derivative!(result, field, 1, 1, :g)
+            @test maximum(abs, result["g"] .- expected; init=0.0) < 1e-10
+
+            ensure_layout!(field, :c)
+            Tarang.evaluate_fourier_derivative!(result, field, 1, 1, :c)
+            @test field.current_layout === :c
+            @test maximum(abs, result["g"] .- expected; init=0.0) < 1e-10
+
+            Tarang._apply_lazy_fourier_diff!(Tarang.get_coeff_data(field), field, bases[1], 1, 1)
+            @test maximum(abs, field["g"] .- expected; init=0.0) < 1e-10
+
+            rbase = RealFourier(coords, "x", Nx)
+            owned_modes = Tarang.local_indices(dist, 1, Tarang.rfft_len(Nx))
+            half = ones(ComplexF64, length(owned_modes), 2, 1)
+            Tarang._apply_spectral_derivative_distributed!(half, rbase, 1, 2, dist; uses_rfft=true)
+            expected_half = -((owned_modes .- 1) .^ 2)
+            @test half[:, 1, 1] ≈ expected_half atol=1e-12
+
+            close(dist)
+        end
     end
 
     # Over-decomposition: ranks that own an EMPTY block must not hang and must

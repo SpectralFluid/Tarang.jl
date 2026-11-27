@@ -184,7 +184,8 @@ ChebyshevT(
 - `coord`: Coordinate object
 - `size`: Number of modes (polynomial degree + 1)
 - `bounds`: Domain boundaries (min, max)
-- `dealias`: accepted, but **ignored on non-Fourier axes** (only Fourier axes are truncated)
+- `dealias` controls oversampling of nonlinear products on this Chebyshev axis.
+  The default is `1`. Use `3/2` for quadratic products.
 
 **Examples**:
 
@@ -453,16 +454,17 @@ Dealiasing prevents aliasing errors in nonlinear terms.
 
 ### `dealias` is a padding factor
 
-`dealias` is the padding factor, **not** a cutoff fraction: `dealias=3/2` gives the 3/2 rule
-(equivalently, 2/3-rule truncation), and any value `≤ 1` switches dealiasing **off**. The
-retained band is `|k| ≤ min(floor(N / (2*dealias)), (N-1)÷3)`.
+`dealias` controls the working resolution for nonlinear products. A factor of
+`3/2` resolves quadratic products before projection onto the original modes.
+Any value `≤ 1` switches padding off on that axis.
 
 ```julia
 # The 3/2 rule — this is already the RealFourier/ComplexFourier default
 basis = RealFourier(x; size=32, bounds=(0.0, 2π), dealias=3/2)
 ```
 
-Cutoffs actually applied for `RealFourier(size=32)`:
+When explicitly applying the Fourier cutoff filter, the retained band is
+`|k| ≤ min(floor(N / (2*dealias)), (N-1)÷3)`. For `RealFourier(size=32)`:
 
 | `dealias=` | modes retained | effect |
 |---|---|---|
@@ -471,8 +473,10 @@ Cutoffs actually applied for `RealFourier(size=32)`:
 | `1.0` | all | dealiasing off |
 | `2/3` | all | dealiasing off (it is `≤ 1`, so **not** what you want) |
 
-The factor is ignored on non-Fourier axes: passing `dealias=3/2` to a Chebyshev or Legendre
-basis is harmless but truncates nothing.
+With `ChebyshevT(...; dealias=3/2)`, products use additional Lobatto nodes and
+retain degrees zero through `N-1`. For example, with 13 modes the projected
+square of `T₁₀` is the constant `1/2`. Other Jacobi bases and Legendre use
+their original product grid.
 
 ### When to Dealias
 

@@ -10,17 +10,16 @@
 Non-blocking allreduce operation for overlapping communication and computation.
 Returns an MPI request that can be waited on later.
 
-GPU arrays require CUDA-aware MPI; host staging is disabled.
+GPU arrays require MPI support for the selected backend.
 """
 function async_allreduce!(dest::AbstractArray, src::AbstractArray, op, dist::Distributor)
-    start_time = time()
-
-    # Handle GPU arrays with non-CUDA-aware MPI
-    if is_gpu_array(src) && !check_cuda_aware_mpi()
-        error("GPU all-reduce requires CUDA-aware MPI; host staging fallback is disabled.")
-    end
-
-    request = MPI.Iallreduce!(src, dest, op, dist.comm)
+    _prepare_mpi_device_buffers!((src, dest))
+    buf = MPI.RBuffer(src === dest ? MPI.IN_PLACE : src, dest)
+    reduction = op isa Union{MPI.Op,MPI.MPI_Op} ? op : MPI.Op(op, eltype(src))
+    request = MPI.Request()
+    # MPI.jl 0.20 exposes nonblocking all-reduce through its C API.
+    MPI.API.MPI_Iallreduce(buf.senddata, buf.recvdata, buf.count, buf.datatype, reduction, dist.comm, request)
+    MPI.setbuffer!(request, (buf, reduction))
     dist.performance_stats.mpi_operations += 1
 
     return request
@@ -75,15 +74,7 @@ function neighbor_exchange!(send_left::AbstractArray, send_right::AbstractArray,
         return  # No communication needed for serial
     end
 
-    # CRITICAL: Check for GPU arrays with non-CUDA-aware MPI
-    # MPI operations on GPU arrays require CUDA-aware MPI.
-    if (is_gpu_array(send_left) || is_gpu_array(send_right) ||
-        is_gpu_array(recv_left) || is_gpu_array(recv_right)) && !check_cuda_aware_mpi()
-        error("neighbor_exchange! with GPU arrays requires CUDA-aware MPI. " *
-              "Set TARANG_CUDA_AWARE_MPI=1 if your MPI supports it, or copy data " *
-              "to CPU before calling. TransposableField GPU operations also require " *
-              "CUDA-aware MPI; implicit staging is disabled.")
-    end
+    _prepare_mpi_device_buffers!((send_left, send_right, recv_left, recv_right))
 
     start_time = time()
 
@@ -147,16 +138,7 @@ function async_neighbor_exchange!(send_left::AbstractArray, send_right::Abstract
         return MPI.Request[]  # No communication needed for serial
     end
 
-    # CRITICAL: Check for GPU arrays with non-CUDA-aware MPI
-    # Async MPI operations on GPU arrays are especially problematic - the GPU pointers
-    # may become invalid before the async operation completes
-    if (is_gpu_array(send_left) || is_gpu_array(send_right) ||
-        is_gpu_array(recv_left) || is_gpu_array(recv_right)) && !check_cuda_aware_mpi()
-        error("async_neighbor_exchange! with GPU arrays requires CUDA-aware MPI. " *
-              "Async operations on GPU data without CUDA-aware MPI can leave invalid " *
-              "device pointers in flight. Set TARANG_CUDA_AWARE_MPI=1 if your MPI " *
-              "supports it, or use synchronous neighbor_exchange! with CPU staging.")
-    end
+    _prepare_mpi_device_buffers!((send_left, send_right, recv_left, recv_right))
 
     # Get neighbor ranks in the specified dimension
     left_rank, right_rank = get_neighbor_ranks(dist, dim; periodic=periodic)

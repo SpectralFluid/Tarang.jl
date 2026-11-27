@@ -20,8 +20,10 @@ jobs:
   test:
     name: Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.arch }}
     runs-on: ${{ matrix.os }}
-    # Julia 1.12 on macOS completed the suite just before the old 60-minute limit.
-    timeout-minutes: ${{ matrix.os == 'macOS-latest' && matrix.version == '1.12' && 90 || 60 }}
+    # The suite grew past the old limits: on 2026-11-27 Ubuntu and Windows 1.11 hit
+    # 60 minutes on main, and every macOS job hit its 60/90-minute limit while
+    # still running tests. These are ceilings; jobs end when the suite does.
+    timeout-minutes: ${{ matrix.os == 'macOS-latest' && 150 || 90 }}
     strategy:
       fail-fast: false
       matrix:
@@ -176,6 +178,58 @@ jobs:
         env:
           JULIA_NUM_THREADS: 2
           OMP_NUM_THREADS: 1
+
+  amdgpu-extension-load:
+    name: AMDGPU extension and FFT layouts (no driver)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      JULIA_NUM_THREADS: 2
+      JULIA_NUM_PRECOMPILE_TASKS: 2
+      OPENBLAS_NUM_THREADS: 1
+    steps:
+      - uses: actions/checkout@v7
+      - uses: julia-actions/setup-julia@v1
+        with:
+          version: '1.11'
+      - uses: julia-actions/cache@v1
+      - name: Install AMDGPU alongside the local Tarang checkout
+        run: |
+          julia --project="$RUNNER_TEMP/tarang-rocm" -e '
+            using Pkg
+            Pkg.develop(path=pwd())
+            Pkg.add(["AMDGPU", "MPI"])
+            using Tarang, AMDGPU'
+      - name: Check extension dispatch and FFT axis layouts
+        run: julia --project="$RUNNER_TEMP/tarang-rocm" test/run_amdgpu_ci.jl
+      - name: Compare two-rank pencil transforms with the serial coefficients
+        run: |
+          julia --project="$RUNNER_TEMP/tarang-rocm" -e '
+            using MPI
+            project = dirname(Base.active_project())
+            run(`$(MPI.mpiexec()) -n 2 $(Base.julia_cmd()) --project=$project test/run_amdgpu_ci.jl`)'
+
+  metal-extension:
+    name: Apple Metal extension
+    runs-on: macos-latest
+    timeout-minutes: 45
+    env:
+      JULIA_NUM_THREADS: 2
+      JULIA_NUM_PRECOMPILE_TASKS: 2
+    steps:
+      - uses: actions/checkout@v7
+      - uses: julia-actions/setup-julia@v1
+        with:
+          version: '1.11'
+      - uses: julia-actions/cache@v1
+      - name: Install Metal alongside the local Tarang checkout
+        run: |
+          julia --project="$RUNNER_TEMP/tarang-metal" -e '
+            using Pkg
+            Pkg.develop(path=pwd())
+            Pkg.add("Metal")'
+      - name: Check the extension and run numerical tests on available hardware
+        run: julia --project="$RUNNER_TEMP/tarang-metal" test/run_metal_ci.jl
 
   optional-cpu-tests:
     name: Optional CPU Feature Tests

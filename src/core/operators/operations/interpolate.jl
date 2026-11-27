@@ -80,8 +80,9 @@ function interpolate_fourier(field::ScalarField, basis::FourierBasis, axis::Int,
     x = mod(position - x0, L)
 
     coeffs = get_coeff_data(field)
-    is_gpu_array(coeffs) && error(
-        "Fourier interpolation is not yet device-native; CPU fallback is disabled.")
+    if field.dist.size > 1 && is_gpu_array(coeffs)
+        throw(ArgumentError("Fourier interpolation on a distributed GPU field requires a global spectrum"))
+    end
     bundle = _field_transform_bundle(field)
     uses_rfft = _axis_uses_rfft(bundle, axis)
 
@@ -92,19 +93,16 @@ function interpolate_fourier(field::ScalarField, basis::FourierBasis, axis::Int,
     # Block it clearly. Interpolation along a NON-decomposed axis reduces correctly.
     # NOTE: this guard MUST precede the 1-D early return below, else a genuinely 1-D
     # MPI-decomposed Fourier field would bypass it and feed local coeffs to global weights.
-    if field.dist.size > 1 && isa(get_coeff_data(field), PencilArrays.PencilArray)
-        if axis in PencilArrays.decomposition(PencilArrays.pencil(get_coeff_data(field)))
+    if field.dist.size > 1 && coeffs isa PencilArrays.PencilArray
+        if axis in PencilArrays.decomposition(PencilArrays.pencil(coeffs))
             throw(ErrorException(
                 "interpolate along axis $axis is not supported under MPI decomposition of " *
                 "that axis (it mixes per-rank-local coefficients with global-length spectral " *
                 "weights). Interpolate along a non-decomposed axis, run serially, or gather " *
                 "the field onto one rank first."))
         end
-    end
-
-    # For 1D fields, evaluate directly
-    if ndims(coeffs) == 1
-        return _interpolate_fourier_1d(coeffs, basis, N, L, x, uses_rfft)
+        # The remaining axes need their entire spectra for reconstruction.
+        coeffs = _allgather_global_grid(coeffs, field.dist.comm)
     end
 
     # Follow the transform plan: complex-valued RealFourier fields use full FFTs,
@@ -112,7 +110,12 @@ function interpolate_fourier(field::ScalarField, basis::FourierBasis, axis::Int,
     interp_weights = if uses_rfft
         _fourier_interp_weights(basis, N, L, x)
     else
-        _fourier_full_weights(N, L, x)
+        _fourier_full_weights(N, L, x; real_field=field.dtype <: Real)
+    end
+    weights = on_architecture(architecture(coeffs), convert(Vector{eltype(coeffs)}, interp_weights))
+    if ndims(coeffs) == 1
+        value = sum(coeffs .* weights)
+        return field.dtype <: Real ? real(value) : value
     end
 
     # Weighted sum along axis: result[...] = Σ_i weights[i] * coeffs[..., i, ...]
@@ -120,7 +123,7 @@ function interpolate_fourier(field::ScalarField, basis::FourierBasis, axis::Int,
     # (a half-spectrum N÷2+1 for the rfft'd RealFourier axis, N otherwise).
     shape = ones(Int, ndims(coeffs))
     shape[axis] = length(interp_weights)
-    w_shaped = reshape(interp_weights, shape...)
+    w_shaped = reshape(weights, shape...)
     result_data = dropdims(sum(coeffs .* w_shaped, dims=axis), dims=axis)
 
     # Reduced-dimension result
@@ -148,7 +151,14 @@ function interpolate_fourier(field::ScalarField, basis::FourierBasis, axis::Int,
             "$(typeof.(new_bases)). Interpolate along the non-Fourier axis separately."))
     end
     if layout != :g
-        # Spectral layout requested: return the remaining-axis coefficients (complex).
+        # Collapsing the rfft with doubled interior weights counts the positive
+        # modes twice. Restore their conjugate partners across the remaining axes.
+        if uses_rfft
+            spectrum = similar(result_data)
+            launch!(architecture(spectrum), _real_slice_spectrum!, spectrum, result_data;
+                    ndrange=size(spectrum))
+            return spectrum
+        end
         return result_data
     end
     # A remaining rfft half-spectrum axis exists only when the interpolated axis was
@@ -167,38 +177,10 @@ function interpolate_fourier(field::ScalarField, basis::FourierBasis, axis::Int,
     return irfft(tmp, grid_shape[remaining_axes[half_axis]], half_axis)
 end
 
-"""
-    _interpolate_fourier_1d(coeffs, basis, N, L, x)
-
-Evaluate 1D Fourier spectral reconstruction at position x.
-"""
-function _interpolate_fourier_1d(coeffs::AbstractVector, basis::FourierBasis, N::Int,
-                                 L::Real, x::Real, uses_rfft::Bool=isa(basis, RealFourier))
-    k0 = 2π / L
-    if uses_rfft
-        # RealFourier coefficients are stored as an UNNORMALIZED complex
-        # half-spectrum (rfft): coeffs[i] holds mode k = i-1 for i = 1..N÷2+1.
-        # Reconstruction: s(x) = (1/N) [ Re(c_0)
-        #                                + Σ_{k=1}^{K} w_k Re(c_k e^{i k k0 x}) ]
-        # with weight w_k = 2 for interior modes and w_k = 1 for the (even-N)
-        # Nyquist mode. The DC term carries weight 1.
-        half = length(coeffs)
-        result = real(coeffs[1])  # DC component
-        nyquist = iseven(N)
-        for i in 2:half
-            k = i - 1
-            factor = (nyquist && i == half) ? 1.0 : 2.0
-            result += factor * real(coeffs[i] * cis(k0 * k * x))
-        end
-        return result / N
-    else  # Full unnormalized spectrum, including complex-valued RealFourier fields.
-        result = complex(0.0, 0.0)
-        for i in 1:N
-            k = i <= (N + 1) ÷ 2 ? i - 1 : i - N - 1
-            result += coeffs[i] * cis(k0 * k * x)
-        end
-        return result / N
-    end
+@kernel function _real_slice_spectrum!(out, @Const(data))
+    I = @index(Global, NTuple)
+    J = ntuple(d -> I[d] == 1 ? 1 : size(data, d) + 2 - I[d], Val(length(I)))
+    @inbounds out[I...] = (data[I...] + conj(data[J...])) / 2
 end
 
 """
@@ -218,8 +200,7 @@ function _fourier_interp_weights(basis::FourierBasis, N::Int, L::Real, x::Real)
         nyquist = iseven(N)
         for i in 2:half
             k = i - 1
-            factor = (nyquist && i == half) ? 1.0 : 2.0
-            weights[i] = (factor / N) * cis(k0 * k * x)
+            weights[i] = nyquist && i == half ? cos(k0 * k * x) / N : (2 / N) * cis(k0 * k * x)
         end
         return weights
     else  # ComplexFourier
@@ -228,19 +209,23 @@ function _fourier_interp_weights(basis::FourierBasis, N::Int, L::Real, x::Real)
 end
 
 """
-    _fourier_full_weights(N, L, x)
+    _fourier_full_weights(N, L, x; real_field=false)
 
 Interpolation weights for a FULL (unnormalized, FFT-ordered) complex Fourier
 spectrum of length `N`: `w_k = e^{i k k0 x} / N` with `k` in FFT order
 (`0,…,N÷2-1,-N÷2,…,-1` for even N). Used for ComplexFourier axes and for RealFourier axes
 stored as a full FFT (any RealFourier axis other than the operand's first).
+For real fields on even grids, the Nyquist bin uses the cosine interpolant.
 """
-function _fourier_full_weights(N::Int, L::Real, x::Real)
+function _fourier_full_weights(N::Int, L::Real, x::Real; real_field::Bool=false)
     k0 = 2π / L
     weights = zeros(ComplexF64, N)
     for i in 1:N
         k = i <= (N + 1) ÷ 2 ? i - 1 : i - N - 1
         weights[i] = cis(k0 * k * x) / N
+    end
+    if real_field && iseven(N)
+        weights[N ÷ 2 + 1] = cospi(N * x / L) / N
     end
     return weights
 end

@@ -68,20 +68,9 @@ function build_matrices(problem::Problem)
             i0 += eqn_size
         end
         
-        # Create sparse matrix
-        if !isempty(data)
-            # Filter small entries (following entry_cutoff pattern)
-            entry_cutoff = 1e-14
-            significant = abs.(data) .>= entry_cutoff
-            data = data[significant]
-            rows = rows[significant]
-            cols = cols[significant]
-            
-            matrices[name] = sparse(rows, cols, data, total_rows, total_cols)
-        else
-            # Empty matrix
-            matrices[name] = spzeros(ComplexF64, total_rows, total_cols)
-        end
+        # A small coefficient can contribute at order one after timestep or
+        # variable scaling. Drop only exact zeros after combining entries.
+        matrices[name] = dropzeros!(sparse(rows, cols, data, total_rows, total_cols))
 
         @debug "Built matrix $name: size=($total_rows, $total_cols), nnz=$(nnz(matrices[name]))"
     end

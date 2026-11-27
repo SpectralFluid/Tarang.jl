@@ -12,7 +12,7 @@ Key concepts:
 
 Usage:
     arch = CPU()           # Use CPU backend (default)
-    arch = GPU()           # Use CUDA GPU backend (requires CUDA.jl)
+    arch = GPU()           # Use a loaded CUDA, AMDGPU or Metal backend
 
     # Create arrays on architecture
     a = zeros(arch, Float64, 100, 100)
@@ -90,50 +90,45 @@ array_type(::CPU, T::Type) = Array{T}
 """
     GPU <: AbstractSerialArchitecture
 
-GPU architecture using CUDA.jl for NVIDIA GPUs.
-Requires CUDA.jl to be loaded for full functionality.
+Select a GPU with `GPU(; backend=:auto, device_id=0)`. Load CUDA.jl for
+NVIDIA, AMDGPU.jl for AMD ROCm, or Metal.jl for Apple silicon. Device IDs
+start at zero. Automatic selection tries CUDA, AMDGPU, then Metal.
 
-# Example
 ```julia
-using CUDA  # Must load CUDA first
-dist = Distributor(coordsys; device=GPU())  # uses CUDA/cuFFT, TransposableField for MPI
+using Tarang, AMDGPU
+dist = Distributor(coordsys; device=GPU(backend=:amdgpu, device_id=0))
 ```
-
-# Notes
-- GPU support is optional and loaded via package extension
-- If CUDA.jl is not available, GPU() will throw an error
-- For multi-GPU, use with MPI (one GPU per MPI rank)
 """
 struct GPU{D} <: AbstractSerialArchitecture
     device::D
 end
 
-# The CUDA extension adds a more-specific `_gpu_device(::Int)` method. Keeping
-# the public constructor here avoids overwriting a core method while package
-# extensions are precompiled on Julia 1.12.
-function _gpu_device(device_id::Integer)
-    error("""
-        GPU architecture requires CUDA.jl to be loaded.
-
-            Please add CUDA.jl to your project and load it:
-                using Pkg
-                Pkg.add("CUDA")
-                using CUDA
-                using Tarang
-
-                arch = GPU()
-            """)
+function _gpu_device(::Val{B}, device_id::Integer) where B
+    B in (:cuda, :amdgpu, :metal) || throw(ArgumentError(
+        "Unknown GPU backend $B. Choose :auto, :cuda, :amdgpu or :metal."))
+    package = (cuda="CUDA", amdgpu="AMDGPU", metal="Metal")[B]
+    error("GPU(backend=:$B) requires loading $package.jl with `using $package`.")
 end
 
-function GPU(; device_id::Int = 0)
-    gpu_device = _gpu_device(device_id)
-    return GPU{typeof(gpu_device)}(gpu_device)
+function GPU(; device_id::Int=0, backend::Symbol=:auto)
+    device_id >= 0 || throw(ArgumentError("GPU device IDs start at zero, got $device_id"))
+    if backend === :auto
+        if has_cuda()
+            backend = :cuda
+        elseif has_amdgpu()
+            backend = :amdgpu
+        elseif has_metal()
+            backend = :metal
+        else
+            error("GPU() requires a functional GPU. Load CUDA.jl for NVIDIA, AMDGPU.jl for AMD ROCm, or Metal.jl for Apple silicon.")
+        end
+    end
+    return GPU(_gpu_device(Val(backend), device_id))
 end
 
-# Placeholder methods - the CUDA extension adds GPU{CuDevice}-specific methods
 device(gpu::GPU) = gpu.device
-array_type(::GPU) = error("GPU array_type requires CUDA.jl to be loaded")
-array_type(::GPU, T::Type) = error("GPU array_type requires CUDA.jl to be loaded")
+array_type(arch::GPU) = error("No array backend is loaded for $arch")
+array_type(arch::GPU, T::Type) = array_type(arch){T}
 
 # ============================================================================
 # Architecture Detection and Inference
@@ -242,7 +237,7 @@ Create a zero-filled array on the specified architecture.
 # Example
 ```julia
 a = zeros(CPU(), Float64, 100, 100)
-a = zeros(GPU(), Float64, 100, 100)
+a = zeros(GPU(), Float32, 100, 100)
 ```
 """
 function Base.zeros(arch::CPU, T::Type, dims::Integer...)
@@ -251,10 +246,7 @@ function Base.zeros(arch::CPU, T::Type, dims::Integer...)
 end
 
 function Base.zeros(arch::GPU, T::Type, dims::Integer...)
-    # Generic-GPU fallback (the CUDA extension provides a device-aware
-    # GPU{CuDevice} method). `similar(AT, dims)` works for any array type
-    # exposing the AT(undef, dims) constructor; there is no array-type-first
-    # `zeros` method to call.
+    # GPU extensions specialize allocation for their native devices.
     AT = array_type(arch, T)
     return fill!(similar(AT, dims), zero(T))
 end
@@ -340,18 +332,64 @@ _uses_transpose_storage(::CPU, nprocs::Integer) = false
 """
     has_cuda()
 
-Check if CUDA is available. The CUDA extension registers `CUDA.functional`
-here from its `__init__`; without the extension this is always `false`.
+Return whether the loaded CUDA backend can execute on an NVIDIA GPU.
 """
-_cuda_functional(::Any) = false
 has_cuda() = _cuda_functional(Val(:cuda))
+_cuda_functional(::Any) = false
+
+"""Return whether the loaded AMDGPU backend can execute on a ROCm device."""
+has_amdgpu() = _amdgpu_functional(Val(:amdgpu))
+_amdgpu_functional(::Any) = false
+
+"""Return whether the loaded Metal.jl extension has a functional Apple GPU."""
+has_metal() = _metal_functional(Val(:metal))
+_metal_functional(::Any) = false
+
+_default_field_dtype(::AbstractArchitecture) = Float64
+
+"""
+    _device_supports_float64(arch) -> Bool
+
+Whether kernels and allocations on `arch` may use double precision. Apple GPUs
+(Metal) cannot, so no Float64 value may reach their kernels or arrays.
+"""
+_device_supports_float64(::AbstractArchitecture) = true
+
+"""
+    _widest_real_type(a::AbstractArray) -> Type
+
+Widest real type that `a`'s device computes in: at least Float64, or `a`'s own
+real type on a device without Float64. Code that accumulates or applies host
+constants in double precision on the CPU, CUDA or ROCm uses this so the same code
+also runs on Metal, without changing results elsewhere.
+"""
+_widest_real_type(a::AbstractArray) =
+    _device_supports_float64(architecture(a)) ? promote_type(real(eltype(a)), Float64) :
+                                                real(eltype(a))
+
+"""
+    _storable_field_dtype(arch, T) -> Type
+
+Element type a field on `arch` stores for an arithmetic result promoted to `T`.
+A device without Float64 narrows it to single precision, so a Float64 scalar
+literal cannot produce a field the device refuses to allocate.
+"""
+_storable_field_dtype(arch::AbstractArchitecture, ::Type{T}) where {T} =
+    _device_supports_float64(arch) ? T : _single_precision(T)
+_single_precision(::Type{<:Complex}) = ComplexF32
+_single_precision(::Type{<:AbstractFloat}) = Float32
+_single_precision(::Type{T}) where {T} = T
+
+_coordinate_array(arch::AbstractArchitecture, ::Type, values) = to_architecture(arch, values)
+_coordinate_array(arch::GPU, T::Type, values) = on_architecture(arch, convert(AbstractArray{real(T)}, values))
+_validate_gpu_field_dtype(::AbstractArchitecture, ::Type) = nothing
+_validate_distributor_size(::AbstractArchitecture, ::Int) = nothing
 
 """
     is_gpu_array(a::AbstractArray)
 
-Check if an array is on GPU (CUDA array).
-Returns false for standard Julia arrays, true for CuArrays.
-This is a default implementation; CUDA extension overrides for CuArray.
+Return whether an array resides on a GPU. The backend extensions recognize
+their device arrays and views.
 """
 is_gpu_array(::Array) = false
 is_gpu_array(::AbstractArray) = false  # Default: not a GPU array
@@ -414,20 +452,20 @@ end
 """
     copy_to_device(a::AbstractArray, target::AbstractArray)
 
-Copy array `a` to the same device as `target`.
-Returns `a` if already on same device, otherwise creates a copy on target device.
+Return a copy of `a` on the device that owns `target`.
 """
 function copy_to_device(a::AbstractArray, target::AbstractArray)
-    # Default: just copy (both assumed CPU)
+    if is_gpu_array(a) && !is_gpu_array(target)
+        return on_architecture(CPU(), a)
+    end
     return copy(a)
 end
 
 """
     _device_cache_token(x::AbstractArray)
 
-Identity of the device that owns `x`, for workspace-cache keys. `nothing` for
-host arrays; the CUDA extension returns the device id for `CuArray`s, so a
-multi-GPU process never shares cached buffers or plans across devices.
+Identify the device that owns `x` so caches can keep buffers and plans local to
+each GPU. Host arrays use `nothing`.
 """
 _device_cache_token(::AbstractArray) = nothing
 
@@ -493,11 +531,10 @@ end
 """
     synchronize(arch::AbstractArchitecture)
 
-Synchronize the device (wait for all operations to complete).
-No-op for CPU, calls CUDA.synchronize() for GPU.
+Wait for pending operations on the selected GPU. CPU execution returns immediately.
 """
 synchronize(::CPU) = nothing
-synchronize(::GPU) = error("GPU synchronize requires CUDA.jl to be loaded")
+synchronize(arch::GPU) = error("No synchronization backend is loaded for $arch")
 
 """
     unsafe_free!(arch::AbstractArchitecture, a)
@@ -505,23 +542,19 @@ synchronize(::GPU) = error("GPU synchronize requires CUDA.jl to be loaded")
 Explicitly free GPU memory. No-op for CPU.
 """
 unsafe_free!(::CPU, a) = nothing
-unsafe_free!(::GPU, a) = error("GPU unsafe_free! requires CUDA.jl to be loaded")
+unsafe_free!(arch::GPU, a) = error("No memory backend is loaded for $arch")
 
 """
     _seed_device_rng!(arch::AbstractArchitecture, seed::Integer)
 
 Seed the generator that `rand!`/`randn!` draw from for arrays on `arch`.
-`Random.seed!(seed)` reaches only the host RNG, while a device backend keeps its
-own — CUDA.jl's task-local `CUDA.default_rng()`, otherwise seeded from
-`RandomDevice` — so without this a seeded GPU fill differed on every run. A no-op
-on the host; backend extensions add their `GPU` method (CUDA: `GPU{CuDevice}`).
-The same seed still gives different values on CPU and GPU: the generators differ.
+Each GPU extension seeds its native generator. The calling code seeds the host
+generator separately. Sequences from the same seed can differ between backends.
 """
 _seed_device_rng!(::CPU, seed::Integer) = nothing
 _seed_device_rng!(arch::GPU, seed::Integer) = throw(ArgumentError(
-    "cannot seed the device RNG of $arch: no `_seed_device_rng!` method for this " *
-    "GPU backend (CUDA.jl provides it for GPU()). Seeded fills on this backend " *
-    "would not repeat; use fill_random!(...; reproducible=true) instead."))
+    "cannot seed the device RNG of $arch. For a reproducible fill on this backend, " *
+    "use fill_random!(...; reproducible=true)."))
 
 # ============================================================================
 # Kernel Launch Utilities
@@ -604,8 +637,8 @@ chain launches using `dependencies` similar to Oceananigans.
 """
     ensure_device!(::AbstractArchitecture)
 
-No-op for CPU. GPU extension overrides to activate the correct CUDA device
-before kernel launches and allocations.
+Activate the selected GPU before kernel launches and allocations. CPU execution
+returns immediately.
 """
 ensure_device!(::AbstractArchitecture) = nothing
 
@@ -652,7 +685,7 @@ export AbstractArchitecture, AbstractSerialArchitecture
 export CPU, GPU
 export device, array_type, architecture
 export on_architecture
-export is_gpu, has_cuda, synchronize, unsafe_free!
+export is_gpu, has_cuda, has_amdgpu, has_metal, synchronize, unsafe_free!
 export is_gpu_array, create_array
 export allocate_like, similar_zeros, copy_to_device
 export launch_config, workgroup_size, launch!, KernelOperation, ensure_device!

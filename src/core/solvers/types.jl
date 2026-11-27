@@ -426,31 +426,45 @@ end
 
 function _hybrid_matsolver_choice(choice)
     key = choice isa Tuple ? first(choice) : choice
-    return key in (:gpu, :hybrid) ||
+    return key in (:gpu, :hybrid) || key === StrictGPUSolver ||
            key === HybridSolver || (key isa Type && key <: HybridSolver)
+end
+
+_matsolver_backend(choice) = nothing
+_matsolver_backend(::Type{<:Union{CuDenseLU,CuSparseLU,CuIterativeCG,CuIterativeGMRES}}) = :cuda
+function _matsolver_backend(choice::Union{Symbol,AbstractString})
+    name = lowercase(String(choice))
+    startswith(name, "cuda_") && return :cuda
+    name == "rocm_dense" && return :amdgpu
+    name == "metal_dense" && return :metal
+    return nothing
 end
 
 """Is this matsolver choice the architecture-dispatched `:auto`?"""
 _matsolver_is_auto(choice) =
     (choice isa Symbol || choice isa AbstractString) && lowercase(String(choice)) == "auto"
 
-function _select_ivp_matsolver(choice, gpu::Bool, coupled::Bool)
+function _select_ivp_matsolver(choice, gpu::Bool, coupled::Bool; gpu_solver=:cuda_sparse, backend=:cuda)
     if _matsolver_is_auto(choice)
-        return gpu && coupled ? :cuda_sparse : :sparse
+        return gpu && coupled ? gpu_solver : :sparse
     end
 
     normalized = _normalize_matsolver(choice)
+    required = _matsolver_backend(normalized)
+    if gpu && required !== nothing && required !== backend
+        throw(ArgumentError("Matrix solver $choice requires the $required backend. Use :auto for $backend fields."))
+    end
     if gpu && _hybrid_matsolver_choice(normalized)
         # HybridSolver may silently choose or retry a CPU solver. A GPU field
         # instead gets the concrete device solver so failure stays explicit.
-        return :cuda_sparse
+        return gpu_solver
     end
     if gpu && coupled &&
        (normalized in (:sparse, :dense) || _cpu_only_matsolver_type(normalized))
         throw(ArgumentError(
             "A coupled Jacobi/Chebyshev GPU InitialValueProblem cannot use the CPU-only " *
             "matrix solver :$normalized. Leave matsolver=:auto or select " *
-            "matsolver=:cuda_sparse explicitly.",
+            "the device matrix solver explicitly.",
         ))
     end
     return normalized
@@ -470,6 +484,7 @@ function _build_initial_value_solver(problem::InitialValueProblem, timestepper;
                                      batched_modes::Union{Nothing, Bool}=nothing,
                                      batched_modes_max_bytes::Int=1 << 30,
                                      threaded_modes::Union{Nothing, Bool}=nothing)
+    h = _checked_timestep(dt, 0.0)
     reset_compiled_problem!(problem)
     setup_domain!(problem)
 
@@ -492,7 +507,7 @@ function _build_initial_value_solver(problem::InitialValueProblem, timestepper;
                                                assembled_global_matrices=false)
 
     solver = InitialValueSolver(base, problem, timestepper, 0.0, 0, Inf, Inf, typemax(Int),
-                                state, Float64(dt), nothing, nothing, time(),
+                                state, h, nothing, nothing, time(),
                                 perf_stats, rhs_fallback_policy, nothing,
                                 provisional_plan)
     attach_evaluator!(solver)
@@ -952,7 +967,7 @@ function _build_boundary_value_solver(problem::Union{LinearBoundaryValueProblem,
     # here; every other CPU choice is still passed through untouched, so existing
     # string/Type arguments keep reaching SolverBaseData exactly as before.
     selected_matsolver = if has_gpu_state
-        _select_ivp_matsolver(solver_choice, true, true)
+        _select_ivp_matsolver(solver_choice, _ivp_state_architecture(state), true)
     elseif _matsolver_is_auto(solver_choice)
         :sparse
     else
@@ -1219,13 +1234,8 @@ end
 """Build matrices for initial value solver"""
 function build_solver_matrices!(solver::InitialValueSolver)
     L, M, F = build_matrices(solver.problem)
-    cutoff = solver.base.entry_cutoff
-    
-    apply_entry_cutoff!(L, cutoff)
-    apply_entry_cutoff!(M, cutoff)
-    apply_entry_cutoff!(F, cutoff)
-    
-    # Store matrices for timestepping
+    # Timestepping scales M and L differently. An absolute cutoff applied
+    # before that scaling would change the equation under a change of units.
     set_compiled_matrices!(solver.problem, sparse(L), sparse(M), F)
 end
 

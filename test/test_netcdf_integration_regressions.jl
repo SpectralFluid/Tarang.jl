@@ -154,9 +154,18 @@ if get(ENV, "TARANG_TEST_NETCDF_OUTPUT", "1") != "0"
         Tarang.add_task!(h, u; name="u")
         fail = Ref(false)
         Tarang.add_task!(h, u; name="second", postprocess=x -> (fail[] ? error("injected") : x))
+        fill!(get_grid_data(u), 3.0)
         @test Tarang.process!(h; iteration=0, sim_time=0.0)
+        fill!(get_grid_data(u), 7.0)
         fail[] = true
         @test_throws ErrorException Tarang.process!(h; iteration=1, sim_time=1.0)
+        output = Tarang.current_file(h)
+        @test Tarang.netcdf_file_info(output).gatts["committed_writes"] == 1
+        @test Tarang.group_ncread(output, "vars", "u")[2, :] == fill(7.0, 4)
+        restored = ScalarField(dist, "restored", u.bases, u.dtype)
+        load_field!(restored, output, "u")
+        @test get_grid_data(restored) == fill(3.0, 4)
+
         resumed = Tarang.NetCDFFileHandler(base, dist, Dict("u" => u); mode="append", sim_dt=1.0)
         @test resumed.file_write_num == 1
         Tarang.add_task!(resumed, u; name="u")

@@ -798,10 +798,8 @@ end
         b = _borrow_scratch!(ws)
         evaluate_lazy!(a, expr.left, state, ws)
         evaluate_lazy!(b, expr.right, state, ws)
-        # A LazyMul is a genuine field·field product (field·scalar becomes LazyScale),
-        # i.e. a nonlinear term. A raw grid multiply aliases; dealias it via the same
-        # 3/2-padded (serial) / 2/3-truncation (MPI) machinery used elsewhere, unless
-        # every Fourier axis has dealias ≤ 1 (dealiasing disabled).
+        # LazyMul represents a field product. Use the ordinary product projection
+        # when a Fourier or ChebyshevT axis requests dealiasing.
         if _any_axis_dealias(out.bases, 1.5)
             # Retain just the second padded operand already present in the
             # nonlinear workspace. Tokens are valid only during one equation's
@@ -828,7 +826,7 @@ function _dealiased_lazy_product!(out::ScalarField, a::ScalarField, b::ScalarFie
     evaluator = _get_evaluator(out.dist)
     # The compiled RHS owns its destination. On the serial padded path write
     # there directly instead of filling an eight-field pool and copying again.
-    if !(a.dist.use_pencil_arrays && a.dist.size > 1) &&
+    if a.dist.size == 1 && !_has_nonunit_arithmetic_scale(a) &&
        a.bases == b.bases == out.bases && a.dtype == b.dtype == out.dtype
         ws = _get_padded_workspace!(evaluator, a.bases, real(a.dtype); real_input=a.dtype <: Real)
         if ws !== nothing
@@ -867,8 +865,9 @@ end
 @inline function evaluate_lazy!(out::ScalarField, expr::LazyScale, state, ws::LazyWorkspace)
     evaluate_lazy!(out, expr.operand, state, ws)
     out_data = get_local_data(grid_data!(out))
-    coeff = eltype(out_data) <: Real ? real(expr.coeff) : expr.coeff
     if out_data !== nothing
+        T = eltype(out_data)
+        coeff = T <: Real ? T(real(expr.coeff)) : T(expr.coeff)
         @. out_data = coeff * out_data
     end
     out.current_layout = :g
@@ -1004,11 +1003,12 @@ function evaluate_lazy!(out::ScalarField, expr::LazyFractionalLaplacian,
     evaluate_lazy!(out, expr.operand, state, ws)
     coeff = get_local_data(coeff_data!(out))
     k2 = get_local_data(_build_k_squared(out))
-    alpha = expr.alpha
+    alpha = eltype(k2)(expr.alpha)
     if alpha >= 0
         @. coeff *= k2 ^ alpha
     else
-        @. coeff *= ifelse(k2 > 1e-14, k2 ^ alpha, zero(eltype(k2)))
+        threshold = eltype(k2)(1e-14)
+        @. coeff *= ifelse(k2 > threshold, k2 ^ alpha, 0)
     end
     out.current_layout = :c
     ensure_layout!(out, :g)
@@ -1033,8 +1033,8 @@ end
 @inline function evaluate_lazy!(out::ScalarField, expr::LazyPow, state, ws::LazyWorkspace)
     evaluate_lazy!(out, expr.operand, state, ws)
     out_data = get_local_data(grid_data!(out))
-    p = expr.exponent
     if out_data !== nothing
+        p = real(eltype(out_data))(expr.exponent)
         @. out_data = out_data ^ p
     end
     out.current_layout = :g
@@ -1214,16 +1214,17 @@ function _apply_lazy_fourier_diff!(coeff_storage, field::ScalarField,
     uses_rfft = isa(basis, RealFourier) &&
                 _axis_uses_rfft(_field_transform_bundle(field), axis)
 
-    if isa(coeff_storage, PencilArrays.PencilArray)
+    if isa(coeff_storage, PencilArrays.PencilArray) ||
+       (field.dist.size > 1 && is_transposable_storage(field))
         _apply_spectral_derivative_distributed!(coeff_storage, basis, axis, order,
-                                                field.dist; uses_rfft=uses_rfft)
+                                                field.dist; uses_rfft, real_field=field.dtype <: Real)
         return coeff_storage
     end
 
     data = get_local_data(coeff_storage)
     data === nothing && return coeff_storage
 
-    deriv_mult = _get_cached_lazy_deriv_mult(basis, order, uses_rfft, data)
+    deriv_mult = _get_cached_lazy_deriv_mult(basis, axis, order, uses_rfft, field.dtype <: Real, data)
     if length(deriv_mult) != size(data, axis)
         error("Lazy Fourier derivative coefficient size mismatch on axis $axis: " *
               "local coefficient size is $(size(data, axis)) but expected $(length(deriv_mult)) " *
@@ -1238,36 +1239,17 @@ function _apply_lazy_fourier_diff!(coeff_storage, field::ScalarField,
     return coeff_storage
 end
 
-"""
-Cache `(ik)^order` for the lazy Fourier derivative in `basis.transforms`.
-Keyed by `(order, uses_rfft)` since the basis (hence N and L) is fixed; this
-mirrors `_get_cached_deriv_mult` for the non-lazy path and avoids reallocating
-the wavenumber-multiplier array on every RHS evaluation.
-"""
-function _get_cached_lazy_deriv_mult(basis::FourierBasis, order::Int, uses_rfft::Bool)::Vector{ComplexF64}
-    cache_key = (:lazy_deriv_mult, order, uses_rfft)
-    return _get_basis_cache!(basis, cache_key) do
-        k_axis = if isa(basis, RealFourier)
-            uses_rfft ? wavenumbers_rfft(basis) : wavenumbers_fft(basis)
-        else
-            wavenumbers(basis)
-        end
-        ComplexF64.((im .* k_axis) .^ order)
-    end
-end
-
-"""Return the cached Fourier multiplier on the same backend as `data`.
-
-Device copies go through `_get_device_basis_cache!` — the shared device-cache
-idiom (also used by `_get_device_deriv_mult!` and the differentiation-matrix
-cache below), which keys device identity by `_device_cache_token` so multi-GPU
-processes never share a cached buffer across devices."""
-function _get_cached_lazy_deriv_mult(basis::FourierBasis, order::Int,
-                                     uses_rfft::Bool, data::AbstractArray)
-    host = _get_cached_lazy_deriv_mult(basis, order, uses_rfft)
+"""Return the Fourier multiplier for a serial field on its coefficient backend."""
+function _get_cached_lazy_deriv_mult(basis::FourierBasis, axis::Int, order::Int,
+                                     uses_rfft::Bool, real_field::Bool, data::AbstractArray)
+    n = uses_rfft ? rfft_len(basis.meta.size) : basis.meta.size
+    host = _cached_fourier_derivative_factors!(basis, axis, order, uses_rfft, 1:n, n, real_field)
     is_gpu_array(data) || return host
-    return _get_device_basis_cache!(() -> host, basis, :lazy_deriv_mult_device,
-                                    data, order, uses_rfft)
+    T = eltype(data)
+    return _get_device_basis_cache!(basis, :lazy_deriv_mult_device, data, axis,
+                                    order, uses_rfft, real_field, T) do
+        convert(Vector{T}, host)
+    end
 end
 
 """Return the Jacobi differentiation matrix on the same backend as `data`.
@@ -1621,16 +1603,7 @@ function _add_registered_forcings_to_lazy_rhs!(rhs_fields, problem::Problem)
         rhs_field = rhs_fields[var_idx]
         isempty(rhs_field.bases) && continue
 
-        coeff_data = coeff_data!(rhs_field)
-        coeff_data === nothing && continue
-
-        F_view = _matched_forcing_view(forcing, coeff_data)
-        if F_view !== nothing
-            coeff_data .+= F_view
-        else
-            throw(ArgumentError(
-                "Forcing size doesn't match RHS size $(size(coeff_data)) for state field $var_idx"))
-        end
+        _add_cached_forcing!(rhs_field, forcing)
     end
 
     return rhs_fields

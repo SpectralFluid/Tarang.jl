@@ -51,7 +51,7 @@ function _mixed_stage_eltype(ops, dim::Int, ::Type{T}) where {T}
     return complex_in ? Complex{RT} : T
 end
 
-function plan_gpu_mixed_transform(arch::GPU{CuDevice}, bases::Tuple, local_grid_shape::Tuple, T::Type)
+function plan_gpu_mixed_transform(arch::GPU{NativeDevice}, bases::Tuple, local_grid_shape::Tuple, T::Type)
     ensure_device!(arch)
 
     ndims = length(bases)
@@ -115,7 +115,7 @@ function plan_gpu_mixed_transform(arch::GPU{CuDevice}, bases::Tuple, local_grid_
 end
 
 plan_gpu_mixed_transform(arch::GPU, bases::Tuple, local_grid_shape::Tuple, T::Type) =
-    plan_gpu_mixed_transform(GPU{CuDevice}(CUDA.device()), bases, local_grid_shape, T)
+    plan_gpu_mixed_transform(GPU{NativeDevice}(DeviceRuntime.device()), bases, local_grid_shape, T)
 
 # ============================================================================
 # Mixed Transform Caching (Thread-Safe)
@@ -134,10 +134,10 @@ const GPU_MIXED_TRANSFORM_CACHE = GPUMixedTransformCache(Dict{Tuple, GPUMixedTra
 
 mutable struct GPUMixedTransformScratch{CT,RT,N}
     shape::NTuple{N,Int}
-    complex_a::Union{Nothing,CuArray{CT,N}}
-    complex_b::Union{Nothing,CuArray{CT,N}}
-    real_input::Union{Nothing,CuArray{RT,N}}
-    real_output::Union{Nothing,CuArray{RT,N}}
+    complex_a::Union{Nothing,DeviceArray{CT,N}}
+    complex_b::Union{Nothing,DeviceArray{CT,N}}
+    real_input::Union{Nothing,DeviceArray{RT,N}}
+    real_output::Union{Nothing,DeviceArray{RT,N}}
 end
 
 # Allocate only buffers used by this stage. In particular, real Chebyshev
@@ -146,7 +146,7 @@ function _mixed_buffer!(scratch::GPUMixedTransformScratch{CT,RT}, ::Val{slot}) w
     buffer = getfield(scratch, slot)
     if buffer === nothing
         T = slot in (:complex_a, :complex_b) ? CT : RT
-        buffer = CUDA.zeros(T, scratch.shape...)
+        buffer = DeviceRuntime.zeros(T, scratch.shape...)
         setfield!(scratch, slot, buffer)
     end
     return buffer
@@ -160,7 +160,7 @@ function get_gpu_mixed_transform_scratch(plan::GPUMixedTransformPlan,
     key = (_current_device_id(), plan.grid_shape, plan.coeff_shape,
            Tuple(plan.stage_shapes), shape, CT)
     scratch = lock(GPU_MIXED_TRANSFORM_CACHE.lock) do
-        get!(GPU_MIXED_SCRATCH_CACHE, key) do
+        get!(_transform_cache(GPU_MIXED_SCRATCH_CACHE), key) do
             GPUMixedTransformScratch{CT,RT,length(shape)}(shape, nothing, nothing, nothing, nothing)
         end
     end
@@ -177,9 +177,9 @@ end
 
 Generate cache key for mixed transform plans.
 """
-function _mixed_plan_key(arch::GPU{CuDevice}, bases::Tuple, local_grid_shape::Tuple, T::Type)
+function _mixed_plan_key(arch::GPU{NativeDevice}, bases::Tuple, local_grid_shape::Tuple, T::Type)
     basis_signature = tuple(((typeof(b), b.meta.size) for b in bases)...)
-    return (CUDA.deviceid(arch.device), basis_signature, local_grid_shape, T)
+    return (_dct_cache_device_id(arch), basis_signature, local_grid_shape, T)
 end
 
 _mixed_plan_key(arch::GPU, bases::Tuple, local_grid_shape::Tuple, T::Type) =
@@ -194,10 +194,9 @@ Get or create a cached GPU mixed transform plan (thread-safe).
 function get_gpu_mixed_transform_plan(arch::GPU, bases::Tuple, local_grid_shape::Tuple, T::Type)
     key = _mixed_plan_key(arch, bases, local_grid_shape, T)
     lock(GPU_MIXED_TRANSFORM_CACHE.lock) do
-        if !haskey(GPU_MIXED_TRANSFORM_CACHE.plans, key)
-            GPU_MIXED_TRANSFORM_CACHE.plans[key] = plan_gpu_mixed_transform(arch, bases, local_grid_shape, T)
+        get!(_transform_cache(GPU_MIXED_TRANSFORM_CACHE.plans), key) do
+            plan_gpu_mixed_transform(arch, bases, local_grid_shape, T)
         end
-        return GPU_MIXED_TRANSFORM_CACHE.plans[key]
     end
 end
 
@@ -208,8 +207,8 @@ Clear all cached GPU mixed transform plans (thread-safe).
 """
 function clear_gpu_mixed_transform_cache!()
     lock(GPU_MIXED_TRANSFORM_CACHE.lock) do
-        empty!(GPU_MIXED_TRANSFORM_CACHE.plans)
-        empty!(GPU_MIXED_SCRATCH_CACHE)
+        empty!(_transform_cache(GPU_MIXED_TRANSFORM_CACHE.plans))
+        empty!(_transform_cache(GPU_MIXED_SCRATCH_CACHE))
     end
 end
 
@@ -224,7 +223,7 @@ function _require_mixed_shape(label::AbstractString, data, expected::Tuple)
 end
 
 """
-    gpu_mixed_forward_transform!(coeff_data::CuArray, grid_data::CuArray, plan::GPUMixedTransformPlan)
+    gpu_mixed_forward_transform!(coeff_data::DeviceArray, grid_data::DeviceArray, plan::GPUMixedTransformPlan)
 
 Execute forward mixed Fourier-Chebyshev transform on GPU.
 Supports both 2D and 3D arrays.
@@ -233,7 +232,7 @@ Transforms grid-space data to spectral coefficients:
 1. Apply FFT along Fourier dimensions (may change array size for real FFT)
 2. Apply DCT along Chebyshev dimensions
 """
-function gpu_mixed_forward_transform!(coeff_data::CuArray{T, N}, grid_data::CuArray{S, N},
+function gpu_mixed_forward_transform!(coeff_data::DeviceArray{T, N}, grid_data::DeviceArray{S, N},
                                       plan::GPUMixedTransformPlan) where {T, S, N}
     complex_T = T <: Complex ? T : Complex{T}
     _require_mixed_shape("grid input", grid_data, plan.grid_shape)
@@ -323,7 +322,7 @@ function gpu_mixed_forward_transform!(coeff_data::CuArray{T, N}, grid_data::CuAr
 end
 
 """
-    gpu_mixed_backward_transform!(grid_data::CuArray, coeff_data::CuArray, plan::GPUMixedTransformPlan;
+    gpu_mixed_backward_transform!(grid_data::DeviceArray, coeff_data::DeviceArray, plan::GPUMixedTransformPlan;
                                   input_disposable=false, nyquist_fold=(0, 0))
 
 Execute backward mixed Fourier-Chebyshev transform on GPU.
@@ -339,7 +338,7 @@ e.g. a spectrum resampled for a scaled grid). `nyquist_fold = (dim, bin)` adds t
 half-spectrum downsample to an even grid still owes, which is local only once the
 other Fourier axes are inverted (`Tarang._fold_half_spectrum_nyquist!`).
 """
-function gpu_mixed_backward_transform!(grid_data::CuArray{T, N}, coeff_data::CuArray{S, N},
+function gpu_mixed_backward_transform!(grid_data::DeviceArray{T, N}, coeff_data::DeviceArray{S, N},
                                        plan::GPUMixedTransformPlan;
                                        input_disposable::Bool=false,
                                        nyquist_fold::Tuple{Int,Int}=(0, 0)) where {T, S, N}
@@ -452,4 +451,42 @@ function gpu_mixed_backward_transform!(grid_data::CuArray{T, N}, coeff_data::CuA
         copyto!(grid_data, current_data)
     end
     return grid_data
+end
+
+"""
+    _gpu_backward_staged!(field, gpu_arch, data_c, grid_shape) -> true
+
+Inverse through the staged (axis-by-axis) mixed driver onto `grid_shape`. The plan
+is built for that grid, so its coefficient layout is the one a forward transform
+there would produce. A stored spectrum that does not fit it on some Fourier axis —
+base coefficients after a scale change — is first resampled into that layout by
+the shared rules (`Tarang.backward_resample_rules`), which classify exactly as the
+CPU chain does stage by stage; the half-spectrum Nyquist fold of a downsample
+waits for the driver's rfft stage. Chebyshev axes keep the basis coefficient count
+and the driver pads or truncates them to the grid.
+"""
+function _gpu_backward_staged!(field::ScalarField, gpu_arch, data_c::DeviceArray,
+                               grid_shape::Tuple)
+    grid_T = field.dtype   # the plan is keyed on the GRID element type
+    plan = get_gpu_mixed_transform_plan(gpu_arch, field.bases, grid_shape, grid_T)
+    coeffs = data_c
+    nyquist = (0, 0)
+    if size(data_c) != plan.coeff_shape
+        rules, _, nyquist = Tarang.backward_resample_rules(field.bases, size(data_c),
+                                                           grid_shape, grid_T)
+        # Cached scratch, not a per-call allocation: every backward of a field
+        # whose coefficients predate a scale change lands here.
+        coeffs = get_gpu_dct_scratch(Tarang.architecture(data_c), plan.coeff_shape,
+                                     eltype(data_c), 1; purpose=:scaled_backward)[1]
+        Tarang._resample_fourier_spectrum!(coeffs, data_c, rules)
+    end
+    existing_grid = get_grid_data(field)
+    if !(existing_grid isa DeviceArray) || eltype(existing_grid) != grid_T ||
+       size(existing_grid) != grid_shape
+        set_grid_data!(field, DeviceRuntime.zeros(grid_T, grid_shape...))
+    end
+    gpu_mixed_backward_transform!(get_grid_data(field), coeffs, plan;
+                                  input_disposable=coeffs !== data_c,
+                                  nyquist_fold=nyquist)
+    return true
 end

@@ -115,7 +115,8 @@ function get_wavenumber_info(velocity::VectorField, fourier_axes::Vector{Int}, f
 
     # Calculate wavenumber grids with global indexing
     kx_grid, ky_grid, kz_grid = calculate_wavenumber_grids_global(
-        fourier_bases, fourier_shape, domain_size, offsets, global_coeff_shape
+        fourier_bases, fourier_shape, domain_size, offsets, global_coeff_shape;
+        first_rfft=_spectrum_rfft_grid_size(first(velocity.components), 1, global_coeff_shape[1]) > 0
     )
 
     # Calculate wavenumber magnitudes
@@ -172,32 +173,7 @@ For serial execution, this is the same as the local shape.
 For MPI execution with PencilArrays, this is retrieved from the pencil metadata.
 """
 function _get_global_coeff_shape(velocity::VectorField, fourier_bases::Vector)
-    first_component = velocity.components[1]
-    coeff_data = get_coeff_data(first_component)
-
-    # CRITICAL: Check for null coeff_data - can happen if field hasn't been transformed yet
-    if coeff_data === nothing
-        error("_get_global_coeff_shape: coefficient data is nothing. " *
-              "This typically means the field hasn't been transformed to spectral space yet. " *
-              "Call forward_transform! on the field before computing spectral diagnostics.")
-    end
-
-    # Try to get global shape from PencilArrays
-    if velocity.dist.use_pencil_arrays && velocity.dist.size > 1
-        try
-            if applicable(PencilArrays.size_global, coeff_data)
-                return Tuple(PencilArrays.size_global(coeff_data))
-            end
-        catch err
-            # A layout with no global size declines with MethodError; the local-shape
-            # fallback below then applies. Any other exception is a real fault in the
-            # decomposition and must not be read as "no global size available".
-            err isa MethodError || rethrow()
-        end
-    end
-
-    # For serial or non-PencilArrays, local shape is global shape
-    return size(coeff_data)
+    return _get_global_coeff_shape_internal(first(velocity.components))
 end
 
 """
@@ -288,7 +264,7 @@ In MPI mode, each rank computes wavenumbers for its local portion of the global 
 """
 function calculate_wavenumber_grids_global(fourier_bases::Vector, fourier_shape::Tuple{Vararg{Int}},
                                             domain_size::Tuple{Vararg{Float64}}, offsets::Tuple,
-                                            global_shape::Tuple)
+                                            global_shape::Tuple; first_rfft=nothing)
     kx_grid = nothing
     ky_grid = nothing
     kz_grid = nothing
@@ -308,7 +284,7 @@ function calculate_wavenumber_grids_global(fourier_bases::Vector, fourier_shape:
         if isa(basis_x, RealFourier)
             # Check if this is RFFT layout
             rfft_size = N_x ÷ 2 + 1
-            if nx_global == rfft_size
+            if something(first_rfft, nx_global == rfft_size)
                 # RFFT layout: global wavenumbers are [0, 1, 2, ..., N/2]
                 # Each local index i maps to global index (i-1 + offset_x), giving wavenumber k
                 for i in 1:nx_local
@@ -520,8 +496,10 @@ end
 function _apply_rfft_weights!(density::AbstractArray, N::Int, offset_k::Int)
     max_interior_k = iseven(N) ? (N ÷ 2 - 1) : (N ÷ 2)
     n1 = size(density, 1)
-    # Local row i holds global rfft mode k = i - 1 + offset_k.
-    weights = [1 <= i - 1 + offset_k <= max_interior_k ? 2.0 : 1.0 for i in 1:n1]
+    # Local row i holds global rfft mode k = i - 1 + offset_k. The weights take
+    # the density's precision, so a Float32-only device never receives Float64.
+    W = real(eltype(density))
+    weights = W[1 <= i - 1 + offset_k <= max_interior_k ? 2 : 1 for i in 1:n1]
     shape = ntuple(d -> d == 1 ? n1 : 1, ndims(density))
     density .*= _logical_multiplier(density, reshape(weights, shape))
     return density
@@ -544,30 +522,24 @@ function calculate_spectral_kinetic_energy(velocity::VectorField; apply_conjugat
 
     # Get first component to determine array size (GPU-compatible allocation)
     first_component = velocity.components[1]
-    ke_spectral = similar(coeff_data!(first_component), Float64)
-    fill!(ke_spectral, zero(Float64))
+    first_coeffs = coeff_data!(first_component)
+    W = _widest_real_type(first_coeffs)   # Float64, except on a Float32-only device
+    ke_spectral = similar(first_coeffs, W)
+    fill!(ke_spectral, zero(W))
 
     # Sum |û_i|² over all velocity components
     for component in velocity.components
         ke_spectral .+= abs2.(coeff_data!(component))
     end
 
-    # Apply conjugate symmetry correction for RFFT
-    # Check if first basis is RealFourier and if we're in RFFT layout
-    if apply_conjugate_symmetry && length(velocity.bases) > 0
-        first_basis = velocity.bases[1]
-        if isa(first_basis, RealFourier)
-            offsets = _get_pencil_array_offsets(velocity)
-            _apply_rfft_weights!(ke_spectral, first_basis.meta.size, offsets[1])
-        end
-    end
+    apply_conjugate_symmetry && _weight_real_spectrum!(ke_spectral, first_component)
 
     # Apply normalization factor (accounts for FFT scaling)
     # Factor of 0.5 for kinetic energy definition: KE = (1/2)|u|².
     # Callers computing a plain squared magnitude Σ|v̂_i|² (e.g. enstrophy spectrum
     # of the vorticity vector) pass apply_half=false to skip the ½.
     if apply_half
-        ke_spectral .*= 0.5
+        ke_spectral .*= W(0.5)
     end
 
     return ke_spectral
@@ -642,7 +614,7 @@ Properly handles:
 
 # Returns
 - If radial_average=true: NamedTuple (k=wavenumbers, power=spectrum values, bin_counts=modes per bin)
-- If radial_average=false: Dict{Tuple, Float64} with (kx, ky, ...) → P(k)
+- If radial_average=false: a dictionary from physical wavenumber tuples (kx, ky, ...) to P(k)
 
 # Examples
 ```julia
@@ -815,6 +787,16 @@ function validate_fourier_bases_scalar(field::ScalarField)
     return fourier_axes, fourier_bases
 end
 
+# A scaled field can carry either coefficients from its current grid or a
+# retained base-grid spectrum. Match the inverse transform's size convention.
+function _spectrum_rfft_grid_size(field::ScalarField, axis::Int, coeff_size::Int)
+    _axis_uses_rfft(_field_transform_bundle(field), axis) || return 0
+    base_size = field.bases[axis].meta.size
+    grid_size = ceil(Int, _axis_scale(field.scales, axis) * base_size)
+    coeff_size == rfft_len(grid_size) && return grid_size
+    return coeff_size == rfft_len(base_size) ? base_size : 0
+end
+
 """
     get_wavenumber_info_scalar(field::ScalarField, fourier_axes, fourier_bases)
 
@@ -830,22 +812,15 @@ function get_wavenumber_info_scalar(field::ScalarField, fourier_axes::Vector{Int
     local_shape = size(coeff_data)
     ndims_field = length(local_shape)
 
-    # Get MPI offsets and global shape
-    use_mpi = field.dist.use_pencil_arrays && field.dist.size > 1
-    if use_mpi
-        global_shape = _get_global_coeff_shape_internal(field)
-        offsets = _get_pencil_array_offsets_internal(field)
-    else
-        global_shape = local_shape
-        offsets = Tuple(zeros(Int, ndims_field))
-    end
+    global_shape = _get_global_coeff_shape_internal(field)
+    offsets = _get_pencil_array_offsets_internal(field)
 
     # Get domain size
     domain_size = _get_domain_size_from_bases(fourier_bases)
 
     # Build wavenumber grids for each dimension
     k_grids = []
-    for (dim_idx, (axis, basis)) in enumerate(zip(fourier_axes, fourier_bases))
+    for (dim_idx, axis) in enumerate(fourier_axes)
         if dim_idx <= length(local_shape)
             local_n = local_shape[dim_idx]
             offset = offsets[dim_idx]
@@ -856,7 +831,7 @@ function get_wavenumber_info_scalar(field::ScalarField, fourier_axes::Vector{Int
             # (calculate_wavenumber_grids_global) and energy_spectrum; the integer
             # mode index alone is wrong on any non-2π domain (off by 1/k0).
             k0 = 2π / L
-            if isa(basis, RealFourier) && global_shape[dim_idx] == basis.meta.size ÷ 2 + 1
+            if _spectrum_rfft_grid_size(field, axis, global_shape[dim_idx]) > 0
                 # RFFT half-spectrum (the FIRST RealFourier axis): k = 0, 1, ..., N/2
                 k_indices = offset:(offset + local_n - 1)
                 k_1d = k0 .* collect(k_indices)
@@ -867,7 +842,7 @@ function get_wavenumber_info_scalar(field::ScalarField, fourier_axes::Vector{Int
                 # axis as 0..N-1 (the rfft assumption above) mislabels every negative-
                 # frequency mode as a large positive |k|, corrupting the spectrum.
                 global_n = global_shape[dim_idx]
-                global_k = collect(fftshift(-global_n÷2:(global_n÷2-1)))
+                global_k = FFTW.fftfreq(global_n, global_n)
                 k_1d = k0 .* global_k[(offset+1):(offset+local_n)]
             end
             push!(k_grids, k_1d)
@@ -934,23 +909,22 @@ function calculate_spectral_power(field::ScalarField; apply_conjugate_symmetry::
     coeff_data = coeff_data!(field)
 
     # Compute |f̂|²
-    power_spectral = similar(coeff_data, Float64)
+    power_spectral = similar(coeff_data, _widest_real_type(coeff_data))
     power_spectral .= abs2.(coeff_data)
 
-    # Apply conjugate symmetry correction for RFFT
-    if apply_conjugate_symmetry && length(field.bases) > 0
-        first_basis = field.bases[1]
-        if isa(first_basis, RealFourier)
-            offset_k = if field.dist.use_pencil_arrays && field.dist.size > 1
-                _get_pencil_array_offsets_internal(field)[1]
-            else
-                0
-            end
-            _apply_rfft_weights!(power_spectral, first_basis.meta.size, offset_k)
-        end
-    end
-
+    apply_conjugate_symmetry && _weight_real_spectrum!(power_spectral, field)
     return power_spectral
+end
+
+function _weight_real_spectrum!(density, field::ScalarField)
+    isempty(field.bases) && return density
+    coeff_size = first(_get_global_coeff_shape_internal(field))
+    grid_size = _spectrum_rfft_grid_size(field, 1, coeff_size)
+    if grid_size > 0
+        offset = first(_get_pencil_array_offsets_internal(field))
+        _apply_rfft_weights!(density, grid_size, offset)
+    end
+    return density
 end
 
 """
@@ -1078,27 +1052,19 @@ function calculate_full_power_spectrum(field::ScalarField, wavenumber_info::Wave
     return _full_power_spectrum(power_spectral, wavenumber_info)
 end
 
-# Scalar/vector power uses rounded physical wavenumbers. Full energy spectra
-# retain their separate global coefficient-index keys for API compatibility.
-function _full_power_spectrum(density, wavenumber_info::WavenumberInfo)
+function _full_power_spectrum(density::AbstractArray{<:Real, N}, wavenumber_info::WavenumberInfo) where N
     density = _host_density(density)
-    full_spectrum = Dict{Tuple{Vararg{Int}}, Float64}()
-    ndims_field = ndims(density)
+    full_spectrum = Dict{NTuple{N, Float64}, Float64}()
+    grids = (wavenumber_info.kx_grid, wavenumber_info.ky_grid, wavenumber_info.kz_grid)
 
     for idx in CartesianIndices(density)
-        if ndims_field == 3
-            global_kx = round(Int, wavenumber_info.kx_grid[idx])
-            global_ky = round(Int, wavenumber_info.ky_grid[idx])
-            global_kz = round(Int, wavenumber_info.kz_grid[idx])
-            full_spectrum[(global_kx, global_ky, global_kz)] = density[idx]
-        elseif ndims_field == 2
-            global_kx = round(Int, wavenumber_info.kx_grid[idx])
-            global_ky = round(Int, wavenumber_info.ky_grid[idx])
-            full_spectrum[(global_kx, global_ky)] = density[idx]
-        else
-            global_kx = round(Int, wavenumber_info.kx_grid[idx[1]])
-            full_spectrum[(global_kx,)] = density[idx]
+        # Vector diagnostics keep singleton dimensions in each axis grid.
+        k = ntuple(Val(N)) do axis
+            grid = grids[axis]
+            indices = ntuple(d -> size(grid, d) == 1 ? 1 : idx[d], Val(N))
+            grid[indices...]
         end
+        full_spectrum[k] = density[idx]
     end
 
     return full_spectrum
@@ -1187,63 +1153,5 @@ In PencilArrays, axes_local contains the global index ranges for each dimension
 on this rank. The offset is first(range) - 1 for 1-based indexing.
 """
 function _get_pencil_array_offsets(velocity::VectorField)
-    first_component = velocity.components[1]
-    coeff_data = get_coeff_data(first_component)
-
-    # CRITICAL: Check for null coeff_data - can happen if field hasn't been transformed yet
-    if coeff_data === nothing
-        error("_get_pencil_array_offsets: coefficient data is nothing. " *
-              "This typically means the field hasn't been transformed to spectral space yet. " *
-              "Call forward_transform! on the field before computing spectral diagnostics.")
-    end
-
-    # Check if this is a PencilArray
-    # NOTE: Don't use isdefined(Main, :PencilArrays) - it fails when Tarang is imported as a module.
-    # Instead, check if coeff_data has the expected PencilArray properties directly.
-    if velocity.dist.use_pencil_arrays && velocity.dist.size > 1
-        # CRITICAL: For MPI runs with PencilArrays, getting offsets is MANDATORY.
-        # Silent fallback to zero offsets would produce incorrect global indexing.
-
-        # Check if this looks like a PencilArray (has pencil property or parent)
-        # PencilArrays.axes_local returns global index ranges
-        if hasproperty(coeff_data, :pencil)
-            # Direct PencilArray access. Use the PUBLIC, exported `range_local`
-            # (default LogicalOrder) — `PencilArrays.axes_local` is a PRIVATE struct
-            # FIELD, not a callable, so the old call raised UndefVarError and crashed
-            # every distributed spectrum. `range_local(::PencilArray)` returns the
-            # owned global index range per axis; offset = first(range) - 1.
-            try
-                axes = PencilArrays.range_local(coeff_data)
-                offsets = Tuple(first(ax) - 1 for ax in axes)
-                return offsets
-            catch e
-                error("_get_pencil_array_offsets: PencilArrays.range_local failed: $e. " *
-                      "Cannot compute correct MPI offsets.")
-            end
-        elseif applicable(PencilArrays.range_local, coeff_data)
-            # Try calling range_local directly (public API; LogicalOrder by default).
-            try
-                axes = PencilArrays.range_local(coeff_data)
-                offsets = Tuple(first(ax) - 1 for ax in axes)
-                return offsets
-            catch e
-                error("_get_pencil_array_offsets: range_local call failed: $e. " *
-                      "Cannot compute correct MPI offsets.")
-            end
-        else
-            # CRITICAL: Expected PencilArray but got plain Array or wrapper
-            # This can happen if:
-            # 1. Upstream code assigned a plain Array into coeff_data
-            # 2. coeff_data is a view/wrapper that doesn't expose pencil property
-            # Must throw an error since continuing would produce incorrect results
-            error("_get_pencil_array_offsets: MPI spectral diagnostics expected PencilArray " *
-                  "but coeff_data is $(typeof(coeff_data)). " *
-                  "This can happen if code assigned a plain Array into the coefficient data, " *
-                  "or if the data is wrapped in a view. " *
-                  "Ensure coefficient data retains its PencilArray wrapper for correct MPI indexing.")
-        end
-    end
-
-    # Serial execution or non-PencilArrays: no offset
-    return Tuple(zeros(Int, ndims(coeff_data)))
+    return _get_pencil_array_offsets_internal(first(velocity.components))
 end

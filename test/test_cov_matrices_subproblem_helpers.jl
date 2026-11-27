@@ -74,6 +74,10 @@ end
         @test _subproblem_kx(sp, "x") == 1.0                     # rfft axis
         @test _subproblem_kx(sp, "y") == -2.0                    # fft axis, signed
         @test _subproblem_kx(sp, "y") == real(wavenumbers_fft(yb)[7])
+        nyquist = Subsystem(solver, (1, 4))
+        sp = Subproblem(solver, (nyquist,), (1, 4))
+        @test iszero(_subproblem_diff_matrix(sp, "y", 1, 1)[1, 1])
+        @test _subproblem_diff_matrix(sp, "y", 2, 1)[1, 1] == -16
     end
 
     @testset "_subproblem_cheb_basis" begin

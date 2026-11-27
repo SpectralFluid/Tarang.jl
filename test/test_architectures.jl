@@ -39,8 +39,12 @@ using Test
     # ------------------------------------------------------------------
     # GPU construction (no CUDA loaded -- should error)
     # ------------------------------------------------------------------
-    @testset "GPU without CUDA errors" begin
-        @test_throws ErrorException GPU()
+    @testset "GPU backend selection" begin
+        if has_cuda() || has_amdgpu()
+            @test GPU() == GPU(backend=has_cuda() ? :cuda : :amdgpu)
+        else
+            @test_throws ErrorException GPU()
+        end
     end
 
     # ------------------------------------------------------------------
@@ -53,8 +57,9 @@ using Test
     # ------------------------------------------------------------------
     # has_cuda (default stub returns false)
     # ------------------------------------------------------------------
-    @testset "has_cuda" begin
-        @test has_cuda() == false
+    @testset "GPU availability" begin
+        @test has_cuda() isa Bool
+        @test has_amdgpu() isa Bool
     end
 
     # ------------------------------------------------------------------

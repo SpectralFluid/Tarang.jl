@@ -80,7 +80,12 @@ function gpu_dct1_along_dim!(out, input, dim, direction)
     out
 end
 const ROOT = dirname(@__DIR__)
-include(joinpath(ROOT, "ext/cuda/mixed_transforms.jl"))
+const DeviceArray = Array
+const NativeDevice = CuDevice
+const DeviceRuntime = CUDA
+_transform_cache(cache) = cache
+_dct_cache_device_id(arch) = 0
+include(joinpath(ROOT, "ext/gpu/mixed_transforms.jl"))
 include(joinpath(ROOT, "ext/cuda/pencil.jl"))
 include(joinpath(ROOT, "ext/cuda/nccl_transpose.jl"))
 include(joinpath(ROOT, "ext/cuda/dct_distributed.jl"))
