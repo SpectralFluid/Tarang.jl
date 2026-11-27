@@ -140,7 +140,7 @@ function _evaluate_local_chebyshev_derivative!(result::ScalarField, operand::Sca
 
     if use_gpu
         # Try GPU-native DCT-I derivative (overridden by TarangCUDAExt for CuArray)
-        if _gpu_chebyshev_deriv!(result, operand, data_g, axis, order, scale)
+        if _with_gpu_workspace(_gpu_chebyshev_deriv!, operand.dist, result, operand, data_g, axis, order, scale)
             result.current_layout = :g
             if layout == :c
                 ensure_layout!(result, :c)
@@ -223,19 +223,11 @@ function _evaluate_local_chebyshev_derivative!(result::ScalarField, operand::Sca
 
     # If coefficient space is requested, convert grid → coeff.
     if layout == :c
-        has_fourier = any(b -> isa(b, RealFourier) || isa(b, ComplexFourier), operand.bases)
-        if has_fourier || !(eltype_data <: AbstractFloat) ||
+        if !all(b -> b isa ChebyshevT, operand.bases) || !(eltype_data <: AbstractFloat) ||
            data_shape != get_coefficient_shape(operand)
-            # Mixed Fourier×Chebyshev (or complex-valued data): the in-place DCT-I
-            # fast path (_cheb_coeff_convert!) only DCT-transforms real Chebyshev
-            # axes and leaves Fourier axes in grid space, producing a wrong-shaped
-            # /typed coeff array (the first RealFourier axis is rfft-halved). Use the
-            # framework's full basis-aware forward transform, which rffts/ffts the
-            # Fourier axes and DCT-Is the Chebyshev axes into the correct coeff buffer.
+            # Each axis must use its own basis transform on a mixed domain.
             ensure_layout!(result, :c)
         else
-            # Pure real Chebyshev/Legendre/Jacobi domain: grid and coeff shapes/eltypes
-            # coincide, so the in-place DCT-I fast path is valid.
             result_data_cpu = get_grid_data(result)
 
             _cheb_coeff_convert!(result_data_cpu, operand, dims, eltype_data)
@@ -626,7 +618,7 @@ function evaluate_jacobi_collocation_derivative!(result::ScalarField, operand::S
     _assert_local_polynomial_axis(operand, axis)
     ensure_layout!(operand, :g)
     basis = operand.bases[axis]
-    nodes = vec(Array(local_grid(basis, operand.dist, 1)))
+    nodes = vec(Array(local_grid(basis, operand.dist, _axis_scale(operand.scales, axis))))
     Dbase = _nodal_diff_matrix(nodes)
     D = order == 1 ? Dbase : Dbase^order
 

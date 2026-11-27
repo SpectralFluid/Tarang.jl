@@ -24,6 +24,45 @@ function _get_etd_phi!(state::TimestepperState, L_linear, dt::Float64)
     return cache[:etd_phi]::NTuple{3, Matrix{ComplexF64}}
 end
 
+"""Evaluate the zero-linear-operator ETD formulas directly on single-device fields."""
+function _try_explicit_etd_field!(state::TimestepperState, solver::InitialValueSolver;
+                                  multistep::Bool)
+    plan_is_gpu(solver.execution_plan) && _explicit_multistep_field_eligible(solver) || return false
+    current = last(state.history)
+    dt = state.dt
+    t = solver.sim_time
+    F = _workspace_field_state!(state, :etd_field_F, current, 1)
+    rhs = evaluate_rhs(solver, current, t)
+    _copy_field_state!(F, rhs; preserve_layout=true)
+    _release_rhs_buffer!(rhs, solver)
+    candidate = _acquire_recycled_history_state!(state, :etd_field_recycled, current;
+                                                  preserve_layout=true)
+    previous = get(state.timestepper_data, :etd_field_previous_F, nothing)
+    if multistep && previous !== nothing
+        # φ₁(0) = 1 and φ₂(0) = 1/2 give variable-step Adams–Bashforth.
+        w = dt / get_previous_timestep(state)
+        _rk_combine_fields!(candidate, current, (F, previous), (dt * (1 + w/2), -dt * w/2))
+    else
+        # ETDRK2, including the first step of both multistep methods, is Heun's method.
+        predictor = _workspace_field_state!(state, :etd_field_predictor, current, 2)
+        _rk_combine_fields!(predictor, current, (F,), (dt,))
+        state.current_substep = 2
+        predicted_rhs = evaluate_rhs(solver, predictor, t + dt)
+        _rk_combine_fields!(candidate, current, (F, predicted_rhs), (dt/2, dt/2))
+        _release_rhs_buffer!(predicted_rhs, solver)
+    end
+    _refresh_algebraic_state!(solver.problem, candidate)
+    if multistep
+        # Commit the accepted derivative by swapping buffers. The previous
+        # derivative stays available for a retry until the update succeeds.
+        previous = _workspace_field_state!(state, :etd_field_previous_F, current, 3)
+        state.timestepper_data[:etd_field_F] = previous
+        state.timestepper_data[:etd_field_previous_F] = F
+    end
+    _push_recycled_history_state!(state, :etd_field_recycled, candidate)
+    return true
+end
+
 """
     2nd-order exponential Runge-Kutta method (ETDRK2).
 
@@ -62,6 +101,7 @@ function step_etd_rk222!(state::TimestepperState, solver::InitialValueSolver)
         step_distributed_diagonal_etd_rk222!(state, solver)
         return
     end
+    _try_explicit_etd_field!(state, solver; multistep=false) && return
 
     # Get linear operator from solver
     L_matrix = _get_problem_matrix(solver.problem, "L_matrix")
@@ -174,6 +214,7 @@ function step_etd_cnab2!(state::TimestepperState, solver::InitialValueSolver)
         step_distributed_diagonal_etd_rk222!(state, solver)
         return
     end
+    _try_explicit_etd_field!(state, solver; multistep=true) && return
 
     # Initialize history arrays if needed
     if !haskey(state.timestepper_data, :etd_cnab2_F_history)
@@ -314,6 +355,7 @@ function step_etd_sbdf2!(state::TimestepperState, solver::InitialValueSolver)
         step_distributed_diagonal_etd_rk222!(state, solver)
         return
     end
+    _try_explicit_etd_field!(state, solver; multistep=true) && return
 
     # Initialize history arrays if needed
     if !haskey(state.timestepper_data, :etd_sbdf2_F_history)

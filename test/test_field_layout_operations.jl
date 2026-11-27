@@ -236,8 +236,7 @@ using Random
 
     # ------------------------------------------------------------------
     # 4. fill_random!(VectorField)
-    #    Components get per-component seeds (seed + (i-1)*1000003), so they
-    #    must be uncorrelated (distinct) when seeded.
+    #    Seeded components use disjoint global counters.
     # ------------------------------------------------------------------
     @testset "fill_random! VectorField" begin
         dom = PeriodicDomain(8, 8)
@@ -248,7 +247,15 @@ using Random
         d2 = Tarang.get_grid_data(u.components[2])
         @test !all(d1 .== 0.0)
         @test !all(d2 .== 0.0)
-        @test d1 != d2                          # per-component seed -> uncorrelated
+        @test d1 != d2
+
+        # Verify the interleaving on a small grid. Fixed offsets between seeds
+        # reused the same draws once the grid grew past the offset.
+        scalar = ScalarField(dom, "scalar_sequence")
+        fill_random!(scalar, "g"; seed=100)
+        draws = vec(get_grid_data(scalar))
+        @test vec(d1)[1:32] == draws[1:2:end]
+        @test vec(d2)[1:32] == draws[2:2:end]
 
         # determinism for vectors too
         v = VectorField(dom, "v")

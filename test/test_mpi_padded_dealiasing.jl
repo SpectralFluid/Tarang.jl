@@ -77,4 +77,14 @@ const MAX_REF   = 1.6899999999999995
             @test isapprox(maximum(g2),  MAX_REF;   rtol=1e-10)
         end
     end
+
+    for axis in 1:2
+        data = grid_data!(u)
+        nodes = data isa PencilArrays.PencilArray ? PencilArrays.global_view(data) : data
+        for I in CartesianIndices(nodes)
+            nodes[I] = isodd(I[axis]) ? 1.0 : -1.0
+        end
+        squared = Tarang.evaluate_transform_multiply(u, u, ev)
+        @test maximum(abs, parent(grid_data!(squared)) .- 0.5) < 1e-12
+    end
 end

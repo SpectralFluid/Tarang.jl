@@ -36,10 +36,16 @@ function _promote_field_arithmetic_operand(field::ScalarField, dtype::DataType)
     field.dtype === dtype && return field
 
     promoted = _allocate_field_arithmetic_result(field, dtype)
-    if field.current_layout == :c
+    # A real-to-complex promotion can replace an rfft half-spectrum with a
+    # full FFT. Use the field's plan, which agrees across ranks even when
+    # individual slabs happen to have matching local shapes.
+    changes_fourier_layout = field.current_layout === :c &&
+        field.dtype <: Real && dtype <: Complex &&
+        any(op -> op.op === :rfft, _field_transform_bundle(field).forward_ops)
+    if field.current_layout === :c && !changes_fourier_layout
         _local_data(coeff_data!(promoted)) .= _local_data(get_coeff_data(field))
     else
-        _local_data(grid_data!(promoted)) .= _local_data(get_grid_data(field))
+        _local_data(grid_data!(promoted)) .= _local_data(grid_data!(field))
     end
     return promoted
 end
@@ -93,18 +99,10 @@ end
 function Base.:*(a::ScalarField, b::ScalarField)
     _check_field_arithmetic_compatibility(a, b, "multiply")
 
-    # Dealiased product for spectral fields: delegate to the SAME nonlinear-product
-    # machinery the solver RHS uses — `evaluate_transform_multiply` (3/2-padded on
-    # serial, 2/3 input-truncation under MPI). The previous implementation multiplied
-    # on the un-padded grid and then applied a 2/3 OUTPUT cutoff, which left input
-    # modes in (N/3, N/2] aliased BELOW the cutoff (contaminating `a*b` and `dot(u,u)`).
-    # The gate uses the GLOBAL element count (prod of basis grid sizes) rather than the
-    # local-slab `length`, so under MPI every rank makes the same (collective) decision.
-    # The result is handed straight to user code, which may hold any number of
-    # products at once, so it must NOT be a borrowed pool buffer — keep the default
-    # `own=true`. See `_own_borrowed_field` in `src/core/field_pool.jl`.
-    if has_spectral_bases(a) && prod(basis.meta.size for basis in a.bases) > 64 &&
-       !_has_nonunit_arithmetic_scale(a)
+    # Respect the basis dealiasing factors even on small grids. Scaled fields
+    # already represent samples on the user's chosen working grid.
+    if has_spectral_bases(a) && !_has_nonunit_arithmetic_scale(a) &&
+       _any_axis_dealias(a.bases, _get_evaluator(a.dist).dealiasing_factor)
         dtype = promote_type(a.dtype, b.dtype)
         promoted_a = _promote_field_arithmetic_operand(a, dtype)
         promoted_b = _promote_field_arithmetic_operand(b, dtype)

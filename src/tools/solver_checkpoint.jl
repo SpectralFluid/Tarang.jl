@@ -70,6 +70,67 @@ function _warn_multistep_restart(solver::InitialValueSolver)
     return nothing
 end
 
+# Julia 1.10 and 1.11 may fall back to copying after a failed filesystem rename.
+# A checkpoint must appear in one operation, or leave the old generation intact.
+function _rename_checkpoint_path(src, dst)
+    err = ccall(:jl_fs_rename, Int32, (Cstring, Cstring), src, dst)
+    Base.uv_error("renaming checkpoint '$src' to '$dst'", err)
+    return nothing
+end
+
+# All files live on the target filesystem, so publication uses renames. One
+# publisher per stem also serializes concurrent writes with different rank counts.
+function _publish_checkpoint!(staged, stem, nranks)
+    serial = string(stem, ".nc")
+    lockdir = string(stem, ".tarang-publish")
+    mkdir(lockdir)
+    olddir = joinpath(lockdir, "previous")
+    oldfile = joinpath(lockdir, "previous.nc")
+    carried = String[]
+    try
+        if isdir(stem)
+            prefix = string(basename(stem), "_p")
+            for name in readdir(stem)
+                numbered = startswith(name, prefix) && endswith(name, ".nc") &&
+                    tryparse(Int, chop(name; head=length(prefix), tail=3)) !== nothing
+                if !numbered || !isfile(joinpath(stem, name))
+                    nranks > 1 || error("save_state: '$stem' contains non-checkpoint data")
+                    push!(carried, name)
+                end
+            end
+            _rename_checkpoint_path(stem, olddir)
+            for name in carried
+                dst = joinpath(staged, name)
+                ispath(dst) && error("save_state: existing entry '$name' conflicts with a staged slab")
+                _rename_checkpoint_path(joinpath(olddir, name), dst)
+            end
+        end
+        if nranks > 1 && isfile(serial)
+            _rename_checkpoint_path(serial, oldfile)
+        end
+        target = nranks == 1 ? serial : stem
+        ispath(target) && !(nranks == 1 && isfile(target)) &&
+            error("save_state: cannot replace '$target' with a checkpoint")
+        _rename_checkpoint_path(staged, target)
+    catch publish_error
+        if isdir(olddir)
+            for name in carried
+                path = joinpath(staged, name)
+                previous = joinpath(olddir, name)
+                if ispath(path) && !ispath(previous)
+                    _rename_checkpoint_path(path, previous)
+                end
+            end
+            _rename_checkpoint_path(olddir, stem)
+        end
+        isfile(oldfile) && _rename_checkpoint_path(oldfile, serial)
+        rm(lockdir)
+        rethrow(publish_error)
+    end
+    rm(lockdir; recursive=true)
+    return nothing
+end
+
 """
     save_state(solver, path) -> String
 
@@ -84,11 +145,8 @@ Previous-solution work-diagnostic scratch is not checkpointed.
 Zero-dimensional tau variables are skipped: they carry no spatial data and are
 re-solved from the state on the next step.
 
-The whole write path — the stale-file removal, the per-field `write_local_slab`
-loop, and the final `ncputatt` — runs inside one `_collectively` region. Every
-one of those steps is per-rank fallible (ENOSPC on one node, a corrupt leftover
-file), and an unguarded throw would leave that rank unwinding while its peers
-walked into the solver's next collective.
+Every rank writes into a temporary generation on the target filesystem. Rank
+zero publishes the generation after all writes and clock attributes succeed.
 """
 function save_state(solver::InitialValueSolver, path::AbstractString)
     isempty(solver.state) && error("save_state: solver.state is empty; nothing to write.")
@@ -96,7 +154,9 @@ function save_state(solver::InitialValueSolver, path::AbstractString)
     forcing_payload = _collectively(dist, "save_state stochastic forcing") do
         _stochastic_checkpoint_payload(solver)
     end
-    target = _slab_output_path!(dist, path, "save_state")
+    stem = endswith(path, ".nc") ? chop(path; tail=3) : String(path)
+    serial = dist.size == 1
+    filename = serial ? basename(stem) * ".nc" : string(basename(stem), "_p", dist.rank, ".nc")
 
     # Transpose EVERY field to grid space before the write loop, not inside it.
     # `ensure_layout!` is collective under MPI, and the guard below wraps the whole
@@ -111,22 +171,35 @@ function save_state(solver::InitialValueSolver, path::AbstractString)
         ensure_layout!(field, :g)
     end
 
-    return _collectively(dist, "save_state") do
-        isfile(target) && rm(target)
-
-        for field in solver.state
-            isempty(field.bases) && continue
-            global_shape, _, local_start = _field_slab_geometry(field)
-            host = Array(get_local_data(get_grid_data(field)))
-            write_local_slab(target, field.name, host, local_start, global_shape)
-        end
-
-        _write_stochastic_checkpoint!(target, forcing_payload)
-        ncputatt(target, "global", Dict("sim_time" => Float64(solver.sim_time),
-                                        "iteration" => Int(solver.iteration),
-                                        "dt" => Float64(solver.dt)))
-        target
+    stage = _collectively(dist, "create checkpoint staging directory") do
+        dist.rank == 0 || return ""
+        parent_dir = dirname(abspath(stem))
+        mkpath(parent_dir)
+        mktempdir(parent_dir)
     end
+    serial || (stage = MPI.bcast(stage, 0, dist.comm))
+    try
+        staged_file = joinpath(stage, filename)
+        _collectively(dist, "write checkpoint") do
+            for field in solver.state
+                isempty(field.bases) && continue
+                global_shape, _, local_start = _field_slab_geometry(field)
+                host = Array(get_local_data(get_grid_data(field)))
+                write_local_slab(staged_file, field.name, host, local_start, global_shape)
+            end
+            _write_stochastic_checkpoint!(staged_file, forcing_payload)
+            ncputatt(staged_file, "global", Dict("sim_time" => Float64(solver.sim_time),
+                     "iteration" => Int(solver.iteration), "dt" => Float64(solver.dt)))
+        end
+        _collectively(dist, "publish checkpoint") do
+            dist.rank == 0 && _publish_checkpoint!(serial ? staged_file : stage, stem, dist.size)
+        end
+    finally
+        _collectively(dist, "clean checkpoint staging directory") do
+            dist.rank == 0 && isdir(stage) && rm(stage; recursive=true)
+        end
+    end
+    return serial ? string(stem, ".nc") : joinpath(stem, filename)
 end
 
 """Clock attributes every checkpoint must carry."""
@@ -156,6 +229,24 @@ function _checkpoint_clock(src::SlabSource, path::AbstractString)
     return reference
 end
 
+function _stage_checkpoint_grid(field::ScalarField, src::SlabSource, path::AbstractString)
+    host = _read_field_slab(field, src, path, field.name)
+    grid = get_grid_data(field)
+    distributed = field.dist.size > 1
+    if distributed || field.current_layout === :g
+        _check_slab_grid_shape(get_local_data(grid), host)
+    end
+    grid isa Array && return host::typeof(grid)
+
+    # Preserve the PencilArray endpoint or device backend without changing the
+    # field's active buffer. Serial fields may have released the inactive grid.
+    staged = (distributed ? similar(grid) : similar(grid, size(host)))::typeof(grid)
+    target = get_local_data(staged)
+    copyto!(target, host)
+    synchronize_device!(field.dist.architecture)
+    return staged
+end
+
 """
     load_state!(solver, path) -> solver
 
@@ -167,50 +258,44 @@ Registered stochastic forcing must match the saved configuration. A legacy
 checkpoint without forcing state cannot reproduce a stochastic trajectory and
 is rejected for a stochastically forced solver before any fields are restored.
 
-Every slab must carry all three clock attributes with identical values. Validate
-them before restoring any fields: a save interrupted on one rank can leave its
-slab without completion attributes, or leave a complete slab from an older save.
-The metadata check has its own collective exit so no rank can begin a field
-transpose while another rank is rejecting the checkpoint.
+Every slab must carry all three clock attributes with identical values. The
+clock, forcing state, and every field slab are validated and staged on all ranks
+before the live solver state changes.
 """
 function load_state!(solver::InitialValueSolver, path::AbstractString)
     isempty(solver.state) && error("load_state!: solver.state is empty; nothing to restore.")
     dist = solver.state[1].dist
 
-    src, clock, forcing_state = _collectively(dist, "load_state! checkpoint metadata") do
+    clock, forcing_state, staged, unused = _collectively(dist, "load_state! staging") do
         src = open_slab_source(path)
-        (src, _checkpoint_clock(src, path), _prepare_stochastic_restart(solver, src))
-    end
-
-    _collectively(dist, "load_state!") do
-        for field in solver.state
-            isempty(field.bases) && continue
-            load_field!(field, path, field.name)
-        end
-
-        solver.sim_time = clock.sim_time
-        solver.iteration = clock.iteration
-        solver.dt = clock.dt
-        _restore_stochastic_restart!(forcing_state)
-
-        # A checkpoint variable with no matching solver.state field is not an
-        # error -- a file may legitimately hold more than this solver needs --
-        # but it is worth naming, because the usual cause is a renamed field or
-        # a checkpoint from a different problem, and the silent half of that
-        # mistake is the state field that then keeps its pre-load values. (The
-        # reverse case, a state field with no variable on disk, already errors
-        # loudly inside load_field!.)
-        restored = Set(field.name for field in solver.state if !isempty(field.bases))
+        clock = _checkpoint_clock(src, path)
+        forcing_state = _prepare_stochastic_restart(solver, src)
+        staged = [(field, _stage_checkpoint_grid(field, src, path))
+                  for field in solver.state if !isempty(field.bases)]
+        restored = Set(field.name for (field, _) in staged)
         unused = sort([v for v in keys(src.entries) if !(v in restored)])
-        isempty(unused) || @info "load_state!: '$path' also holds variable(s) " *
-            "$(join(unused, ", ")) with no matching field in solver.state; they were " *
-            "not loaded."
-        nothing
+        return (clock, forcing_state, staged, unused)
     end
+
+    _collectively(dist, "load_state! stochastic forcing") do
+        _restore_stochastic_restart!(forcing_state)
+    end
+    # Install staged grids through the shared storage so problem variable handles
+    # continue to alias solver state. This phase performs no file or device I/O.
+    for (field, grid) in staged
+        set_grid_data!(field, grid)
+        field.current_layout = :g
+    end
+    solver.sim_time = clock.sim_time
+    solver.iteration = clock.iteration
+    solver.dt = clock.dt
 
     # Drop the cached timestepper state: its history refers to the pre-restart
     # trajectory. `_ensure_timestepper_state!` rebuilds it from the loaded fields.
     solver.timestepper_state = nothing
+    isempty(unused) || @info "load_state!: '$path' also holds variable(s) " *
+        "$(join(unused, ", ")) with no matching field in solver.state; they were " *
+        "not loaded."
     _warn_multistep_restart(solver)
     return solver
 end

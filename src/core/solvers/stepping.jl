@@ -25,10 +25,26 @@ function step!(solver::InitialValueSolver, dt::Float64=solver.dt)
     start_time = time()
 
     _refresh_step_boundary_conditions!(solver, dt)
+    previous_state = solver.timestepper_state
+    previous_dt = solver.dt
+    previous_state_dt = previous_state === nothing ? previous_dt : previous_state.dt
+    previous_length = previous_state === nothing ? 0 : length(previous_state.dt_history)
+    oldest_dt = previous_length == 0 ? previous_dt : first(previous_state.dt_history)
     ts_state = _ensure_timestepper_state!(solver, dt)
 
-    # Call existing timestepper step function from timesteppers.jl
-    step!(ts_state, solver)
+    try
+        step!(ts_state, solver)
+    catch step_error
+        # The current step is recorded before dispatch so multistep formulas
+        # can read it alongside accepted steps. Remove it if dispatch fails.
+        solver.dt = previous_dt
+        if previous_state === nothing
+            solver.timestepper_state = nothing
+        else
+            _restore_timestep_history!(previous_state, previous_state_dt, previous_length, oldest_dt)
+        end
+        rethrow(step_error)
+    end
 
     step_time = time() - start_time
     _sync_solver_from_timestepper!(solver)
@@ -386,7 +402,7 @@ function _solve_bvp_per_subproblem!(solver::BoundaryValueSolver)
         # Override the M-gated target cache with the BVP bulk-equation targets.
         sp.runtime.eqn_targets = bvp_targets
         n_eq = size(sp.L_min, 1)
-        rhs = zeros(sp.dist.architecture, ComplexF64, n_eq)
+        rhs = zeros(sp.dist.architecture, _subproblem_eltype(sp.dist.architecture), n_eq)
         gather_eqn_F!(rhs, sp, solver, pde_F, state)
         alg_f = similar(rhs)
         gather_alg_F!(alg_f, sp)

@@ -10,19 +10,21 @@ Requires CUDA-capable GPU.
 using Test
 using SparseArrays
 using LinearAlgebra
+using Tarang
 
 # Check if CUDA is available
-cuda_available = false
-try
+cuda_available = try
     using CUDA
     if CUDA.functional()
-        cuda_available = true
         println("CUDA is available: ", CUDA.name(CUDA.device()))
+        true
     else
         println("CUDA found but not functional")
+        false
     end
 catch e
     println("CUDA not available: $e")
+    false
 end
 
 if cuda_available
@@ -31,8 +33,6 @@ if cuda_available
     @testset "ILU(0) Preconditioner Tests" begin
 
         @testset "CuSparseLU reuses device solve buffers" begin
-            using Tarang
-
             n = 8
             A = spdiagm(
                 -1 => fill(-1.0 + 0.25im, n - 1),
@@ -48,8 +48,14 @@ if cuda_available
             rhs_buffer = solver.rhs_buffer
             solution_buffer = solver.solution_buffer
             temp_buffer = solver.temp_buffer
+            @test rhs_buffer === temp_buffer
+            @test solution_buffer !== temp_buffer
 
+            CUDA.synchronize()
+            before = CUDA.alloc_stats.alloc_bytes
             Tarang.MatSolvers.solve!(dest, solver, rhs)
+            CUDA.synchronize()
+            @test CUDA.alloc_stats.alloc_bytes == before
             @test solver.rhs_buffer === rhs_buffer
             @test solver.solution_buffer === solution_buffer
             @test solver.temp_buffer === temp_buffer
@@ -63,6 +69,16 @@ if cuda_available
             @test solver.temp_buffer === temp_buffer
             Tarang.MatSolvers.solve!(dest, solver, rhs)
             @test Array(dest) ≈ A2 \ rhs_cpu rtol=1e-10
+
+            # Float64 selects cuSOLVER RF when the toolkit supplies it.
+            real_A = real.(A)
+            real_solver = CuSparseLU(real_A)
+            real_rhs = eltype(real_solver.solution_buffer).(1:n)
+            in_out = CUDA.CuArray(real_rhs)
+            Tarang.MatSolvers.solve!(in_out, real_solver, in_out)
+            @test Array(in_out) ≈ real_A \ real_rhs rtol=1e-10
+            @test real_solver.rhs_buffer === real_solver.temp_buffer
+            @test real_solver.solution_buffer !== real_solver.temp_buffer
         end
 
         @testset "ilu02 function exists and works" begin
@@ -139,8 +155,6 @@ if cuda_available
         end
 
         @testset "Integration with Tarang solvers" begin
-            using Tarang
-
             # Create a test problem - 2D Poisson-like matrix (ill-conditioned)
             n = 50
             N = n^2
@@ -187,8 +201,6 @@ if cuda_available
         end
 
         @testset "ILU(0) with GMRES" begin
-            using Tarang
-
             # Non-symmetric matrix
             n = 30
             N = n^2

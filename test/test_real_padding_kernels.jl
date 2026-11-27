@@ -1,5 +1,26 @@
 using Test, Tarang, FFTW, Random
 
+@testset "Real and complex grid resize match a full FFT with Nyquist folding" begin
+    rng = MersenneTwister(52)
+    for (a,b) in (((1,), (6,)), ((12,9), (6,14)), ((6,8), (10,12)),
+                  ((9,10,11), (6,8,4)), ((1,6,5), (7,4,8)))
+        for (old,new) in ((a,b),(b,a)), T in (Float32,Float64,ComplexF32,ComplexF64)
+            src = randn(rng,T,old)
+            rdim = T <: Real ? 1 : 0
+            spectrum = iszero(rdim) ? fft(src) : rfft(src)
+            shape = iszero(rdim) ? new : Base.setindex(new, Tarang.rfft_len(new[1]), 1)
+            dst = similar(spectrum, shape)
+            scale = real(T)(prod(new) / prod(old))
+            Tarang.launch!(CPU(), Tarang._resize_grid_spectrum!, dst, spectrum, new, old, scale, rdim;
+                           ndrange=size(dst))
+            expected = zeros(complex(T),new)
+            Tarang._resample_fourier_spectrum!(expected, fft(src),
+                ntuple(d -> (old[d],new[d],:c2c), length(old)))
+            @test dst ≈ selectdim(expected,1,axes(dst,1)) rtol=50eps(real(T))
+        end
+    end
+end
+
 @testset "Half-spectrum maps match full-complex padding on every Fourier axis" begin
     for shape in ((9, 10), (10, 9, 8)), T in (Float32, Float64)
         rng = MersenneTwister(23)

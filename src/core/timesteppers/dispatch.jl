@@ -32,20 +32,18 @@ function step!(state::TimestepperState, solver::InitialValueSolver)
     _check_gpu_implicit_compatibility!(state, solver)
     _check_timestepper_mass_compatibility!(state, solver)
 
-    # Generate stochastic forcing ONCE at the beginning of the timestep
-    update_forcing!(state, solver.sim_time)
-
-    # Registered stochastic forcings share one draw across all stages.
-    # Deterministic forcings are refreshed by the RHS at the actual stage time.
-    _update_registered_forcings!(solver, solver.sim_time, state.dt, StochasticForcingType)
-
-    state.current_substep = 1  # Reset substep counter
-
-    # Dispatch to the appropriate stepping method based on timestepper type
-    _dispatch_step!(state.timestepper, state, solver)
-
-    # Reset forcing flag at the end of timestep (prepare for next forcing generation)
-    reset_forcing_flag!(state)
+    forcing_snapshots = _save_forcing_step!(state, solver.problem)
+    try
+        update_forcing!(state, solver.sim_time)
+        _update_registered_forcings!(solver, solver.sim_time, state.dt, StochasticForcingType)
+        state.current_substep = 1
+        _dispatch_step!(state.timestepper, state, solver)
+    catch step_error
+        _restore_forcing_step!(forcing_snapshots, solver.problem)
+        rethrow(step_error)
+    finally
+        reset_forcing_flag!(state)
+    end
     return nothing
 end
 

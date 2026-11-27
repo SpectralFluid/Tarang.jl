@@ -88,8 +88,8 @@ end
 
 function _do_alltoallv!(send_buf, recv_buf, send_counts, recv_counts,
                         comm::MPI.Comm, arch::AbstractArchitecture, buffers=nothing)
-    if is_gpu(arch) && !check_cuda_aware_mpi()
-        error("GPU MPI transpose requires CUDA-aware MPI; host staging fallback is disabled.")
+    if is_gpu(arch) && !_device_aware_mpi(arch)
+        error("GPU MPI transpose requires GPU-aware MPI; host staging fallback is disabled.")
     end
     # Direct device-buffer MPI after the strict capability check above.
     if is_gpu(arch)
@@ -171,8 +171,8 @@ function _do_ialltoallv!(send_buf, recv_buf, send_counts, recv_counts,
         return nothing
     end
 
-    if is_gpu(arch) && !check_cuda_aware_mpi()
-        error("Asynchronous GPU MPI transpose requires CUDA-aware MPI; " *
+    if is_gpu(arch) && !_device_aware_mpi(arch)
+        error("Asynchronous GPU MPI transpose requires GPU-aware MPI; " *
               "host staging fallback is disabled.")
     elseif is_gpu(arch)
         # CRITICAL: Sync GPU before MPI to ensure pack kernels completed
@@ -315,8 +315,8 @@ function _do_allgatherv!(send_buf, recv_buf, send_count::Int, recv_counts::Vecto
     recv_displs, total_recv = _prepare_allgatherv(
         recv_buf, send_count, recv_counts, comm, recv_displs)
 
-    if is_gpu(arch) && !check_cuda_aware_mpi()
-        error("GPU MPI all-gather requires CUDA-aware MPI; host staging fallback is disabled.")
+    if is_gpu(arch) && !_device_aware_mpi(arch)
+        error("GPU MPI all-gather requires GPU-aware MPI; host staging fallback is disabled.")
     elseif is_gpu(arch)
         # CRITICAL: Sync GPU before MPI to ensure data is ready
         _sync_gpu_if_needed(arch)

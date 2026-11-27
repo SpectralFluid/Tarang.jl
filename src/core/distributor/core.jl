@@ -90,6 +90,8 @@ mutable struct Distributor
     # GPU-specific caches
     gpu_fft_plans::Dict{Tuple, Any}  # Cached GPU FFT plans (CUDA-ext types)
     gpu_arrays::Dict{Symbol, Any}    # Cached GPU working arrays
+    # Queue-private spectral plans and scratch shared by fields on this distributor.
+    gpu_workspaces::Union{Nothing,WeakKeyDict{Task,Dict{Any,IdDict{Any,Any}}}}
 
     # Distributed GPU configuration (for GPU+MPI without PencilArrays)
     distributed_gpu_config::Union{Nothing, AbstractDistributedGPUConfig}
@@ -112,13 +114,15 @@ mutable struct Distributor
     function Distributor(coordsys::CoordinateSystem;
                         comm::MPI.Comm=MPI.COMM_WORLD,
                         mesh::Union{Nothing, Tuple{Vararg{Int}}}=nothing,
-                        dtype::Type=Float64,
                         device::Union{AbstractArchitecture, Nothing}=nothing,
                         arch::Union{AbstractArchitecture, Nothing}=nothing,
                         architecture::AbstractArchitecture=CPU(),
+                        dtype::Type=_default_field_dtype(something(device, arch, architecture)),
                         use_pencil_arrays::Union{Nothing, Bool}=nothing)
         # Allow `device=`, `arch=`, and `architecture=` kwargs; device > arch > architecture
         architecture = device !== nothing ? device : (arch !== nothing ? arch : architecture)
+
+        _validate_gpu_field_dtype(architecture, dtype)
 
         # Ensure MPI is initialized and not finalized before using communicator
         if MPI.Finalized()
@@ -132,10 +136,11 @@ mutable struct Distributor
 
         size = MPI.Comm_size(comm)
         rank = MPI.Comm_rank(comm)
+        _validate_distributor_size(architecture, size)
 
         # Route based on device:
         #   device=CPU() + MPI → PencilArrays/PencilFFTs for distributed FFTs
-        #   device=GPU()       → CUDA/cuFFT, TransposableField for MPI communication
+        #   device=GPU()       → cuFFT or rocFFT, TransposableField for MPI communication
         # Allow explicit override via use_pencil_arrays parameter
         _use_pencil_arrays = if use_pencil_arrays !== nothing
             use_pencil_arrays
@@ -249,9 +254,9 @@ mutable struct Distributor
         if rank == 0
             if is_gpu(architecture)
                 if size > 1
-                    @info "device=GPU(): using CUDA/cuFFT with TransposableField for MPI ($size processes)"
+                    @info "device=$architecture: using TransposableField for MPI ($size processes)"
                 else
-                    @info "device=GPU(): using CUDA/cuFFT (single GPU)"
+                    @info "device=$architecture: single GPU"
                 end
             else
                 if size > 1
@@ -277,7 +282,9 @@ mutable struct Distributor
             architecture, _use_pencil_arrays, pencil_config, mpi_topology, false, pencil_cache, transforms,
             transform_plan_cache,
             pencil_fft_plan, pencil_fft_input, pencil_fft_output, pencil_solve, layouts, perf_stats,
-            mesh_coords, neighbor_ranks, nothing, gpu_fft_plans, gpu_arrays, distributed_gpu_config,
+            mesh_coords, neighbor_ranks, nothing, gpu_fft_plans, gpu_arrays,
+            architecture isa GPU ? WeakKeyDict{Task,Dict{Any,IdDict{Any,Any}}}() : nothing,
+            distributed_gpu_config,
             transpose_workspace_cache, nothing)
 
         # Precompute neighbor ranks for all mesh dimensions
@@ -292,6 +299,54 @@ mutable struct Distributor
 
         return dist
     end
+end
+
+const _GPU_WORKSPACE_SCOPE = gensym(:tarang_gpu_workspace)
+const _GPU_STANDALONE_WORKSPACE = gensym(:tarang_gpu_standalone)
+_gpu_workspace_queue(::GPU) = nothing
+
+# Low-level transforms also accept bare arrays. Bind the owning distributor at
+# field entry points so nested FFTs, DCTs and resizes borrow the same workspace.
+function _with_gpu_workspace(f::F, dist::Distributor, args...) where F
+    contexts = dist.gpu_workspaces
+    isnothing(contexts) && return f(args...)
+    dist.closed && throw(ArgumentError("Cannot use a closed GPU distributor"))
+    ensure_device!(dist.architecture)
+    queues = get!(Dict{Any,IdDict{Any,Any}}, contexts, current_task())
+    workspace = get!(IdDict{Any,Any}, queues, _gpu_workspace_queue(dist.architecture))
+    scope = (current_task(), workspace)
+    get(task_local_storage(), _GPU_WORKSPACE_SCOPE, nothing) === scope && return f(args...)
+    return task_local_storage(() -> f(args...), _GPU_WORKSPACE_SCOPE, scope)
+end
+
+function _gpu_workspace_cache(cache::D; task_local::Bool=true) where D<:Dict
+    tls = task_local_storage()
+    scope = get(tls, _GPU_WORKSPACE_SCOPE, nothing)
+    if scope === nothing || first(scope) !== current_task()
+        task_local || return cache
+        scope = get(tls, _GPU_STANDALONE_WORKSPACE, nothing)
+        if scope === nothing || first(scope) !== current_task()
+            scope = tls[_GPU_STANDALONE_WORKSPACE] = (current_task(), IdDict{Any,Any}())
+        end
+    end
+    return get!(D, last(scope), cache)::D
+end
+
+"""
+    clear_gpu_workspaces!(dist::Distributor)
+
+Drop this distributor's cached local GPU transform plans and scratch on every
+task and queue. Call between operations to reclaim space during a resolution
+sweep. The next transform rebuilds its workspace. Field data stays usable.
+"""
+function clear_gpu_workspaces!(dist::Distributor)
+    contexts = dist.gpu_workspaces
+    isnothing(contexts) && return nothing
+    for queues in values(contexts), workspace in values(queues), cache in values(workspace)
+        empty!(cache)
+    end
+    empty!(contexts)
+    return nothing
 end
 
 """
@@ -358,7 +413,9 @@ function Base.close(dist::Distributor)
     empty!(dist.transforms)
     empty!(dist.transform_plan_cache)
     empty!(dist.layouts)
-    _free_transpose_workspaces!(dist)
+    empty!(dist.gpu_fft_plans)
+    empty!(dist.gpu_arrays)
+    clear_gpu_workspaces!(dist)
     # Transpose workspaces own two MPI sub-communicators each. Free them
     # explicitly here so the (collective) frees happen at a point every rank
     # reaches together, rather than whenever each rank's GC runs the

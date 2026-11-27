@@ -21,38 +21,27 @@ Uses existing infrastructure:
 - Kronecker products for multi-dimensional operators
 """
 function _spectral_operator_matrix(expr, var, eqn_size::Int, var_size::Int)
-    field = _get_matching_scalar_field(expr, var)
-    field === nothing && return nothing
-
-    if isa(expr, Laplacian)
-        # Composed operand (e.g. Δ(∂x(u))): build Δ as a square axis-operator and
-        # left-multiply by the operand's matrix so inner derivatives are NOT dropped.
-        if _operand_matches_variable(expr.operand, var)
-            return _spectral_laplacian(field, eqn_size, var_size)
-        end
-        return _compose_outer_with_operand(
-            _spectral_laplacian(field, var_size, var_size),
-            expr.operand, var, eqn_size, var_size)
-    elseif isa(expr, FractionalLaplacian)
-        return _spectral_fractional_laplacian(field, expr.α, eqn_size, var_size)
-    elseif isa(expr, Differentiate)
-        # Composed operand (e.g. ∂x(∂x(u)), ∂x(∂y(u)), ∂x(lap(u))): the old code
-        # walked straight to the innermost field and applied ONLY the outer
-        # coord/order, silently dropping every intermediate operator — so ∂x(∂x(u))
-        # was assembled as (ik)¹ instead of (ik)² = -k², turning an implicit
-        # diffusion term into an advection-like one. Recurse instead: build the
-        # outer 1D derivative as a square axis-operator and left-multiply by the
-        # operand's matrix.
-        if _operand_matches_variable(expr.operand, var)
-            return _spectral_differentiate(field, expr.coord, expr.order, eqn_size, var_size)
-        end
-        return _compose_outer_with_operand(
-            _spectral_differentiate(field, expr.coord, expr.order, var_size, var_size),
-            expr.operand, var, eqn_size, var_size)
-    elseif isa(expr, Gradient)
+    if expr isa Gradient
+        _get_matching_scalar_field(expr, var) === nothing && return nothing
         return _spectral_gradient(expr, var, eqn_size, var_size)
     end
-    return nothing
+
+    build = if expr isa Laplacian
+        _spectral_laplacian
+    elseif expr isa FractionalLaplacian
+        (field, m, n) -> _spectral_fractional_laplacian(field, expr.α, m, n)
+    elseif expr isa Differentiate
+        (field, m, n) -> _spectral_differentiate(field, expr.coord, expr.order, m, n)
+    else
+        return nothing
+    end
+    if _operand_matches_variable(expr.operand, var)
+        return _componentwise_spectral_matrix(build, var, eqn_size, var_size)
+    end
+    _references_variable(expr.operand, var) || return _zero_block(eqn_size, var_size)
+    # Apply the outer derivative to the complete inner operator, component by component.
+    outer = _componentwise_spectral_matrix(build, var, var_size, var_size)
+    return _compose_outer_with_operand(outer, expr.operand, var, eqn_size, var_size)
 end
 
 """
@@ -199,26 +188,24 @@ function _try_div_grad_spectral(div_expr::Divergence, var, eqn_size::Int, var_si
     for addend in addends
         actual = isa(addend, NegateOperator) ? addend.operand : addend
         if isa(actual, Gradient) && _operand_matches_variable(actual.operand, var)
-            return _spectral_laplacian_for_var(var, eqn_size, var_size)
+            return _componentwise_spectral_matrix(_spectral_laplacian, var, eqn_size, var_size)
         end
     end
 
     return nothing
 end
 
-"""Build spectral Laplacian sized to match a variable (scalar or block-diagonal for vector)."""
-function _spectral_laplacian_for_var(var, eqn_size::Int, var_size::Int)
-    if isa(var, ScalarField)
-        return _spectral_laplacian(var, eqn_size, var_size)
-    elseif isa(var, VectorField)
-        # Block-diagonal: Δ ⊕ Δ ⊕ ... ⊕ Δ (one block per component)
-        n_comp = length(var.components)
-        comp_size = var_size ÷ n_comp
-        lap = _spectral_laplacian(var.components[1], comp_size, comp_size)
-        lap === nothing && return nothing
-        # Build block-diagonal via kron(I_ncomp, lap)
-        result = kron(sparse(ComplexF64(1)*I, n_comp, n_comp), lap)
-        return size(result) == (eqn_size, var_size) ? result : nothing
+"""Lift a scalar spectral operator into the variable's component-major coefficient layout."""
+function _componentwise_spectral_matrix(build, var, eqn_size::Int, var_size::Int)
+    if var isa ScalarField
+        return build(var, eqn_size, var_size)
+    elseif var isa VectorField
+        ncomp = length(var.components)
+        eqn_size == var_size && ncomp > 0 && rem(var_size, ncomp) == 0 || return nothing
+        n = var_size ÷ ncomp
+        block = build(first(var.components), n, n)
+        block === nothing && return nothing
+        return kron(sparse(ComplexF64(1)*I, ncomp, ncomp), block)
     end
     return nothing
 end
@@ -277,9 +264,10 @@ function _spectral_differentiate(field::ScalarField, coord::Coordinate, order::I
     if isa(basis, FourierBasis)
         is_rfft = isa(basis, RealFourier) &&
                   _axis_uses_rfft(_field_transform_bundle(field), dim_idx)
-        kvals = is_rfft ? wavenumbers_rfft(basis) : wavenumbers_fft(basis)
-        length(kvals) == Nk || return nothing
-        vals = ComplexF64.((im .* kvals) .^ order)
+        expected = is_rfft ? rfft_len(basis.meta.size) : basis.meta.size
+        Nk == expected || return nothing
+        vals = _cached_fourier_derivative_factors!(basis, dim_idx, order, is_rfft, 1:Nk, Nk,
+                                            field.dtype <: Real)
         D1d = spdiagm(0 => vals)
     else
         # As above: a basis without a matrix for this order declines with MethodError

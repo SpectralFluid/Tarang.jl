@@ -4,6 +4,17 @@
 # Padded Dealiasing (3/2-rule) — GPU and MPI compatible
 # ============================================================================
 
+@inline function _padded_fourier_size(n::Int, factor::Real)
+    factor <= 1 && return n
+    m = ceil(Int, factor * n)
+    # Keeping both Nyquist images requires a strict bound: at m = 3n/2,
+    # quadratics at ±n wrap onto the retained ∓n/2 modes.
+    if factor >= 1.5
+        m = max(m, 3n ÷ 2 + 1)
+    end
+    return 2cld(m, 2)
+end
+
 """
     PaddedDealiasingWorkspace{T, A}
 
@@ -90,23 +101,13 @@ function _get_padded_workspace!(evaluator::NonlinearEvaluator, bases::Tuple, dty
         return nothing
     end
 
-    # Skip padded dealiasing for grids too small to benefit from it.
-    # With N ≤ 4, there are at most 2 independent modes (DC + Nyquist) —
-    # the 3/2-rule padding would produce incorrect results.
-    min_fourier_size = minimum(original_shape[d] for d in fourier_dims)
-    if min_fourier_size <= 4
-        return nothing
-    end
-
     # Compute padded shape: pad only Fourier dimensions. Each axis uses its own
     # basis `dealias` strength when set (>1), falling back to the global factor,
     # so per-basis dealias=... controls the padding (3/2-rule) resolution.
     padded_shape = copy(original_shape)
     for d in fourier_dims
         axis_factor = d <= length(bases) ? _axis_dealias_factor(bases[d], factor) : factor
-        M = Int(ceil(axis_factor * original_shape[d]))
-        if isodd(M); M += 1; end
-        padded_shape[d] = M
+        padded_shape[d] = _padded_fourier_size(original_shape[d], axis_factor)
     end
 
     orig_t = Tuple(original_shape)
@@ -125,10 +126,8 @@ function _get_padded_workspace!(evaluator::NonlinearEvaluator, bases::Tuple, dty
         # In-place plans, like the CPU branch — the out-of-place forms allocated
         # (and then copied) a fresh padded-size device array per FFT, three times
         # per product evaluation.
-        plan_forward = plan_fft!(padded1, fourier_dims)
-        plan_backward = plan_ifft!(padded1, fourier_dims)
-        plan_spec_forward = plan_fft!(spectrum, fourier_dims)
-        plan_spec_backward = plan_ifft!(spectrum, fourier_dims)
+        plan_forward, plan_backward = _device_complex_fft_plans!(padded1, fourier_dims)
+        plan_spec_forward, plan_spec_backward = _device_complex_fft_plans!(spectrum, fourier_dims)
     else
         # In-place padded plans (UNALIGNED — applied to padded1/padded2):
         # the per-call `ws.padded .= plan * ws.padded` then transforms in place instead
@@ -661,11 +660,13 @@ function _checkout_nl_result!(evaluator::NonlinearEvaluator, field1::ScalarField
     _NL_RESULT_IDX[] += 1
     # Tuple key (no per-call string allocation; matches the tuple-key convention
     # used by `_get_padded_workspace!`).
-    key = (i, objectid(_field_transform_bundle(field1)), field1.dtype)
+    key = (i, objectid(_field_transform_bundle(field1)), field1.dtype, is_transposable_storage(field1))
     pool = evaluator.nl_result_pool
     cached = get(pool, key, nothing)
     cached === nothing || return cached
-    field = ScalarField(field1.dist, "_nl_product", field1.bases, field1.dtype)
+    field = is_transposable_storage(field1) ? copy(field1) :
+            ScalarField(field1.dist, "_nl_product", field1.bases, field1.dtype)
+    field.name = "_nl_product"
     pool[key] = field
     return field
 end

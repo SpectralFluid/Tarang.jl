@@ -480,7 +480,7 @@ end
 @inline function _sa_axpy!(y_data::AbstractArray{T}, a::Float64,
                            x_data::AbstractArray{T}) where {T<:AbstractFloat}
     if is_gpu_array(x_data)
-        y_data .+= a .* x_data
+        y_data .+= T(a) .* x_data
         return y_data
     end
     n = length(x_data)
@@ -499,7 +499,7 @@ end
 
 """`y .+= a*x` — complex (coefficient) and device arrays: plain broadcast."""
 @inline function _sa_axpy!(y_data, a::Float64, x_data)
-    y_data .+= a .* x_data
+    y_data .+= real(eltype(y_data))(a) .* x_data
     return y_data
 end
 
@@ -507,7 +507,7 @@ end
 @inline function _sa_add_scaled!(dest::AbstractArray{T}, x_data::AbstractArray{T},
                                  y_data::AbstractArray{T}, a::Float64) where {T<:AbstractFloat}
     if is_gpu_array(x_data)
-        dest .= x_data .+ a .* y_data
+        dest .= x_data .+ T(a) .* y_data
         return dest
     end
     n = length(x_data)
@@ -527,7 +527,7 @@ end
 
 """`dest .= x .+ a*y` — complex (coefficient) and device arrays."""
 @inline function _sa_add_scaled!(dest, x_data, y_data, a::Float64)
-    dest .= x_data .+ a .* y_data
+    dest .= x_data .+ real(eltype(dest))(a) .* y_data
     return dest
 end
 
@@ -535,7 +535,7 @@ end
 @inline function _sa_lincomb!(dest::AbstractArray{T}, α::Float64, a_data::AbstractArray{T},
                               β::Float64, b_data::AbstractArray{T}) where {T<:AbstractFloat}
     if is_gpu_array(a_data)
-        dest .= α .* a_data .+ β .* b_data
+        dest .= T(α) .* a_data .+ T(β) .* b_data
         return dest
     end
     if length(a_data) > 100
@@ -551,7 +551,8 @@ end
 
 """`dest .= α*a .+ β*b` — complex (coefficient) and device arrays."""
 @inline function _sa_lincomb!(dest, α::Float64, a_data, β::Float64, b_data)
-    dest .= α .* a_data .+ β .* b_data
+    T = real(eltype(dest))
+    dest .= T(α) .* a_data .+ T(β) .* b_data
     return dest
 end
 
@@ -1111,6 +1112,8 @@ function _scalar_constraint_solve(e::Int, label::String, terms::Vector{_Constrai
         end
     end
 
+    T = real(v.dtype)
+    C = Complex{T}
     fourier = _constraint_all_fourier_bases(v)
     template = fourier ? _constraint_template(v) : nothing
     k2 = nothing
@@ -1130,7 +1133,7 @@ function _scalar_constraint_solve(e::Int, label::String, terms::Vector{_Constrai
     else
         fourier || return "`$(v.name)` has a non-Fourier basis, so only a constant multiple " *
                           "of it can be solved for"
-        multiplier = similar_zeros(k2, ComplexF64, size(k2)...)
+        multiplier = similar_zeros(k2, C, size(k2)...)
         for (c, term) in target_terms
             _accumulate_diagonal_L!(multiplier, k2, term, c, template) ||
                 return "`$(expression_to_string(term))` is not diagonal in Fourier space"
@@ -1146,7 +1149,7 @@ function _scalar_constraint_solve(e::Int, label::String, terms::Vector{_Constrai
     if m isa AbstractArray
         local_scale = isempty(m) ? 0.0 : Float64(maximum(abs, m))
         scale = _constraint_allreduce(local_scale, max, v.dist)
-        zero_modes = abs.(m) .<= 1e-13 * scale
+        zero_modes = abs.(m) .<= T(1e-13 * scale)
         singular = _constraint_allreduce(count(zero_modes .& .!k0), +, v.dist)
         singular == 0 ||
             return "its operator on `$(v.name)` vanishes at $singular nonzero wavenumber(s), so it is singular"
@@ -1173,26 +1176,26 @@ function _scalar_constraint_solve(e::Int, label::String, terms::Vector{_Constrai
 
     neg_inv = if m isa AbstractArray
         inverse = similar(m)
-        inverse .= ifelse.(zero_modes .| (pinned .& k0), zero(ComplexF64), .-inv.(m))
+        inverse .= ifelse.(zero_modes .| (pinned .& k0), zero(C), -one(C) ./ m)
         inverse
     elseif pinned
-        inverse = similar_zeros(k2, ComplexF64, size(k2)...)
-        inverse .= ifelse.(k0, zero(ComplexF64), ComplexF64(-1 / m))
+        inverse = similar_zeros(k2, C, size(k2)...)
+        inverse .= ifelse.(k0, zero(C), C(-1 / m))
         inverse
     else
-        -1 / m
+        T(-1 / m)
     end
 
     pin = nothing
     if pinned && !iszero(pin_value)
         volume = prod(b.meta.bounds[2] - b.meta.bounds[1] for b in v.bases)
         unit = _unit_constant_coefficients(v)
-        pin = similar_zeros(k2, ComplexF64, size(k2)...)
-        pin .= ifelse.(k0, (pin_value / volume) .* unit, zero(ComplexF64))
+        pin = similar_zeros(k2, C, size(k2)...)
+        pin .= ifelse.(k0, T(pin_value / volume) .* unit, zero(C))
     end
 
     constant_coefficients = iszero(constant) ? nothing :
-                            constant .* _unit_constant_coefficients(v)
+                            T(constant) .* _unit_constant_coefficients(v)
 
     # Inputs: a field with the target's layout enters with a scalar weight, or a
     # multiplier when its operator is diagonal; anything else is evaluated.
@@ -1202,11 +1205,11 @@ function _scalar_constraint_solve(e::Int, label::String, terms::Vector{_Constrai
         weight = nothing
         if x.dist === v.dist && x.bases == v.bases
             if term isa ScalarField
-                weight = c
+                weight = T(c)
             elseif fourier
                 input_template = _constraint_template(x)
                 coeff_data!(input_template)
-                multiplier = similar_zeros(k2, ComplexF64, size(k2)...)
+                multiplier = similar_zeros(k2, C, size(k2)...)
                 _accumulate_diagonal_L!(multiplier, k2, term, c, input_template) &&
                     (weight = multiplier)
             end
@@ -1453,11 +1456,11 @@ function _apply_scalar_constraint!(solve::_ConstraintSolve, problem::Problem,
                 "constraint refresh of `$(solve.label)`: the term " *
                 "`$(expression_to_string(term))` evaluated to $(typeof(value)), not a " *
                 "scalar field"))
-            _constraint_accumulate!(dest, c, _local_coeff(coeff_data!(value)), first)
+            _constraint_accumulate!(dest, real(eltype(dest))(c), _local_coeff(coeff_data!(value)), first)
             first = false
         end
         if solve.constant !== nothing
-            _constraint_accumulate!(dest, 1.0, solve.constant, first)
+            _constraint_accumulate!(dest, 1, solve.constant, first)
             first = false
         end
         first && fill!(dest, zero(eltype(dest)))

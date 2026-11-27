@@ -113,8 +113,7 @@ end
         @test Array(grid_data!(w)) ≈ ones(8) atol=1e-12
     end
 
-    # Direct RHS refresh also preserves a nonzero algebraic RHS. The global
-    # DAE stepper intentionally declines this projection, so inspect its RHS.
+    # Direct RHS refresh preserves a nonzero algebraic RHS between solves.
     solver, u, v = ordering_regression_solver(RK222(), ["dt(u) = v", "v - u = 2"];
                                               initial=(0.5, 2.5))
     rhs = Tarang.evaluate_rhs(solver, solver.state, 0.0)
@@ -131,5 +130,81 @@ end
             @test Array(grid_data!(u)) ≈ fill(solver.sim_time, 8) atol=1e-12
             @test Array(grid_data!(v)) ≈ fill(2solver.sim_time, 8) atol=1e-12
         end
+    end
+end
+
+@testset "Global multistep solves impose nonzero algebraic rows" begin
+    schemes = (CNAB1(), CNAB2(), SBDF1(), SBDF2(), SBDF3(), SBDF4(),
+               Tarang.MCNAB2(), Tarang.CNLF2())
+    for ts in schemes
+        solver, u, v = ordering_regression_solver(ts, ["v - u = 2", "dt(u) = v"])
+        initial = 0.5 .+ sin.(2π .* (0:7) ./ 8)
+        grid_data!(u) .= initial
+        grid_data!(v) .= initial .+ 2
+        for dt in (0.1, 0.2, 0.15, 0.12, 0.08)
+            step!(solver, dt)
+            @test grid_data!(v) - grid_data!(u) ≈ fill(2.0, 8) atol=1e-12
+        end
+    end
+end
+
+@testset "Rejected steps preserve accepted timestep history" begin
+    equations = ["dt(u) = -u", "dt(v) = 0"]
+    for accepted_steps in (0, 1, 3)
+        reference, ref_u, _ = ordering_regression_solver(CNAB2(), equations; initial=(1.0, 0.0))
+        solver, u, _ = ordering_regression_solver(CNAB2(), equations; initial=(1.0, 0.0))
+        for dt in (0.1, 0.2, 0.15)[1:accepted_steps]
+            step!(reference, dt)
+            step!(solver, dt)
+        end
+        accepted_history = accepted_steps == 0 ? nothing : copy(solver.timestepper_state.dt_history)
+        solver.problem.parameters["spectral_linear_operator"] = SpectralLinearOperator(u, :laplacian)
+        @test_throws ArgumentError step!(solver, 0.5)
+        delete!(solver.problem.parameters, "spectral_linear_operator")
+        @test solver.sim_time == reference.sim_time
+        @test solver.iteration == reference.iteration
+        @test solver.dt == reference.dt
+        if accepted_history === nothing
+            @test solver.timestepper_state === nothing
+        else
+            @test solver.timestepper_state.dt_history == accepted_history
+        end
+        step!(reference, 0.1)
+        step!(solver, 0.1)
+        @test grid_data!(u) ≈ grid_data!(ref_u) atol=1e-13
+    end
+end
+
+@testset "Inconsistent bounded systems reject a step without changing history" begin
+    function bounded_growth(ts)
+        u = ScalarField(ChebyshevDomain(8), "u")
+        set!(u, 1.0)
+        problem = InitialValueProblem([u])
+        add_equation!(problem, "dt(u) - u = 0")
+        return InitialValueSolver(problem, ts; dt=0.1)
+    end
+    for (ts, singular_dt) in ((SBDF1(), 1.0), (SBDF2(), 1.5),
+                              (RK111(), 1.0), (RK443(), 2.0), (RKSMR(), 6.0))
+        solver = bounded_growth(ts)
+        reference = bounded_growth(ts)
+        if ts isa SBDF2
+            # The startup matrix is invertible. Equal consecutive steps give
+            # a BDF2 coefficient of 3/(2dt), exactly one on the rejected step.
+            step!(solver, 1.5)
+            step!(reference, 1.5)
+        elseif ts isa Union{RK111,RK443,RKSMR}
+            # RKSMR reaches its singular last stage after two successful solves.
+            step!(solver, 0.1)
+            step!(reference, 0.1)
+        end
+        clock = (solver.sim_time, solver.iteration)
+        field = only(solver.state)
+        accepted = copy(grid_data!(field))
+        @test_throws ArgumentError step!(solver, singular_dt)
+        @test (solver.sim_time, solver.iteration) == clock
+        @test grid_data!(field) ≈ accepted atol=1e-13
+        step!(solver, 0.2)
+        step!(reference, 0.2)
+        @test grid_data!(field) ≈ grid_data!(only(reference.state)) atol=1e-13
     end
 end

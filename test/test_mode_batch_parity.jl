@@ -80,6 +80,42 @@ function _parity_channel_solver_3d(; nx=4, ny=4, nz=8, dt=1e-3,
     return solver, b
 end
 
+@testset "Batched RK restores earlier stage writes after a singular last stage" begin
+    coords = CartesianCoordinates("x", "z")
+    dist = Distributor(coords; dtype=Float64)
+    xb = RealFourier(coords["x"]; size=8, bounds=(0.0, 2π))
+    domain = Domain(dist, (xb, ChebyshevT(coords["z"]; size=8, bounds=(0.0, 1.0))))
+    function batched_growth(enabled)
+        u = ScalarField(domain, "u")
+        grid_data!(u) .= [1 + cos(2π*x/8) + z/8 for x in 0:7, z in 0:7]
+        tau = ScalarField(dist, "tau", (xb,), Float64)
+        p = InitialValueProblem([u, tau])
+        add_equation!(p, "dt(u) - u = 0")
+        add_equation!(p, "integ(tau) = 0")
+        return InitialValueSolver(p, RKSMR(); dt=0.1, batched_modes=enabled), u, tau
+    end
+    solver, u, tau = batched_growth(true)
+    control, v, control_tau = batched_growth(false)
+    step!(solver)
+    step!(control)
+    @test !isempty(Tarang.active_mode_batches(solver))
+    # The integral only constrains the mean. Nonzero Fourier coefficients of
+    # tau are filtered out of the compressed solve but belong to the input.
+    tau_values = cos.((2π/8) .* (0:7))
+    accepted = copy(grid_data!(v))
+    for (s, field, auxiliary) in ((solver, u, tau), (control, v, control_tau))
+        grid_data!(auxiliary) .= tau_values
+        @test_throws Union{ArgumentError,ErrorException} step!(s, 6.0)
+        @test (s.sim_time, s.iteration) == (0.1, 1)
+        @test grid_data!(auxiliary) ≈ tau_values atol=1e-12
+        @test grid_data!(field) ≈ accepted atol=1e-12
+    end
+    @test grid_data!(u) ≈ grid_data!(v) atol=1e-12
+    step!(solver, 0.2)
+    step!(control, 0.2)
+    @test grid_data!(u) ≈ grid_data!(v) atol=1e-12
+end
+
 @testset "batched mode engagement guards" begin
     @testset "default on CPU is OFF" begin
         solver, _ = _parity_channel_solver()

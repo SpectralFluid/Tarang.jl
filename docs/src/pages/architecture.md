@@ -49,14 +49,20 @@ src/
     └── flow_tools/           CFL, spectra, QG/streamfunction diagnostics, quick domains, plotting
 
 ext/
-├── TarangCUDAExt.jl          extension module and ordered CUDA includes
-└── cuda/                    device architecture, cuFFT/DCT-I transforms, Chebyshev
-                             derivatives, batched matsolvers, NCCL transposes, memory
+├── TarangCUDAExt.jl          CUDA extension
+├── TarangAMDGPUExt.jl        AMD ROCm extension
+├── TarangMetalExt.jl         Apple Metal extension
+├── gpu/                     shared DCT-I, Chebyshev, mixed transforms and transpose kernels
+├── cuda/                    CUDA arrays, cuFFT, CUDA solvers and NCCL communication
+├── amdgpu/                  ROCArray, rocFFT, rocSOLVER and ROCm-aware MPI
+└── metal/                   Metal Performance Shaders matrix solver
 
 test/
 ├── file_lists.jl             shared CPU, optional, GPU, MPI, and distributed GPU registry
 ├── runtests.jl               package test runner
 ├── run_gpu_ci.jl             CUDA test driver
+├── run_amdgpu_ci.jl          AMD backend and ROCm hardware test driver
+├── run_metal_ci.jl           Apple Metal hardware test driver
 └── run_mpi_ci.jl             launches each registered MPI test in its own process world
 
 docs/
@@ -103,13 +109,11 @@ solvers and timesteppers
         ↓
 models, output, and extras
 
-CUDA extension ──implements──► backend hooks declared by core
+GPU extensions ──implement──► backend hooks declared by core
 public API     ──exposes───► selected bindings from all layers
 ```
 
-Core must load without CUDA. CUDA-specific module bindings for CUSOLVER and
-CUSPARSE are methods supplied by `TarangCUDAExt`; core owns only the solver
-contracts and backend-neutral orchestration.
+Core loads independently of the optional GPU packages. `TarangCUDAExt` supplies cuSOLVER and cuSPARSE bindings. `TarangAMDGPUExt` supplies rocSOLVER and rocSPARSE bindings. `TarangMetalExt` uses MPSGraph FFTs and Metal Performance Shaders LU.
 
 ## Public API boundary
 
@@ -263,12 +267,12 @@ NetCDF output is an explicit host I/O boundary, not a computational fallback.
 
 The core/extension split is:
 
-| Concern | Core | CUDA extension |
+| Concern | Core | GPU extensions |
 |---|---|---|
-| Architecture contract | `AbstractArchitecture`, `GPU`, dispatch hooks | CUDA device and array methods |
-| Fourier transforms | field/layout contract | cuFFT plans and execution |
+| Architecture contract | `AbstractArchitecture`, `GPU`, dispatch hooks | CUDA, ROCm and Metal device and array methods |
+| Fourier transforms | field/layout contract | cuFFT or rocFFT plans and execution |
 | Mixed transforms | basis/operator selection | cached Fourier–Chebyshev plans and DCT kernels |
-| Matrix solves | solver types, selection policy, reusable buffers | CUDA allocation plus CUSOLVER/CUSPARSE bindings |
+| Matrix solves | solver types, selection policy, reusable buffers | cuSOLVER/cuSPARSE or rocSOLVER/rocSPARSE |
 | Output | scheduling and NetCDF staging contract | device-to-host bulk copy methods |
 
 Supported single-GPU IVPs are 2D/3D pure Fourier and mixed

@@ -531,6 +531,8 @@ function should_batch_modes(base, sps, indices::Vector{Int};
     length(indices) >= 2 || return false
 
     sp1 = sps[indices[1]]
+    # ModeBatch stores ComplexF64 operators and factors. Other precisions use per-mode LU.
+    sp1.dist === nothing || _subproblem_eltype(sp1.dist.architecture) === ComplexF64 || return false
     # `mode_batch_bytes` needs the built matrices to size the batch, and
     # `build_mode_batch` needs all four. A bucket from `bucket_subproblems`
     # always has them (`batch_signature` returns `0x0` otherwise); a

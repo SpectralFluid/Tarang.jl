@@ -247,24 +247,15 @@ function set_scales!(field::ScalarField, scales::Union{Real, Vector{Real}, Tuple
         old_data = get_local_data(get_grid_data(field))
 
         if old_data !== nothing && !isempty(old_data)
-            # Store coefficient data if it exists
-            old_coeff_data = get_coeff_data(field) !== nothing ? copy(get_local_data(get_coeff_data(field))) : nothing
-
-            # Reallocate with new scales
+            # The old grid is still live here. preset_scales! replaces only the
+            # grid, so caller-owned coefficients need no backup or restore.
             preset_scales!(field, new_scales)
 
             # Resample grid data to new resolution
             new_data = get_local_data(get_grid_data(field))
             if new_data !== nothing
-                resample_grid_data!(new_data, old_data, old_grid_shape, new_grid_shape)
-            end
-
-            # Restore coefficient data (unchanged by grid scaling)
-            if old_coeff_data !== nothing && get_coeff_data(field) !== nothing
-                coeff_data = get_local_data(get_coeff_data(field))
-                if coeff_data !== nothing && size(coeff_data) == size(old_coeff_data)
-                    copyto!(coeff_data, old_coeff_data)
-                end
+                _with_gpu_workspace(resample_grid_data!, field.dist, new_data, old_data,
+                                    old_grid_shape, new_grid_shape)
             end
         else
             preset_scales!(field, new_scales)
@@ -351,8 +342,8 @@ function _resample_fourier_axes_in_grid!(field::ScalarField, old_scales, new_sca
     mid_scales = ntuple(a -> is_fourier_basis(field.bases[a]) ? new_scales[a] : olds[a], n)
     old_data = get_local_data(get_grid_data(field))
     preset_scales!(field, mid_scales)
-    resample_grid_data!(get_local_data(get_grid_data(field)), old_data, old_grid_shape,
-                        get_scaled_shape(field, field.scales))
+    _with_gpu_workspace(resample_grid_data!, field.dist, get_local_data(get_grid_data(field)),
+                        old_data, old_grid_shape, get_scaled_shape(field, field.scales))
     return field
 end
 
@@ -361,11 +352,11 @@ end
 
 GPU-native spectral resampling using cuFFT.
 Returns true if GPU resample was applied, false otherwise.
-Override provided by TarangCUDAExt when CUDA is loaded.
+The CUDA, AMDGPU and Metal extensions provide the device implementations.
 """
 function gpu_resample_grid_data!(new_data::AbstractArray, old_data::AbstractArray,
                                  old_shape::Tuple, new_shape::Tuple)
-    return false  # No GPU support without CUDA extension
+    return false
 end
 
 function resample_grid_data!(new_data::AbstractArray, old_data::AbstractArray,

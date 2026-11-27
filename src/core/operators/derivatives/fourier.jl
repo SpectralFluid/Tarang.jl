@@ -31,7 +31,7 @@ function evaluate_fourier_derivative!(result::ScalarField, operand::ScalarField,
     if dist.size > 1 && ndim >= 2 && dist.mesh !== nothing
         if is_decomposed_axis(dist, ndim, axis)
             # Axis is distributed - need MPI transpose to compute derivative correctly
-            _evaluate_distributed_fourier_derivative!(result, operand, axis, order, layout, decomposed_axes(dist, ndim))
+            _evaluate_distributed_fourier_derivative!(result, operand, axis, order, layout)
             return
         end
     end
@@ -41,31 +41,21 @@ function evaluate_fourier_derivative!(result::ScalarField, operand::ScalarField,
 end
 
 """
-    _evaluate_distributed_fourier_derivative!(result, operand, axis, order, layout, decomp_dims)
+    _evaluate_distributed_fourier_derivative!(result, operand, axis, order, layout)
 
 Evaluate Fourier derivative on a distributed axis using coefficient-space operations.
 
-The correct approach for MPI differentiation:
-1. Transform to coefficient space using PencilFFTs (handles distributed FFT correctly)
-2. Multiply coefficients by (ik)^order - works on local portion of distributed coefficients
-3. Transform back using PencilFFTs if grid space result is needed
-
-This is simpler and more correct than manual transposes because PencilFFTs handles
-all MPI communication internally.
+Transform with the field's distributed backend, multiply the owned coefficients
+by `(im*k)^order`, and invert the transform if grid values are requested.
 """
 function _evaluate_distributed_fourier_derivative!(result::ScalarField, operand::ScalarField,
-                                                    axis::Int, order::Int, layout::Symbol,
-                                                    decomp_dims::Tuple)
+                                                    axis::Int, order::Int, layout::Symbol)
     dist = operand.dist
     basis = operand.bases[axis]
 
-    # Step 1: Ensure operand is in coefficient space using PencilFFTs
-    # Make a working copy to avoid modifying the original
+    # Transform a copy to preserve the operand's current layout and data.
     work_field = copy(operand)
-    forward_transform!(work_field)
-
-    # Get the coefficient data (distributed across processes)
-    coeff_data = get_coeff_data(work_field)
+    coeff_data = coeff_data!(work_field)
     if coeff_data === nothing
         error("Forward transform did not produce coefficient data")
     end
@@ -74,7 +64,8 @@ function _evaluate_distributed_fourier_derivative!(result::ScalarField, operand:
     # Each process works on its local portion of the distributed coefficient array
     # CRITICAL: Determine if this axis uses RFFT (only first RealFourier axis does)
     uses_rfft = _axis_uses_rfft(_field_transform_bundle(operand), axis)
-    _apply_spectral_derivative_distributed!(coeff_data, basis, axis, order, dist; uses_rfft=uses_rfft)
+    _apply_spectral_derivative_distributed!(coeff_data, basis, axis, order, dist;
+                                            uses_rfft, real_field=operand.dtype <: Real)
 
     # Step 3: Allocate result coefficient data if needed
     if get_coeff_data(result) === nothing
@@ -144,14 +135,12 @@ Each process multiplies its local coefficients by the appropriate (ik)^order fac
 
 For PencilArrays: uses axes_local to determine which wavenumber indices this process owns.
 
-IMPORTANT: For RealFourier bases, the `uses_rfft` parameter must be set correctly:
-- `uses_rfft=true`: First RealFourier axis, coefficient size is N/2+1
-- `uses_rfft=false`: Subsequent RealFourier axes, coefficient size is N (full FFT)
+Pass `uses_rfft=true` when the field's forward plan stores a half spectrum on this axis.
 """
 function _apply_spectral_derivative_distributed!(coeff_data::PencilArrays.PencilArray,
                                                    basis::Union{RealFourier, ComplexFourier},
                                                    axis::Int, order::Int, dist::Distributor;
-                                                   uses_rfft::Bool=false)
+                                                   uses_rfft::Bool=false, real_field::Bool=uses_rfft)
     # Get the local data and the global index ranges for this process
     local_data = parent(coeff_data)
     pencil = PencilArrays.pencil(coeff_data)
@@ -174,8 +163,10 @@ function _apply_spectral_derivative_distributed!(coeff_data::PencilArrays.Pencil
     # The per-rank derivative multiplier (im*k)^order depends only on the basis,
     # order, uses_rfft, and this rank's owned index range — all fixed across a run.
     # Cache it so the wavenumber array isn't rebuilt and re-sliced every RHS eval.
-    local_range = axis <= length(local_axes) ? local_axes[axis] : nothing
-    deriv_mult = _get_cached_dist_deriv_mult!(coeff_data, basis, axis, order, uses_rfft, local_range)
+    local_range = local_axes[axis]
+    global_size = PencilArrays.size_global(coeff_data)[axis]
+    deriv_mult = _cached_fourier_derivative_factors!(basis, axis, order, uses_rfft,
+                                             local_range, global_size, real_field)
 
     # Apply to local data along the PHYSICAL axis in parent array (accounting for permutation)
     mult_shape = ntuple(i -> i == physical_axis ? length(deriv_mult) : 1, ndims(local_data))
@@ -183,81 +174,57 @@ function _apply_spectral_derivative_distributed!(coeff_data::PencilArrays.Pencil
 end
 
 """
-Cached `(ik)^order` multiplier for this rank's owned slice of a distributed
-Fourier axis. Keyed by `(order, uses_rfft, axis, local_range_lo, local_range_hi)`
-in `basis.transforms`; the range bounds in the key guarantee a distinct entry if
-the decomposition ever differs, so cached values can never be misapplied. All
-size/bounds validation runs on the cache-miss path (config is fixed per run).
+Cache `(im*k)^order` for the rank's owned global coefficient indices.
 """
-function _get_cached_dist_deriv_mult!(coeff_data::PencilArrays.PencilArray,
-                                      basis::Union{RealFourier, ComplexFourier},
-                                      axis::Int, order::Int, uses_rfft::Bool, local_range)::Vector{ComplexF64}
-    lr_lo = local_range === nothing ? 0 : Int(first(local_range))
-    lr_hi = local_range === nothing ? 0 : Int(last(local_range))
-    cache_key = (:dist_deriv_mult, order, uses_rfft, axis, lr_lo, lr_hi)
+function _cached_fourier_derivative_factors!(basis::FourierBasis, axis::Int, order::Int,
+                                      uses_rfft::Bool, local_range, global_size::Int,
+                                      real_field::Bool)::Vector{ComplexF64}
+    cache_key = (:dist_deriv_mult, order, uses_rfft, axis, local_range, global_size, real_field)
     return _get_basis_cache!(basis, cache_key) do
-        L = basis.meta.bounds[2] - basis.meta.bounds[1]
-        N_global = basis.meta.size
-
-        # CRITICAL: In PencilFFTs, RFFT is only used on the FIRST RealFourier axis.
-        # Subsequent RealFourier axes use FFT with full size N (not N/2+1).
-        if isa(basis, RealFourier) && uses_rfft
-            N_coeff = div(N_global, 2) + 1
-            k0 = 2π / L
-            k_global = collect(0:(N_coeff-1)) .* k0  # rfft: [0, 1, …, N/2]
-        elseif isa(basis, RealFourier)
-            N_coeff = N_global
-            k0 = 2π / L
-            k_global = _fftfreq(N_global) .* N_global .* k0
-        else
-            N_coeff = N_global
-            k0 = 2π / L
-            k_global = _fftfreq(N_global) .* N_global .* k0
+        k_global = basis isa RealFourier && uses_rfft ?
+            wavenumbers_rfft(basis) : wavenumbers_fft(basis)
+        length(k_global) == global_size || throw(DimensionMismatch(
+            "Fourier derivative axis $axis has $global_size global coefficients, " *
+            "but $(typeof(basis)) and uses_rfft=$uses_rfft imply $(length(k_global))"))
+        factors = ComplexF64.((im .* view(k_global, local_range)) .^ order)
+        # The two signs of an even-grid Nyquist mode coincide on a real grid.
+        # Their odd derivatives cancel, including along full FFT axes of an rfft.
+        n = basis.meta.size
+        nyquist = n ÷ 2 + 1
+        if real_field && iseven(n) && isodd(order) && nyquist in local_range
+            factors[nyquist - first(local_range) + 1] = 0
         end
-
-        # CRITICAL: Validate coefficient global size matches expected N_coeff (catches
-        # uses_rfft / data-size mismatch).
-        global_size_axis = PencilArrays.size_global(coeff_data)[axis]
-        if global_size_axis != N_coeff
-            error("Spectral derivative coefficient size mismatch on axis $axis: " *
-                  "global coefficient size is $global_size_axis but expected $N_coeff " *
-                  "(basis=$(typeof(basis)), uses_rfft=$uses_rfft, N_global=$N_global). " *
-                  "Check that uses_rfft correctly identifies the first RealFourier axis.")
-        end
-
-        if local_range !== nothing
-            if last(local_range) > length(k_global)
-                error("Spectral derivative index out of bounds: local_range=$local_range but k_global has $(length(k_global)) elements. " *
-                      "This may indicate a mismatch between coefficient sizing and wavenumber computation. " *
-                      "axis=$axis, uses_rfft=$uses_rfft, basis=$(typeof(basis)), N_global=$N_global")
-            end
-            k_local = k_global[local_range]
-        else
-            k_local = k_global  # Axis not distributed: use full wavenumber array
-        end
-
-        ComplexF64.((im .* k_local) .^ order)
+        factors
     end
 end
 
 function _apply_spectral_derivative_distributed!(coeff_data::AbstractArray,
-                                                   basis::Union{RealFourier, ComplexFourier},
-                                                   axis::Int, order::Int, dist::Distributor)
-    # Fallback for non-PencilArray data (shouldn't happen in MPI mode, but handle gracefully)
-    L = basis.meta.bounds[2] - basis.meta.bounds[1]
-    N = size(coeff_data, axis)
+                                                  basis::Union{RealFourier, ComplexFourier},
+                                                  axis::Int, order::Int, dist::Distributor;
+                                                  uses_rfft::Bool=false, real_field::Bool=uses_rfft)
+    # Explicit transposes return coefficients in the distributor's unpermuted
+    # Z-local layout. A half spectrum has its own decomposition of mode indices.
+    n = basis.meta.size
+    global_size = basis isa RealFourier && uses_rfft ? rfft_len(n) : n
+    local_range = local_indices(dist, axis, global_size)
+    n_local = length(local_range)
+    n_local == size(coeff_data, axis) || throw(DimensionMismatch(
+        "Fourier derivative axis $axis has $(size(coeff_data, axis)) local coefficients, " *
+        "but this rank owns $n_local modes ($local_range)"))
 
-    if isa(basis, RealFourier)
-        k0 = 2π / L
-        k_axis = collect(0:(N-1)) .* k0
+    multiplier = _cached_fourier_derivative_factors!(basis, axis, order, uses_rfft,
+                                              local_range, global_size, real_field)
+    shape = ntuple(i -> i == axis ? n_local : 1, ndims(coeff_data))
+    T = eltype(coeff_data)
+    shaped = if is_gpu_array(coeff_data)
+        _get_device_basis_cache!(basis, :dist_deriv_mult_dev, coeff_data,
+                                 axis, order, uses_rfft, real_field, local_range, shape, T) do
+            reshape(convert(Vector{T}, multiplier), shape)
+        end
     else
-        k0 = 2π / L
-        k_axis = _fftfreq(N) .* N .* k0
+        reshape(multiplier, shape)
     end
-
-    deriv_mult = (im .* k_axis) .^ order
-    mult_shape = ntuple(i -> i == axis ? length(deriv_mult) : 1, ndims(coeff_data))
-    coeff_data .*= reshape(deriv_mult, mult_shape...)
+    coeff_data .*= shaped
 end
 
 """
@@ -339,10 +306,12 @@ end
 # protects registration, not concurrent use of the cached device buffers.
 const _DERIV_FFT_WS_GPU = Dict{Tuple, Any}()
 const _DERIV_FFT_WS_GPU_LOCK = ReentrantLock()
+_deriv_fft_cache_token(a::AbstractArray) = _device_cache_token(a)
 
 function _get_gpu_deriv_workspace!(data_g::AbstractArray, axis::Int)
+    ensure_device!(architecture(data_g))
     CT = complex(float(real(eltype(data_g))))
-    key = (_device_cache_token(data_g), size(data_g), axis, CT)
+    key = (_deriv_fft_cache_token(data_g), size(data_g), axis, CT)
     return lock(_DERIV_FFT_WS_GPU_LOCK) do
         get!(_DERIV_FFT_WS_GPU, key) do
             cin = similar(data_g, CT, size(data_g))
@@ -363,8 +332,7 @@ function _get_gpu_deriv_workspace!(data_g::AbstractArray, axis::Int)
             # is now copied into `cin` rather than fed straight to an out-of-place
             # plan; a real-valued operand already paid that copy to promote
             # real -> complex.
-            pf  = plan_fft!(cin, axis)
-            pin = plan_ifft!(cin, axis)
+            pf, pin = _device_complex_fft_plans!(cin, (axis,))
             (cin, pf, pin)
         end
     end

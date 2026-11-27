@@ -26,7 +26,7 @@ end
 function scalar_field_fixture(arch)
     coords = CartesianCoordinates("x")
     dist = Distributor(coords; mesh=(1,), architecture=arch, dtype=Float64)
-    basis = RealFourier(coords["x"]; size=4, bounds=(0.0, 2π))
+    basis = RealFourier(coords["x"]; size=4, bounds=(0.0, 2π), dealias=1.0)
     u = ScalarField(dist, "u", (basis,), Float64)
     v = ScalarField(dist, "v", (basis,), Float64)
     set_field_data!(u, Float64.(1:4))
@@ -38,9 +38,9 @@ function vector_field_fixture(arch; right_handed::Bool=true)
     coords = CartesianCoordinates("x", "y", "z"; right_handed=right_handed)
     dist = Distributor(coords; mesh=(1, 1, 1), architecture=arch, dtype=Float64)
     bases = (
-        RealFourier(coords["x"]; size=2, bounds=(0.0, 2π)),
-        RealFourier(coords["y"]; size=2, bounds=(0.0, 2π)),
-        RealFourier(coords["z"]; size=2, bounds=(0.0, 2π))
+        RealFourier(coords["x"]; size=2, bounds=(0.0, 2π), dealias=1.0),
+        RealFourier(coords["y"]; size=2, bounds=(0.0, 2π), dealias=1.0),
+        RealFourier(coords["z"]; size=2, bounds=(0.0, 2π), dealias=1.0)
     )
     a = VectorField(dist, coords, "a", bases, Float64)
     b = VectorField(dist, coords, "b", bases, Float64)
@@ -233,6 +233,17 @@ end
     run_vector_tests(CPU())
 end
 
+@testset "Small Fourier products respect the requested padding" begin
+    for n in (2, 3, 4, 16), dtype in (Float64, ComplexF64)
+        dom = PeriodicDomain(n; dtype)
+        f = ScalarField(dom, "f")
+        k = n == 16 ? 7 : n ÷ 2
+        x = vec(local_grid(only(dom.bases), dom.dist, 1.0))
+        grid_data!(f) .= cos.(k .* x)
+        @test maximum(abs, grid_data!(f * f) .- 0.5) < 1e-12
+    end
+end
+
 @testset "scaled and mixed-precision ScalarField arithmetic" begin
     coords = CartesianCoordinates("x")
     dist = Distributor(coords; mesh=(1,), dtype=Float64, architecture=CPU())
@@ -331,7 +342,7 @@ end
 
     coords = CartesianCoordinates("x")
     dist = Distributor(coords; mesh=(1,), dtype=Float64)
-    basis = RealFourier(coords["x"]; size=8, bounds=(0.0, 2π))
+    basis = RealFourier(coords["x"]; size=8, bounds=(0.0, 2π), dealias=1.0)
 
     a = ScalarField(dist, "a", (basis,), Float64)
     b = ScalarField(dist, "b", (basis,), Float64)
@@ -416,6 +427,26 @@ end
     end
 end
 
+@testset "dealiased real-complex multiplication from coefficient layout" begin
+    N = 65
+    coords = CartesianCoordinates("x")
+    dist = Distributor(coords; mesh=(1,), dtype=Float64)
+    basis = RealFourier(coords["x"]; size=N, bounds=(0.0, 2π))
+    a = ScalarField(dist, "real_operand", (basis,), Float64)
+    b = ScalarField(dist, "complex_operand", (basis,), ComplexF64)
+    values = cos.(2π .* (0:(N - 1)) ./ N)
+    grid_data!(a) .= values
+    grid_data!(b) .= 1 + 2im
+
+    for (left, right) in ((a, b), (b, a))
+        ensure_layout!(a, :c)
+        ensure_layout!(b, :c)
+        @test size(get_coeff_data(a)) == (N ÷ 2 + 1,)
+        @test size(get_coeff_data(b)) == (N,)
+        @test grid_data!(left * right) ≈ (1 + 2im) .* values
+    end
+end
+
 @testset "ScalarField product is correctly dealiased (no aliasing)" begin
     # REGRESSION GUARD: `a*b` used to multiply on the un-padded grid then apply a 2/3
     # OUTPUT cutoff — input modes in (N/3, N/2] aliased BELOW the cutoff and survived.
@@ -436,4 +467,12 @@ end
     @test pc[1] > 1.0                                          # DC present
     # no spurious aliased energy anywhere except DC (the k=28 contamination is gone)
     @test maximum(pc[2:end]) < 1e-8
+
+    # With exactly 3N/2 padded points, the ±N harmonics of this product wrap
+    # onto the retained Nyquist bin. Exercise both padded FFT implementations.
+    for dtype in (Float64, ComplexF64)
+        nyquist = ScalarField(dist, "nyquist", (xb,), dtype)
+        grid_data!(nyquist) .= [iseven(j) ? 1 : -1 for j in 0:(N - 1)]
+        @test grid_data!(nyquist * nyquist) ≈ fill(dtype(0.5), N) atol=1e-12
+    end
 end

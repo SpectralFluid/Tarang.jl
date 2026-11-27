@@ -205,6 +205,15 @@ struct Differentiate{O<:Operand} <: Operator
     coord::Coordinate
     order::Int
 end
+
+function Differentiate(inner::Differentiate, coord::Coordinate, order::Int)
+    # Combine symbolic derivatives before sampling an intermediate field. In
+    # particular, a real even-grid Nyquist mode has a nonzero second derivative
+    # even though its first derivative vanishes at every collocation point.
+    inner.coord == coord && return Differentiate(inner.operand, coord, inner.order + order)
+    return Differentiate{typeof(inner)}(inner, coord, order)
+end
+
 const _Differentiate_constructor = Differentiate
 
 # ============================================================================

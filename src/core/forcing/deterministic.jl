@@ -82,8 +82,8 @@ function DeterministicForcing(
     forcing_function::Function,
     field_size::NTuple{N, Int};
     parameters::AbstractDict{Symbol} = Dict{Symbol, Any}(),
-    dtype::Type{T} = Float64,
-    architecture::AbstractArchitecture = CPU()
+    architecture::AbstractArchitecture = CPU(),
+    dtype::Type{T} = _default_field_dtype(architecture)
 ) where {T<:AbstractFloat, N}
 
     cached_forcing = zeros(architecture, T, field_size...)

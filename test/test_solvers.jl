@@ -148,6 +148,12 @@ using Test
         @test solver.rank < solver.n
         MS.solve!(dest, solver, b)
         @test dest ≈ ComplexF64[2, 0, 0]
+        MS.solve!(dest, solver, b; require_consistent=true)
+        @test A * dest ≈ b
+        b[2] = 1
+        @test_throws ArgumentError MS.solve!(dest, solver, b; require_consistent=true)
+        MS.solve!(dest, solver, b)
+        @test A * dest ≈ ComplexF64[2, 0]
     end
 
     @testset "mass inverse in-place allocations" begin

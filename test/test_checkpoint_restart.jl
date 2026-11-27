@@ -201,6 +201,27 @@ function _decay_solver(stepper; dt=0.02)
     return InitialValueSolver(problem, stepper; dt)
 end
 
+@testset "Failed replacement preserves the last complete checkpoint" begin
+    mktempdir() do dir
+        path = joinpath(dir, "recovery_α")
+        source = _decay_solver(RK222())
+        step!(source)
+        written = save_state(source, path)
+        saved = read(written)
+
+        u = ScalarField(PeriodicDomain(8; dtype=ComplexF64), "u")
+        problem = InitialValueProblem([u])
+        add_equation!(problem, "dt(u) = 0")
+        @test_throws Exception save_state(InitialValueSolver(problem, RK111(); dt=0.1), path)
+        @test readdir(dir) == ["recovery_α.nc"]
+        @test read(written) == saved
+        restored = _decay_solver(RK222())
+        load_state!(restored, written)
+        @test (restored.sim_time, restored.iteration) == (source.sim_time, source.iteration)
+        @test grid_data!(only(restored.state)) == grid_data!(only(source.state))
+    end
+end
+
 @testset "save_state / load_state! restores fields and clock" begin
     dir = mktempdir()
     path = joinpath(dir, "chk")
@@ -221,6 +242,12 @@ end
     @test b.iteration == a.iteration
     @test b.dt ≈ a.dt
     ensure_layout!(b.state[1], :g)
+    @test get_grid_data(b.state[1]) == expected
+
+    ensure_layout!(b.state[1], :c)
+    Tarang.set_grid_data!(b.state[1], Float64[])
+    load_state!(b, path)
+    @test b.state[1].current_layout === :g
     @test get_grid_data(b.state[1]) == expected
 end
 
@@ -454,6 +481,38 @@ end
     add_equation!(problem, "dt(u) = -u")
     wrong = InitialValueSolver(problem, RK222(); dt=0.02)
     @test_throws ErrorException load_state!(wrong, path)
+end
+
+@testset "failed restart leaves fields, clock, and timestepper history intact" begin
+    mktempdir() do dir
+        donor = _decay_solver(RK222())
+        set!(donor.state[1], 12.0)
+        path = save_state(donor, joinpath(dir, "incomplete_for_target"))
+
+        domain = PeriodicDomain(16)
+        u = ScalarField(domain, "u")
+        v = ScalarField(domain, "v")
+        set!(u, 2.0)
+        set!(v, 3.0)
+        problem = InitialValueProblem([u, v])
+        add_equation!(problem, "dt(u) + u = 0")
+        add_equation!(problem, "dt(v) + v = 0")
+        target = InitialValueSolver(problem, RK222(); dt=0.25)
+        step!(target)
+        before = map(target.state) do field
+            ensure_layout!(field, :c)
+            copy(get_coeff_data(field))
+        end
+        history = target.timestepper_state
+        clock = (target.sim_time, target.iteration, target.dt)
+
+        @test_throws ErrorException load_state!(target, path)
+        @test (target.sim_time, target.iteration, target.dt) == clock
+        @test target.timestepper_state === history
+        @test all(field -> field.current_layout === :c, target.state)
+        @test get_coeff_data.(target.state) == before
+        @test get_coeff_data.([u, v]) == before
+    end
 end
 
 # --- Fix round: Finding 3 -- the tau/algebraic-field skip path had zero

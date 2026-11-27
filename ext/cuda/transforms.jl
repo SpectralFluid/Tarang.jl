@@ -299,7 +299,7 @@ function clear_distributed_dct_plan_cache!()
 end
 
 """Finalize and drop every cached distributed DCT plan built on `dist.comm`, in build order."""
-function Tarang._close_backend_plan_caches!(dist::Tarang.Distributor, ::GPU)
+function Tarang._close_backend_plan_caches!(dist::Tarang.Distributor, ::GPU{CuDevice})
     token = _distributed_dct_comm_token(dist.comm)
     lock(DISTRIBUTED_DCT_PLAN_LOCK) do
         _finalize_distributed_dct_plans!(_distributed_dct_teardown_order(
@@ -397,13 +397,13 @@ TransposableField early return (every multi-rank GPU field has transposable
 storage, and that path cannot hold a RealFourier half spectrum). Returns `false`
 for every other field, which then continues down the generic path.
 """
-function Tarang._distributed_gpu_transform!(arch::GPU, field::ScalarField, direction::Symbol)
+function Tarang._distributed_gpu_transform!(arch::GPU{CuDevice}, field::ScalarField, direction::Symbol)
     Tarang._uses_distributed_gpu_dct(arch, field.dist.size, field.bases) || return false
     ensure_device!(arch)
     if direction === :forward
-        distributed_gpu_forward_transform!(field)
+        Tarang._with_gpu_workspace(distributed_gpu_forward_transform!, field.dist, field)
     elseif direction === :backward
-        distributed_gpu_backward_transform!(field)
+        Tarang._with_gpu_workspace(distributed_gpu_backward_transform!, field.dist, field)
     else
         throw(ArgumentError("direction must be :forward or :backward, got $(repr(direction))"))
     end
@@ -430,9 +430,9 @@ Supports:
   Eligible distributed 3D fields use the multi-GPU DCT-I path above.
 """
 # Backend entry points — the more-specific `::GPU` methods Tarang dispatches to.
-Tarang._gpu_forward_transform_backend!(::GPU, field::ScalarField) =
+Tarang._gpu_forward_transform_backend!(::GPU{CuDevice}, field::ScalarField) =
     _gpu_forward_transform_impl!(field)
-Tarang._gpu_backward_transform_backend!(::GPU, field) =
+Tarang._gpu_backward_transform_backend!(::GPU{CuDevice}, field) =
     _gpu_backward_transform_impl!(field)
 
 # Shorthand for a refusal that carries its reason to the user.
@@ -688,44 +688,6 @@ function _gpu_backward_c2c_fft!(field::ScalarField, gpu_arch::GPU, data_c::CuArr
 end
 
 """
-    _gpu_backward_staged!(field, gpu_arch, data_c, grid_shape) -> true
-
-Inverse through the staged (axis-by-axis) mixed driver onto `grid_shape`. The plan
-is built for that grid, so its coefficient layout is the one a forward transform
-there would produce. A stored spectrum that does not fit it on some Fourier axis —
-base coefficients after a scale change — is first resampled into that layout by
-the shared rules (`Tarang.backward_resample_rules`), which classify exactly as the
-CPU chain does stage by stage; the half-spectrum Nyquist fold of a downsample
-waits for the driver's rfft stage. Chebyshev axes keep the basis coefficient count
-and the driver pads or truncates them to the grid.
-"""
-function _gpu_backward_staged!(field::ScalarField, gpu_arch, data_c::CuArray,
-                               grid_shape::Tuple)
-    grid_T = field.dtype   # the plan is keyed on the GRID element type
-    plan = get_gpu_mixed_transform_plan(gpu_arch, field.bases, grid_shape, grid_T)
-    coeffs = data_c
-    nyquist = (0, 0)
-    if size(data_c) != plan.coeff_shape
-        rules, _, nyquist = Tarang.backward_resample_rules(field.bases, size(data_c),
-                                                           grid_shape, grid_T)
-        # Cached scratch, not a per-call allocation: every backward of a field
-        # whose coefficients predate a scale change lands here.
-        coeffs = get_gpu_dct_scratch(Tarang.architecture(data_c), plan.coeff_shape,
-                                     eltype(data_c), 1; purpose=:scaled_backward)[1]
-        Tarang._resample_fourier_spectrum!(coeffs, data_c, rules)
-    end
-    existing_grid = get_grid_data(field)
-    if !(existing_grid isa CuArray) || eltype(existing_grid) != grid_T ||
-       size(existing_grid) != grid_shape
-        set_grid_data!(field, CUDA.zeros(grid_T, grid_shape...))
-    end
-    gpu_mixed_backward_transform!(get_grid_data(field), coeffs, plan;
-                                  input_disposable=coeffs !== data_c,
-                                  nyquist_fold=nyquist)
-    return true
-end
-
-"""
     _gpu_backward_transform_impl!(field::ScalarField)
 
 GPU-specific backward transform using CUFFT (extension-local implementation).
@@ -933,13 +895,7 @@ function plan_gpu_fft(arch::GPU{CuDevice}, local_size::Tuple, T::Type; real_inpu
         # Plan is created based on local array dimensions
         dummy_in = CUDA.zeros(T, local_size...)
         plan = CUFFT.plan_rfft(dummy_in)
-
-        # Complex-to-real inverse FFT (like irfft)
-        out_size = (div(local_size[1], 2) + 1, local_size[2:end]...)
-        dummy_out = CUDA.zeros(complex_T, out_size...)
-        iplan = CUFFT.plan_irfft(dummy_out, local_size[1])
-
-        return GPUFFTPlan(plan, iplan, local_size, true)
+        return GPUFFTPlan(plan, inv(plan), local_size, true)
     else
         # Complex-to-complex FFT
         dummy = CUDA.zeros(complex_T, local_size...)
@@ -970,28 +926,10 @@ end
 
 Execute backward (inverse) FFT on GPU.
 
-!!! warning "Scratch-cache single-task contract"
-    The C2R branch borrows a scratch buffer from `get_gpu_dct_scratch`, which
-    caches buffers per (device, shape, eltype, count) and hands the SAME buffers
-    to every caller with matching keys. Concurrent same-shape transforms from
-    multiple Julia tasks would collide on that shared scratch; serial use (one
-    transform at a time per device) is the supported pattern.
+The cuFFT plan preserves the input coefficients during a real inverse.
 """
 function gpu_backward_fft!(output::CuArray, input::CuArray, plan::GPUFFTPlan)
-    if plan.is_real
-        # cuFFT C2R (irfft) OVERWRITES its input buffer (same as FFTW irfft). Here `input`
-        # is the field's coefficient buffer, so transforming from it directly corrupts the
-        # caller's coefficients. Copy into a cached scratch first and transform from that —
-        # mirrors the CPU path (fourier.jl), which copies into a cached scratch for
-        # exactly this reason. (C2C inverse, below, is non-destructive — no copy needed.)
-        arch = Tarang.architecture(input)
-        scratch = get_gpu_dct_scratch(arch, size(input), eltype(input), 1)[1]
-        copyto!(scratch, input)
-        mul!(output, plan.iplan, scratch)
-    else
-        mul!(output, plan.iplan, input)
-    end
-    return output
+    return mul!(output, plan.iplan, input)
 end
 
 # ============================================================================
@@ -1023,10 +961,9 @@ function get_gpu_fft_plan(arch::GPU{CuDevice}, local_size::Tuple, T::Type; real_
     key = (device_id, local_size, T, real_input)
 
     lock(GPU_TRANSFORM_CACHE.lock) do
-        if !haskey(GPU_TRANSFORM_CACHE.plans, key)
-            GPU_TRANSFORM_CACHE.plans[key] = plan_gpu_fft(arch, local_size, T; real_input=real_input)
+        return get!(_transform_cache(GPU_TRANSFORM_CACHE.plans), key) do
+            plan_gpu_fft(arch, local_size, T; real_input)
         end
-        return GPU_TRANSFORM_CACHE.plans[key]
     end
 end
 
@@ -1037,10 +974,11 @@ get_gpu_fft_plan(arch::GPU, local_size::Tuple, T::Type; real_input::Bool=false) 
 """
     clear_gpu_transform_cache!()
 
-Clear all cached GPU transform plans (thread-safe).
+Clear cached CUDA FFT plans and the calling task's asynchronous real inverses.
 """
 function clear_gpu_transform_cache!()
     lock(GPU_TRANSFORM_CACHE.lock) do
-        empty!(GPU_TRANSFORM_CACHE.plans)
+        empty!(Tarang._gpu_workspace_cache(_ASYNC_REAL_INVERSES))
+        empty!(_transform_cache(GPU_TRANSFORM_CACHE.plans))
     end
 end

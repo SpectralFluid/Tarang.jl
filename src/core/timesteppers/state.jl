@@ -224,7 +224,7 @@ Callers must decide whether their scheme supports a singular mass matrix.
 function _get_mass_factor!(state::TimestepperState, M_matrix::AbstractMatrix)
     cache = state.timestepper_data
     if !haskey(cache, :M_factor) || get(cache, :M_factor_source, nothing) !== M_matrix
-        if _is_singular_mass(M_matrix)
+        if !isempty(_global_zero_mass_rows!(state, M_matrix))
             cache[:M_factor] = nothing
         else
             cache[:M_factor] = _factorize_timestep_matrix(M_matrix)
@@ -236,24 +236,23 @@ function _get_mass_factor!(state::TimestepperState, M_matrix::AbstractMatrix)
     return cache[:M_factor]
 end
 
-"""
-Quick singularity check for mass matrices.  M is singular when any row
-is entirely zero (non-evolution equation with no ∂t term).
-"""
-function _is_singular_mass(M::AbstractMatrix)
-    n = size(M, 1)
-    m = size(M, 2)
-    for i in 1:n
-        row_max = zero(real(eltype(M)))
-        for j in 1:m
-            row_max = max(row_max, abs(M[i, j]))
-            row_max > 1e-14 && break  # early exit: row is non-zero
-        end
-        if row_max <= 1e-14
-            return true
-        end
+_zero_mass_rows(M::AbstractMatrix) = findall(row -> all(iszero, row), eachrow(M))
+
+function _zero_mass_rows(M::SparseMatrixCSC)
+    has_mass = falses(size(M, 1))
+    for (row, value) in zip(rowvals(M), nonzeros(M))
+        iszero(value) || (has_mass[row] = true)
     end
-    return false
+    return findall(!, has_mass)
+end
+
+function _global_zero_mass_rows!(state::TimestepperState, M_matrix::AbstractMatrix)
+    cached = get(state.timestepper_data, :global_zero_mass_rows, nothing)
+    if cached === nothing || cached[1] !== M_matrix
+        cached = (M_matrix, _zero_mass_rows(M_matrix))
+        state.timestepper_data[:global_zero_mass_rows] = cached
+    end
+    return cached[2]::Vector{Int}
 end
 
 # Keep ETD's DAE rejection outside its numerical fallback paths.
@@ -471,6 +470,51 @@ function _update_registered_forcings!(solver::InitialValueSolver, sim_time::Floa
             "only $(length(solver.state)) state fields.",
         ))
         _generate_one_forcing!(forcing, sim_time, dt, solver.state[var_idx])
+    end
+end
+
+# Keep the last accepted draw available until the step succeeds. These buffers
+# follow the forcing's backend and are reused at every timestep.
+_forcing_step_arrays(f::StochasticForcing) = (f.cached_forcing, f.random_phases)
+_forcing_step_arrays(f::SeparableStochasticForcing) =
+    (f.cached_forcing, f.random_phases, f.fourier_realization)
+
+mutable struct ForcingStepSnapshot{R,A,T}
+    rng::R
+    arrays::A
+    dt::T
+    last_update_time::Float64
+end
+
+function _save_forcing_step!(state, problem)
+    snapshots = nothing
+    for forcing in values(problem.stochastic_forcings)
+        forcing isa Union{StochasticForcing,SeparableStochasticForcing} || continue
+        if snapshots === nothing
+            snapshots = get!(IdDict, state.timestepper_data, :forcing_step_snapshots)
+        end
+        buffers = _forcing_step_arrays(forcing)
+        snapshot = get!(snapshots, forcing) do
+            ForcingStepSnapshot(copy(forcing.rng), map(similar, buffers),
+                                forcing.dt, forcing.last_update_time)
+        end
+        copy!(snapshot.rng, forcing.rng)
+        foreach(copyto!, snapshot.arrays, buffers)
+        snapshot.dt = forcing.dt
+        snapshot.last_update_time = forcing.last_update_time
+    end
+    return snapshots
+end
+
+function _restore_forcing_step!(snapshots, problem)
+    snapshots === nothing && return
+    for forcing in values(problem.stochastic_forcings)
+        snapshot = get(snapshots, forcing, nothing)
+        snapshot === nothing && continue
+        copy!(forcing.rng, snapshot.rng)
+        foreach(copyto!, _forcing_step_arrays(forcing), snapshot.arrays)
+        forcing.dt = snapshot.dt
+        forcing.last_update_time = snapshot.last_update_time
     end
 end
 
@@ -865,6 +909,21 @@ function update_timestep_history!(state::TimestepperState, dt::Float64)
             history[i] = history[i + 1]
         end
         history[end] = dt
+    end
+    return nothing
+end
+
+function _restore_timestep_history!(state::TimestepperState, previous_dt::Float64,
+                                    previous_length::Int, oldest_dt::Float64)
+    state.dt = previous_dt
+    history = state.dt_history
+    if length(history) > previous_length
+        resize!(history, previous_length)
+    elseif previous_length > 0
+        @inbounds for i in previous_length:-1:2
+            history[i] = history[i - 1]
+        end
+        history[1] = oldest_dt
     end
     return nothing
 end

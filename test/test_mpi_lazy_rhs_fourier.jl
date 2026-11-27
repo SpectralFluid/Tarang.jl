@@ -61,6 +61,18 @@ _local_grid_data(field) = get_grid_data(field) isa PencilArrays.PencilArray ?
     expected = @. -5 * cos(3 * x - 5 * y')
     local_error = maximum(abs.(_local_grid_data(rhs) .- expected))
     @test MPI.Allreduce(local_error, MPI.MAX, comm) < 1e-10
+
+    nyquist = cos.(x) .* cos.((N ÷ 2) .* y')
+    parent(grid_data!(q)) .= nyquist
+    rhs = only(Tarang.evaluate_rhs(solver, solver.state, 0.0))
+    @test MPI.Allreduce(maximum(abs, parent(grid_data!(rhs))), MPI.MAX, comm) < 1e-10
+    step!(solver)
+    err = maximum(abs, parent(grid_data!(q)) .- nyquist)
+    @test MPI.Allreduce(err, MPI.MAX, comm) < 1e-12
+
+    dyy = evaluate(d(d(q, coords["y"]), coords["y"]), :g)
+    err = maximum(abs, parent(grid_data!(dyy)) .+ (N ÷ 2)^2 .* nyquist)
+    @test MPI.Allreduce(err, MPI.MAX, comm) < 1e-10
 end
 
 rank == 0 && println("MPI lazy RHS Fourier tests completed")

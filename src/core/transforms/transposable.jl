@@ -80,7 +80,7 @@ function setup_distributed_transforms!(dist::Distributor, domain::Domain)
     if dist.distributed_gpu_config === nothing
         gshape = global_shape(domain)
         config = DistributedGPUConfig(dist.comm, gshape;
-                                       cuda_aware_mpi=check_cuda_aware_mpi())
+                                       cuda_aware_mpi=_device_aware_mpi(dist.architecture))
         dist.distributed_gpu_config = config
     end
 

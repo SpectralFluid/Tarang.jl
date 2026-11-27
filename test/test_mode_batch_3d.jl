@@ -55,14 +55,14 @@ function _check_3d_mode_batch_parity(; device=CPU())
         foreach(f -> ensure_layout!(f, :c), fields)
         sps = bat.problem.compiled.subproblems
         for (batch, ws) in zip(plan.batches, plan.workspaces)
-            device isa CPU || @test Tarang.is_gpu_array(ws.X0)
-            Tarang._batched_gather_state!(ws.X0, ws, batch, fields)
-            packed = Array(ws.X0)
+            device isa CPU || @test Tarang.is_gpu_array(ws.Xg)
+            Tarang._batched_gather_state!(ws.Xg, ws, batch, fields)
+            packed = Array(ws.Xg)
             for (m, index) in enumerate(batch.sp_indices)
                 @test packed[:, m] ≈ Array(Tarang.gather_inputs(sps[index], fields))
             end
             before = [copy(Array(get_coeff_data(f))) for f in fields]
-            Tarang._batched_scatter_state!(ws, batch, fields, ws.X0)
+            Tarang._batched_scatter_state!(ws, batch, fields, ws.Xg)
             for (field, original) in zip(fields, before)
                 @test Array(get_coeff_data(field)) ≈ original
             end

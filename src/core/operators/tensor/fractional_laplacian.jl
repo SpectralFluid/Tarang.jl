@@ -67,13 +67,14 @@ function evaluate_scalar_fractional_laplacian(operand::ScalarField, alpha::Float
     k_squared_total = compute_wavenumber_squared_grid(work)
 
     # Compute |k|^(2*alpha) factor
+    alpha_native = eltype(k_squared_total)(alpha)
     if alpha >= 0
-        k_factor = k_squared_total .^ alpha
+        k_factor = k_squared_total .^ alpha_native
     else
         # For inverse operations, set k=0 mode to zero
         k_factor = similar(k_squared_total)
-        threshold = 1e-14
-        k_factor .= ifelse.(k_squared_total .> threshold, k_squared_total .^ alpha, zero(eltype(k_squared_total)))
+        threshold = eltype(k_squared_total)(1e-14)
+        k_factor .= ifelse.(k_squared_total .> threshold, k_squared_total .^ alpha_native, zero(eltype(k_squared_total)))
     end
 
     # Apply the fractional Laplacian in spectral space
@@ -118,14 +119,15 @@ the squared wavenumber magnitude at each spectral coefficient location.
 function compute_wavenumber_squared_grid(field::ScalarField)
     bases = field.bases
     cd = get_coeff_data(field)
-    isempty(bases) && return similar_zeros(cd, Float64, size(cd)...)
+    T = real(eltype(cd))
+    isempty(bases) && return similar_zeros(cd, T, size(cd)...)
     bundle = _field_transform_bundle(field)
 
     # MPI-distributed (PencilArray): build |k|² on each rank's LOCAL coefficients
     # using its GLOBAL wavenumber indices (axes_local), in rfft/fft layout. The
     # serial path below uses the global wavenumber arrays directly.
     if isa(cd, PencilArrays.PencilArray)
-        k_squared = similar_zeros(cd, Float64, size(cd)...)
+        k_squared = similar_zeros(cd, T, size(cd)...)
         kp = parent(k_squared)
         pencil = PencilArrays.pencil(cd)
         local_axes = pencil.axes_local
@@ -141,7 +143,7 @@ function compute_wavenumber_squared_grid(field::ScalarField)
                 continue
             end
             local_range = axis <= length(local_axes) ? local_axes[axis] : (1:length(k_axis))
-            k_local = Float64.(k_axis[local_range])
+            k_local = T.(k_axis[local_range])
             physical_axis = findfirst(==(axis), perm_tuple)
             physical_axis === nothing && (physical_axis = axis)
             shp = ntuple(i -> i == physical_axis ? length(k_local) : 1, ndims(kp))
@@ -153,7 +155,7 @@ function compute_wavenumber_squared_grid(field::ScalarField)
     data_shape = size(cd)
 
     # Initialize with zeros on the same device as get_coeff_data(field)
-    k_squared = similar_zeros(cd, Float64, data_shape...)
+    k_squared = similar_zeros(cd, T, data_shape...)
 
     # Add contribution from each basis
     for (axis, basis) in enumerate(bases)
@@ -186,14 +188,14 @@ end
 Add k^2 contribution from one axis to the total wavenumber grid.
 Works with both CPU and GPU arrays.
 """
-function add_wavenumber_squared_contribution!(k_squared::AbstractArray, k_axis_cpu::Vector{Float64}, axis::Int, ndims::Int)
+function add_wavenumber_squared_contribution!(k_squared::AbstractArray, k_axis_cpu::AbstractVector{<:Real}, axis::Int, ndims::Int)
     # Create shape for broadcasting
     shape = ones(Int, ndims)
     shape[axis] = length(k_axis_cpu)
 
     # Move k_axis to the same device as k_squared if needed
     if is_gpu_array(k_squared)
-        k_axis = copy_to_device(k_axis_cpu, k_squared)
+        k_axis = copy_to_device(convert(AbstractVector{eltype(k_squared)}, k_axis_cpu), k_squared)
     else
         k_axis = k_axis_cpu
     end

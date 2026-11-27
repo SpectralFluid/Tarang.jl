@@ -130,6 +130,7 @@ mutable struct ScalarField{T, S<:AbstractFieldStorage} <: Operand
 
     function ScalarField(dist::Distributor, name::String="field", bases::Tuple{Vararg{Basis}}=(),
                          dtype::Type{T}=dist.dtype) where T
+        _validate_gpu_field_dtype(dist.architecture, T)
         domain = length(bases) > 0 ? get_or_build_domain(dist, bases) : nothing
         bases = domain === nothing ? bases : domain.bases
         layout = length(bases) > 0 ? get_layout(dist, bases, dtype) : nothing

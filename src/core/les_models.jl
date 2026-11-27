@@ -283,8 +283,8 @@ function SmagorinskyModel(;
     C_s::Real = 0.17,
     filter_width::NTuple{N, Real},
     field_size::NTuple{N, Int},
-    dtype::Type{T} = Float64,
-    architecture::Arch = CPU()
+    architecture::Arch = CPU(),
+    dtype::Type{T} = _default_field_dtype(architecture)
 ) where {T<:AbstractFloat, N, Arch<:AbstractArchitecture}
 
     _validate_model_params(:C_s, C_s, filter_width, field_size)
@@ -509,8 +509,8 @@ function AMDModel(;
     filter_width::NTuple{N, Real},
     field_size::NTuple{N, Int},
     clip_negative::Bool = true,
-    dtype::Type{T} = Float64,
-    architecture::Arch = CPU()
+    architecture::Arch = CPU(),
+    dtype::Type{T} = _default_field_dtype(architecture)
 ) where {T<:AbstractFloat, N, Arch<:AbstractArchitecture}
 
     _validate_model_params(:C, C, filter_width, field_size)

@@ -37,6 +37,8 @@ if NP == 1
         @test Lhat !== nothing
         kx = wavenumbers_rfft(xb)
         expected = ComplexF64[im * kx[I[1]] for I in CartesianIndices(size(cd))]
+        # On a real even grid the two Nyquist images have cancelling odd derivatives.
+        expected[N ÷ 2 + 1, :] .= 0
         @test maximum(abs.(ComplexF64.(Lhat) .- expected)) < 1e-10
 
         # ∂y(q): second axis is full-FFT layout. Multiplier i*k_y on axis 2.
@@ -44,6 +46,7 @@ if NP == 1
         @test Lhat_y !== nothing
         ky = wavenumbers_fft(yb)
         expected_y = ComplexF64[im * ky[I[2]] for I in CartesianIndices(size(cd))]
+        expected_y[:, N ÷ 2 + 1] .= 0
         @test maximum(abs.(ComplexF64.(Lhat_y) .- expected_y)) < 1e-10
     end
 
@@ -69,6 +72,64 @@ if NP == 1
         @test _diagonal_Lhat_from_expr(d(p, coords["x"]), q) === nothing
     end
 else
+    @testset "A singular zero mode rejects the Fourier step on all ranks" begin
+        for (ts, h, first_h) in ((RK111(), 1.0, 0.06), (RK443(), 2.0, 0.06),
+                                 (SBDF2(), 1.0, 0.0), (SBDF2(), 1.5, 1.5))
+            function zero_mode_growth(name)
+                _, _, _, _, domain, _, _ = _mk_field(np=NP)
+                u = ScalarField(domain, name)
+                fill!(parent(grid_data!(u)), 1)
+                p = InitialValueProblem([u])
+                add_equation!(p, "dt($name) + lap($name) - $name = 0")
+                return InitialValueSolver(p, ts; dt=0.06), u
+            end
+            solver, u = zero_mode_growth("u")
+            control, v = zero_mode_growth("v")
+            if first_h > 0
+                step!(solver, first_h)
+                step!(control, first_h)
+            end
+            before = copy(parent(grid_data!(u)))
+            @test_throws Exception step!(solver, h)
+            @test (solver.iteration, solver.sim_time, solver.dt) ==
+                  (control.iteration, control.sim_time, control.dt)
+            @test parent(grid_data!(u)) ≈ before atol=1e-12
+            step!(solver, 0.025)
+            step!(control, 0.025)
+            @test parent(grid_data!(u)) ≈ parent(grid_data!(v)) atol=1e-12
+        end
+    end
+
+    @testset "MPI vector diffusion and complex phase" begin
+        coords, dist, _, _, domain, _, N = _mk_field(np=NP)
+        u = VectorField(domain, "u")
+        gd = grid_data!(first(u.components))
+        ax = Tarang.PencilArrays.pencil(gd).axes_local
+        xs = (2π/N) .* (ax[1] .- 1)
+        ys = (2π/N) .* (ax[2] .- 1)
+        initial = ([cos(2x) for x in xs, y in ys], [sin(y) for x in xs, y in ys])
+        for (component, values) in zip(u.components, initial)
+            parent(grid_data!(component)) .= values
+        end
+        problem = InitialValueProblem([u])
+        add_equation!(problem, "dt(u) - 0.5*lap(u) = 0")
+        solver = InitialValueSolver(problem, RK111(); dt=0.1)
+        step!(solver)
+        for (component, values, rate) in zip(u.components, initial, (2.0, 0.5))
+            @test parent(grid_data!(component)) ≈ values ./ (1 + 0.1rate) atol=1e-12
+        end
+
+        cdist = Distributor(coords; mesh=(NP,), dtype=ComplexF64)
+        bases = map(c -> ComplexFourier(coords[c]; size=N, bounds=(0.0, 2π)), ("x", "y"))
+        q = ScalarField(Domain(cdist, bases), "q")
+        fill!(parent(grid_data!(q)), 1)
+        oscillator = InitialValueProblem([q])
+        add_parameters!(oscillator; omega=1im)
+        add_equation!(oscillator, "dt(q) + omega*q = 0")
+        step!(InitialValueSolver(oscillator, RK111(); dt=0.1))
+        @test maximum(abs, parent(grid_data!(q)) .- inv(1 + 0.1im)) < 1e-12
+    end
+
     @testset "MPI: implicit advection no longer freezes the field (rank=$RANK)" begin
         coords, dist, xb, yb, domain, q, N = _mk_field(np=NP)
         problem = InitialValueProblem([q])

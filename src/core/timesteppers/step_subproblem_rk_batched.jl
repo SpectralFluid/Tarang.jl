@@ -92,8 +92,8 @@ stale reference — the same contract the per-mode slot containers in
 mutable struct BatchWorkspace
     n_var::Int
     n_eq::Int
-    X0::AbstractMatrix{ComplexF64}      # compressed state at t_n
-    MX0::AbstractMatrix{ComplexF64}     # M_min * X0
+    X0_raw::AbstractMatrix{ComplexF64}  # original coefficients, including filtered columns
+    MX0::AbstractMatrix{ComplexF64}     # M_min * compressed state at t_n
     RHS::AbstractMatrix{ComplexF64}     # stage RHS
     X::AbstractMatrix{ComplexF64}       # stage solution
     Xg::AbstractMatrix{ComplexF64}      # state RE-GATHERED after the scatter
@@ -283,7 +283,7 @@ function _batch_workspace(batch::ModeBatch, sps, state_fields)
     stages_placeholder = AbstractMatrix{ComplexF64}[]
 
     return BatchWorkspace(n, n,
-                          mat(n), mat(n), mat(n), mat(n), mat(n), mat(n),
+                          mat(n_raw_var), mat(n), mat(n), mat(n), mat(n), mat(n),
                           stages_placeholder, AbstractMatrix{ComplexF64}[],
                           mat(n_raw_var), mat(n_raw_eq),
                           Matrix{ComplexF64}(undef, n, nmodes),
@@ -313,7 +313,7 @@ function _mode_batch_rk_workspace_bytes(sp, nmodes, fields, stages)
     n = size(sp.LHS, 1)
     raw_var = sum(subproblem_field_size(sp, f) for f in fields)
     raw_eq = _subproblem_raw_eqn_size(sp)
-    bytes = ((7 + 2 * stages) * n + raw_var + raw_eq) * nmodes * sizeof(ComplexF64)
+    bytes = ((6 + 2 * stages) * n + 2 * raw_var + raw_eq) * nmodes * sizeof(ComplexF64)
     bytes += n * sizeof(ComplexF64)  # host algebraic column
     # State starts, equation starts (one per raw equation row is a safe upper
     # bound), device pivots/status, and per-mode success flags. CPU dense LU
@@ -359,7 +359,7 @@ function _build_batched_rk_plan(solver, subproblems, state_fields;
         (setting === nothing ? is_gpu : setting) || return nothing
         _mode_batch_supported_layout(sp1) || return nothing
 
-        like = zeros(sp1.dist.architecture, ComplexF64, 0)
+        like = zeros(sp1.dist.architecture, _subproblem_eltype(sp1.dist.architecture), 0)
         build_mode_batches!(solver.base, subproblems; is_gpu=is_gpu,
                             nprocs=nprocs, like=like,
                             workspace_bytes=(sp, nm) -> _mode_batch_rk_workspace_bytes(
@@ -465,11 +465,10 @@ end
 """Gather every state field's strided run into `raw`, then compress into `dest`."""
 function _batched_gather_state!(dest::AbstractMatrix{ComplexF64},
                                 ws::BatchWorkspace, batch::ModeBatch,
-                                state_fields)
+                                state_fields, raw=ws.raw_var)
     length(state_fields) == length(ws.state_plan) || error(
         "step_subproblem_rk_batched!: the state-field list changed length " *
         "under a live gather plan.")
-    raw = ws.raw_var
     fill!(raw, zero(ComplexF64))
     @inbounds for k in eachindex(state_fields)
         p = ws.state_plan[k]
@@ -482,11 +481,14 @@ end
 """Expand `X` into raw variable space and scatter it back into the fields."""
 function _batched_scatter_state!(ws::BatchWorkspace, batch::ModeBatch,
                                  state_fields, X::AbstractMatrix{ComplexF64})
+    _batch_apply!(ws.raw_var, batch.expand_var, X)
+    return _batched_scatter_raw!(ws, state_fields, ws.raw_var)
+end
+
+function _batched_scatter_raw!(ws::BatchWorkspace, state_fields, raw)
     length(state_fields) == length(ws.state_plan) || error(
         "step_subproblem_rk_batched!: the state-field list changed length " *
         "under a live scatter plan.")
-    raw = ws.raw_var
-    _batch_apply!(raw, batch.expand_var, X)
     @inbounds for k in eachindex(state_fields)
         p = ws.state_plan[k]
         cd = _plan_coeff_data(state_fields[k], p)
@@ -780,7 +782,7 @@ function _leftover_prestage!(sp, sp_idx, MX0, RHS, ALG_F, state_fields,
     n_var = size(sp.M_min, 2)
     mx0 = _sp_stage_vector!(sp, :mx0, n_eq)
     rhs = _sp_stage_vector!(sp, :rhs, n_var)
-    x0_pre = gather_inputs!(rhs, sp, state_fields)
+    x0_pre = _gather_rk_start!(rhs, sp, state_fields)
     _apply_subproblem_operator!(mx0, _subproblem_operator(sp, :M, x0_pre), x0_pre)
     MX0[sp_idx] = mx0
     RHS[sp_idx] = rhs
@@ -821,12 +823,7 @@ function _leftover_stage_solve!(sp, sp_idx, i::Int, dt::Float64, A_exp, A_imp,
         end
     else
         lhs_solver = _get_or_build_lhs!(sp, i, dt, a_ii)
-        if lhs_solver !== nothing
-            _solve_cached_system!(x_sol, lhs_solver, rhs)
-        else
-            @warn "step_subproblem_rk_batched!: LHS factorization failed for sp group=$(sp.group), stage=$i; using rhs as fallback" maxlog=1
-            _assign_to_buffer!(x_sol, rhs)
-        end
+        _solve_implicit_stage!(x_sol, lhs_solver, rhs)
     end
 
     scatter_inputs(sp, x_sol, state_fields)
@@ -933,9 +930,9 @@ function step_subproblem_rk_batched!(solver::InitialValueSolver,
     for k in eachindex(batches)
         batch = batches[k]
         ws = workspaces[k]
-        _batched_gather_state!(ws.X0, ws, batch, state_fields)
+        _batched_gather_state!(ws.Xg, ws, batch, state_fields, ws.X0_raw)
         batched_spmv!(ws.MX0, batch.M_min_rowptr, batch.M_min_colval,
-                      batch.M_min_nzval, ws.X0)
+                      batch.M_min_nzval, ws.Xg)
         if bc_dynamic || !ws.alg_F_valid || !_batch_alg_F_static(batch, subproblems)
             _batched_gather_alg_F!(ws, batch, subproblems)
         end
@@ -966,36 +963,38 @@ function step_subproblem_rk_batched!(solver::InitialValueSolver,
 
         a_ii = A_imp[i, i]
         if !_is_explicit_first_stage(i, a_ii)
-            for k in eachindex(batches)
-                batch = batches[k]
-                ws = workspaces[k]
+            _rk_stage_transaction!(state_fields, subproblems, solve_stash, dist, plan) do
+                for k in eachindex(batches)
+                    batch = batches[k]
+                    ws = workspaces[k]
 
-                copyto!(ws.RHS, ws.MX0)
-                for j in 1:(i - 1)
-                    if !iszero(A_exp[i, j])
-                        _batch_axpy!(ws.RHS, dt * A_exp[i, j], ws.F[j])
+                    copyto!(ws.RHS, ws.MX0)
+                    for j in 1:(i - 1)
+                        if !iszero(A_exp[i, j])
+                            _batch_axpy!(ws.RHS, dt * A_exp[i, j], ws.F[j])
+                        end
+                        if !iszero(A_imp[i, j])
+                            _batch_axpy!(ws.RHS, -dt * A_imp[i, j], ws.LX[j])
+                        end
                     end
-                    if !iszero(A_imp[i, j])
-                        _batch_axpy!(ws.RHS, -dt * A_imp[i, j], ws.LX[j])
+
+                    if abs(a_ii) > 1e-14
+                        batched_bc_override!(ws.RHS, ws.ALG_F, batch.bc_rows, dt * a_ii)
+                        s = _ensure_batch_factored!(batch, dt, a_ii)
+                        batched_solve!(ws.X, s, ws.RHS)
+                    else
+                        _batch_mass_solve!(ws.X, ws.RHS, batch, subproblems, ws;
+                                           skip_missing=false)
                     end
-                end
 
-                if abs(a_ii) > 1e-14
-                    batched_bc_override!(ws.RHS, ws.ALG_F, batch.bc_rows, dt * a_ii)
-                    s = _ensure_batch_factored!(batch, dt, a_ii)
-                    batched_solve!(ws.X, s, ws.RHS)
-                else
-                    _batch_mass_solve!(ws.X, ws.RHS, batch, subproblems, ws;
-                                       skip_missing=false)
+                    _batched_scatter_state!(ws, batch, state_fields, ws.X)
                 end
-
-                _batched_scatter_state!(ws, batch, state_fields, ws.X)
-            end
-            for sp_idx in leftovers
-                sp = subproblems[sp_idx]
-                sp.M_min === nothing && continue
-                _leftover_stage_solve!(sp, sp_idx, i, dt, A_exp, A_imp, MX0, RHS, F,
-                                       LX, ALG_F, state_fields)
+                for sp_idx in leftovers
+                    sp = subproblems[sp_idx]
+                    sp.M_min === nothing && continue
+                    _leftover_stage_solve!(sp, sp_idx, i, dt, A_exp, A_imp, MX0, RHS, F,
+                                           LX, ALG_F, state_fields)
+                end
             end
         end
 

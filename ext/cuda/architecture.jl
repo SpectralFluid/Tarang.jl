@@ -3,7 +3,7 @@
 # ============================================================================
 
 """
-    Tarang._gpu_device(device_id::Int)
+    Tarang._gpu_device(::Val{:cuda}, device_id::Int)
 
 Select and return the specified CUDA device for Tarang's `GPU` constructor.
 
@@ -19,7 +19,7 @@ arch = GPU()                 # Use default device
 arch = GPU(device_id=1)      # Use second GPU
 ```
 """
-function Tarang._gpu_device(device_id::Int)
+function Tarang._gpu_device(::Val{:cuda}, device_id::Int)
     if !CUDA.functional()
         error("CUDA is not functional. Please check your GPU drivers and CUDA installation.")
     end
@@ -185,9 +185,6 @@ function Tarang.on_architecture(gpu::GPU{CuDevice}, a::Array)
     return CuArray(a)
 end
 
-# Fallback for generic GPU (uses current device)
-Tarang.on_architecture(::GPU, a::Array) = CuArray(a)
-
 """
     on_architecture(gpu::GPU{CuDevice}, a::CuArray)
 
@@ -214,9 +211,6 @@ function Tarang.on_architecture(gpu::GPU{CuDevice}, a::CuArray)
         end
     end
 end
-
-# Fallback for generic GPU
-Tarang.on_architecture(::GPU, a::CuArray) = a
 
 """
     on_architecture(::CPU, a::CuArray)
@@ -259,7 +253,7 @@ Generic host-array fallback (ReshapedArray/SubArray/... of host memory):
 materialize to a dense Array, then upload. Without this, `scatter!`'s
 `reshape(slice, shape)` views hit a MethodError on GPU fields.
 """
-Tarang.on_architecture(gpu::GPU{CuDevice}, a::AbstractArray) = Tarang.on_architecture(gpu, Array(a))
+Tarang.on_architecture(gpu::GPU{CuDevice}, a::AbstractArray) = Tarang.on_architecture(gpu, convert(Array, Tarang.on_architecture(CPU(), a)))
 
 # ============================================================================
 # GPU Utilities
@@ -292,9 +286,6 @@ function Tarang.unsafe_free!(gpu::GPU{CuDevice}, a::CuArray)
     # the context is correct for any cleanup operations
     CUDA.unsafe_free!(a)
 end
-
-# Fallback
-Tarang.unsafe_free!(::GPU, a::CuArray) = CUDA.unsafe_free!(a)
 
 """
     _seed_device_rng!(gpu::GPU{CuDevice}, seed::Integer)

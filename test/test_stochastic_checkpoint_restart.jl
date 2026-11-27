@@ -3,7 +3,8 @@ using Tarang
 using Random
 
 function _stochastic_restart_solver(; architecture=CPU(), separable=false, seed=42,
-                                      rate=0.1, forced=true)
+                                      rate=0.1, forced=true, equation="∂t(q) = 0",
+                                      timestepper=RK222())
     coords = CartesianCoordinates("x", "y")
     dist = Distributor(coords; dtype=Float64, device=architecture)
     xb = RealFourier(coords["x"]; size=8, bounds=(0.0, 2π))
@@ -17,9 +18,31 @@ function _stochastic_restart_solver(; architecture=CPU(), separable=false, seed=
         chebyshev_basis=yb, chebyshev_profile=ones(8), kwargs...) :
         StochasticForcing(; field_size=(8, 8), kwargs...)
     problem = InitialValueProblem([q])
-    add_equation!(problem, "∂t(q) = 0")
+    add_equation!(problem, equation)
     forced && add_stochastic_forcing!(problem, :q, forcing)
-    return InitialValueSolver(problem, RK222(); dt=0.01), forcing
+    return InitialValueSolver(problem, timestepper; dt=0.01), forcing
+end
+
+@testset "Rejected stochastic step preserves the next draw, separable=$separable" for separable in (false, true)
+    # The second step makes the implicit matrix singular after generating a draw.
+    kwargs = (; separable, equation="dt(q) - q = 0", timestepper=separable ? SBDF1() : RK111())
+    control, control_forcing = _stochastic_restart_solver(; kwargs...)
+    retry, forcing = _stochastic_restart_solver(; kwargs...)
+    step!(control, 0.1)
+    step!(retry, 0.1)
+    cached = get_cached_forcing(forcing)
+    saved = copy(cached)
+    next_draw = rand(copy(forcing.rng), UInt64)
+    accepted = (forcing.dt, forcing.last_update_time, retry.iteration, retry.sim_time)
+    @test_throws ArgumentError step!(retry, 1.0)
+    @test (forcing.dt, forcing.last_update_time, retry.iteration, retry.sim_time) == accepted
+    @test cached === get_cached_forcing(forcing)
+    @test cached == saved
+    @test rand(copy(forcing.rng), UInt64) == next_draw
+    step!(control, 0.2)
+    step!(retry, 0.2)
+    @test cached == get_cached_forcing(control_forcing)
+    @test grid_data!(only(retry.state)) ≈ grid_data!(only(control.state)) atol=1e-13
 end
 
 function _test_stochastic_restart(architecture)

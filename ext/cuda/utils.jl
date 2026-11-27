@@ -16,22 +16,18 @@ const FFT_1D_PLAN_CACHE = FFT1DPlanCache()
 function get_fft_1d_plan(size::Tuple, dim::Int, T::Type; inverse::Bool=false, device_id::Int=_current_device_id())
     # Include device ID in cache key for multi-GPU correctness
     key = (device_id, size, dim, T, inverse)
-    lock(FFT_1D_PLAN_CACHE.lock)
-    try
-        if !haskey(FFT_1D_PLAN_CACHE.plans, key)
+    return lock(FFT_1D_PLAN_CACHE.lock) do
+        get!(_transform_cache(FFT_1D_PLAN_CACHE.plans), key) do
             # Ensure plan is created on the correct device
             prev_device = CUDA.device()
             CUDA.device!(CuDevice(device_id))
             try
                 dummy = CUDA.zeros(T, size...)
-                FFT_1D_PLAN_CACHE.plans[key] = inverse ? CUFFT.plan_ifft(dummy, (dim,)) : CUFFT.plan_fft(dummy, (dim,))
+                inverse ? CUFFT.plan_ifft(dummy, (dim,)) : CUFFT.plan_fft(dummy, (dim,))
             finally
                 CUDA.device!(prev_device)
             end
         end
-        return FFT_1D_PLAN_CACHE.plans[key]
-    finally
-        unlock(FFT_1D_PLAN_CACHE.lock)
     end
 end
 
@@ -391,137 +387,6 @@ function apply_dealiasing_gpu!(data::CuArray{T, 1}, cutoff::Float64=2.0/3.0) whe
 end
 
 # ============================================================================
-# GPU-Native Spectral Resampling
-# ============================================================================
-
-"""
-    gpu_resample_grid_data!(new_data::CuArray, old_data::CuArray, old_shape, new_shape)
-
-GPU-native spectral resampling using cuFFT: FFT → pad/truncate → IFFT entirely on GPU.
-Avoids CPU round-trip for scale changes and dealiasing.
-"""
-function Tarang.gpu_resample_grid_data!(new_data::CuArray, old_data::CuArray,
-                                        old_shape::Tuple, new_shape::Tuple)
-    # Pin the current CUDA device to the array's device before any CUFFT plan /
-    # CUDA.zeros below — every sibling GPU entry point does this; without it a
-    # multi-GPU run whose current device != the data's device would allocate and
-    # plan on the wrong device.
-    ensure_device!(Tarang.architecture(new_data))
-    old_size = size(old_data)
-    new_size = size(new_data)
-
-    if old_size == new_size
-        copyto!(new_data, old_data)
-        return true
-    end
-
-    ndims_data = length(old_size)
-    if length(new_size) != ndims_data
-        return false  # Unsupported; core raises instead of staging through CPU.
-    end
-
-    gpu_spectral_resample!(new_data, old_data)
-    return true
-end
-
-"""
-    gpu_spectral_resample!(new_data::CuArray{T}, old_data::CuArray{T})
-
-Perform spectral interpolation on GPU: forward FFT, pad/truncate coefficients,
-inverse FFT. Handles real and complex element types.
-"""
-function gpu_spectral_resample!(new_data::CuArray{T}, old_data::CuArray{T}) where T
-    # Pin the device (also called directly, not only via gpu_resample_grid_data!).
-    ensure_device!(Tarang.architecture(new_data))
-    CT = T <: Real ? Complex{T} : T
-    RT = T <: Real ? T : real(T)
-
-    # Convert to complex for FFT if needed
-    old_complex = T <: Real ? CuArray{CT}(old_data) : old_data
-
-    # Forward FFT on GPU
-    old_fft = CUFFT.fft(old_complex)
-
-    # Create new spectral array and copy appropriate frequency components
-    new_fft = CUDA.zeros(CT, size(new_data)...)
-    spectral_pad_truncate_gpu!(new_fft, old_fft)
-
-    # Scale for energy conservation
-    scale_factor = RT(prod(size(new_data))) / RT(prod(size(old_data)))
-    new_fft .*= scale_factor
-
-    # Inverse FFT on GPU
-    result = CUFFT.ifft(new_fft)
-    if T <: Real
-        new_data .= real.(result)
-    else
-        copyto!(new_data, result)
-    end
-end
-
-"""
-    _resample_axis_pairs(n_old::Int, n_new::Int) -> Vector{Tuple{UnitRange{Int}, UnitRange{Int}}}
-
-Per-axis (src_range, dst_range) copy list for spectral pad/truncate: the non-empty
-slices of the shared rule `Tarang.spectral_resample_ranges`, which the CPU
-`Tarang.resample_1d!` (src/core/field/field_data/scales.jl) follows and the
-backward transform into a scaled grid is built from:
-
-- Upsampling from even n_old: the old Nyquist bin (index n_old÷2+1) is ZEROED
-  (not copied) — copying it one-sidedly would leave a non-Hermitian spectrum and
-  an aliased half-period oscillation on the fine grid.
-- Downsampling to even n_new: the new Nyquist bin (index n_new÷2+1) receives
-  old[+Nyq] PLUS the −Nyq image old[n_old−n_new÷2+1] (conjugate partners for a
-  real field) — without the fold the new Nyquist mode comes out at half amplitude.
-
-Destination ranges may overlap (the fold targets a bin inside the positive-copy
-range), so consumers must ACCUMULATE (`.+=`) into a zeroed destination.
-"""
-function _resample_axis_pairs(n_old::Int, n_new::Int)
-    r = Tarang.spectral_resample_ranges(n_old, n_new)
-    return [pair for pair in ((r.pos_src, r.pos_dst), (r.neg_src, r.neg_dst),
-                              (r.fold_src, r.fold_dst)) if !isempty(pair[1])]
-end
-
-"""
-    spectral_pad_truncate_gpu!(new_fft::CuArray, old_fft::CuArray)
-
-Copy FFT coefficients from old_fft into the ZEROED new_fft, handling the standard
-FFT frequency layout (DC, positive freqs, [Nyquist,] negative freqs) per axis.
-Pads with zeros for upsampling, truncates for downsampling, with the same even-N
-Nyquist conventions as the CPU `Tarang.resample_1d!` (zero the old Nyquist on
-upsample; fold the −Nyq image into the new Nyquist on downsample) — see
-`_resample_axis_pairs`. Accumulates (`.+=`), so `new_fft` MUST be zero on entry
-(the caller `gpu_spectral_resample!` allocates it with `CUDA.zeros`).
-"""
-function spectral_pad_truncate_gpu!(new_fft::CuArray{T,1}, old_fft::CuArray{T,1}) where T
-    for (s1, d1) in _resample_axis_pairs(size(old_fft, 1), size(new_fft, 1))
-        @views new_fft[d1] .+= old_fft[s1]
-    end
-    return new_fft
-end
-
-function spectral_pad_truncate_gpu!(new_fft::CuArray{T,2}, old_fft::CuArray{T,2}) where T
-    pairs1 = _resample_axis_pairs(size(old_fft, 1), size(new_fft, 1))
-    pairs2 = _resample_axis_pairs(size(old_fft, 2), size(new_fft, 2))
-    # Tensor product of the per-axis maps == sequential per-axis resample_1d!.
-    for (s1, d1) in pairs1, (s2, d2) in pairs2
-        @views new_fft[d1, d2] .+= old_fft[s1, s2]
-    end
-    return new_fft
-end
-
-function spectral_pad_truncate_gpu!(new_fft::CuArray{T,3}, old_fft::CuArray{T,3}) where T
-    pairs1 = _resample_axis_pairs(size(old_fft, 1), size(new_fft, 1))
-    pairs2 = _resample_axis_pairs(size(old_fft, 2), size(new_fft, 2))
-    pairs3 = _resample_axis_pairs(size(old_fft, 3), size(new_fft, 3))
-    for (s1, d1) in pairs1, (s2, d2) in pairs2, (s3, d3) in pairs3
-        @views new_fft[d1, d2, d3] .+= old_fft[s1, s2, s3]
-    end
-    return new_fft
-end
-
-# ============================================================================
 # GPU Field Multiplication (Override for nonlinear terms)
 # ============================================================================
 
@@ -733,11 +598,11 @@ Tarang._diff_matmul_cache_token(x::CuArray) =
 Copy array `a` to GPU on the same device as target CuArray.
 Ensures correct device context for multi-GPU support.
 """
-function Tarang.copy_to_device(a::AbstractArray, target::CuArray)
+function Tarang.copy_to_device(a::AbstractArray, target::CUDA.AnyCuArray)
     prev_device = CUDA.device()
     try
-        CUDA.device!(CUDA.device(target))
-        return CuArray(a)
+        result = Tarang.on_architecture(Tarang.architecture(target), a)
+        return result === a ? copy(result) : result
     finally
         CUDA.device!(prev_device)
     end
@@ -798,7 +663,7 @@ function Tarang._plan_padded_inverse(forward::CUFFT.CuFFTPlan, spectrum, n, dims
 end
 
 function Tarang._padded_plan_spectrum(forward::CUFFT.CuFFTPlan, arch, ::Type{T}, shape) where T
-    buffer = forward.buffer
+    buffer = hasproperty(forward, :buffer) ? forward.buffer : nothing
     if buffer !== nothing && size(buffer) == shape && eltype(buffer) === Complex{T}
         return buffer
     end

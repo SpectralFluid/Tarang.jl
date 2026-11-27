@@ -318,9 +318,9 @@ function StochasticForcing(;
     dt::Real = 0.01,
     spectrum_type::Symbol = :ring,
     rng::AbstractRNG = Random.MersenneTwister(),
-    dtype::Type{T} = Float64,
     enforce_hermitian::Bool = true,
-    architecture::AbstractArchitecture = CPU()
+    architecture::AbstractArchitecture = CPU(),
+    dtype::Type{T} = _default_field_dtype(architecture)
 ) where {T<:AbstractFloat, N}
 
     # Normalize aliases before validation so :isotropic/:bandlimited are caught
@@ -470,9 +470,9 @@ function SeparableStochasticForcing(;
     dt::Real=0.01,
     spectrum_type::Symbol=:ring,
     rng::AbstractRNG=Random.MersenneTwister(),
-    dtype::Type{T}=Float64,
     enforce_hermitian::Bool=true,
     architecture::AbstractArchitecture=CPU(),
+    dtype::Type{T}=_default_field_dtype(architecture),
 ) where {T<:AbstractFloat,NF}
     chebyshev_basis isa ChebyshevT || throw(ArgumentError(
         "SeparableStochasticForcing requires a ChebyshevT basis",

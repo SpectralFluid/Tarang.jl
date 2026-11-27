@@ -634,7 +634,8 @@ function solve(s::SPQRSolver{T}, rhs::AbstractMatrix) where T
     return result
 end
 
-function solve!(dest::AbstractVector, s::SPQRSolver{T}, rhs::AbstractVector) where T
+function solve!(dest::AbstractVector, s::SPQRSolver{T}, rhs::AbstractVector;
+                require_consistent::Bool=false) where T
     length(rhs) == s.m ||
         throw(DimensionMismatch("SPQR rhs length $(length(rhs)) does not match matrix rows $(s.m)"))
     length(dest) == s.n ||
@@ -648,6 +649,15 @@ function solve!(dest::AbstractVector, s::SPQRSolver{T}, rhs::AbstractVector) whe
         end
 
         lmul!(s.q_adjoint, q_rhs)
+        if require_consistent && s.rank < s.m
+            # In Q coordinates the trailing entries are exactly the part of the
+            # RHS outside the column space, including for a zero matrix.
+            residual = norm(view(q_rhs, s.rank + 1:s.m))
+            tolerance = 32 * max(s.m, s.n) * eps(real(T)) * norm(rhs)
+            residual <= tolerance || throw(ArgumentError(
+                "Inconsistent implicit timestep system (rank $(s.rank)/$(s.m), " *
+                "residual $residual exceeds $tolerance)"))
+        end
 
         @inbounds for i in 1:s.rank
             rank_rhs[i] = q_rhs[i]

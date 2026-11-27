@@ -49,6 +49,9 @@ Supports mixed basis types (e.g., Chebyshev-Fourier).
 function distributed_forward_transform!(tf::TransposableField{F,T,N};
                                         overlap::Bool=false,
                                         plans=nothing) where {F,T,N}
+    return _with_gpu_workspace(_distributed_forward_transform!, tf.field.dist, tf, overlap, plans)
+end
+function _distributed_forward_transform!(tf::TransposableField{F,T,N}, overlap::Bool, plans) where {F,T,N}
     _require_open(tf, "distributed_forward_transform!")
     _require_distributed_source_layout(tf.field, :g, :forward)
 
@@ -210,6 +213,9 @@ Automatically selects IFFT for Fourier bases and inverse DCT for Chebyshev/Jacob
 function distributed_backward_transform!(tf::TransposableField{F,T,N};
                                          overlap::Bool=false,
                                          plans=nothing) where {F,T,N}
+    return _with_gpu_workspace(_distributed_backward_transform!, tf.field.dist, tf, overlap, plans)
+end
+function _distributed_backward_transform!(tf::TransposableField{F,T,N}, overlap::Bool, plans) where {F,T,N}
     _require_open(tf, "distributed_backward_transform!")
     _require_distributed_source_layout(tf.field, :c, :backward)
 

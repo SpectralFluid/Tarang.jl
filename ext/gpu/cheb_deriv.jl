@@ -1,5 +1,5 @@
 # ============================================================================
-# GPU Chebyshev Derivative via DCT-I using cuFFT (no CPU transfer)
+# GPU Chebyshev derivative via DCT-I using the device FFT
 # ============================================================================
 #
 # DCT-I via rfft (symmetric extension trick):
@@ -8,8 +8,8 @@
 #     z[N+k] = x[N-k]   for k = 1..N-2  (interior mirror)
 #   Then real(rfft(z))[k] == DCT-I(x)[k]  (imaginary parts cancel by symmetry)
 #
-# This replaces FFTW.plan_r2r!(v, FFTW.REDFT00) with cuFFT rfft, enabling
-# the Chebyshev derivative recurrence entirely on GPU.
+# The real FFT computes REDFT00 on either backend. The derivative recurrence
+# and its scratch arrays stay on the selected device.
 #
 # Kernel indexing: every kernel except the derivative recurrence is a pure
 # element map, launched with a 2-D ndrange covering the whole matrix — one
@@ -21,7 +21,7 @@
 # ============================================================================
 
 # Plan cache: keyed by (device, n, batch, T). The device MUST be part of the key —
-# the plan's CuArray work buffers and CUFFT plan are allocated on whatever device is
+# the work buffers and FFT plan are allocated on whichever device is
 # current at build time, so a plan built on device 0 must never be reused on device 1
 # (illegal cross-device access). Guarded by a lock for concurrent first-touch inserts.
 # NOTE: the cached plan's work_* buffers are shared across calls with the same key, so
@@ -41,26 +41,27 @@ const _GPU_CHEB_DERIV_LOCK = ReentrantLock()
 mutable struct GPUChebyshevDerivPlan{T}
     const n::Int                            # points along transform dimension
     const batch::Int                        # product of all other dimensions
-    const work_ext::CuMatrix{T}             # (2*(n-1), batch) extension buffer
-    const work_cx::CuMatrix{Complex{T}}     # (n, batch) rfft output
-    work_real::Union{Nothing, CuMatrix{T}}  # (n, batch) raw DCT-I / recurrence ping
-    work_deriv::Union{Nothing, CuMatrix{T}} # (n, batch) derivative coefficients
-    work_perm::Union{Nothing, CuMatrix{T}}  # (n, batch) permuted / packed staging
-    const rfft_plan::Any                    # CUFFT rfft along dim 1 of work_ext
+    const work_ext::DeviceMatrix{T}             # (2*(n-1), batch) extension buffer
+    const work_cx::DeviceMatrix{Complex{T}}     # (n, batch) rfft output
+    work_real::Union{Nothing, DeviceMatrix{T}}  # (n, batch) raw DCT-I / recurrence ping
+    work_deriv::Union{Nothing, DeviceMatrix{T}} # (n, batch) derivative coefficients
+    work_perm::Union{Nothing, DeviceMatrix{T}}  # (n, batch) permuted / packed staging
+    const rfft_plan::Any                    # real FFT along dim 1 of work_ext
 end
 
 function _get_gpu_cheb_deriv_plan(n::Int, batch::Int, ::Type{T}) where {T<:AbstractFloat}
-    key = (CUDA.device(), n, batch, T)
+    key = (_current_device_id(), n, batch, T)
     return lock(_GPU_CHEB_DERIV_LOCK) do
-        p = get(_GPU_CHEB_DERIV_CACHE, key, nothing)
+        cache = _transform_cache(_GPU_CHEB_DERIV_CACHE)
+        p = get(cache, key, nothing)
         if p === nothing
             M = 2 * (n - 1)
-            work_ext  = CUDA.zeros(T,          M, batch)
-            work_cx   = CUDA.zeros(Complex{T}, n, batch)
-            rfft_plan = CUFFT.plan_rfft(work_ext, (1,))
+            work_ext  = DeviceRuntime.zeros(T,          M, batch)
+            work_cx   = DeviceRuntime.zeros(Complex{T}, n, batch)
+            rfft_plan = DeviceFFT.plan_rfft(work_ext, (1,))
             p = GPUChebyshevDerivPlan{T}(n, batch, work_ext, work_cx,
                                          nothing, nothing, nothing, rfft_plan)
-            _GPU_CHEB_DERIV_CACHE[key] = p
+            cache[key] = p
         end
         p::GPUChebyshevDerivPlan{T}
     end
@@ -68,8 +69,8 @@ end
 
 @inline function _plan_work!(plan::GPUChebyshevDerivPlan{T}, ::Val{slot}) where {T,slot}
     buf = getfield(plan, slot)
-    buf === nothing || return buf::CuMatrix{T}
-    buf = CUDA.zeros(T, plan.n, plan.batch)
+    buf === nothing || return buf::DeviceMatrix{T}
+    buf = DeviceRuntime.zeros(T, plan.n, plan.batch)
     setfield!(plan, slot, buf)
     return buf
 end
@@ -216,7 +217,7 @@ end
 `out_mat === inp_mat` is allowed: the input is fully consumed by the first
 kernel (into `work_ext`) and `out_mat` is only written by the last one.
 """
-function _apply_gpu_cheb_deriv_nth!(inp_mat::CuMatrix{T}, out_mat::CuMatrix{T},
+function _apply_gpu_cheb_deriv_nth!(inp_mat::DeviceMatrix{T}, out_mat::DeviceMatrix{T},
                                      scale::Float64, order::Int,
                                      plan::GPUChebyshevDerivPlan{T}) where {T}
     if order == 0
@@ -303,7 +304,7 @@ PLACE, and un-permute into `dest`. CONTRACT: `core!` must not touch
 `work_perm` other than through the matrix it is handed (the DCT and derivative
 cores only use `work_ext`/`work_cx`/`work_real`/`work_deriv`).
 """
-function _permuted_axis_apply!(core!::F, dest::CuArray{T,N}, src::CuArray{T,N},
+function _permuted_axis_apply!(core!::F, dest::DeviceArray{T,N}, src::DeviceArray{T,N},
                                axis::Int, plan::GPUChebyshevDerivPlan{T}) where {F,T,N}
     n, batch = plan.n, plan.batch
     other_dims = ntuple(i -> i < axis ? i : i + 1, N - 1)
@@ -348,8 +349,8 @@ Complex variant of `_permuted_axis_apply!`: pack/unpack kernels also map the
 axis-first indices, using only `plan2`'s real `work_perm`. The pack consumes the
 entire input before the unpack writes, so `dest === src` remains safe.
 """
-function _permuted_axis_apply_complex!(core!::F, dest::CuArray{Complex{T},N},
-                                       src::CuArray{Complex{T},N}, axis::Int,
+function _permuted_axis_apply_complex!(core!::F, dest::DeviceArray{Complex{T},N},
+                                       src::DeviceArray{Complex{T},N}, axis::Int,
                                        plan2::GPUChebyshevDerivPlan{T}, arch) where {F,T,N}
     n = size(src, axis)
     batch = prod(size(src)) ÷ n
@@ -364,18 +365,18 @@ function _permuted_axis_apply_complex!(core!::F, dest::CuArray{Complex{T},N},
 end
 
 # ---------------------------------------------------------------------------
-# Main dispatch: overrides Tarang._gpu_chebyshev_deriv! for CuArray
+# Main dispatch: overrides Tarang._gpu_chebyshev_deriv! for DeviceArray
 # ---------------------------------------------------------------------------
 
 """
-    _gpu_cheb_deriv_into!(dest, data_g::CuArray{<:AbstractFloat}, axis, order, scale)
+    _gpu_cheb_deriv_into!(dest, data_g::DeviceArray{<:AbstractFloat}, axis, order, scale)
 
 Batched real Chebyshev derivative, written directly into `dest` (same shape and
 eltype as `data_g`; `dest === data_g` is allowed). The permutation staging for
 `axis != 1` runs through the cached plan's `work_perm` buffer — no per-call
 device allocation anywhere on this path.
 """
-function _gpu_cheb_deriv_into!(dest::CuArray{T}, data_g::CuArray{T}, axis::Int,
+function _gpu_cheb_deriv_into!(dest::DeviceArray{T}, data_g::DeviceArray{T}, axis::Int,
                                order::Int, scale::Float64) where {T<:AbstractFloat}
     n  = size(data_g, axis)
     batch = prod(size(data_g)) ÷ n
@@ -395,7 +396,7 @@ function _gpu_cheb_deriv_into!(dest::CuArray{T}, data_g::CuArray{T}, axis::Int,
 end
 
 """
-    _gpu_cheb_deriv_complex_into!(dest, data_g::CuArray{<:Complex}, axis, order, scale)
+    _gpu_cheb_deriv_complex_into!(dest, data_g::DeviceArray{<:Complex}, axis, order, scale)
 
 Complex Chebyshev derivative: the DCT-I workspace is real-only, so pack the real
 and imaginary parts as EXTRA BATCH COLUMNS — one (n, 2*batch) matrix — and run a
@@ -403,7 +404,7 @@ single batched derivative over both, then recombine. (The transform is linear;
 this replaces the old `real.(x)` / `imag.(x)` / `complex.(re, im)` version that
 allocated ~10 full arrays and ran the whole DCT chain twice.)
 """
-function _gpu_cheb_deriv_complex_into!(dest::CuArray{Complex{T}}, data_g::CuArray{Complex{T}},
+function _gpu_cheb_deriv_complex_into!(dest::DeviceArray{Complex{T}}, data_g::DeviceArray{Complex{T}},
                                        axis::Int, order::Int, scale::Float64) where {T<:AbstractFloat}
     n  = size(data_g, axis)
     batch = prod(size(data_g)) ÷ n
@@ -423,7 +424,7 @@ end
 
 function Tarang._gpu_chebyshev_deriv!(result::Tarang.ScalarField,
                                        operand::Tarang.ScalarField,
-                                       data_g::CuArray, axis::Int, order::Int,
+                                       data_g::DeviceArray, axis::Int, order::Int,
                                        scale::Float64)
     n  = size(data_g, axis)
 
@@ -437,8 +438,8 @@ function Tarang._gpu_chebyshev_deriv!(result::Tarang.ScalarField,
 
     T = eltype(data_g)
 
-    # Pin the current CUDA device to the operand's device before allocating work buffers
-    # / building the plan / launching kernels. The plan cache is keyed by CUDA.device()
+    # Select the operand's device before allocating work buffers
+    # / building the plan / launching kernels. The plan cache is keyed by DeviceRuntime.device()
     # at call time, so without this a multi-GPU run whose current device != data_g's device
     # would build the plan and scratch on the wrong device and then mix cross-device buffers.
     ensure_device!(Tarang.architecture(data_g))
@@ -446,9 +447,9 @@ function Tarang._gpu_chebyshev_deriv!(result::Tarang.ScalarField,
     # The derivative writes STRAIGHT into the result's grid buffer (allocated
     # here only if missing or mis-shaped — steady-state calls reuse it).
     result_data = Tarang.get_grid_data(result)
-    if !(result_data isa CuArray) || eltype(result_data) != T ||
+    if !(result_data isa DeviceArray) || eltype(result_data) != T ||
        size(result_data) != size(data_g)
-        Tarang.set_grid_data!(result, CUDA.zeros(T, size(data_g)...))
+        Tarang.set_grid_data!(result, DeviceRuntime.zeros(T, size(data_g)...))
         result_data = Tarang.get_grid_data(result)
     end
 
@@ -499,7 +500,7 @@ reverse/prescale + symmetric extension) → batched rfft → tail kernel (fused
 extract + normalize/finalize). `out_mat === in_mat` is allowed — the head
 kernel fully consumes the input before the tail writes.
 """
-function _dct1_batch_mat!(out_mat::CuMatrix{T}, in_mat::CuMatrix{T}, direction::Symbol,
+function _dct1_batch_mat!(out_mat::DeviceMatrix{T}, in_mat::DeviceMatrix{T}, direction::Symbol,
                           plan::GPUChebyshevDerivPlan{T}, arch) where {T}
     n, batch = plan.n, plan.batch
     M = 2 * (n - 1)
@@ -527,7 +528,7 @@ end
     gpu_dct1_along_dim!(output, input, dim, direction) -> output
 
 Plain DCT-I (REDFT00, 1/(N-1) norm, endpoint half-weight, odd-index sign flip)
-along `dim` of a CuArray, `:forward` or `:backward`. Real arrays run one batched
+along `dim` of a DeviceArray, `:forward` or `:backward`. Real arrays run one batched
 DCT-I; complex arrays pack re/im as extra batch columns and run ONE batched
 DCT-I of width 2·batch (the transform is linear and real-coefficient). The
 transform axis is viewed first as an (N, batch) matrix; the cached
@@ -539,7 +540,7 @@ odd-flip equivalence).
 NOTE: this is the plain transform only — it does NOT truncate/zero-pad the
 coefficient axis. `size(output) == size(input)` is required.
 """
-function gpu_dct1_along_dim!(output::CuArray{T,N}, input::CuArray{T,N},
+function gpu_dct1_along_dim!(output::DeviceArray{T,N}, input::DeviceArray{T,N},
                              dim::Int, direction::Symbol) where {T<:AbstractFloat,N}
     ensure_device!(Tarang.architecture(input))
     @assert size(output) == size(input) "gpu_dct1_along_dim!: output and input must match size"
@@ -570,7 +571,7 @@ function gpu_dct1_along_dim!(output::CuArray{T,N}, input::CuArray{T,N},
     return output
 end
 
-function gpu_dct1_along_dim!(output::CuArray{Complex{T},N}, input::CuArray{Complex{T},N},
+function gpu_dct1_along_dim!(output::DeviceArray{Complex{T},N}, input::DeviceArray{Complex{T},N},
                              dim::Int, direction::Symbol) where {T<:AbstractFloat,N}
     ensure_device!(Tarang.architecture(input))
     @assert size(output) == size(input) "gpu_dct1_along_dim!: output and input must match size"

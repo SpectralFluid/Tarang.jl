@@ -103,7 +103,7 @@ function SpectralLinearOperator(
     ν::Real=1.0,
     order::Int=1,
     coefficients::Union{Nothing, AbstractArray}=nothing,
-    dtype::Type{T}=Float64,
+    dtype::Type{T}=real(dist.dtype),
     field_dtype::Type=dist.dtype
 ) where {T<:AbstractFloat}
 
@@ -321,7 +321,8 @@ function apply_implicit_diagonal!(
 
     # û_new = û_old / (1 + dt*γ*L)
     # Broadcasting works on both CPU and GPU arrays
-    coeff_data!(u_new) .= get_coeff_data(u_old) ./ (1 .+ dt .* γ .* L.coefficients)
+    shift = eltype(L.coefficients)(dt * γ)
+    coeff_data!(u_new) .= get_coeff_data(u_old) ./ (1 .+ shift .* L.coefficients)
 
     return u_new
 end
@@ -337,7 +338,8 @@ function apply_implicit_diagonal_inplace!(
     dt::Real,
     γ::Real
 )
-    coeff_data!(u) ./= (1 .+ dt .* γ .* L.coefficients)
+    shift = eltype(L.coefficients)(dt * γ)
+    coeff_data!(u) ./= (1 .+ shift .* L.coefficients)
     return u
 end
 

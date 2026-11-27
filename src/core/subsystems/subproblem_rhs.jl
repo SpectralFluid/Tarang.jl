@@ -355,7 +355,7 @@ this vector — they are handled separately via `gather_alg_F!` + a direct RHS
 override in the stepper, because the IMEX-RK accumulated formula gives the
 wrong `1/γ` scaling for inhomogeneous algebraic constraints.
 """
-function gather_eqn_F!(dest::AbstractVector{ComplexF64}, sp::Subproblem, solver,
+function gather_eqn_F!(dest::_SubproblemVector, sp::Subproblem, solver,
                        pde_F_fields::Vector, state_fields::Vector)
     eqn_sizes = _subproblem_eqn_sizes(sp)
     eqn_targets = _subproblem_eqn_targets(sp, state_fields)
@@ -370,7 +370,7 @@ end
 # Recover the concrete cached-buffer type before indexing it or walking field
 # targets. The equation geometry is already compiled; no EquationIR lookup is
 # needed for PDE rows, and all field values are still gathered at this call.
-function _gather_eqn_F_raw!(raw::AbstractVector{ComplexF64}, sp::Subproblem,
+function _gather_eqn_F_raw!(raw::_SubproblemVector, sp::Subproblem,
                             pde_F_fields::Vector, state_fields::Vector,
                             eqn_sizes::Vector{Int}, eqn_targets::Vector{Vector{Int}})
     fill!(raw, zero(eltype(raw)))
@@ -491,7 +491,7 @@ This override is necessary because the standard IMEX-RK accumulated RHS
 formula gives `L_row * X = (A^E[i,j]/a_ii) * F_BC` which is wrong by a factor
 of `1/γ` for inhomogeneous algebraic constraints.
 """
-function gather_alg_F!(dest::AbstractVector{ComplexF64}, sp::Subproblem)
+function gather_alg_F!(dest::_SubproblemVector, sp::Subproblem)
     problem = sp.problem
     eqns = problem.equation_data
 
@@ -505,7 +505,7 @@ function gather_alg_F!(dest::AbstractVector{ComplexF64}, sp::Subproblem)
     # `CUDA.allowscalar(false)`.
     raw_cpu = sp.runtime.gather_alg_F_raw_cpu
     if raw_cpu === nothing || length(raw_cpu) != I_raw
-        raw_cpu = zeros(ComplexF64, I_raw)
+        raw_cpu = zeros(eltype(dest), I_raw)
         sp.runtime.gather_alg_F_raw_cpu = raw_cpu
     end
     _gather_alg_F_raw!(raw_cpu, sp, eqns, blocks)
@@ -528,10 +528,10 @@ function gather_alg_F!(dest::AbstractVector{ComplexF64}, sp::Subproblem)
     return dest
 end
 
-function _gather_alg_F_raw!(raw::Vector{ComplexF64}, sp::Subproblem,
+function _gather_alg_F_raw!(raw::Vector{<:Complex}, sp::Subproblem,
                             eqns::AbstractVector,
                             blocks::Vector{_SubproblemAlgebraicBlock})
-    fill!(raw, zero(ComplexF64))
+    fill!(raw, zero(eltype(raw)))
     for block in blocks
         # Boundary refresh can replace either the expression or the entire IR
         # entry. Cache only its row geometry; always read the current value.
@@ -543,7 +543,7 @@ function _gather_alg_F_raw!(raw::Vector{ComplexF64}, sp::Subproblem,
     return raw
 end
 
-function _write_alg_F_block!(raw::Vector{ComplexF64}, F_expr, sp::Subproblem,
+function _write_alg_F_block!(raw::Vector{<:Complex}, F_expr, sp::Subproblem,
                              offset::Int, size::Int, bulk::Bool)
     _is_zero_F_expr(F_expr) && return nothing
     # In a BVP the bulk PDE is algebraic too. Its value is computed as before,

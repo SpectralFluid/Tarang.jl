@@ -123,61 +123,6 @@ function _remove_stale_rank_files(stem::AbstractString, nranks::Integer)
     return nothing
 end
 
-"""Throw on every rank if any rank failed.
-
-`throw`, never `rethrow`: this runs outside the `catch` block that produced `err`,
-and `rethrow` there raises "rethrow(exc) not allowed outside a catch block",
-destroying the original error."""
-function _abort_if_any_rank_failed(dist, err, context::AbstractString)
-    failed = err === nothing ? 0 : 1
-    if dist.size > 1 && MPI.Initialized() && !MPI.Finalized()
-        failed = MPI.Allreduce(failed, MPI.MAX, dist.comm)
-    end
-    failed == 0 && return nothing
-    err === nothing && error("$context: another rank failed; aborting collectively.")
-    throw(err)
-end
-
-"""Run `f()` and settle its outcome collectively; return `f()`'s value on success.
-
-The rank-uniformity invariant belongs to the ENTRY POINT, not to the individual
-throw sites inside it. Guarding one throw site at a time is what let three
-regions stay exposed through two review rounds: a per-rank filesystem or NetCDF
-failure that escapes an unguarded statement leaves that rank unwinding while its
-peers walk into the caller's next collective, and the run hangs rather than
-fails. `_collectively` wraps a whole fallible body in one `try`, so the exit is
-rank-uniform no matter where inside it the failure happened.
-
-COLLECTIVE ORDERING. Exactly one `_abort_if_any_rank_failed` (one
-`MPI.Allreduce`) runs per call, on the success path and on the failure path
-alike — the body cannot return or throw past it. So every rank performs the same
-number of `Allreduce`s in the same order, which is the property that makes the
-guard safe rather than merely well-intentioned.
-
-NESTING. `load_state!` wraps its body while calling `load_field!`, which wraps
-its own. That nests safely, and safely for the reason that matters: because the
-inner `_collectively` makes its own exit rank-uniform, a rank cannot leave the
-inner region while another rank is still inside it. All ranks therefore reach
-the outer guard having performed the identical sequence of inner `Allreduce`s.
-(An "outermost guard only" scheme that suppressed the inner one would be worse,
-not better: the rank that threw would race ahead into the NEXT field's
-`ensure_layout!` transpose while its peers were still in the failed one.)
-
-SERIAL. With `dist.size <= 1` `_abort_if_any_rank_failed` performs no MPI call
-at all, so this degrades to a plain try/throw and needs no initialised MPI.
-"""
-function _collectively(f, dist, context::AbstractString)
-    result = nothing
-    err = nothing
-    try
-        result = f()
-    catch e
-        err = e
-    end
-    _abort_if_any_rank_failed(dist, err, context)
-    return result
-end
-
 """Copy a host slab into `field`'s grid storage.
 
 NetCDF reads into host memory, so a device-resident field needs one explicit
@@ -185,9 +130,30 @@ upload. That `copyto!` is deliberate one-shot I/O staging, not a silent CPU
 fallback — file I/O cannot read into device memory at all."""
 function _store_local_grid_data!(field::ScalarField, host::Array)
     target = get_local_data(get_grid_data(field))
-    size(target) == size(host) && return (copyto!(target, host); field)
-    error("load_field!: the checkpoint slab is $(size(host)) but the field's local " *
-          "storage is $(size(target)).")
+    _check_slab_grid_shape(target, host)
+    copyto!(target, host)
+    return field
+end
+
+function _check_slab_grid_shape(target, host)
+    size(target) == size(host) || error(
+        "load_field!: the checkpoint slab is $(size(host)) but the field's local " *
+        "storage is $(size(target)).")
+    return nothing
+end
+
+function _read_field_slab(field::ScalarField, src::SlabSource, filename::AbstractString,
+                          dataset_name::String)
+    global_shape, local_shape, local_start = _field_slab_geometry(field)
+    haskey(src.global_shape, dataset_name) || error(
+        "load_field!: no variable '$dataset_name' with slab metadata in '$filename'. " *
+        "Variables found: $(sort(collect(keys(src.entries)))).")
+    src.global_shape[dataset_name] == global_shape || error(
+        "load_field!: '$dataset_name' was written with global shape " *
+        "$(src.global_shape[dataset_name]) but this field is $global_shape.")
+
+    host = Array{eltype(get_grid_data(field))}(undef, local_shape...)
+    return read_local_slab!(host, src, dataset_name, local_start)
 end
 
 """Save `field` to NetCDF, one file per rank under MPI. Returns the path written.
@@ -244,29 +210,15 @@ end
 
 """Load `field` from NetCDF written at any rank count.
 
-The whole body is one `_collectively` region. `_store_local_grid_data!` is the
-reason that has to include the tail and not just the read: it compares
-`get_local_shape`'s analytic split against the field's actual storage — two
-independent computations of the same quantity, which this repo's audit
-records diverging on non-divisible splits and >=2-D meshes, i.e.
-rank-dependently by construction. A throw there used to escape after the last
-`Allreduce`, so `load_state!` would move on to the next field and open its
-`load_field!` with a collective the failed rank never reaches."""
+For time-series output, load the latest committed record. Legacy files without
+commit metadata use their last stored record.
+"""
 function load_field!(field::ScalarField, filename::String, dataset_name::String="field")
+    host = _collectively(field.dist, "load_field! read") do
+        _read_field_slab(field, open_slab_source(filename), filename, dataset_name)
+    end
     return _collectively(field.dist, "load_field!") do
         ensure_layout!(field, :g)
-        global_shape, local_shape, local_start = _field_slab_geometry(field)
-
-        src = open_slab_source(filename)
-        haskey(src.global_shape, dataset_name) || error(
-            "load_field!: no variable '$dataset_name' with slab metadata in '$filename'. " *
-            "Variables found: $(sort(collect(keys(src.entries)))).")
-        src.global_shape[dataset_name] == global_shape || error(
-            "load_field!: '$dataset_name' was written with global shape " *
-            "$(src.global_shape[dataset_name]) but this field is $global_shape.")
-
-        host = Array{eltype(get_local_data(get_grid_data(field)))}(undef, local_shape...)
-        read_local_slab!(host, src, dataset_name, local_start)
         _store_local_grid_data!(field, host)
     end
 end

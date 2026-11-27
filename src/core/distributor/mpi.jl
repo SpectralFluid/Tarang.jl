@@ -172,7 +172,7 @@ function _scatter_array_from_root(dist::Distributor,
         error("rank 0 must provide the global scatter array")
     cpu_global_array = global_array
     if dist.rank == 0 && is_gpu_array(global_array)
-        if !check_cuda_aware_mpi()
+        if !_device_aware_mpi(architecture(global_array))
             # Stage through CPU for MPI operations
             cpu_global_array = Array(global_array)
         end
@@ -564,4 +564,29 @@ function create_3d_process_mesh(nproc::Int)
         mesh_2d = create_2d_process_mesh(nproc)
         return (mesh_2d[1], mesh_2d[2], 1)
     end
+end
+
+"""Propagate a rank-local failure to every participant before the next collective."""
+function _abort_if_any_rank_failed(dist, err, context::AbstractString)
+    failed = err === nothing ? 0 : 1
+    if dist.size > 1 && MPI.Initialized() && !MPI.Finalized()
+        failed = MPI.Allreduce(failed, MPI.MAX, dist.comm)
+    end
+    failed == 0 && return nothing
+    err === nothing && error("$context: another rank failed; aborting collectively.")
+    throw(err)
+end
+
+"""Run a local operation on each rank and agree on success before continuing."""
+function _collectively(f, dist, context::AbstractString)
+    dist.size <= 1 && return f()
+    result = nothing
+    err = nothing
+    try
+        result = f()
+    catch e
+        err = e
+    end
+    _abort_if_any_rank_failed(dist, err, context)
+    return result
 end

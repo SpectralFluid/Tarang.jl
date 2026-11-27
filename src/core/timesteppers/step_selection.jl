@@ -232,10 +232,8 @@ function _gpu_subproblem_execution(sp)
     return any(f -> !isempty(f.bases) && _field_uses_gpu(f), solver.state)
 end
 
-function _linear_operator_is_zero(L_matrix::AbstractMatrix)
-    return (L_matrix isa SparseMatrixCSC && nnz(L_matrix) == 0) ||
-           (norm(L_matrix, Inf) < 1e-14)
-end
+_linear_operator_is_zero(L_matrix::AbstractMatrix) = all(iszero, L_matrix)
+_linear_operator_is_zero(L_matrix::SparseMatrixCSC) = all(iszero, nonzeros(L_matrix))
 
 """
     _imex_rk_explicit_fallback_reason(state, solver, current_state, L_matrix)

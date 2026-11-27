@@ -31,7 +31,7 @@
 Fixed-capacity circular buffer for per-subproblem multistep history. Stores
 `capacity` pre-allocated `AbstractVector{ComplexF64}` slots and maintains a
 `head` index pointing at the newest entry. Allows O(1) replacement
-(`ring_push_newest!`) and O(1) age-indexed access (`ring_get`) without any
+with one spare slot for the current attempt and O(1) age-indexed access without any
 per-step allocation after the initial slot allocation.
 
 Used by `step_subproblem_multistep!` to store `M*X`, `L*X`, and `F` history
@@ -40,48 +40,47 @@ per subproblem across timesteps. Replaces the earlier `Vector{Vector}` +
 subproblem per step.
 """
 mutable struct SPHistoryRing
-    buffers::Vector{AbstractVector{ComplexF64}}  # Pre-allocated slots (length = capacity)
+    buffers::Vector{_SubproblemVector}  # Pre-allocated slots (capacity plus one candidate)
     head::Int                                     # 1-based slot of newest entry, or 0 if empty
     count::Int                                    # Number of valid entries, 0 ≤ count ≤ capacity
     capacity::Int
 end
 
 SPHistoryRing(capacity::Int) = SPHistoryRing(
-    Vector{AbstractVector{ComplexF64}}(undef, 0),
+    Vector{_SubproblemVector}(undef, 0),
     0, 0, max(capacity, 1),
 )
 
 """Return the k-th newest entry (k=1 is newest), or `nothing` if `k > count`.
 
 Mapping from age `k` to slot: with `head` pointing at the newest slot, age
-`k` lives at `mod1(head - k + 1, capacity)`.
+`k` lives at `mod1(head - k + 1, length(buffers))`.
 """
 @inline function ring_get(ring::SPHistoryRing, k::Int)
     (k < 1 || k > ring.count) && return nothing
-    slot = mod1(ring.head - k + 1, ring.capacity)
+    slot = mod1(ring.head - k + 1, length(ring.buffers))
     return ring.buffers[slot]
 end
 
-"""
-    ring_push_newest!(ring, reference) -> AbstractVector
-
-Advance the ring's head and return the underlying slot for the newest
-entry so the caller can **write into it directly** (zero-copy). The caller
-must not retain the returned reference after the next `ring_push_newest!`
-call — it may be overwritten when the ring wraps.
-
-On first use, allocates `capacity` slots of length `length(reference)`
-using `similar_zeros(reference, ComplexF64, length(reference))`, so the
-buffer backend (CPU / CuArray / ROCArray) matches the reference's backend.
-"""
-@inline function ring_push_newest!(ring::SPHistoryRing, reference::AbstractVector)
+"""Return the spare slot for an attempted step. Committed entries stay readable."""
+function ring_stage!(ring::SPHistoryRing, reference::AbstractVector)
     if isempty(ring.buffers)
-        n = length(reference)
-        ring.buffers = [similar_zeros(reference, ComplexF64, n) for _ in 1:ring.capacity]
+        ring.buffers = [similar_zeros(reference, eltype(reference), length(reference))
+                        for _ in 1:(ring.capacity + 1)]
     end
-    ring.head = mod1(ring.head + 1, ring.capacity)
+    return _ring_candidate(ring)
+end
+
+@inline _ring_candidate(ring::SPHistoryRing) =
+    ring.buffers[mod1(ring.head + 1, length(ring.buffers))]
+
+@inline _ring_step_entry(ring::SPHistoryRing, k::Int) =
+    k == 1 ? _ring_candidate(ring) : ring_get(ring, k - 1)
+
+function ring_accept!(ring::SPHistoryRing)
+    ring.head = mod1(ring.head + 1, length(ring.buffers))
     ring.count = min(ring.count + 1, ring.capacity)
-    return ring.buffers[ring.head]
+    return nothing
 end
 
 """Grow a ring's capacity (e.g. when the user switches from SBDF2 to SBDF4
@@ -95,26 +94,26 @@ function ring_resize!(ring::SPHistoryRing, new_capacity::Int)
         return ring
     end
     # Copy entries age-sorted (newest first) into a new slot array.
-    old_cap = ring.capacity
+    old_cap = length(ring.buffers)
     old_count = ring.count
-    new_bufs = similar(ring.buffers, new_capacity)
+    new_bufs = similar(ring.buffers, new_capacity + 1)
     for k in 1:old_count
         old_slot = mod1(ring.head - k + 1, old_cap)
-        new_slot = mod1(new_capacity - k + 1, new_capacity)
+        new_slot = length(new_bufs) - k + 1
         new_bufs[new_slot] = ring.buffers[old_slot]
     end
     # Any remaining new slots point at scratch buffers we'll create on demand;
     # mark them by reusing the first allocated buffer (shape reference).
     ref = ring.buffers[1]
     n = length(ref)
-    for i in 1:new_capacity
+    for i in eachindex(new_bufs)
         if !isassigned(new_bufs, i)
-            new_bufs[i] = similar_zeros(ref, ComplexF64, n)
+            new_bufs[i] = similar_zeros(ref, eltype(ref), n)
         end
     end
     ring.buffers = new_bufs
     ring.capacity = new_capacity
-    ring.head = new_capacity  # newest entry ended up at slot `new_capacity`
+    ring.head = length(new_bufs)
     return ring
 end
 
@@ -164,7 +163,6 @@ function step_subproblem_multistep!(
     a_hist_depth = length(a) - 1
     b_hist_depth = length(b) - 1
     c_hist_depth = length(c) - 1
-    max_depth = max(a_hist_depth, b_hist_depth, c_hist_depth, 0)
 
     state_fields = _cached_state_fields!(state, problem)
     for f in state_fields
@@ -174,13 +172,13 @@ function step_subproblem_multistep!(
     # Distributor handle for the mixed Fourier–Chebyshev solve-layout transpose
     # (to_solve_layout!/from_solve_layout! are no-ops outside distributed
     # mixed-basis runs). Same bracketing pattern as step_subproblem_rk!.
-    dist = length(subproblems) >= 1 ? subproblems[1].dist : nothing
+    dist = first(state_fields).dist
 
     n_sp = length(subproblems)
 
     # ── Per-subproblem ring-buffer history (cached in timestepper_data) ──────
     # We pre-allocate `max_capacity` slots per ring on first use. Subsequent
-    # steps reuse those slots via `ring_push_newest!` (zero per-step
+    # steps reuse those slots via `ring_stage!` (zero per-step
     # allocation). If the user switches to a higher-order method mid-run
     # (e.g. SBDF2 → SBDF4), we `ring_resize!` to grow capacity while
     # preserving existing history.
@@ -210,15 +208,13 @@ function step_subproblem_multistep!(
 
     for (sp_idx, sp) in enumerate(subproblems)
         sp.M_min === nothing && continue
-        n = size(sp.M_min, 1)
-
         # Gather X in variable space — CPU or GPU matching state-field storage.
         x_cur = gather_inputs(sp, state_fields)
 
-        # Advance each ring and obtain the newest-slot buffer to write into.
-        mx_cur = ring_push_newest!(MX_rings[sp_idx], x_cur)
-        lx_cur = ring_push_newest!(LX_rings[sp_idx], x_cur)
-        f_cur  = ring_push_newest!(F_rings[sp_idx],  x_cur)
+        # The previous accepted time levels remain available if this attempt fails.
+        mx_cur = ring_stage!(MX_rings[sp_idx], x_cur)
+        lx_cur = ring_stage!(LX_rings[sp_idx], x_cur)
+        f_cur  = ring_stage!(F_rings[sp_idx],  x_cur)
 
         # M*X_current and L*X_current in equation space
         M_op = _subproblem_operator(sp, :M, x_cur)
@@ -235,17 +231,16 @@ function step_subproblem_multistep!(
     _restore_subproblem_rhs!(F_fields, _ms_g_F, solver)
 
     # ── Step 2: check if we have enough history to advance ──────────────────
-    # Need at least one of each history type (we just pushed current, so
-    # count ≥ 1). The `ring_get` calls in the RHS loop return `nothing` for
-    # missing entries, which the accumulator silently skips — giving a
+    # The candidate supplies the current time level. Older levels can be
+    # missing during startup, in which case the accumulator skips them, giving a
     # lower-order first step if the caller's startup dispatch didn't fall
     # back. This is the same behavior as the old `Vector{Vector}` path.
     have_enough = true
     for sp_idx in 1:n_sp
         subproblems[sp_idx].M_min === nothing && continue
-        if F_rings[sp_idx].count  < max(c_hist_depth, 1) ||
-           MX_rings[sp_idx].count < max(a_hist_depth, 1) ||
-           LX_rings[sp_idx].count < max(b_hist_depth, 1)
+        if F_rings[sp_idx].count + 1 < max(c_hist_depth, 1) ||
+           MX_rings[sp_idx].count + 1 < max(a_hist_depth, 1) ||
+           LX_rings[sp_idx].count + 1 < max(b_hist_depth, 1)
             have_enough = false
             break
         end
@@ -263,9 +258,8 @@ function step_subproblem_multistep!(
             continue
         end
         n = size(sp.M_min, 1)
-        ref = ring_get(F_rings[sp_idx], 1)  # always valid after step 1
-        alg_f = ref === nothing ? zeros(ComplexF64, n) :
-                                  _sp_stage_vector!(sp, :multistep_alg_f, n, ref)
+        ref = _ring_candidate(F_rings[sp_idx])
+        alg_f = _sp_stage_vector!(sp, :multistep_alg_f, n, ref)
         ALG_F[sp_idx] = _ensure_alg_F!(alg_f, sp,
                                      has_time_dependent_bcs(sp.problem.bc_manager))
     end
@@ -276,38 +270,40 @@ function step_subproblem_multistep!(
     RHS = _sp_slots!(state, :_sp_ms_RHS, n_sp)
     solutions = _sp_slots!(state, :_sp_ms_solutions, n_sp)
     factors = _local_mode_factor_slots!(state, n_sp)
-    for (sp_idx, sp) in enumerate(subproblems)
-        sp.M_min === nothing && continue
-        n = size(sp.M_min, 1)
-        ref = ring_get(F_rings[sp_idx], 1)
-        RHS[sp_idx] = ref === nothing ? zeros(ComplexF64, n) :
-                                       _sp_stage_vector!(sp, :multistep_rhs, n, ref)
-        factors[sp_idx] = _get_or_build_multistep_lhs!(sp, a[1], b[1])
-        if factors[sp_idx] === nothing
-            @warn "step_subproblem_multistep!: LHS factorization failed for group=$(sp.group); skipping step" maxlog=1
-            continue
+    try
+        _collectively(dist, "multistep local solves") do
+            for (sp_idx, sp) in enumerate(subproblems)
+                sp.M_min === nothing && continue
+                n = size(sp.M_min, 1)
+                ref = _ring_candidate(F_rings[sp_idx])
+                RHS[sp_idx] = _sp_stage_vector!(sp, :multistep_rhs, n, ref)
+                factors[sp_idx] = _get_or_build_multistep_lhs!(sp, a[1], b[1])
+                solutions[sp_idx] = _sp_stage_vector!(sp, :multistep_sol, size(sp.M_min, 2), ref)
+            end
+            threaded_modes = _thread_local_modes(solver.base.threaded_modes, subproblems,
+                                                 solver.base.matsolver)
+            _foreach_local_mode!(n_sp, threaded_modes) do sp_idx
+                sp = subproblems[sp_idx]
+                sp.M_min === nothing && return
+                _solve_multistep_local_mode!(sp, RHS[sp_idx], solutions[sp_idx], factors[sp_idx],
+                                             ALG_F[sp_idx], F_rings[sp_idx], MX_rings[sp_idx],
+                                             LX_rings[sp_idx], a, b, c)
+            end
         end
-        solutions[sp_idx] = _sp_stage_vector!(sp, :multistep_sol, size(sp.M_min, 2), ref)
-    end
-    threaded_modes = _thread_local_modes(solver.base.threaded_modes, subproblems,
-                                         solver.base.matsolver)
-    _foreach_local_mode!(n_sp, threaded_modes) do sp_idx
-        sp = subproblems[sp_idx]
-        sp.M_min === nothing && return
-        factors[sp_idx] === nothing && return
-        _solve_multistep_local_mode!(sp, RHS[sp_idx], solutions[sp_idx], factors[sp_idx],
-                                     ALG_F[sp_idx], F_rings[sp_idx], MX_rings[sp_idx],
-                                     LX_rings[sp_idx], a, b, c)
-    end
-    for (sp_idx, sp) in enumerate(subproblems)
-        sp.M_min === nothing && continue
-        factors[sp_idx] === nothing && continue
-        scatter_inputs(sp, solutions[sp_idx], state_fields)
+        for (sp_idx, sp) in enumerate(subproblems)
+            sp.M_min === nothing && continue
+            scatter_inputs(sp, solutions[sp_idx], state_fields)
+        end
+    finally
+        from_solve_layout!(ms_state_stash, dist)
     end
 
-    # Restore state to the FFT pencil before the grid-space history push below.
-    # Consumes the single ms_state_stash armed at step 1.
-    from_solve_layout!(ms_state_stash, dist)
+    for (i, sp) in enumerate(subproblems)
+        sp.M_min === nothing && continue
+        ring_accept!(MX_rings[i])
+        ring_accept!(LX_rings[i])
+        ring_accept!(F_rings[i])
+    end
 
     # ── Step 5: push new state to history ───────────────────────────────────
     _push_trim!(state.history, state_fields, 1)
@@ -315,29 +311,29 @@ end
 
 function _solve_multistep_local_mode!(sp, rhs, solution, factor, alg_f,
                                       F_ring, MX_ring, LX_ring, a, b, c)
-    fill!(rhs, zero(ComplexF64))
+    fill!(rhs, zero(eltype(rhs)))
     for k in 2:length(c)
         ck = c[k]
-        abs(ck) < 1e-14 && continue
-        entry = ring_get(F_ring, k - 1)
+        iszero(ck) && continue
+        entry = _ring_step_entry(F_ring, k - 1)
         entry === nothing || _sp_axpy!(rhs, ck, entry)
     end
     for k in 2:length(a)
         ak = a[k]
-        abs(ak) < 1e-14 && continue
-        entry = ring_get(MX_ring, k - 1)
+        iszero(ak) && continue
+        entry = _ring_step_entry(MX_ring, k - 1)
         entry === nothing || _sp_axpy!(rhs, -ak, entry)
     end
     for k in 2:length(b)
         bk = b[k]
-        abs(bk) < 1e-14 && continue
-        entry = ring_get(LX_ring, k - 1)
+        iszero(bk) && continue
+        entry = _ring_step_entry(LX_ring, k - 1)
         entry === nothing || _sp_axpy!(rhs, -bk, entry)
     end
-    if abs(b[1]) > 1e-14
+    if !iszero(b[1])
         apply_bc_override!(rhs, alg_f, sp, b[1])
     end
-    _solve_cached_system!(solution, factor, rhs)
+    _solve_implicit_stage!(solution, factor, rhs)
     return nothing
 end
 
@@ -365,7 +361,7 @@ function _get_or_build_multistep_lhs!(sp::Subproblem, a0::Float64, b0::Float64)
     # Build the new LHS matrix. Under variable-dt multistep the sparsity
     # pattern is unchanged — only `nzval` differs — so we can refactor the
     # cached `SparseLUSolver` in place and reuse its symbolic analysis.
-    LHS = if L !== nothing && abs(b0) > 1e-14
+    LHS = if L !== nothing && !iszero(b0)
         ComplexF64(a0) * M + ComplexF64(b0) * L
     else
         ComplexF64(a0) * M
@@ -402,19 +398,15 @@ function _get_or_build_multistep_lhs!(sp::Subproblem, a0::Float64, b0::Float64)
                   "CPU sparse/dense fallback is disabled. Original error: " *
                   "$(sprint(showerror, err))")
         end
-        # Same policy as the RK stage system: a gauge-mode singular system is
-        # solved in the least-squares sense with a warning; duplicate tau lifts
-        # are refused at problem build (`_check_duplicate_tau_lifts`).
+        # A gauge can leave a null space. QR solves that case and checks
+        # consistency against this step's RHS before the solution is committed.
         if solver_type != MatSolvers.SPQRSolver
             try
                 qr_solver = MatSolvers.solver_instance(MatSolvers.SPQRSolver, LHS)
                 sp.matrices[cache_key] = qr_solver
                 sp.matrices[cache_key_k] = current_key
-                @warn "step_subproblem_multistep!: the multistep system (a₀·M + b₀·L) for " *
-                      "subproblem group=$(sp.group) is singular ($(sprint(showerror, err))); " *
-                      "solving it in the least-squares sense with sparse QR. Expected for a " *
-                      "pressure/gauge mode; otherwise check the tau/boundary rows of that " *
-                      "Fourier mode." maxlog=1
+                @warn "Multistep system for group=$(sp.group) is singular. " *
+                      "Using sparse QR to check consistency and solve for its determined modes." maxlog=1
                 return qr_solver
             catch qr_err
                 @debug "multistep: sparse QR fallback also failed for group=$(sp.group)" exception=qr_err

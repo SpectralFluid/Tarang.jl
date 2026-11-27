@@ -144,11 +144,17 @@ silently drops an implicit operator or substitutes a lower-order scheme.
 | MPI, pure Fourier, no implicit operator | every RK and multistep scheme on the matrix-free field path at nominal order | — |
 | MPI, Chebyshev axis | the per-mode subproblem path (Chebyshev axis first) | — |
 | Single GPU, pure Fourier, implicit operator | `RK111`, `RK222`, `RK443`, `RKSMR`, `RKGFY`, `SBDF2` only, per-mode on device (from the equation's `L`, or an attached `SpectralLinearOperator`) | the remaining schemes (`ErrorException` naming supported schemes or "move the term to the RHS"; `ArgumentError` for an attached operator) |
-| Single GPU, pure Fourier, no implicit operator | explicit RK, CNAB/SBDF/MCNAB2/CNLF2 field path | — |
-| Single GPU, Chebyshev axis | IMEX RK and multistep through per-mode subproblems with CUDA sparse solves, mode-batched by default | rank-deficient stage systems (e.g. duplicate tau lifts, see below); ETD |
+| Single GPU, pure Fourier, no implicit operator | explicit RK, CNAB/SBDF/MCNAB2/CNLF2, and all three ETD schemes operate directly on fields | — |
+| Single GPU, Chebyshev axis | IMEX RK and multistep through per-mode subproblems. CUDA and ROCm can batch modes. Metal uses single-precision LU for each mode. | rank-deficient stage systems (e.g. duplicate tau lifts, see below); ETD |
 
 The field and diagonal paths in this table require identity mass; see
 [Mass operators on field and diagonal paths](@ref).
+
+With zero linear operator, `ETD_RK222` uses Heun's predictor and corrector.
+`ETD_CNAB2` and `ETD_SBDF2` on a single GPU use that startup once and then apply
+variable-step Adams–Bashforth with the previous accepted right-hand side.
+The Fourier diagonal IMEX solvers reject a step if any mode has a zero or
+nonfinite implicit denominator. Under MPI this rejection applies to every rank.
 
 For `RK222`, `RK443`, and `SBDF2`, MPI CPU problems whose state consists entirely
 of spatial Fourier fields skip global sparse matrix assembly at construction.
@@ -210,7 +216,7 @@ This per-stage refresh (gated on `has_time_dependent_bcs`, so it's free when BCs
 
 RK dispatch via `step_rk_imex!` → `step_subproblem_rk!` is the obvious path, but `CNAB1`/`CNAB2`/`SBDF1..4` also dispatch through the subproblem path whenever `problem.compiled.subproblems` is available. The dispatch happens inside each `step_<scheme>!` function: it computes the scheme's `(a, b, c)` coefficient tuples and calls the generic `step_subproblem_multistep!(state, solver, sps, a, b, c)`.
 
-This means every IMEX stepper that supports the subproblem path gets DAE-correct BC handling automatically. The global-matrix path is still used when subproblem decomposition is unavailable, including pure-periodic/global systems. Inhomogeneous tau BCs should use the subproblem path; the global multistep path does not carry those algebraic BC values through the same override machinery.
+Every IMEX stepper that supports the subproblem path enforces these boundary values automatically. The global-matrix path also enforces numeric algebraic targets when it can project them onto the equation's coefficient rows. For example, a periodic system with `v - u = 2` satisfies that constraint at the end of each IMEX step. Use the subproblem path for inhomogeneous tau boundary conditions with field-valued data.
 
 !!! warning "Give each tau variable its own lift"
     Write `lift(tau1, basis, -1) + lift(tau2, basis, -2)`, not two lifts to the same
@@ -221,9 +227,10 @@ This means every IMEX stepper that supports the subproblem path gets DAE-correct
     exponentially unstable — fine for a few dozen steps, then growing without
     bound while the boundary values stayed exact.) A lift *inside* a derivative
     operator, as in `div(grad(b) + ez*lift(tau1, b, -1)) + lift(tau2, b, -1)`, is
-    a different row and is fine. A genuinely singular mode that is not a duplicate
-    lift — the pressure-gauge mode of an incompressible problem — is still solved
-    in the least-squares sense, now with a warning naming the mode.
+    a different row and is fine. For a rank-deficient CPU stage such as a
+    pressure-gauge mode, sparse QR checks that the right-hand side is in the
+    matrix's column space to roundoff. An inconsistent stage rejects the step
+    and restores the accepted field values.
 
 ### Why not just always use the override
 

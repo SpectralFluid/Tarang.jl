@@ -21,7 +21,7 @@ mutable struct RealPaddedDealiasingWorkspace{R,C,PF,PB,SF,SB} <: AbstractNonline
 end
 
 # The workspace owns these input spectra and permits inverse FFTs to destroy
-# them. CUDA specializes these hooks to avoid its normal input-preservation copy.
+# them. cuFFT and rocFFT can skip their usual input-preservation copy.
 _plan_padded_inverse(forward, spectrum, n, dims) = plan_irfft(spectrum, n, dims)
 _padded_inverse!(dst, plan, src) = mul!(dst, plan, src)
 _padded_plan_spectrum(forward, arch, ::Type{T}, shape) where T = zeros(arch, Complex{T}, shape...)
@@ -57,9 +57,9 @@ function _get_real_padded_workspace!(ev, bases, ::Type{T}) where T
     dims = findall(b -> b isa Union{RealFourier,ComplexFourier}, collect(bases))
     isempty(dims) && return nothing
     shape = map(b -> b.meta.size, bases)
-    (length(shape) > 3 || minimum(shape[d] for d in dims) <= 4) && return nothing
+    length(shape) > 3 && return nothing
     padded = ntuple(length(shape)) do d
-        d in dims ? 2cld(ceil(Int, _axis_dealias_factor(bases[d], ev.dealiasing_factor)*shape[d]), 2) : shape[d]
+        d in dims ? _padded_fourier_size(shape[d], _axis_dealias_factor(bases[d], ev.dealiasing_factor)) : shape[d]
     end
     rdim = first(dims)
     half(s) = ntuple(d -> d == rdim ? s[d] ÷ 2 + 1 : s[d], length(s))
@@ -97,42 +97,58 @@ end
     @inbounds out[I...] = valid ? weight * src[J...] : zero(eltype(out))
 end
 
-# Fold all Nyquist images. Negative reduced-axis frequencies are implicit:
-# reflecting that axis requires conjugating and reflecting EVERY Fourier axis.
+# Gather a coefficient while folding downsampled Nyquist planes. A nonzero
+# rdim identifies the reduced axis of a real FFT, zero denotes a full spectrum.
+# When a grid axis grows, its old even Nyquist is dropped by the grid-resize
+# convention. Nonlinear padding has a separate splitting convention.
+@inline function _resized_fourier_coefficient(src, I, dstshape, srcshape, fourier, rdim)
+    modes = I
+    folds = 0
+    for d in 1:length(I)
+        fourier[d] || continue
+        k = I[d] - 1
+        if d != rdim && k > dstshape[d] ÷ 2
+            k -= dstshape[d]
+        end
+        if dstshape[d] > srcshape[d] && abs(k) > (srcshape[d] - 1) ÷ 2
+            return zero(eltype(src))
+        end
+        if srcshape[d] > dstshape[d] && iseven(dstshape[d]) && k == dstshape[d] ÷ 2
+            folds |= 1 << (d - 1)
+        end
+        modes = Base.setindex(modes, k, d)
+    end
+
+    total = zero(eltype(src))
+    images = folds
+    while true
+        # A negative frequency on the reduced axis lives in the conjugate
+        # half. Reflect every Fourier axis to address it in stored memory.
+        reflect = rdim != 0 && !iszero(images & (1 << (rdim - 1)))
+        J = I
+        for d in 1:length(I)
+            fourier[d] || continue
+            k = iszero(images & (1 << (d - 1))) ? modes[d] : -modes[d]
+            k = reflect ? -k : k
+            J = Base.setindex(J, k < 0 ? srcshape[d] + k + 1 : k + 1, d)
+        end
+        @inbounds value = src[J...]
+        total += reflect ? conj(value) : value
+        iszero(images) && break
+        images = (images - 1) & folds
+    end
+    return total
+end
+
 @kernel function _truncate_real_spectrum_kernel!(out, @Const(src), shape, padded, fourier, rdim)
     I = @index(Global, NTuple)
-    total = zero(eltype(out))
-    for mask in 0:((1 << length(shape)) - 1)
-        K = I
-        valid = true
-        for d in 1:length(shape)
-            negative = !iszero(mask & (1 << (d - 1)))
-            if fourier[d]
-                k = I[d] - 1
-                if d != rdim && k > shape[d] ÷ 2
-                    k -= shape[d]
-                end
-                split = iseven(shape[d]) && k == shape[d] ÷ 2 && padded[d] > shape[d]
-                valid &= !negative || split
-                K = Base.setindex(K, negative ? -k : k, d)
-            else
-                valid &= !negative
-            end
-        end
-        if valid
-            reflect = K[rdim] < 0
-            J = I
-            for d in 1:length(shape)
-                if fourier[d]
-                    k = reflect ? -K[d] : K[d]
-                    J = Base.setindex(J, k < 0 ? padded[d] + k + 1 : k + 1, d)
-                end
-            end
-            @inbounds value = src[J...]
-            total += reflect ? conj(value) : value
-        end
-    end
-    @inbounds out[I...] = total
+    @inbounds out[I...] = _resized_fourier_coefficient(src, I, shape, padded, fourier, rdim)
+end
+
+@kernel function _resize_grid_spectrum!(out, @Const(src), dstshape, srcshape, scale, rdim)
+    I = @index(Global, NTuple)
+    fourier = ntuple(_ -> true, Val(length(I)))
+    @inbounds out[I...] = scale * _resized_fourier_coefficient(src, I, dstshape, srcshape, fourier, rdim)
 end
 
 function _real_pad!(ws, src)

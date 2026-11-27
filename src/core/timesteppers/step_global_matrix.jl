@@ -107,39 +107,39 @@ function step_mcnab2!(state::TimestepperState, solver::InitialValueSolver)
         F_current_vec = _timestep_global_rhs_vector!(state, :mcnab2_F_current_vec,
                                                        solver, current_state, solver.sim_time)
 
-        # Rotate and store history
         MX_history = state.timestepper_data[:MX_history]::Vector{Vector{ComplexF64}}
         LX_history = state.timestepper_data[:LX_history]::Vector{Vector{ComplexF64}}
         F_history  = state.timestepper_data[:F_history]::Vector{Vector{ComplexF64}}
 
-        _prepend_history_buffer!(MX_history, MX_current, 2)
-        _prepend_history_buffer!(LX_history, LX_current, 2)
-        _prepend_history_buffer!(F_history, F_current_vec, 2)
-
         # Build RHS: c[1]*F[0] + c[2]*F[1] - a[1]*MX[0] - b[1]*LX[0]
         rhs = _timestep_vector_buffer!(state, :mcnab2_rhs_vec, length(F_current_vec))
-        @. rhs = c[2] * F_history[1]
-        if length(F_history) >= 2
-            rhs .+= c[3] * F_history[2]
+        @. rhs = c[2] * F_current_vec
+        if !isempty(F_history)
+            rhs .+= c[3] * F_history[1]
         end
-        rhs .-= a[2] * MX_history[1]
-        rhs .-= b[2] * LX_history[1]
-        if length(b) >= 3 && length(LX_history) >= 2
-            rhs .-= b[3] * LX_history[2]
+        rhs .-= a[2] * MX_current
+        rhs .-= b[2] * LX_current
+        if length(b) >= 3 && !isempty(LX_history)
+            rhs .-= b[3] * LX_history[1]
         end
+        zero_rows = _global_zero_mass_rows!(state, M_matrix)
+        _apply_global_algebraic_rhs!(rhs, state, solver.problem, zero_rows, b[1])
 
         # Build and solve LHS: (a[0]*M + b[0]*L) X = RHS
         # Cache single LU factorization; recompute only when (a[1],b[1]) changes.
         cache_key = (a[1], b[1])
         if get(state.timestepper_data, :mcnab2_lhs_key, nothing) !== cache_key
-            state.timestepper_data[:mcnab2_lhs_key] = cache_key
             state.timestepper_data[:mcnab2_lhs_factor] = _factorize_timestep_matrix(a[1] * M_matrix + b[1] * L_matrix)
+            state.timestepper_data[:mcnab2_lhs_key] = cache_key
         end
         X_new = _timestep_vector_buffer!(state, :mcnab2_X_new_vec, length(rhs))
         _timestep_ldiv!(X_new, state.timestepper_data[:mcnab2_lhs_factor], rhs)
 
         # Update state
         _push_vector_state!(state.history, X_new, current_state, 4)
+        _prepend_history_buffer!(MX_history, MX_current, 2)
+        _prepend_history_buffer!(LX_history, LX_current, 2)
+        _prepend_history_buffer!(F_history, F_current_vec, 2)
         state.timestepper_data[:iteration] += 1
 
         @debug "MCNAB2 step completed: dt=$dt_current, iteration=$(state.timestepper_data[:iteration])"
@@ -252,12 +252,14 @@ function step_cnlf2!(state::TimestepperState, solver::InitialValueSolver)
         @. rhs -= a3 * MX_previous
         @. rhs -= b2 * LX_current
         @. rhs -= b3 * LX_previous
+        zero_rows = _global_zero_mass_rows!(state, M_matrix)
+        _apply_global_algebraic_rhs!(rhs, state, solver.problem, zero_rows, b1)
 
         # Cache single LU factorization; recompute only when (a1,b1) changes.
         cache_key = (a1, b1)
         if get(state.timestepper_data, :cnlf2_lhs_key, nothing) !== cache_key
-            state.timestepper_data[:cnlf2_lhs_key] = cache_key
             state.timestepper_data[:cnlf2_lhs_factor] = _factorize_timestep_matrix(a1 * M_matrix + b1 * L_matrix)
+            state.timestepper_data[:cnlf2_lhs_key] = cache_key
         end
         X_new = _timestep_vector_buffer!(state, :cnlf2_X_new_vec, length(rhs))
         _timestep_ldiv!(X_new, state.timestepper_data[:cnlf2_lhs_factor], rhs)

@@ -70,8 +70,8 @@ function _create_batched_fft_plan(field_size::Tuple, T::Type, batch_size::Int, r
 
         # Inverse plan — rfft reduces the first dimension (FFTW/CUFFT convention)
         out_size = (div(field_size[1], 2) + 1, field_size[2:end]..., batch_size)
-        dummy_out = CUDA.zeros(complex_T, out_size...)
-        iplan = CUFFT.plan_irfft(dummy_out, field_size[1], fft_dims)
+        dummy_out = Tarang._padded_plan_spectrum(plan, GPU(CUDA.device()), T, out_size)
+        iplan = inv(plan)
 
         return BatchedGPUFFTPlan(plan, iplan, field_size, batch_size, true,
             dummy_in, dummy_out, WeakRef(current_task()), CUDA.stream(), _current_device_id())
@@ -157,7 +157,11 @@ function _execute_batched_fft!(outputs, inputs, fft_plan, packed_in, packed_out)
     for i in 1:n
         selectdim(packed_in, batch_dim, i) .= inputs[i]
     end
-    mul!(packed_out, fft_plan, packed_in)
+    if eltype(packed_out) <: Real && eltype(packed_in) <: Complex
+        Tarang._padded_inverse!(packed_out, fft_plan, packed_in)
+    else
+        mul!(packed_out, fft_plan, packed_in)
+    end
     for i in 1:n
         outputs[i] .= selectdim(packed_out, ndims(packed_out), i)
     end
@@ -219,6 +223,7 @@ function gpu_fft_async!(output::CuArray, input::CuArray, plan::GPUFFTPlan; strea
         synchronize && CUDA.synchronize(stream)
     else
         mul!(output, plan.plan, input)
+        synchronize && CUDA.synchronize()
     end
     return output
 end
@@ -233,14 +238,11 @@ Uses CUDA.stream! context manager which properly integrates with CUDA.jl's
 internal stream management (update_stream) so the plan correctly tracks
 which stream it's executing on.
 
-For real plans (`plan.is_real`), the C2R (irfft) transform is DESTRUCTIVE on
-its input buffer (cuFFT convention, same as FFTW). The input is copied into a
-freshly allocated scratch before the `mul!` so the caller's coefficient buffer
-is never corrupted — mirrors the guard in `gpu_backward_fft!` (a fresh
-allocation, not the shared `get_gpu_dct_scratch` cache, because async/stream
-execution must not race other users of the shared scratch).
+For real transforms each task and stream owns an inverse plan that preserves
+the caller's coefficients. Repeated calls at the same shape reuse its scratch.
 """
 function gpu_ifft_async!(output::CuArray, input::CuArray, plan::GPUFFTPlan; stream=nothing, synchronize::Bool=false)
+    ensure_device!(GPU(CUDA.device(input)))
     if stream !== nothing
         CUDA.stream!(stream) do
             _gpu_ifft_exec!(output, input, plan)
@@ -248,20 +250,34 @@ function gpu_ifft_async!(output::CuArray, input::CuArray, plan::GPUFFTPlan; stre
         synchronize && CUDA.synchronize(stream)
     else
         _gpu_ifft_exec!(output, input, plan)
+        synchronize && CUDA.synchronize()
     end
     return output
 end
 
-# Execute the inverse transform, guarding the caller's input against cuFFT's
-# destructive C2R. C2C inverse is non-destructive — no copy needed.
+const _ASYNC_REAL_INVERSES = Dict{Tuple,Any}()
+
 function _gpu_ifft_exec!(output::CuArray, input::CuArray, plan::GPUFFTPlan)
-    if plan.is_real
-        scratch = similar(input)
-        copyto!(scratch, input)
-        mul!(output, plan.iplan, scratch)
-    else
-        mul!(output, plan.iplan, input)
+    plan.is_real || return mul!(output, plan.iplan, input)
+    dev = CUDA.device(input)
+    CUDA.device(output) == dev || throw(ArgumentError("Inverse FFT arrays must reside on the same GPU"))
+    CUFFT.assert_applicable(plan.iplan.p, input, output)
+    region = Tuple(plan.iplan.p.region)
+    cache = Tarang._gpu_workspace_cache(_ASYNC_REAL_INVERSES)
+    key = (dev, CUDA.stream(), eltype(input), ndims(input))
+    inverse = _async_real_inverse!(cache, key, input, size(output), region, plan.iplan.scale)
+    return mul!(output, inverse, input)
+end
+
+# Each task/stream retains just its last geometry for a given rank and
+# precision. The inverse owns the handle and scratch for pending commands.
+function _async_real_inverse!(cache, key, input, outsize, region, scale)
+    shape = (size(input), outsize, region, scale)
+    entry = get(cache, key, nothing)
+    if isnothing(entry) || first(entry) != shape
+        native = AbstractFFTs.plan_brfft(input, outsize[first(region)], region)
+        entry = cache[key] = (shape, AbstractFFTs.ScaledPlan(native, scale))
     end
-    return output
+    return last(entry)
 end
 

@@ -631,25 +631,8 @@ function setup_legendre_transform!(dist::Distributor, basis::Legendre, axis::Int
             quad_weights = Vector{Float64}(qw)
         end
         
-        # Build Legendre polynomials at quadrature points
-        poly_matrix = build_legendre_polynomials(coeff_size, grid_points)
-        
-        # Build forward transform matrix
-        forward_matrix = zeros(coeff_size, grid_size)
-        for n in 0:coeff_size-1, i in 1:grid_size
-            normalization = sqrt((2*n + 1) / 2.0)
-            forward_matrix[n+1, i] = poly_matrix[n+1, i] * quad_weights[i] * normalization
-        end
-        
-        # Build backward transform matrix
-        backward_matrix = zeros(grid_size, coeff_size)
-        for i in 1:grid_size, n in 0:coeff_size-1
-            normalization = sqrt((2*n + 1) / 2.0)
-            backward_matrix[i, n+1] = poly_matrix[n+1, i] * normalization
-        end
-        
-        transform.forward_matrix = sparse(forward_matrix)
-        transform.backward_matrix = sparse(backward_matrix)
+        transform.forward_matrix, transform.backward_matrix =
+            _legendre_transform_matrices(grid_points, quad_weights, coeff_size)
         transform.grid_points = grid_points
         transform.quad_weights = quad_weights
         
@@ -667,6 +650,21 @@ function setup_legendre_transform!(dist::Distributor, basis::Legendre, axis::Int
     push!(dist.transforms, transform)
 
     @debug "Legendre transform setup completed for axis $axis"
+end
+
+function _legendre_transform_matrices(nodes, weights, coeff_size::Int)
+    grid_size = length(nodes)
+    retained_modes = min(grid_size, coeff_size)
+    polynomials = build_legendre_polynomials(retained_modes, nodes)
+    forward = zeros(coeff_size, grid_size)
+    backward = zeros(grid_size, coeff_size)
+    for degree in 0:(retained_modes - 1), i in 1:grid_size
+        normalization = sqrt((2degree + 1) / 2.0)
+        value = polynomials[degree + 1, i]
+        forward[degree + 1, i] = value * weights[i] * normalization
+        backward[i, degree + 1] = value * normalization
+    end
+    return (sparse(forward), sparse(backward))
 end
 
 
@@ -690,12 +688,8 @@ function setup_jacobi_transform!(dist::Distributor, basis::JacobiBasis, axis::In
     # Field's physical grid points along this axis (evaluate_basis maps [a,b]→[-1,1]).
     nodes = vec(Array(local_grid(basis, dist, 1)))
 
-    # Backward collocation matrix B[i, n+1] = φ_n(x_i); forward = B^{-1}.
-    B = Matrix{Float64}(evaluate_basis(basis, nodes, 0:N-1))
-    F = inv(B)
-
-    transform.backward_matrix = sparse(B)
-    transform.forward_matrix = sparse(F)
+    transform.forward_matrix, transform.backward_matrix =
+        _jacobi_transform_matrices(basis, nodes, N)
     transform.grid_points = nodes
     transform.grid_size = N
     transform.coeff_size = N
@@ -704,6 +698,21 @@ function setup_jacobi_transform!(dist::Distributor, basis::JacobiBasis, axis::In
     push!(dist.transforms, transform)
 
     @debug "Jacobi collocation transform setup for axis $axis: N=$N, basis=$(typeof(basis))"
+end
+
+function _jacobi_transform_matrices(basis::JacobiBasis, nodes, coeff_size::Int)
+    grid_size = length(nodes)
+    # Interpolate all polynomial modes resolved by these nodes before truncating
+    # to stored modes. A coarser grid resolves fewer than the stored number.
+    backward = Matrix{Float64}(evaluate_basis(basis, nodes, 0:(grid_size - 1)))
+    forward = inv(backward)
+    if grid_size < coeff_size
+        missing_modes = coeff_size - grid_size
+        return (vcat(sparse(forward), spzeros(missing_modes, grid_size)),
+                hcat(sparse(backward), spzeros(grid_size, missing_modes)))
+    end
+    return (sparse(view(forward, 1:coeff_size, :)),
+            sparse(view(backward, :, 1:coeff_size)))
 end
 
 

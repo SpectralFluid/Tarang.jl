@@ -149,7 +149,7 @@ function evaluate_transform_multiply(field1::ScalarField, field2::ScalarField, e
         # Detect the MPI pencil path WITHOUT forcing a layout first, so the
         # distributed routine can truncate inputs in coefficient space (avoids a
         # c→g→c round trip when operands arrive in coeff space — the usual case).
-        if field1.dist.use_pencil_arrays && evaluator.dist.size > 1
+        if evaluator.dist.size > 1
             # MPI path. Primary: FULL 3/2-rule padded dealiasing via the transpose-pad
             # distributed FFT (evaluate_padded_multiply_distributed) — the cross-rank
             # redistribution needed to embed the N-mode spectrum into the 3N/2 padded
@@ -157,11 +157,13 @@ function evaluate_transform_multiply(field1::ScalarField, field2::ScalarField, e
             # serial padded multiply to roundoff (round-7 audit 2026-06). Covers 2D + 3D
             # (incl. 2D process mesh) pure-Fourier and mixed Fourier×(Cheb/Jacobi).
             # Fallback: it returns `nothing` for the cases it does not cover (>3D, a
-            # decomposed non-Fourier axis, or a Fourier axis with N ≤ 4 — the last
-            # mirroring serial's own small-grid skip), routing to local 2/3-rule
+            # decomposed non-Fourier axis), routing to local 2/3-rule
             # truncation-after-multiply (evaluate_truncated_multiply_distributed).
-            padded = evaluate_padded_multiply_distributed(field1, field2, evaluator;
-                                                          result_layout=result_layout)
+            padded = if field1.dist.use_pencil_arrays
+                evaluate_padded_multiply_distributed(field1, field2, evaluator; result_layout)
+            else
+                _transpose_padded_product(field1, field2, evaluator, result_layout)
+            end
             result = padded !== nothing ? padded :
                      evaluate_truncated_multiply_distributed(field1, field2, evaluator;
                                                              result_layout=result_layout)
@@ -230,6 +232,93 @@ function gpu_multiply_fields!(result_data::AbstractArray, data1::AbstractArray, 
     # Default CPU implementation using broadcasting
     result_data .= data1 .* data2
     return result_data
+end
+
+# Resize one Fourier axis while a rank owns the entire axis. The source and
+# destination pencils have identical transverse ranges in this layout.
+function _resize_transpose_axis!(dst, src, axis)
+    topo = src.topology
+    layout = if axis == 1 && topo.Rx > 1
+        length(src.global_shape) == 2 && topo.Ry == 1 ? YLocal : XLocal
+    elseif axis == 2 && topo.Ry > 1
+        YLocal
+    else
+        ZLocal
+    end
+    layout != ZLocal && transpose_z_to_y!(src)
+    layout == XLocal && transpose_y_to_x!(src)
+    dst.buffers.active_layout[] = layout
+    input, output = current_data(src), current_data(dst)
+    if !isempty(input)
+        arch = src.buffers.architecture
+        fft_in_dim!(input, axis, :forward, arch)
+        if dst.global_shape[axis] > src.global_shape[axis]
+            _pad_spectral!(output, input, size(input), size(output), [axis])
+        else
+            _truncate_spectral!(output, input, size(output), size(input), [axis])
+        end
+        fft_in_dim!(output, axis, :backward, arch)
+    end
+    layout == XLocal && transpose_x_to_y!(dst)
+    layout != ZLocal && transpose_y_to_z!(dst)
+    return dst
+end
+
+"""Padded Fourier product on the explicit transpose backend, using rank-local buffers."""
+function _transpose_padded_product(a, b, evaluator, result_layout)
+    dist = a.dist
+    dist.closed && throw(ArgumentError("cannot multiply fields on a closed Distributor"))
+    shape = map(basis -> basis.meta.size, a.bases)
+    axes_to_pad = findall(eachindex(shape)) do d
+        a.bases[d] isa FourierBasis && _axis_dealias_factor(a.bases[d], evaluator.dealiasing_factor) > 1
+    end
+    padded_workspace(sz) = get!(dist.transpose_workspace_cache, (:nonlinear, sz, a.dtype)) do
+        _build_transpose_workspace(a, sz, nothing)
+    end
+    stages = [padded_workspace(shape)]
+    for axis in axes_to_pad
+        factor = _axis_dealias_factor(a.bases[axis], evaluator.dealiasing_factor)
+        shape = Base.setindex(shape, _padded_fourier_size(shape[axis], factor), axis)
+        push!(stages, padded_workspace(shape))
+    end
+    function interpolate!(field)
+        first(stages).buffers.active_layout[] = ZLocal
+        first(stages).buffers.z_local_data .= grid_data!(field)
+        for (i, axis) in enumerate(axes_to_pad)
+            _resize_transpose_axis!(stages[i+1], stages[i], axis)
+        end
+        return last(stages).buffers.z_local_data
+    end
+    padded = interpolate!(a)
+    if a === b
+        padded .*= padded
+    else
+        # Retain the first interpolant while the second uses the same transpose buffers.
+        i = findfirst(x -> typeof(x) === typeof(padded) && size(x) == size(padded), evaluator.scratch_arrays)
+        saved = if isnothing(i)
+            push!(evaluator.scratch_arrays, similar(padded))
+            last(evaluator.scratch_arrays)
+        else
+            evaluator.scratch_arrays[i]
+        end
+        copyto!(saved, padded)
+        interpolate!(b)
+        padded .*= saved
+    end
+    for i in reverse(eachindex(axes_to_pad))
+        _resize_transpose_axis!(stages[i], stages[i+1], axes_to_pad[i])
+    end
+    result = _checkout_nl_result!(evaluator, a)
+    data = first(stages).buffers.z_local_data
+    scale = prod(shape) / prod(first(stages).global_shape)
+    if result.dtype <: Real
+        get_grid_data(result) .= scale .* real.(data)
+    else
+        get_grid_data(result) .= scale .* data
+    end
+    result.current_layout = :g
+    ensure_layout!(result, result_layout)
+    return result
 end
 
 # ── Cached workspace for the distributed padded multiply ─────────────────────
@@ -401,14 +490,9 @@ function evaluate_padded_multiply_distributed(field1::ScalarField, field2::Scala
     # nodal grid and are left untouched. Mp[d] == N[d] for non-Fourier axes.
     Mp = ntuple(D) do d
         isfourier(bases[d]) || return N[d]
-        af = _axis_dealias_factor(bases[d], factor); m = Int(ceil(af * N[d])); isodd(m) && (m += 1); m
+        return _padded_fourier_size(N[d], _axis_dealias_factor(bases[d], factor))
     end
     any(d -> Mp[d] > N[d], fourier_axes) || return nothing
-    # Match serial _get_padded_workspace!: the 3/2-rule is invalid for a Fourier axis
-    # with N ≤ 4 (≤2 independent modes), where serial falls back to truncation. Mirror
-    # that here so distributed == serial on tiny Fourier axes too.
-    minimum(N[d] for d in fourier_axes) <= 4 && return nothing
-
     ensure_layout!(field1, :g); ensure_layout!(field2, :g)
     gd1 = get_grid_data(field1); gd2 = get_grid_data(field2)
     (gd1 isa PencilArrays.PencilArray && gd2 isa PencilArrays.PencilArray) || return nothing

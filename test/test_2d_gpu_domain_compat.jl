@@ -30,6 +30,7 @@ catch err
 end
 
 if _JL2D_OK
+    include("strict_device_support.jl")
     const _JLA2D = JLArrays.JLArray
     # Wire JLArray into Tarang's GPU dispatch so the REAL refresh functions treat
     # it as device memory — mirrors ext/cuda/architecture.jl and ext/cuda/utils.jl.
@@ -94,18 +95,20 @@ end
         end
 
         @testset "spectral derivative multiply (skew/grad core)" begin
-            # verbatim from _apply_lazy_fourier_diff! (lazy_rhs.jl):
-            #   data .*= reshape(deriv_mult, mult_shape)
             # ∂/∂x sin(3x) = 3 cos(3x) via full FFT along axis 1.
-            N = 16; L = 2π; k0 = 2π / L; m = 3
+            N = 16; L = 2π; m = 3
             x = (0:N-1) .* (L / N)
             f = [sin(m * x[i]) for i in 1:N, j in 1:N]
             fhat = fft(f, 1)
-            kfft = k0 .* Float64.([0:(N ÷ 2 - 1); -(N ÷ 2):-1])
-            deriv_mult = ComplexF64.(im .* kfft)           # (ik)^1
+            coords = CartesianCoordinates("x", "y")
+            dist = Distributor(coords; comm=Tarang.MPI.COMM_SELF, use_pencil_arrays=false)
+            xb = ComplexFourier(coords["x"]; size=N, bounds=(0.0, L))
 
             dhat = _JLA2D(copy(fhat))
-            dhat .*= reshape(_JLA2D(deriv_mult), N, 1)     # device ×(ik) along axis 1
+            with_strict_device() do
+                Tarang._apply_spectral_derivative_distributed!(dhat, xb, 1, 1, dist;
+                                                                uses_rfft=false)
+            end
             got = real.(ifft(Array(dhat), 1))
             @test got ≈ [m * cos(m * x[i]) for i in 1:N, j in 1:N] rtol=1e-10
         end

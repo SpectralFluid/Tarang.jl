@@ -72,19 +72,19 @@ function _prepare_global_multistep_matrices!(state::TimestepperState,
     return L_matrix, M_matrix, false
 end
 
-"""Accumulate `sign * coefs[i] * history[i-1]` for every term the history can supply.
+"""Accumulate the current value and any earlier values available in history.
 
 `coefs` is 1-based, so `coefs[1]` is the implicit `a[0]`/`b[0]` handled by the LHS
-and only `coefs[2:end]` contribute here. A scheme running below its nominal order
-(startup, or after a history reset) simply has fewer entries and drops the tail —
-the same per-term `length(history) >= k` guards the six schemes each wrote out by
-hand, now written once."""
+and only `coefs[2:end]` contribute here. The current value is held separately until
+the solve succeeds."""
 @inline function _accumulate_history_terms!(rhs::Vector{ComplexF64}, coefs::Tuple,
+                                            current::Vector{ComplexF64},
                                             history::Vector{Vector{ComplexF64}}, sign::Float64)
-    @inbounds for i in 2:length(coefs)
-        (i - 1) <= length(history) || continue
+    length(coefs) < 2 && return rhs
+    @. rhs += (sign * coefs[2]) * current
+    @inbounds for i in 3:min(length(coefs), length(history) + 2)
         coef = sign * coefs[i]
-        h = history[i - 1]
+        h = history[i - 2]
         @. rhs += coef * h
     end
     return rhs
@@ -130,35 +130,36 @@ function _global_multistep_core!(state::TimestepperState, solver::InitialValueSo
     F_current_vec = _timestep_global_rhs_vector!(state, :multistep_F_current_vec,
                                                    solver, current_state, solver.sim_time)
 
-    # Step 4: rotate and store history
     MX_history = state.timestepper_data[:MX_history]::Vector{Vector{ComplexF64}}
     F_history  = state.timestepper_data[:F_history]::Vector{Vector{ComplexF64}}
-    _prepend_history_buffer!(MX_history, MX_current, mx_depth)
-    _prepend_history_buffer!(F_history, F_current_vec, f_depth)
-
     LX_history = state.timestepper_data[:LX_history]::Vector{Vector{ComplexF64}}
-    if use_lx
-        LX_current = _timestep_matvec!(state, :multistep_LX_current_vec, L_matrix, X_current)
-        _prepend_history_buffer!(LX_history, LX_current, lx_depth)
-    end
-
-    if warn_short_f && length(F_history) < length(c) - 1
-        @warn "$name: insufficient F_history ($(length(F_history)) < $(length(c) - 1)), " *
+    available_rhs = 1 + length(F_history)
+    if warn_short_f && available_rhs < length(c) - 1
+        @warn "$name: insufficient F_history ($available_rhs < $(length(c) - 1)), " *
               "falling back to lower-order extrapolation" maxlog=1
     end
 
-    # Step 5: RHS
+    # Step 4: RHS
     rhs = _global_multistep_zero_rhs!(state, length(X_current))
-    _accumulate_history_terms!(rhs, c, F_history, 1.0)
-    _accumulate_history_terms!(rhs, a, MX_history, -1.0)
-    use_lx && _accumulate_history_terms!(rhs, b, LX_history, -1.0)
+    _accumulate_history_terms!(rhs, c, F_current_vec, F_history, 1.0)
+    _accumulate_history_terms!(rhs, a, MX_current, MX_history, -1.0)
+    LX_current = if use_lx
+        linear_value = _timestep_matvec!(state, :multistep_LX_current_vec, L_matrix, X_current)
+        _accumulate_history_terms!(rhs, b, linear_value, LX_history, -1.0)
+        linear_value
+    end
+    zero_rows = _global_zero_mass_rows!(state, M_matrix)
+    _apply_global_algebraic_rhs!(rhs, state, solver.problem, zero_rows, b[1])
 
-    # Step 6: solve (a[0] M + b[0] L) X = RHS
+    # Step 5: solve (a[0] M + b[0] L) X = RHS
     cache_key = (a[1], b[1])
     X_new = _global_multistep_solve!(state, cache_key, M_matrix, L_matrix, a[1], b[1], rhs)
 
-    # Step 7: update state
+    # Step 6: commit the new state and its accepted histories
     _push_vector_state!(state.history, X_new, current_state, state_cap)
+    _prepend_history_buffer!(MX_history, MX_current, mx_depth)
+    _prepend_history_buffer!(F_history, F_current_vec, f_depth)
+    LX_current === nothing || _prepend_history_buffer!(LX_history, LX_current, lx_depth)
     state.timestepper_data[iter_key] += 1
 
     @debug "$name step completed: dt=$(state.dt), iteration=$(state.timestepper_data[iter_key]), |X_new|=$(norm(X_new))"
@@ -171,9 +172,6 @@ function step_cnab1!(state::TimestepperState, solver::InitialValueSolver)
     dt = state.dt
 
     # Subproblem path: use the per-Fourier-mode multistep stepper when available.
-    # This is the only path that correctly handles inhomogeneous algebraic
-    # constraints (BCs like `T(z=0) = 1`), because the global-matrix path below
-    # packs F in variable space and silently drops BC F values.
     sps = _timestepper_subproblems(solver)
     if sps !== nothing
         a, b, c = _cnab1_coefs(dt)
