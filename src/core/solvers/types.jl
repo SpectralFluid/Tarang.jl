@@ -510,8 +510,8 @@ function _build_initial_value_solver(problem::InitialValueProblem, timestepper;
         # RK/IMEX dispatch deliberately uses the field-wise explicit path for
         # pure-Fourier GPU states.  Building global host matrices here is both
         # unused and prohibitive at production sizes (e.g. the 512² turbulence
-        # example), while the algebraic Poisson/velocity constraints are handled
-        # spectrally by evaluate_rhs at each stage.
+        # example), while the algebraic constraints are solved spectrally by
+        # the constraint refresh (checked below).
         @info "Pure-Fourier GPU InitialValueProblem: skipping unused global CPU matrix assembly"
     elseif _mpi_matrix_free_fourier_state(state, timestepper)
         # Keep parsing and format validation, but omit unused sparse L/M and F.
@@ -541,6 +541,14 @@ function _build_initial_value_solver(problem::InitialValueProblem, timestepper;
     end
 
     _prepare_boundary_values!(problem, 0.0)
+
+    # With neither global matrices nor subproblems, nothing but the spectral
+    # constraint refresh imposes the algebraic equations. Refuse one it cannot
+    # solve exactly now, naming it, rather than step with it stale or wrong.
+    # (After the boundary values above: they are part of what it reads.)
+    if !assembled_global_matrices && !solver.execution_plan.assembled_subproblems
+        _require_refreshable_constraints!(problem, state)
+    end
 
     return solver
 end

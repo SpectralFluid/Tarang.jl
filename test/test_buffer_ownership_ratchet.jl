@@ -58,9 +58,8 @@ end
         "_DERIV_RESULT_POOL_SIZE"   => 16,
         # `evaluate_transform_multiply(...; own=true)` copies out by default.
         "_NL_RESULT_POOL_SIZE"      => 8,
-        # Single consumer, `copy_field_data!`s the result on the next line
-        # (`_solve_poisson_constraint!` in timesteppers/state_utils.jl).
-        "_POISSON_RESULT_POOL_SIZE" => 4,
+        # (`_POISSON_RESULT_POOL_SIZE` is gone: the constraint refresh in
+        # timesteppers/state_utils.jl now solves straight into the target field.)
     )
 
     @test sort(collect(keys(pools))) == sort(collect(keys(expected)))

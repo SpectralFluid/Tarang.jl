@@ -12,9 +12,6 @@ using SparseArrays
 using FFTW
 using AbstractFFTs: Plan as AbstractFFTPlan
 using StaticArrays
-using Parameters
-using ChainRulesCore
-using ForwardDiff
 using LoopVectorization
 using ExponentialUtilities  # For Krylov-based exponential integrators
 using FastGaussQuadrature   # For Gauss-Legendre quadrature in Legendre transforms

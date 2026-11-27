@@ -334,6 +334,12 @@ struct TransposeCounts <: AbstractTransposeCounts
     yx_recv_counts::Vector{Int}
     yx_send_displs::Vector{Int}
     yx_recv_displs::Vector{Int}
+
+    # Whether `compute_yx_counts_2d!` filled the Y ↔ X counts. Tracked explicitly:
+    # all-zero counts are legitimate on a rank whose x and y blocks are both empty
+    # (more ranks than points), and reading them as "not computed" made that rank
+    # throw while its column peers blocked in Alltoallv.
+    yx_computed::Base.RefValue{Bool}
 end
 
 """
@@ -345,7 +351,8 @@ This ensures MPI.Alltoallv receives correctly sized counts/displs vectors.
 function TransposeCounts(zy_nprocs::Int, yx_nprocs::Int)
     return TransposeCounts(
         zeros(Int, zy_nprocs), zeros(Int, zy_nprocs), zeros(Int, zy_nprocs), zeros(Int, zy_nprocs),
-        zeros(Int, yx_nprocs), zeros(Int, yx_nprocs), zeros(Int, yx_nprocs), zeros(Int, yx_nprocs)
+        zeros(Int, yx_nprocs), zeros(Int, yx_nprocs), zeros(Int, yx_nprocs), zeros(Int, yx_nprocs),
+        Ref(false)
     )
 end
 

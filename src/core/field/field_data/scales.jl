@@ -180,6 +180,11 @@ end
     - Grid space: subsample or average to coarser grid
     - Coefficient space: retain the stored spectral coefficients
 
+    The next backward transform resamples retained coefficients onto the new grid
+    along every axis. If a RealFourier half-spectrum length cannot identify the
+    grid it was formed on (coefficients from another non-unit scale, or a length
+    the base and new grids share), the field is returned in grid space instead.
+
     Resolution-changing scale updates are not supported for distributed fields;
     they throw before modifying metadata or storage. Distributed nonlinear
     dealiasing uses a separate coefficient-padding implementation.
@@ -219,6 +224,15 @@ function set_scales!(field::ScalarField, scales::Union{Real, Vector{Real}, Tuple
         # basis transforms instead: forward to coefficients, resize the grid buffer,
         # then backward — the basis-aware backward transform regenerates grid values at
         # the new (scaled) collocation nodes exactly, for both Chebyshev and Fourier axes.
+        if !_rfft_rescale_resolvable(field, old_grid_shape, new_grid_shape)
+            # The rfft axis' coefficients from the old grid would not name it on
+            # the new one (formed off the base grid, or a half-spectrum length the
+            # base and new grids share — see `backward_axis_op`). Resample the
+            # uniform periodic axes in grid space first (exact, same convention),
+            # so the spectral pass below changes only the non-Fourier axes.
+            _resample_fourier_axes_in_grid!(field, old_scales, new_scales, old_grid_shape)
+            field.scales == new_scales && return field
+        end
         forward_transform!(field)            # → :c (coefficients unaffected by scale)
         preset_scales!(field, new_scales)    # resize grid buffer; coeff size unchanged
         backward_transform!(field)           # → :g at the new collocation nodes
@@ -259,7 +273,16 @@ function set_scales!(field::ScalarField, scales::Union{Real, Vector{Real}, Tuple
     elseif !is_grid_space && get_coeff_data(field) !== nothing
         # In coefficient space: scales don't affect coefficient storage
         # but we still need to update the field's scale parameter
-        # The grid data will be recomputed on next backward transform
+        # The grid data will be recomputed on next backward transform —
+        # unless that backward could not tell which grid an rfft axis'
+        # coefficients came from. Then invert them now, at the scales they
+        # belong to, and change scales in grid space instead.
+        if old_grid_shape != new_grid_shape &&
+           !_rfft_rescale_resolvable(field, _coefficient_grid_shape(field, old_grid_shape),
+                                     new_grid_shape)
+            backward_transform!(field)
+            return set_scales!(field, new_scales)
+        end
         preset_scales!(field, new_scales)
 
     else
@@ -268,6 +291,68 @@ function set_scales!(field::ScalarField, scales::Union{Real, Vector{Real}, Tuple
     end
 
     @debug "Changed field scales with data transformation" old_scales=old_scales new_scales=new_scales
+    return field
+end
+
+"""
+    _rfft_rescale_resolvable(field, src_shape, dst_shape) -> Bool
+
+Whether a backward transform carries coefficients formed on grid `src_shape` onto
+`dst_shape` correctly. C2C and non-Fourier axes always do (their stored lengths
+are unambiguous); an rfft axis only from its own grid, or from the base grid onto
+one whose half-spectrum length differs from the base one (`backward_axis_op`).
+"""
+function _rfft_rescale_resolvable(field::ScalarField, src_shape::Tuple, dst_shape::Tuple)
+    rfft = _rfft_axes(field)
+    for (axis, basis) in enumerate(field.bases)
+        rfft[axis] || continue
+        src_shape[axis] == dst_shape[axis] && continue
+        n = basis.meta.size
+        (src_shape[axis] == n && rfft_len(dst_shape[axis]) != rfft_len(n)) || return false
+    end
+    return true
+end
+
+"""
+The grid `field`'s stored coefficients were formed on: the current one
+(`grid_shape`), except along an rfft axis whose length fits only the base grid
+(coefficients kept through an earlier coefficient-space scale change).
+"""
+function _coefficient_grid_shape(field::ScalarField, grid_shape::Tuple)
+    rfft = _rfft_axes(field)
+    coeff = get_local_data(get_coeff_data(field))
+    return ntuple(length(field.bases)) do axis
+        n = field.bases[axis].meta.size
+        stored = size(coeff, axis)
+        rfft[axis] && stored == rfft_len(n) &&
+            stored != rfft_len(grid_shape[axis]) ? n : grid_shape[axis]
+    end
+end
+
+# The axes the forward transform halves (rfft), from the shared layout rule — the
+# plan bundle's own `forward_ops`, without needing the (possibly closed) plans.
+_rfft_axes(field::ScalarField) =
+    map(op -> op.op === :rfft,
+        first(forward_layout(field.bases, map(b -> b.meta.size, field.bases), field.dtype)))
+
+"""
+Resample the Fourier axes of `field`'s grid data from `old_scales` to
+`new_scales` in grid space (`resample_grid_data!`; the other axes keep their
+length, which the resample leaves unchanged), leaving the field at those mixed
+scales for the spectral pass of `set_scales!` to finish.
+"""
+function _resample_fourier_axes_in_grid!(field::ScalarField, old_scales, new_scales,
+                                         old_grid_shape::Tuple)
+    n = length(field.bases)
+    n <= 3 || throw(ArgumentError(
+        "set_scales! cannot resample the Fourier axes of a $(n)D field with a " *
+        "non-Fourier axis in grid space (the grid resample handles 1D-3D)"))
+    olds = old_scales === nothing ? ntuple(_ -> 1.0, n) : old_scales
+    mid_scales = ntuple(a -> is_fourier_basis(field.bases[a]) ? new_scales[a] : olds[a], n)
+    old_data = get_local_data(get_grid_data(field))
+    preset_scales!(field, mid_scales)
+    resample_grid_data!(get_local_data(get_grid_data(field)), old_data, old_grid_shape,
+                        get_scaled_shape(field, field.scales))
     return field
 end
 

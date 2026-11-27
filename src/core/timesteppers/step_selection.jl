@@ -59,15 +59,38 @@ function _timestepper_subproblems(solver::InitialValueSolver)
     return sps isa Tuple ? sps : nothing
 end
 
-"""Use an internal serial diagonal solver on GPU or with an attached operator.
-Subproblem and MPI solvers retain their own implicit execution paths."""
-function _serial_diagonal_imex_applicable(solver::InitialValueSolver, ts::TimeStepper)
-    ts isa Union{RK222, RK443, SBDF2} || return false
+"""
+Public schemes with a serial (single CPU process or single GPU) per-mode diagonal
+implicit solve. Every IMEX Runge-Kutta tableau reaches it through `step_rk_imex!`,
+whose `_step_diagonal_imex_rk_impl!` is generic over the tableau, and SBDF2 through
+`step_diagonal_imex_sbdf2!`. CNAB1/2, SBDF1/3/4, MCNAB2, CNLF2 and the ETD schemes
+have no such implementation: they solve the equations' own operator through a
+global matrix and cannot apply an attached `SpectralLinearOperator`.
+"""
+const _SERIAL_DIAGONAL_IMEX_TIMESTEPPERS = Union{RK111, RK222, RK443, RKSMR, RKGFY, SBDF2}
+
+"""Can a serial step of `ts` take the internal diagonal solve in this
+configuration? Subproblem and MPI solvers retain their own implicit paths."""
+function _serial_diagonal_imex_capable(solver::InitialValueSolver, ts::TimeStepper)
+    ts isa _SERIAL_DIAGONAL_IMEX_TIMESTEPPERS || return false
     _timestepper_subproblems(solver) === nothing || return false
     isempty(solver.state) && return false
-    _mpi_pencil_distribution_active(first(solver.state).dist) && return false
+    return !_mpi_pencil_distribution_active(first(solver.state).dist)
+end
+
+"""Use an internal serial diagonal solver on GPU or with an attached operator."""
+function _serial_diagonal_imex_applicable(solver::InitialValueSolver, ts::TimeStepper)
+    _serial_diagonal_imex_capable(solver, ts) || return false
     return plan_is_gpu(solver.execution_plan) ||
            _get_spectral_linear_operator(solver) !== nothing
+end
+
+"""Does a step of `ts` read an attached `SpectralLinearOperator`? Only the
+diagonal paths do (`_serial_diagonal_imex_Lmap!`); every other path solves the
+equations' own operator and would silently integrate without the attached one."""
+function _attached_operator_consumed(solver::InitialValueSolver, ts::TimeStepper)
+    ts isa _DIAGONAL_IMEX_TIMESTEPPERS && return true
+    return _serial_diagonal_imex_capable(solver, ts)
 end
 
 @inline function _mpi_pencil_distribution_active(dist::Distributor)

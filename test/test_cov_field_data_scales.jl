@@ -295,6 +295,109 @@ band_signal(x) = sin(2 * x) + 0.5 * cos(3 * x)
     end
 
     # =====================================================================
+    # Backward into a scaled grid — EVERY Fourier axis resampled
+    # =====================================================================
+    # A coefficient-space scale change keeps the stored (base) spectrum and the
+    # next backward must land on get_scaled_shape. It used to resample only the
+    # first RealFourier axis: RF×RF (16,16) at 1.5 came back (24,16), ComplexFourier
+    # axes and complex-dtype fields not at all, and downscaling garbled even the
+    # first axis. The grid-space path (pure Fourier: grid resample; mixed:
+    # forward→resize→backward) must agree.
+    scale_basis(c, name, kind, n) =
+        kind === :RF ? RealFourier(c[name]; size=n, bounds=(0.0, 2pi)) :
+        kind === :CF ? ComplexFourier(c[name]; size=n, bounds=(0.0, 2pi)) :
+                       ChebyshevT(c[name]; size=n, bounds=(-1.0, 1.0))
+    function scale_field(kinds, sizes, T)
+        names = ("x", "y", "z")[1:length(kinds)]
+        c = CartesianCoordinates(names...)
+        d = Distributor(c; mesh=(1,), dtype=T)
+        bases = ntuple(i -> scale_basis(c, names[i], kinds[i], sizes[i]), length(kinds))
+        return ScalarField(d, "u", bases, T), d, bases
+    end
+    # Band-limited on every grid used below: Fourier modes |k| <= 2, degree-3
+    # polynomials; complex fields carry negative modes too.
+    scale_factor(kind, axis, x, cplx) = kind === :CHEB ? x^3 - 0.5x + 0.25 :
+        cplx ? cis(2x) + 0.5cis(-x) + 0.25 : sin(2x + 0.3axis) + 0.5cos(x) + 0.25
+    function scale_exact(kinds, d, bases, s, T)
+        nodes = [vec(Array(g)) for g in local_grids(d, bases...; scales=s)]
+        vals = [prod(scale_factor(kinds[a], a, nodes[a][I[a]], T <: Complex) for a in eachindex(kinds))
+                for I in CartesianIndices(Tuple(length.(nodes)))]
+        return T <: Complex ? T.(vals) : T.(real.(vals))
+    end
+
+    @testset "set_scales! then backward: all Fourier axes on the scaled grid" begin
+        layouts = [((:RF, :RF), (16, 16), Float64), ((:RF, :RF), (15, 9), Float64),
+                   ((:RF, :CF), (16, 12), Float64), ((:RF, :CF), (15, 11), ComplexF64),
+                   ((:CF, :CF), (12, 11), Float64), ((:CF, :CF), (12, 11), ComplexF64),
+                   ((:RF, :RF, :CHEB), (8, 8, 9), Float64),
+                   ((:RF, :RF, :CHEB), (7, 9, 9), ComplexF64),
+                   ((:CF, :CHEB), (12, 9), Float64), ((:CF, :CHEB), (11, 9), ComplexF64)]
+        for (kinds, sizes, T) in layouts, s in (1.5, 2.0, 0.75), layout in (:c, :g)
+            u, d, bases = scale_field(kinds, sizes, T)
+            ensure_layout!(u, :g)
+            get_grid_data(u) .= scale_exact(kinds, d, bases, 1.0, T)
+            ensure_layout!(u, layout)
+            set_scales!(u, s)
+            ensure_layout!(u, :g)
+            @test size(get_grid_data(u)) == get_scaled_shape(u)
+            @test isapprox(get_grid_data(u), scale_exact(kinds, d, bases, s, T); atol=1e-11)
+        end
+    end
+
+    @testset "coefficient-space backward follows the grid resample's Nyquist rule" begin
+        # Random data has even-N Nyquist content: dropped on upsampling, folded
+        # into the new Nyquist bin on downsampling — on every axis, exactly as
+        # resample_grid_data! does in grid space.
+        for (kinds, sizes, T) in [((:RF, :RF), (16, 12), Float64), ((:RF, :CF), (15, 10), Float64),
+                                  ((:CF, :RF), (10, 12), ComplexF64),
+                                  ((:RF, :CF, :RF), (8, 6, 10), Float64)],
+            s in (1.5, 0.75, 0.5)
+            a, _, _ = scale_field(kinds, sizes, T)
+            b, _, _ = scale_field(kinds, sizes, T)
+            ensure_layout!(a, :g); ensure_layout!(b, :g)
+            data = randn(T, size(get_grid_data(a))...)
+            get_grid_data(a) .= data
+            get_grid_data(b) .= data
+            set_scales!(a, s)                                   # grid resample
+            ensure_layout!(b, :c); set_scales!(b, s); ensure_layout!(b, :g)
+            @test size(get_grid_data(b)) == size(get_grid_data(a))
+            @test isapprox(get_grid_data(b), get_grid_data(a); atol=1e-12)
+        end
+    end
+
+    @testset "set_scales! chains and rfft-length collisions" begin
+        # RF(7): the 6-point grid of scale 0.75 has the same half-spectrum length
+        # (4) as the 7-point base, and 1.5 → 1.0 leaves coefficients formed off the
+        # base grid; neither can be told apart from the stored length alone, so
+        # set_scales! resamples those axes in grid space.
+        for (kinds, sizes) in [((:RF, :CHEB), (7, 9)), ((:CHEB, :RF), (9, 16)),
+                               ((:RF, :CF, :CHEB), (7, 6, 9)), ((:RF,), (7,))],
+            start in (:g, :c)
+            u, d, bases = scale_field(kinds, sizes, Float64)
+            ensure_layout!(u, :g)
+            get_grid_data(u) .= scale_exact(kinds, d, bases, 1.0, Float64)
+            for s in (0.75, 1.0, 1.5, 2.0, 1.0)
+                ensure_layout!(u, start)
+                set_scales!(u, s)
+                ensure_layout!(u, :g)
+                @test size(get_grid_data(u)) == get_scaled_shape(u)
+                @test isapprox(get_grid_data(u), scale_exact(kinds, d, bases, s, Float64);
+                               atol=1e-11)
+            end
+        end
+
+        # Bypassing set_scales! with such coefficients is refused loudly rather
+        # than inverted at a guessed length.
+        u, d, bases = scale_field((:RF, :CHEB), (16, 17), Float64)
+        preset_scales!(u, 1.5)
+        ensure_layout!(u, :g)
+        get_grid_data(u) .= scale_exact((:RF, :CHEB), d, bases, 1.5, Float64)
+        ensure_layout!(u, :c)                  # rfft axis: 13 bins of a 24-point grid
+        preset_scales!(u, 1.0)
+        @test_throws DimensionMismatch backward_transform!(u)
+    end
+
+    # =====================================================================
     # VectorField scale propagation
     # =====================================================================
     @testset "VectorField scales" begin

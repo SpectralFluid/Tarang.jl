@@ -20,6 +20,10 @@ end
 
 using Tarang
 
+# Device type of the stand-in NCCL module below (teardown synchronizes it first).
+struct SubcommMockDevice end
+Tarang.synchronize(::Tarang.GPU{SubcommMockDevice}) = nothing
+
 @testset "NCCL Sub-communicators" begin
     @testset "NCCLSubComms struct exists and defaults" begin
         # Test that we can create the struct with default values
@@ -131,7 +135,7 @@ using Tarang
         @test isdefined(Tarang, :finalize_nccl_subcomms!)
     end
 
-    @testset "finalize_nccl_subcomms! resets struct" begin
+    @testset "finalize_nccl_subcomms! destroys explicitly and resets struct" begin
         # Create and manually set up a subcomms struct
         subcomms = Tarang.NCCLSubComms()
         subcomms.initialized = true
@@ -142,9 +146,22 @@ using Tarang
         subcomms.col_rank = 2
         subcomms.col_size = 2
 
-        # Finalize should reset the struct
-        Tarang.finalize_nccl_subcomms!(subcomms)
+        # Finalize destroys the communicators through NCCL.jl (row, then column)
+        # instead of leaving ncclCommDestroy to rank-asynchronous GC finalizers.
+        # A stand-in module records the calls; its device needs no synchronization.
+        destroyed = Any[]
+        mock = Module(:NCCL)
+        Core.eval(mock, :(device(comm) = $(SubcommMockDevice())))
+        Core.eval(mock, :(destroy(comm) = push!($destroyed, comm)))
+        previous = Tarang._NCCL_MODULE[]
+        Tarang._NCCL_MODULE[] = mock
+        try
+            Tarang.finalize_nccl_subcomms!(subcomms; barrier_comm=MPI.COMM_WORLD)
+        finally
+            Tarang._NCCL_MODULE[] = previous
+        end
 
+        @test destroyed == [:mock_row_comm, :mock_col_comm]
         @test subcomms.initialized == false
         @test subcomms.row_comm === nothing
         @test subcomms.col_comm === nothing

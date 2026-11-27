@@ -31,12 +31,12 @@ helpers below may allocate metadata outside that hot path.
 
 What one transform stage does to one axis.
 
-- `op` — `:rfft`, `:fft`, `:irfft`, `:irfft_upsampled`, `:ifft`, `:dct1_forward`,
-  `:dct1_backward`, or `:none`
+- `op` — `:rfft`, `:fft`, `:irfft`, `:irfft_resampled`, `:ifft`, `:ifft_resampled`,
+  `:dct1_forward`, `:dct1_backward`, or `:none`
 - `out_len` — the axis length AFTER the stage
 - `out_complex` — whether the stage's output is complex
-- `pad_len` — `:irfft_upsampled` only: the half-spectrum length to zero-pad to
-  before the inverse (`0` otherwise)
+- `pad_len` — `:irfft_resampled` / `:ifft_resampled` only: the spectral length the
+  stored spectrum is zero-padded or truncated to before the inverse (`0` otherwise)
 """
 struct AxisOp
     op::Symbol
@@ -195,6 +195,15 @@ function _zero_pad_axis_prefix!(dst::AbstractArray, src::AbstractArray, axis::In
 end
 
 """
+Truncate or zero-pad `src` into `dst` along `axis`, whichever the lengths call
+for — a Chebyshev coefficient axis meeting an upscaled grid (pad) or a
+downscaled one (truncate), as the CPU chain does with `min(coeff, grid)` modes.
+"""
+_resize_axis_prefix!(dst::AbstractArray, src::AbstractArray, axis::Int) =
+    size(dst, axis) < size(src, axis) ? _copy_axis_prefix!(dst, src, axis) :
+                                        _zero_pad_axis_prefix!(dst, src, axis)
+
+"""
     layout_coefficient_shape(bases, dtype) -> Tuple
 
 Canonical (unscaled) coefficient shape implied by `bases` and `dtype`. This is
@@ -218,25 +227,33 @@ The inverse stage for one axis: `in_len` is the stored spectral length and
 
 The `RealFourier` classification order matters and is shared by both backends:
 test the direct half-spectrum FIRST (a pure shape heuristic misreads `N = 1` and
-`N = 2`, where `rfft_len(N) == N`), then the UPSAMPLED half-spectrum of a scaled
-field, and only then fall through to a same-shape complex inverse. Guessing wrong
+`N = 2`, where `rfft_len(N) == N`), then the BASE half-spectrum of a scaled
+field, and only then fall through to a complex (C2C) spectrum. Guessing wrong
 here stores a wrong-length or wrong-typed array instead of raising.
+
+A spectrum that does not fit the grid is resampled onto it — never inverted at its
+stored length, which produced a grid of the wrong shape on every Fourier axis but
+the first. A base half-spectrum becomes `:irfft_resampled`; a C2C spectrum of any
+other length becomes `:ifft_resampled`, from exactly that length (a full spectrum
+has one bin per point it was formed on, so this is unambiguous). The index map is
+`spectral_resample_ranges`.
 """
 @inline function backward_axis_op(basis, in_len::Int, grid_len::Int, in_complex::Bool)
     if isa(basis, RealFourier)
         base_len = basis.meta.size
         if in_len == rfft_len(grid_len)
             return AxisOp(:irfft, grid_len, false)
-        elseif grid_len > base_len && in_len == rfft_len(base_len)
-            # Scaled field: pad the base half-spectrum out to the finer grid.
-            return AxisOp(:irfft_upsampled, grid_len, false, rfft_len(grid_len))
+        elseif in_len == rfft_len(base_len)
+            # Scaled field: zero-pad (finer grid) or truncate (coarser grid) the
+            # base half-spectrum to the grid's half-spectrum length.
+            return AxisOp(:irfft_resampled, grid_len, false, rfft_len(grid_len))
         else
             # Complex spectrum at full length (e.g. the axis was transformed C2C
             # because it was not the first Fourier axis).
-            return AxisOp(:ifft, in_len, true)
+            return _c2c_backward_axis_op(in_len, grid_len)
         end
     elseif isa(basis, ComplexFourier)
-        return AxisOp(:ifft, in_len, true)
+        return _c2c_backward_axis_op(in_len, grid_len)
     elseif isa(basis, ChebyshevT)
         # Zero-pads (or truncates) the coefficient axis to the grid length.
         return AxisOp(:dct1_backward, grid_len, in_complex)
@@ -244,6 +261,10 @@ here stores a wrong-length or wrong-typed array instead of raising.
         return AxisOp(:none, in_len, in_complex)
     end
 end
+
+@inline _c2c_backward_axis_op(in_len::Int, grid_len::Int) =
+    in_len == grid_len ? AxisOp(:ifft, in_len, true) :
+                         AxisOp(:ifft_resampled, grid_len, true, grid_len)
 
 """
     backward_axis_op(basis, in_len, grid_len, in_complex, uses_rfft) -> AxisOp
@@ -253,13 +274,238 @@ Canonical inverse classification when the forward plan is known.  A
 later Fourier stages use a full C2C transform.  That distinction cannot be
 recovered from array shape for one- and two-point axes because
 `rfft_len(grid_len) == grid_len` there.
+
+Knowing the axis is an RFFT axis also makes an unmatched half-spectrum an error
+rather than a guess. Its length is `rfft_len` of the grid it was formed on: the
+target grid, the basis size, or a third grid whose parity the length does not
+record (`2L - 2` and `2L - 1` points share `rfft_len`). A full-length spectrum
+(`in_len == grid_len`, coefficients written directly) keeps its C2C inverse.
 """
 @inline function backward_axis_op(basis, in_len::Int, grid_len::Int,
                                   in_complex::Bool, uses_rfft::Bool)
-    if isa(basis, RealFourier) && !uses_rfft
-        return AxisOp(:ifft, in_len, true)
+    if isa(basis, RealFourier)
+        uses_rfft || return _c2c_backward_axis_op(in_len, grid_len)
+        base_len = basis.meta.size
+        in_len == rfft_len(grid_len) || in_len == rfft_len(base_len) ||
+            in_len == grid_len || _unresolvable_half_spectrum(in_len, grid_len, base_len)
     end
     return backward_axis_op(basis, in_len, grid_len, in_complex)
+end
+
+@noinline _unresolvable_half_spectrum(in_len::Int, grid_len::Int, base_len::Int) =
+    throw(DimensionMismatch(
+        "a RealFourier half-spectrum of length $in_len fits neither the $grid_len-point " *
+        "grid (length $(rfft_len(grid_len))) nor the $base_len-point basis (length " *
+        "$(rfft_len(base_len))); it was formed on a grid of $(2in_len - 2) or " *
+        "$(2in_len - 1) points, which the stored length cannot tell apart. Transform " *
+        "back to grid space at the scales the coefficients were formed on, then " *
+        "change scales with set_scales!."))
+
+# ---------------------------------------------------------------------------
+# Spectral resampling — a backward transform into a grid of another resolution
+# ---------------------------------------------------------------------------
+
+"""
+    spectral_resample_ranges(n_src, n_dst) -> NamedTuple of UnitRanges
+
+Index map carrying a full FFT spectrum formed on `n_src` uniform points to the
+spectrum the same field has on `n_dst` points, as `(pos_src, pos_dst)`,
+`(neg_src, neg_dst)` and `(fold_src, fold_dst)` slices (empty when unused). This is
+THE resampling rule: the backward transform into a scaled grid and the device grid
+resample (`_resample_axis_pairs`) are built from it, and the CPU grid resample
+`resample_1d!` follows it.
+
+- Upsampling from even `n_src` DROPS the source Nyquist bin: it stands for both
+  `±n_src/2`, and copying it to one side breaks Hermitian symmetry.
+- Downsampling to even `n_dst` FOLDS the `-n_dst/2` image into the new Nyquist
+  bin (`fold_*`, accumulated onto the positive copy) — the value the truncated
+  series takes on the coarser grid. Odd lengths have no Nyquist bin.
+
+Values must also be scaled by `n_dst/n_src` (unnormalised FFTs: the inverse
+divides by the new length). A half spectrum uses only the positive slice; see
+`half_spectrum_resample`.
+"""
+@inline function spectral_resample_ranges(n_src::Int, n_dst::Int)
+    if n_dst == n_src
+        return (pos_src=1:n_src, pos_dst=1:n_dst, neg_src=1:0, neg_dst=1:0,
+                fold_src=1:0, fold_dst=1:0)
+    elseif n_dst > n_src
+        h = div(n_src, 2)
+        npos = iseven(n_src) ? h : h + 1
+        nneg = n_src - h - 1
+        return (pos_src=1:npos, pos_dst=1:npos,
+                neg_src=(n_src - nneg + 1):n_src, neg_dst=(n_dst - nneg + 1):n_dst,
+                fold_src=1:0, fold_dst=1:0)
+    else
+        h = div(n_dst, 2)
+        nneg = n_dst - h - 1
+        fold = iseven(n_dst)
+        return (pos_src=1:(h + 1), pos_dst=1:(h + 1),
+                neg_src=(n_src - nneg + 1):n_src, neg_dst=(n_dst - nneg + 1):n_dst,
+                fold_src=fold ? ((n_src - h + 1):(n_src - h + 1)) : (1:0),
+                fold_dst=fold ? ((h + 1):(h + 1)) : (1:0))
+    end
+end
+
+"""
+    half_spectrum_resample(n_src, n_dst) -> (ncopy, nyquist)
+
+The rfft-axis form of `spectral_resample_ranges`: copy the leading `ncopy` bins of
+the half spectrum of an `n_src`-point signal into that of an `n_dst`-point one.
+`nyquist > 0` (downsampling to an even `n_dst`) is the new Nyquist bin, which still
+needs its `-n_dst/2` image added by `_fold_half_spectrum_nyquist!`.
+"""
+@inline function half_spectrum_resample(n_src::Int, n_dst::Int)
+    n_dst == n_src && return (rfft_len(n_src), 0)
+    ncopy = length(spectral_resample_ranges(n_src, n_dst).pos_src)
+    return (ncopy, n_dst < n_src && iseven(n_dst) ? rfft_len(n_dst) : 0)
+end
+
+"""
+    _resample_spectrum_axis!(dst, src, axis, n_src, n_dst, half) -> dst
+
+Write into `dst` the spectrum that `src` (formed on `n_src` points along `axis`)
+has on `n_dst` points — `spectral_resample_ranges`, or `half_spectrum_resample`
+for an rfft (`half`) axis — scaled by `n_dst/n_src`; other axes are copied as
+they are. A `half` axis still owes its Nyquist fold. Broadcasts over views only,
+so device arrays work too.
+"""
+function _resample_spectrum_axis!(dst::AbstractArray, src::AbstractArray, axis::Int,
+                                  n_src::Int, n_dst::Int, half::Bool)
+    fill!(dst, zero(eltype(dst)))
+    s = real(eltype(dst))(n_dst / n_src)
+    if half
+        ncopy, _ = half_spectrum_resample(n_src, n_dst)
+        _add_axis_slab!(dst, 1:ncopy, src, 1:ncopy, axis, s)
+    else
+        r = spectral_resample_ranges(n_src, n_dst)
+        _add_axis_slab!(dst, r.pos_dst, src, r.pos_src, axis, s)
+        _add_axis_slab!(dst, r.neg_dst, src, r.neg_src, axis, s)
+        _add_axis_slab!(dst, r.fold_dst, src, r.fold_src, axis, s)
+    end
+    return dst
+end
+
+# Accumulates: the fold slice lands on the bin the positive copy already wrote.
+@inline function _add_axis_slab!(dst::AbstractArray, dst_range::UnitRange{Int},
+                                 src::AbstractArray, src_range::UnitRange{Int},
+                                 axis::Int, s)
+    isempty(dst_range) && return dst
+    view(_axis_as_middle(dst, axis), :, dst_range, :) .+=
+        view(_axis_as_middle(src, axis), :, src_range, :) .* s
+    return dst
+end
+
+# `A` as a (before, axis, after) array sharing its memory: a slab along a runtime
+# `axis` is then one concrete view type, so the copies compile once instead of
+# dispatching per call (`selectdim` builds a differently typed view per axis).
+@inline function _axis_as_middle(A::AbstractArray, axis::Int)
+    before = 1
+    for d in 1:(axis - 1)
+        before *= size(A, d)
+    end
+    after = 1
+    for d in (axis + 1):ndims(A)
+        after *= size(A, d)
+    end
+    return reshape(A, before, size(A, axis), after)
+end
+
+"""
+    _fold_half_spectrum_nyquist!(data, axis, bin) -> data
+
+Finish a half-spectrum downsample to an even grid (`half_spectrum_resample`): add
+the `-n/2` image to the new Nyquist `bin`. For a real field that image is the
+bin's own conjugate WHILE every other axis holds a real-linear image of the data
+(grid values or Chebyshev coefficients) — true at the inverse-rfft stage of both
+backends, which invert the other Fourier axes first. In a full multi-axis spectrum
+the image sits at mirrored wavenumbers instead. `bin == 0` is a no-op.
+"""
+function _fold_half_spectrum_nyquist!(data::AbstractArray, axis::Int, bin::Int)
+    bin > 0 || return data
+    plane = view(_axis_as_middle(data, axis), :, bin:bin, :)
+    plane .= plane .+ conj.(plane)
+    return data
+end
+
+"""
+    backward_resample_rules(bases, coeff_shape, grid_shape, dtype)
+        -> (rules, grid_coeff_shape, nyquist)
+
+Whole-field form of `backward_axis_op` for a backend that resamples every axis of
+the stored spectrum up front and then inverts at `grid_shape`: per-axis
+`(n_src, n_dst, mode)` rules for `_resample_fourier_spectrum!` (`mode` is `:copy`,
+`:c2c` or `:half`), the coefficient shape the grid implies (`forward_layout`), and
+`nyquist = (axis, bin)` — the half-spectrum fold that must wait until the other
+Fourier axes are inverted (`(0, 0)` if none). RFFT axes are the forward plan's, so
+this classifies exactly as the CPU chain does stage by stage.
+"""
+function backward_resample_rules(bases, coeff_shape::Tuple, grid_shape::Tuple, dtype::Type)
+    n = length(bases)
+    (length(coeff_shape) == n && length(grid_shape) == n) || throw(DimensionMismatch(
+        "$n bases, coefficient shape $coeff_shape and grid shape $grid_shape disagree"))
+    fwd_ops, grid_coeff_shape, _ = forward_layout(bases, grid_shape, dtype)
+    rules = ntuple(n) do a
+        b = bases[a]
+        (isa(b, RealFourier) || isa(b, ComplexFourier)) ||
+            return (coeff_shape[a], coeff_shape[a], :copy)
+        op = backward_axis_op(b, coeff_shape[a], grid_shape[a], true,
+                              fwd_ops[a].op === :rfft)
+        op.op === :irfft_resampled && return (b.meta.size, grid_shape[a], :half)
+        op.op === :ifft_resampled && return (coeff_shape[a], grid_shape[a], :c2c)
+        return (coeff_shape[a], coeff_shape[a], :copy)
+    end
+    nyquist = (0, 0)
+    for a in 1:n
+        if rules[a][3] === :half
+            bin = half_spectrum_resample(rules[a][1], rules[a][2])[2]
+            bin > 0 && (nyquist = (a, bin))
+        end
+    end
+    return rules, grid_coeff_shape, nyquist
+end
+
+"""
+    _resample_fourier_spectrum!(dst, src, rules) -> dst
+
+All axes of `_resample_spectrum_axis!` in one tensor-product pass, driven by
+`backward_resample_rules`: the same index maps and `n_dst/n_src` scaling, and the
+half-spectrum Nyquist fold likewise left to the caller. Broadcasts over views only.
+"""
+function _resample_fourier_spectrum!(dst::AbstractArray, src::AbstractArray, rules)
+    N = ndims(dst)
+    (ndims(src) == N && length(rules) == N) || throw(DimensionMismatch(
+        "resampling a $(ndims(src))D spectrum into $(N)D with $(length(rules)) axis rules"))
+    slices = Vector{Vector{NTuple{2,UnitRange{Int}}}}(undef, N)
+    scale = 1.0
+    for a in 1:N
+        n_src, n_dst, mode = rules[a]
+        src_len, dst_len = mode === :half ? (rfft_len(n_src), rfft_len(n_dst)) :
+                           (n_src, n_dst)
+        (size(src, a) == src_len && size(dst, a) == dst_len) || throw(DimensionMismatch(
+            "axis $a ($mode, $n_src → $n_dst points) needs lengths $src_len → " *
+            "$dst_len, got $(size(src, a)) → $(size(dst, a))"))
+        if mode === :copy
+            slices[a] = [(1:src_len, 1:dst_len)]
+            continue
+        end
+        scale *= n_dst / n_src
+        if mode === :half
+            ncopy = half_spectrum_resample(n_src, n_dst)[1]
+            slices[a] = [(1:ncopy, 1:ncopy)]
+        else
+            r = spectral_resample_ranges(n_src, n_dst)
+            slices[a] = [p for p in ((r.pos_src, r.pos_dst), (r.neg_src, r.neg_dst),
+                                     (r.fold_src, r.fold_dst)) if !isempty(p[1])]
+        end
+    end
+    fill!(dst, zero(eltype(dst)))
+    s = real(eltype(dst))(scale)
+    # Accumulate: fold slices overlap the positive copy on the new Nyquist bins.
+    for combo in Iterators.product(slices...)
+        @views dst[ntuple(a -> combo[a][2], N)...] .+= src[ntuple(a -> combo[a][1], N)...] .* s
+    end
+    return dst
 end
 
 """

@@ -197,9 +197,9 @@ method is not L-stable and does not rapidly damp unresolved stiff modes.
 
 `Tarang.RK443_IMEX` is a `const` alias for `RK443` — the same type, not a
 copy of its tableau. It was a separate type until it was found to diverge: the
-per-mode diagonal implicit solve is selected by `ts isa Union{RK222, RK443,
-SBDF2}`, so the twin lost that path and a single-GPU run with an implicit `L`
-that `RK443()` completed was *refused* under the other name.
+per-mode diagonal implicit solve is selected by the scheme's type, so the twin
+lost that path and a single-GPU run with an implicit `L` that `RK443()` completed
+was *refused* under the other name.
 
 ### Diagonal IMEX
 
@@ -207,12 +207,13 @@ that `RK443()` completed was *refused* under the other name.
 RK222()  # 2nd order; automatic diagonal implementation on GPU
 RK443()  # 3rd order
 SBDF2()  # 2nd order multistep
+RK111(), RKSMR(), RKGFY()  # the other IMEX RK tableaux take the same path
 ```
 
-For GPU `RK222()`, `RK443()`, and `SBDF2()`, diagonal implementations are internal;
-no GPU-specific timestepper constructors are exported. CPU and boundary-value problems
-retain the appropriate matrix or subproblem solve. An attached spectral linear
-operator also selects the internal diagonal path on serial CPU.
+For GPU `RK111()`, `RK222()`, `RK443()`, `RKSMR()`, `RKGFY()`, and `SBDF2()`, diagonal
+implementations are internal; no GPU-specific timestepper constructors are exported.
+CPU and boundary-value problems retain the appropriate matrix or subproblem solve. An
+attached spectral linear operator also selects the internal diagonal path on serial CPU.
 
 The implicit solve is **diagonal in spectral space** — the linear operator is applied per
 Fourier mode (`(I + γ·dt·L̂)⁻¹` per wavenumber) rather than through a global matrix solve.
@@ -224,9 +225,13 @@ These schemes read the implicit operator from your equation's `L` and diagonaliz
 automatically, so `∂t(u) - nu*lap(u) = 0` is treated implicitly with no extra setup. You can
 still attach an explicit `SpectralLinearOperator` with `set_spectral_linear_operator!` on
 serial CPU or a single GPU to override that — an attached operator takes precedence
-and is applied to every field. MPI rejects attached operators with `ArgumentError`;
-write the linear term on the equation's LHS instead. Scalar division such as
-`dt(u) - lap(u)/2 = 0` is supported by the diagonal parser on all three paths.
+and is applied to every spatial field. Only these six schemes read an attached operator,
+and only on a problem whose axes are all Fourier: every other scheme (CNAB1/2, SBDF1/3/4,
+MCNAB2, CNLF2, the ETD family), a problem with a Chebyshev/Jacobi axis, and MPI reject
+it with `ArgumentError` when it is attached (or at the first `step!`) instead of silently
+integrating without it; write the linear term on the equation's LHS instead. Scalar
+division such as `dt(u) - lap(u)/2 = 0` is supported by the diagonal parser on all three
+paths.
 
 Serial attachment example:
 
@@ -377,7 +382,7 @@ are IMEX.
 | Smooth high-order integration | RK443 or SBDF3/SBDF4 | Higher formal order; the multistep members need startup history and are only A(α)-stable |
 | Very stiff, linear-dominated | ETD_RK222 | Exact exponential propagation of L |
 | Classic incompressible DNS IMEX | RKSMR | SMR explicit-third / implicit-second accuracy profile |
-| Diagonal Fourier linear operator / GPU | RK222, RK443, SBDF2 | Per-mode implicit division avoids a global sparse solve; the operator comes from the equation's `L` (Laplacian, hyper-/fractional Laplacian, damping, derivatives of the field itself) or an attached `SpectralLinearOperator` |
+| Diagonal Fourier linear operator / GPU | RK222, RK443, SBDF2 (also RK111, RKSMR, RKGFY) | Per-mode implicit division avoids a global sparse solve; the operator comes from the equation's `L` (Laplacian, hyper-/fractional Laplacian, damping, derivatives of the field itself) or an attached `SpectralLinearOperator` |
 
 ## Performance
 

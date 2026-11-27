@@ -74,6 +74,13 @@ function backward_transform!(field::ScalarField, target_layout::Symbol=:g; apply
 
     ensure_layout!(field, :c)  # Start in coefficient space
 
+    # Mirror of forward_transform!: the dedicated multi-GPU DCT-I backend takes
+    # the fields it supports before the TransposableField early return.
+    if _distributed_gpu_transform!(field.dist.architecture, field, :backward)
+        field.current_layout = :g
+        return
+    end
+
     # A distributed GPU field transforms by explicit transposes. PencilFFTs is
     # CPU-only and the local transform chain would compute a per-rank inverse
     # FFT of a slab, which is silently wrong rather than an error.
@@ -210,19 +217,33 @@ dispatching through this boundary makes Julia specialize the body on both
 concrete types so `_backward_output_spec`, scratch/plan lookup and the in-place
 `mul!` resolve statically and run allocation-free on a warm cache.
 """
-# Scaled grid size along a Fourier transform's axis (scale × base size). Threaded
-# into the backward path so the irfft targets the scaled grid, not the base. 0 for
-# non-Fourier / non-RealFourier axes (no scale context needed → base-size fallback).
+# Scaled grid size along a transform's axis (scale × base size), threaded into the
+# backward stage so its inverse targets the scaled grid, not the base. EVERY Fourier
+# axis needs it: this used to answer only for RealFourier, so a ComplexFourier axis
+# (and, through the C2C classification, every RealFourier axis but the first) was
+# inverted at its stored length and the scaled grid kept base resolution there.
+# 0 for transforms without scale support (→ base-size fallback).
 _bwd_rfft_target(field::ScalarField, transform) = 0
 function _bwd_rfft_target(field::ScalarField, transform::FourierTransform)
-    isa(transform.basis, RealFourier) || return 0
     ax = transform.axis
-    scale = field.scales === nothing ? 1.0 : field.scales[ax]
+    scale = _axis_scale(field.scales, ax)
     # MUST match the scaled-grid allocation in get_scaled_shape (scales.jl),
     # which uses ceil(N*scale). Using round here disagreed for non-integer N*scale
     # (e.g. N=7, scale=1.5 → ceil 11 vs round 10), so the backward irfft targeted the
     # wrong grid length and the forward∘backward round-trip was broken.
     return ceil(Int, scale * transform.basis.meta.size)
+end
+
+# `field.scales[ax]` with a runtime `ax` on the abstractly typed
+# `Tuple{Vararg{Float64}}` field boxes its result (16 B per backward stage); the
+# concrete-length branches index without boxing. A field may carry more scales
+# than bases (a 1D tau field on a 2D distributor), hence the generic fallback.
+@inline function _axis_scale(scales, ax::Int)
+    scales === nothing && return 1.0
+    scales isa NTuple{1,Float64} && return scales[ax]
+    scales isa NTuple{2,Float64} && return scales[ax]
+    scales isa NTuple{3,Float64} && return scales[ax]
+    return Float64(scales[ax])
 end
 
 @inline _backward_stage_uses_rfft(::TransformPlanBundle, transform) = false
@@ -435,7 +456,7 @@ function _backward_output_spec(in::AbstractArray, transform::FourierTransform, o
     real_T = in_eltype <: Complex ? real(in_eltype) : in_eltype
     ax = transform.axis
 
-    # Classification order (direct half-spectrum, then upsampled, then C2C) is
+    # Classification order (direct half-spectrum, then resampled, then C2C) is
     # stated once in layout.jl and shared with the GPU backend; a pure
     # shape heuristic misreads N=1/N=2, where rfft_len(N) == N.
     op = backward_axis_op(transform.basis, in_shape[ax],
@@ -503,13 +524,13 @@ function _get_or_plan_backward!(transform::FourierTransform, in::AbstractArray,
     dims = (transform.axis,)
     plan = if op.op === :irfft
         FFTW.plan_irfft(in, grid_n, dims)
-    elseif op.op === :irfft_upsampled
-        expected_rfft_size = div(grid_n, 2) + 1
-        # The half-spectrum is zero-padded to the scaled length before irfft, so
-        # build the plan against that padded shape rather than `in`.
-        padded_shape = _replace_axis_shape(in_shape, transform.axis, expected_rfft_size)
-        dummy = zeros(eltype(in), padded_shape...)
-        FFTW.plan_irfft(dummy, grid_n, dims)
+    elseif op.op === :irfft_resampled || op.op === :ifft_resampled
+        # The stored spectrum is resampled to the grid's spectral length
+        # (`op.pad_len`) before the inverse, so plan against that shape, not `in`.
+        resampled_shape = _replace_axis_shape(in_shape, transform.axis, op.pad_len)
+        dummy = zeros(eltype(in), resampled_shape...)
+        op.op === :irfft_resampled ? FFTW.plan_irfft(dummy, grid_n, dims) :
+                                     FFTW.plan_ifft(dummy, dims)
     else
         FFTW.plan_ifft(in, dims)
     end
@@ -604,30 +625,37 @@ function _apply_backward_fourier!(out::AbstractArray, in::AbstractArray,
     # Use a cached scratch that's reused across calls. Only irfft needs
     # this; ifft (complex → complex) is non-destructive.
     is_irfft_path = op.op === :irfft
-    is_upsampled_irfft = op.op === :irfft_upsampled
 
-    if is_upsampled_irfft
+    if op.op === :irfft_resampled
+        # Base half-spectrum onto a scaled grid: zero-pad (finer) or truncate
+        # (coarser) it to the grid's half-spectrum length and rescale by
+        # grid_n/base_n — irfft divides by grid_n while the stored coefficients
+        # were formed on base_n points. Even-N Nyquist handling is the shared
+        # resample rule (`spectral_resample_ranges`), as in `resample_1d!`.
         grid_n = _bwd_grid_size(transform, out_n)
         base_n = transform.basis.meta.size
         ax = transform.axis
-        padded_shape = _replace_axis_shape(size(in), ax, div(grid_n, 2) + 1)
+        padded_shape = _replace_axis_shape(size(in), ax, op.pad_len)
         scratch_key = (padded_shape, _fft_eltype_tag(eltype(in)), SLOT_IRFFT)
         scratch = _get_or_alloc_scratch!(transform.bwd_scratch, scratch_key,
                                          padded_shape, eltype(in))
-        fill!(scratch, zero(eltype(scratch)))
-        # Copy the base half-spectrum into the low modes and rescale by
-        # grid_n/base_n: irfft divides by the (finer) grid_n while the stored
-        # coeffs were formed on base_n points, so without this factor the
-        # interpolated grid amplitude would be scaled by base_n/grid_n.
-        low = ntuple(i -> i == ax ? (1:size(in, ax)) : Colon(), ndims(in))
-        @views scratch[low...] .= in .* (grid_n / base_n)
-        if iseven(base_n)
-            # The base Nyquist mode (C_{N/2}) is ambiguous on the finer grid;
-            # drop it so this path agrees with the grid-space resample_1d! upsample.
-            nyq_i = div(base_n, 2) + 1
-            nyq = ntuple(i -> i == ax ? (nyq_i:nyq_i) : Colon(), ndims(in))
-            @views scratch[nyq...] .= 0
-        end
+        _resample_spectrum_axis!(scratch, in, ax, base_n, grid_n, true)
+        # The rfft axis is the FIRST Fourier axis, so every other Fourier axis has
+        # already been inverted by an earlier backward stage (and the rest are
+        # Chebyshev coefficients, a real-linear image): the Nyquist fold of a
+        # downsample is local here — see `_fold_half_spectrum_nyquist!`.
+        _fold_half_spectrum_nyquist!(scratch, ax, half_spectrum_resample(base_n, grid_n)[2])
+        return _fourier_bwd_kernel!(out, scratch, plan)
+    elseif op.op === :ifft_resampled
+        # C2C spectrum of another length (base coefficients on a scaled grid, or
+        # coefficients formed at other scales): resample it onto the grid. Its
+        # length is the number of points it was formed on.
+        ax = transform.axis
+        resampled_shape = _replace_axis_shape(size(in), ax, op.pad_len)
+        scratch_key = (resampled_shape, _fft_eltype_tag(eltype(in)), SLOT_BWD_RESAMPLE)
+        scratch = _get_or_alloc_scratch!(transform.bwd_scratch, scratch_key,
+                                         resampled_shape, eltype(in))
+        _resample_spectrum_axis!(scratch, in, ax, size(in, ax), op.out_len, false)
         return _fourier_bwd_kernel!(out, scratch, plan)
     elseif is_irfft_path
         scratch_key = (size(in), _fft_eltype_tag(eltype(in)), SLOT_IRFFT)

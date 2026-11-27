@@ -141,11 +141,14 @@ function TransposableField(field::ScalarField; topology=nothing)
     dist = field.dist
     arch = dist.architecture
 
-    # Validate: TransposableField only supports ComplexFourier for MPI
-    # (RealFourier's half-spectrum layout is incompatible with custom transposes)
+    # Validate before the first collective (the topology split below): the basis
+    # families, then the fixed-shape buffer rule, which rejects an rfft-halved
+    # RealFourier axis. Both read only values every rank shares, so every rank
+    # refuses identically instead of some failing while others enter MPI calls.
     if dist.size > 1 && field.domain !== nothing
         bases = field.domain.bases
         validate_mpi_fourier_only(bases, dist.size; use_pencil_arrays=false)
+        _require_transposable_layout(field)
     end
 
     # Get global shape from field's domain
@@ -252,6 +255,58 @@ function TransposableField(field::ScalarField; topology=nothing)
     end
 
     return tf
+end
+
+"""
+    _transposable_field_unsupported_reason(bases, dtype) -> Union{Nothing, String}
+
+Why a multi-rank `TransposableField` cannot transform a field with these bases
+and element type, or `nothing` when it can. Its transposes and per-axis FFT/DCT
+run on fixed full-size complex buffers whose result is copied straight into the
+field's coefficient buffer, so every axis must keep its length. An rfft-halved
+axis — a real field's RealFourier dim 1 (the first Fourier axis) — does not:
+Tarang stores `rfft_len(N)` coefficients there. `validate_mpi_fourier_only`
+cannot catch this (it is dtype-blind, and accepts the 3D layouts of the
+multi-GPU DCT-I path), so the copy failed with a BoundsError on ranks whose
+blocks disagreed while ranks whose blocks happened to match entered the
+collectives and hung. A complex field's RealFourier axis is full-length C2C and
+is supported.
+"""
+function _transposable_field_unsupported_reason(bases, dtype::Type)
+    complex_now = dtype <: Complex
+    for axis in eachindex(bases)
+        basis = bases[axis]
+        n = basis.meta.size
+        op = forward_axis_op(basis, n, complex_now)
+        if op.out_len != n
+            return "axis $axis ($(nameof(typeof(basis))), $n points) stores $(op.out_len) " *
+                   "coefficients for $dtype data (the rfft half spectrum), but TransposableField " *
+                   "moves full-length complex spectra and needs every axis to keep its length. " *
+                   "Use ComplexFourier, or a complex dtype. Under device=GPU() a 3D " *
+                   "Fourier x Chebyshev field with RealFourier only on dim 1 is transformed by " *
+                   "the dedicated multi-GPU DCT-I path, which forward_transform!/" *
+                   "backward_transform! select automatically"
+        end
+        complex_now = op.out_complex
+    end
+    return nothing
+end
+
+"""
+    _require_transposable_layout(field)
+
+Throw if a multi-rank `TransposableField` cannot transform `field` (see
+`_transposable_field_unsupported_reason`). Depends only on the bases and dtype,
+which every rank shares, so it raises on every rank or on none — call it before
+the first collective.
+"""
+function _require_transposable_layout(field::ScalarField)
+    domain = field.domain
+    domain === nothing && return nothing
+    reason = _transposable_field_unsupported_reason(domain.bases, field.dtype)
+    reason === nothing && return nothing
+    error("TransposableField (nprocs=$(field.dist.size)) cannot transform field " *
+          "$(repr(field.name)): $reason.")
 end
 
 """

@@ -53,5 +53,12 @@ end
 
         # has_cuda() now reflects CUDA.functional() rather than a stale false
         @test Tarang.has_cuda() == CUDA.functional()
+
+        # A seeded fill_random!(...; reproducible=false) reaches CUDA.jl's native
+        # generator — `CUDA.default_rng()`, the one randn!/rand! on a CuArray draw
+        # from — through the extension's hook, not the src fallback that throws.
+        m = which(Tarang._seed_device_rng!, Tuple{Tarang.GPU{CUDA.CuDevice}, Int})
+        @test m.module === ext
+        @test hasmethod(CUDA.default_rng, Tuple{})
     end
 end

@@ -312,7 +312,7 @@ end
 # M == N == grid_size, so unscaled fields are byte-for-byte unaffected.
 function _bwd_rfft_target(field::ScalarField, transform::ChebyshevTransform)
     ax = transform.axis
-    scale = field.scales === nothing ? 1.0 : field.scales[ax]
+    scale = _axis_scale(field.scales, ax)   # unboxed read; see fourier.jl
     return ceil(Int, scale * transform.grid_size)
 end
 

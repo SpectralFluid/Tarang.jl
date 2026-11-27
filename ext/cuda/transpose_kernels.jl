@@ -438,9 +438,13 @@ that each rank's portion is contiguous in the send buffer.
 Handles both forward and reverse transpose directions:
 - Forward: `dims[dim] < global_n` → dim is distributed, pack splits along other_dim
 - Reverse: `dims[dim] == global_n` → dim is local (full), pack splits along dim
+
+`reverse` names the direction explicitly (`distributed_fft_cuda_aware!` always
+does); `nothing` infers it from the shape as above.
 """
 function Tarang._gpu_pack_for_transpose!(send_buf::CuArray, data::CuArray,
-                                          dim::Int, config::Tarang.DistributedGPUConfig)
+                                          dim::Int, config::Tarang.DistributedGPUConfig;
+                                          reverse::Union{Nothing, Bool}=nothing)
     isempty(data) && return send_buf
     nprocs = config.size
     ndims_data = ndims(data)
@@ -454,14 +458,14 @@ function Tarang._gpu_pack_for_transpose!(send_buf::CuArray, data::CuArray,
     global_n = config.global_shape[dim]
     other_dim = dim == ndims_data ? 1 : ndims_data
 
-    # Determine pack direction from data shape:
+    # Determine pack direction (explicit, or from data shape):
     # Forward: dim is distributed (small), split other_dim among ranks
     # Reverse: dim is local (global_n), split dim among ranks
     # Degenerate global_n == 1: the shapes cannot distinguish the directions
-    # (dims[dim] == global_n either way). Classify as FORWARD so the pack
-    # matches the forward `Tarang._compute_alltoall_counts` (split other_dim),
-    # which is what `mpi_alltoall_transpose` uses for the alltoallv itself.
-    if dims[dim] < global_n || global_n == 1
+    # (dims[dim] == global_n either way), so inference assumes FORWARD — wrong
+    # for the reverse pass, which is why the distributed FFT passes `reverse`.
+    forward = reverse === nothing ? (dims[dim] < global_n || global_n == 1) : !reverse
+    if forward
         # Forward: split along other_dim
         split_dim = other_dim
         split_n = dims[split_dim]
@@ -496,9 +500,12 @@ correctly-shaped output array using GPU kernels.
 Handles both directions:
 - Forward: output has `dim` of size global_n → assemble along dim
 - Reverse: output has `dim` of size local_n → assemble along other_dim
+
+`reverse` names the direction explicitly; `nothing` infers it from the shape.
 """
 function Tarang._gpu_unpack_from_transpose!(output::CuArray, recv_buf::CuArray,
-                                             dim::Int, config::Tarang.DistributedGPUConfig)
+                                             dim::Int, config::Tarang.DistributedGPUConfig;
+                                             reverse::Union{Nothing, Bool}=nothing)
     isempty(output) && return output
     nprocs = config.size
     ndims_data = ndims(output)
@@ -512,13 +519,14 @@ function Tarang._gpu_unpack_from_transpose!(output::CuArray, recv_buf::CuArray,
     global_n = config.global_shape[dim]
     other_dim = dim == ndims_data ? 1 : ndims_data
 
-    # Determine unpack direction from output shape:
+    # Determine unpack direction (explicit, or from output shape):
     # Forward: output[dim] == global_n → assemble along dim from per-rank chunks
     # Reverse: output[dim] < global_n → assemble along other_dim
     # Degenerate global_n == 1: ambiguous by shape (out_dims[dim] is 1 == global_n
-    # on the owning rank, 0 elsewhere). Classify as FORWARD on every rank, matching
-    # the pack side and the forward `Tarang._compute_alltoall_counts` recv counts.
-    if out_dims[dim] == global_n || global_n == 1
+    # on the owning rank, 0 elsewhere), so inference assumes FORWARD — wrong for
+    # the reverse pass, which is why the distributed FFT passes `reverse`.
+    forward = reverse === nothing ? (out_dims[dim] == global_n || global_n == 1) : !reverse
+    if forward
         # Forward unpack: assemble along dim
         assemble_dim = dim
         assemble_n = global_n
@@ -557,6 +565,9 @@ may be a CPU FFTW plan or a placeholder, so the cached CUFFT plan is used instea
 """
 function Tarang.fft_in_dim!(data::CuArray, dim::Int, direction::Symbol, arch::Tarang.GPU;
                             plan=nothing)
+    # A rank whose block in this layout is empty (more ranks than points along an
+    # axis) has nothing to transform; cuFFT cannot plan an empty batch.
+    isempty(data) && return data
     # Pin the device to the DATA's device, and key the plan cache on it too. The
     # `device_id` keyword defaults to whatever device happens to be current,
     # which in a multi-GPU run is not necessarily where `data` lives — the plan
@@ -587,74 +598,28 @@ end
 # GPU DCT in dimension (for Chebyshev transforms)
 # ============================================================================
 
-# Sign vectors for the odd-degree flip, cached per (device, length, eltype).
-# `sgn` used to be rebuilt with a host comprehension + upload on EVERY call, on a
-# path that runs once per axis per distributed transform.
-const _DCT1_SIGN_CACHE = Dict{Tuple{Int, Int, DataType}, Any}()
-const _DCT1_SIGN_LOCK = ReentrantLock()
-
-function _dct1_sign_vector(::Type{RT}, n::Int) where {RT<:AbstractFloat}
-    key = (_current_device_id(), n, RT)
-    v = lock(_DCT1_SIGN_LOCK) do
-        get!(() -> CuArray(RT[iseven(k) ? -one(RT) : one(RT) for k in 1:n]),
-             _DCT1_SIGN_CACHE, key)
-    end
-    return v::CuVector{RT}
-end
-
-"""Clear the cached DCT-I odd-flip sign vectors (thread-safe)."""
-clear_dct1_sign_cache!() = lock(_DCT1_SIGN_LOCK) do
-    empty!(_DCT1_SIGN_CACHE)
-end
-
-# The sign vector is REAL even for complex data: `Complex .* Real` broadcasts
-# fine and halves the multiply work.
-@inline _dct1_sign_shaped(::Type{T}, n::Int, dim::Int) where {T} =
-    reshape(_dct1_sign_vector(real(T), n), ntuple(i -> i == dim ? n : 1, 3))
-
-"""Undo the odd-degree sign flip along `dim` of a 3D array in place:
-`a[k, …] *= (-1)^(k-1)` (1-based `k` along `dim`). Since
-`REDFT00(reverse(x))[k] = (-1)^k REDFT00(x)[k]`, this converts between the
-reversed-grid DCT-I convention of `gpu_dct1_along_dim!` and the plain (unflipped)
-REDFT00 convention of the CPU distributed reference."""
-function _dct1_undo_odd_flip!(a::CuArray{T,3}, dim::Int) where {T}
-    n = size(a, dim)
-    a .*= _dct1_sign_shaped(T, n, dim)
-    return a
-end
-
-"""Out-of-place form of [`_dct1_undo_odd_flip!`](@ref): `dest = flip(src)`.
-
-The backward path needs this rather than the in-place form. Flipping the
-CALLER's buffer and only afterwards transforming means an exception thrown in
-between leaves the caller holding sign-flipped coefficients — a plausible-looking
-wrong answer with no indication that anything happened."""
-function _dct1_odd_flip_into!(dest::CuArray{T,3}, src::CuArray{T,3}, dim::Int) where {T}
-    n = size(src, dim)
-    dest .= src .* _dct1_sign_shaped(T, n, dim)
-    return dest
-end
-
 """
 Override dct_in_dim! for GPU arrays.
 
-Tarang's Chebyshev transform is DCT-I (REDFT00) on the Gauss–Lobatto grid, so
-this must match the CPU distributed reference `Tarang.dct_in_dim!(…, ::CPU)` in
-src/core/transpose/transforms.jl EXACTLY:
+Must match the CPU distributed reference `Tarang.dct_in_dim!(…, ::CPU)` in
+src/core/transpose/transforms.jl EXACTLY, and both produce Tarang's CANONICAL
+Chebyshev coefficients (those of `_chebyshev_forward` / `_chebyshev_backward`):
   forward:  REDFT00, 1/(N-1) normalization, half-weight at both endpoints,
-            NO odd-degree sign flip
-  backward: double both endpoint coefficients, REDFT00, divide by 2
+            odd-degree sign flip
+  backward: odd-degree sign flip, double both endpoint coefficients, REDFT00,
+            divide by 2
 
-The verified GPU DCT-I building block `gpu_dct1_along_dim!` (ext/cuda/cheb_deriv.jl)
-implements the same transform but in the reversed-grid convention of
-chebyshev.jl, whose output is `(-1)^k ×` the CPU reference here
-(a grid reversal ≡ an odd-degree coefficient sign flip). We therefore undo that
-flip explicitly: AFTER the forward transform, and on the coefficients BEFORE the
-backward transform.
+That is precisely the verified building block `gpu_dct1_along_dim!`
+(ext/cuda/cheb_deriv.jl), which realises the flip as a grid reversal
+(`REDFT00(reverse(x))[k] = (-1)^k REDFT00(x)[k]`), so it is used unmodified.
+(This override used to undo that flip to match a CPU reference that lacked it;
+the two agreed with each other while both handed every coefficient consumer a
+mirrored field.)
 """
 function Tarang.dct_in_dim!(data::CuArray{T,N}, dim::Int, direction::Symbol, arch::Tarang.GPU) where {T,N}
     n = size(data, dim)
-    n <= 1 && return data
+    # n <= 1 is the identity; an empty block (over-decomposed mesh) has nothing to transform.
+    (n <= 1 || isempty(data)) && return data
 
     RT = T <: Complex ? real(T) : T
     if N > 3 || !(RT <: AbstractFloat)
@@ -678,14 +643,10 @@ function Tarang.dct_in_dim!(data::CuArray{T,N}, dim::Int, direction::Symbol, arc
     # version split into `real.(data)` / `imag.(data)`, recursed twice (each
     # recursion allocating its own `similar` and syncing), and recombined —
     # roughly six device allocations and three device-wide syncs per axis.
-    if direction == :forward
-        gpu_dct1_along_dim!(out3, data3, dim, :forward)
-        _dct1_undo_odd_flip!(out3, dim)
-    elseif direction == :backward
-        # Flip into the scratch, never the caller's buffer — see
-        # `_dct1_odd_flip_into!` for why the in-place form is unsafe here.
-        _dct1_odd_flip_into!(out3, data3, dim)
-        gpu_dct1_along_dim!(out3, out3, dim, :backward)
+    # Transforming into the scratch leaves the caller's buffer untouched if the
+    # transform throws.
+    if direction == :forward || direction == :backward
+        gpu_dct1_along_dim!(out3, data3, dim, direction)
     else
         error("direction must be :forward or :backward, got $direction")
     end
@@ -705,4 +666,3 @@ export copy_to_buffer_kernel!, copy_from_buffer_kernel!
 export apply_fft_normalization_kernel!
 export gpu_pack_for_transpose!, gpu_unpack_from_transpose!
 export GPU_PACK_3D_OP, GPU_UNPACK_3D_OP, GPU_PACK_2D_OP, GPU_UNPACK_2D_OP
-export clear_dct1_sign_cache!

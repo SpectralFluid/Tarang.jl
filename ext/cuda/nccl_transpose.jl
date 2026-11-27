@@ -423,6 +423,27 @@ Gathers Y-slices from each rank (the reverse of the Y->X pack).
     @inbounds data[i, j, k] = packed[buf_idx]
 end
 
+"""
+    _launch_transpose_kernel!(kernel!, backend, ndrange, args...) -> Bool
+
+Launch a directional pack/unpack kernel over `ndrange` work items, or skip it
+when this rank's pencil block is empty (more ranks than points along a
+decomposed axis). Returns whether the kernel was launched.
+
+The skip is required, not an optimization: on `CUDABackend()` KernelAbstractions
+sizes the provisional workgroup from `ndrange`, so `ndrange == 0` throws
+`DivideError` before its own empty-grid check (the KA CPU backend treats it as a
+no-op, which is why CPU tests never saw it) — and the empty rank died while its
+peers blocked in the NCCL exchange. The transpose drivers still post this rank's
+(zero-count) part of `nccl_alltoall!` after a skipped pack, so every peer's
+sends and receives keep pairing up.
+"""
+function _launch_transpose_kernel!(kernel!, backend, ndrange::Int, args...)
+    ndrange > 0 || return false
+    kernel!(backend)(args...; ndrange=ndrange)
+    return true
+end
+
 # NOTE: `nccl_pack_for_transpose!(packed, data, dim)` and its unpack partner used
 # to live here as exported "simplified interfaces for testing". They were removed
 # because the signature cannot express the operation: which elements go to which
@@ -621,12 +642,13 @@ function _transpose_z_to_y!(output::CuArray{T,3}, buffer::NCCLTransposeBuffer{T}
     Ny_global = pencil.global_shape[2]
     _compute_transpose_counts!(buffer, pencil, :z_to_y, size(data), row_size)
 
-    # Pack data: split by Z dimension (z_chunk_sizes for each rank)
+    # Pack data: split by Z dimension (z_chunk_sizes for each rank). An empty
+    # block skips the launch but still joins the exchange below.
     chunk_sizes_gpu, displs_gpu, prefix_sums_gpu =
         _stage_chunk_plan!(buffer, :send, Nz, row_size)
-    kernel = pack_z_to_y_kernel!(CUDABackend())
-    kernel(buffer.send_buffer, data, Nx_local, Ny_local, Nz,
-           chunk_sizes_gpu, displs_gpu, row_size, prefix_sums_gpu; ndrange=total)
+    _launch_transpose_kernel!(pack_z_to_y_kernel!, CUDABackend(), total,
+        buffer.send_buffer, data, Nx_local, Ny_local, Nz,
+        chunk_sizes_gpu, displs_gpu, row_size, prefix_sums_gpu)
     CUDA.synchronize()
 
     # Perform NCCL all-to-all (pass my_rank to avoid self-send deadlock)
@@ -639,9 +661,9 @@ function _transpose_z_to_y!(output::CuArray{T,3}, buffer::NCCLTransposeBuffer{T}
     # Unpack: each peer contributed its Ny_local chunk (Y-chunks)
     recv_chunk_sizes_gpu, recv_displs_gpu, recv_prefix_sums_gpu =
         _stage_chunk_plan!(buffer, :recv, Ny_global, row_size)
-    kernel_unpack = unpack_z_to_y_kernel!(CUDABackend())
-    kernel_unpack(output, buffer.recv_buffer, Nx_y, Ny_y, Nz_y,
-                  recv_chunk_sizes_gpu, recv_displs_gpu, row_size, recv_prefix_sums_gpu; ndrange=prod(pencil.y_pencil_shape))
+    _launch_transpose_kernel!(unpack_z_to_y_kernel!, CUDABackend(), prod(pencil.y_pencil_shape),
+        output, buffer.recv_buffer, Nx_y, Ny_y, Nz_y,
+        recv_chunk_sizes_gpu, recv_displs_gpu, row_size, recv_prefix_sums_gpu)
     CUDA.synchronize()
 
     set_orientation!(pencil, :y_pencil)
@@ -709,9 +731,9 @@ function _transpose_y_to_z!(output::CuArray{T,3}, buffer::NCCLTransposeBuffer{T}
     # Partition Y dimension and pack data for each destination rank
     chunk_sizes_gpu, displs_gpu, prefix_sums_gpu =
         _stage_chunk_plan!(buffer, :send, Ny, row_size)
-    kernel = pack_y_to_z_kernel!(CUDABackend())
-    kernel(buffer.send_buffer, data, Nx_local, Ny, Nz_local,
-           chunk_sizes_gpu, displs_gpu, row_size, prefix_sums_gpu; ndrange=total)
+    _launch_transpose_kernel!(pack_y_to_z_kernel!, CUDABackend(), total,
+        buffer.send_buffer, data, Nx_local, Ny, Nz_local,
+        chunk_sizes_gpu, displs_gpu, row_size, prefix_sums_gpu)
     CUDA.synchronize()
 
     row_rank = MPI.Comm_rank(pencil.row_comm)
@@ -722,9 +744,9 @@ function _transpose_y_to_z!(output::CuArray{T,3}, buffer::NCCLTransposeBuffer{T}
     recv_chunk_sizes_gpu, recv_displs_gpu, recv_prefix_sums_gpu =
         _stage_chunk_plan!(buffer, :recv, Nz_global, row_size)
 
-    kernel_unpack = unpack_y_to_z_kernel!(CUDABackend())
-    kernel_unpack(output, buffer.recv_buffer, Nx_z, Ny_z, Nz_z,
-                  recv_chunk_sizes_gpu, recv_displs_gpu, row_size, recv_prefix_sums_gpu; ndrange=prod(pencil.z_pencil_shape))
+    _launch_transpose_kernel!(unpack_y_to_z_kernel!, CUDABackend(), prod(pencil.z_pencil_shape),
+        output, buffer.recv_buffer, Nx_z, Ny_z, Nz_z,
+        recv_chunk_sizes_gpu, recv_displs_gpu, row_size, recv_prefix_sums_gpu)
     CUDA.synchronize()
 
     set_orientation!(pencil, :z_pencil)
@@ -794,9 +816,9 @@ function _transpose_y_to_x!(output::CuArray{T,3}, buffer::NCCLTransposeBuffer{T}
     # Pack data: split by Y dimension (y_chunk_sizes for each rank)
     chunk_sizes_gpu, displs_gpu, prefix_sums_gpu =
         _stage_chunk_plan!(buffer, :send, Ny, col_size)
-    kernel = pack_y_to_x_kernel!(CUDABackend())
-    kernel(buffer.send_buffer, data, Nx_local, Ny, Nz_local,
-           chunk_sizes_gpu, displs_gpu, col_size, prefix_sums_gpu; ndrange=total)
+    _launch_transpose_kernel!(pack_y_to_x_kernel!, CUDABackend(), total,
+        buffer.send_buffer, data, Nx_local, Ny, Nz_local,
+        chunk_sizes_gpu, displs_gpu, col_size, prefix_sums_gpu)
     CUDA.synchronize()
 
     col_rank = MPI.Comm_rank(pencil.col_comm)
@@ -807,9 +829,9 @@ function _transpose_y_to_x!(output::CuArray{T,3}, buffer::NCCLTransposeBuffer{T}
     recv_chunk_sizes_gpu, recv_displs_gpu, recv_prefix_sums_gpu =
         _stage_chunk_plan!(buffer, :recv, Nx_global, col_size)
 
-    kernel_unpack = unpack_y_to_x_kernel!(CUDABackend())
-    kernel_unpack(output, buffer.recv_buffer, Nx_x, Ny_x, Nz_x,
-                  recv_chunk_sizes_gpu, recv_displs_gpu, col_size, recv_prefix_sums_gpu; ndrange=prod(pencil.x_pencil_shape))
+    _launch_transpose_kernel!(unpack_y_to_x_kernel!, CUDABackend(), prod(pencil.x_pencil_shape),
+        output, buffer.recv_buffer, Nx_x, Ny_x, Nz_x,
+        recv_chunk_sizes_gpu, recv_displs_gpu, col_size, recv_prefix_sums_gpu)
     CUDA.synchronize()
 
     set_orientation!(pencil, :x_pencil)
@@ -878,9 +900,9 @@ function _transpose_x_to_y!(output::CuArray{T,3}, buffer::NCCLTransposeBuffer{T}
     # Pack data: split by X dimension using GPU kernel
     chunk_sizes_gpu, displs_gpu, prefix_sums_gpu =
         _stage_chunk_plan!(buffer, :send, Nx_global, col_size)
-    kernel = pack_x_to_y_kernel!(CUDABackend())
-    kernel(buffer.send_buffer, data, Nx, Ny_local, Nz_local,
-           chunk_sizes_gpu, displs_gpu, col_size, prefix_sums_gpu; ndrange=total)
+    _launch_transpose_kernel!(pack_x_to_y_kernel!, CUDABackend(), total,
+        buffer.send_buffer, data, Nx, Ny_local, Nz_local,
+        chunk_sizes_gpu, displs_gpu, col_size, prefix_sums_gpu)
     CUDA.synchronize()
 
     _nccl_buffer_alltoall!(buffer, buffer.nccl_subcomms.col_comm, col_size; my_rank=col_rank)
@@ -890,9 +912,9 @@ function _transpose_x_to_y!(output::CuArray{T,3}, buffer::NCCLTransposeBuffer{T}
     recv_chunk_sizes_gpu, recv_displs_gpu, recv_prefix_sums_gpu =
         _stage_chunk_plan!(buffer, :recv, Ny_global, col_size)
 
-    kernel_unpack = unpack_x_to_y_kernel!(CUDABackend())
-    kernel_unpack(output, buffer.recv_buffer, Nx_y, Ny_y, Nz_y,
-                  recv_chunk_sizes_gpu, recv_displs_gpu, col_size, recv_prefix_sums_gpu; ndrange=prod(pencil.y_pencil_shape))
+    _launch_transpose_kernel!(unpack_x_to_y_kernel!, CUDABackend(), prod(pencil.y_pencil_shape),
+        output, buffer.recv_buffer, Nx_y, Ny_y, Nz_y,
+        recv_chunk_sizes_gpu, recv_displs_gpu, col_size, recv_prefix_sums_gpu)
     CUDA.synchronize()
 
     set_orientation!(pencil, :y_pencil)
@@ -1020,10 +1042,12 @@ end
 """
     finalize_nccl_transpose!(buffer::NCCLTransposeBuffer)
 
-Clean up NCCL transpose buffer resources.
+Clean up NCCL transpose buffer resources. Collective over the pencil's world
+communicator: the NCCL sub-communicators are destroyed explicitly (device sync,
+barrier, row then column) instead of by rank-asynchronous GC finalizers.
 """
 function finalize_nccl_transpose!(buffer::NCCLTransposeBuffer)
     empty!(buffer.chunk_plans)
     empty!(buffer.wire_plans)
-    Tarang.finalize_nccl_subcomms!(buffer.nccl_subcomms)
+    Tarang.finalize_nccl_subcomms!(buffer.nccl_subcomms; barrier_comm=buffer.pencil.world_comm)
 end

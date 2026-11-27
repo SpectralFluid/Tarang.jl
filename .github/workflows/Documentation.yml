@@ -72,12 +72,15 @@ jobs:
           # Publish to this repository with the workflow token. The legacy
           # DOCUMENTER_KEY cannot push after the repository transfer.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Release tag for `tagbot-release` dispatches; docs/make.jl deploys it
+          # as the tag's version. Empty for every other event.
+          TARANG_DOCS_TAG: ${{ github.event.client_payload.tag }}
         run: julia --project=docs docs/make.jl
 
       # GITHUB_TOKEN pushes do not automatically trigger a branch-based Pages
       # build, so request publication explicitly after Documenter succeeds.
       - name: Publish GitHub Pages
-        if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+        if: github.event_name == 'push' || github.event_name == 'repository_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh api --method POST "repos/$GITHUB_REPOSITORY/pages/builds"

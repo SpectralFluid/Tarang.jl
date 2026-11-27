@@ -455,3 +455,258 @@ n_ref_len(c) = length(c)
         end
     end
 end
+
+# ── TransposableField's GPU per-axis DCT (`Tarang.dct_in_dim!` for CuArray) ──
+#
+# The PRODUCTION override from ext/cuda/transpose_kernels.jl runs here on host
+# arrays together with the PRODUCTION `gpu_dct1_along_dim!` (and its permutation /
+# packed re-im helpers and plan cache) from ext/cuda/cheb_deriv.jl: CuArray ===
+# Array, kernels on the KA CPU backend, FFTW's rfft standing in for cuFFT's. Only
+# device plumbing is shimmed, so this needs no CUDA.jl. The override used to undo
+# `gpu_dct1_along_dim!`'s odd-degree flip to match a CPU reference that lacked it;
+# both handed every coefficient consumer the mirrored field. Pinned to the
+# canonical convention through the CPU reference, which the support tests pin
+# against the serial ChebyshevTransform.
+module GPUDctInDimEmulation
+import Tarang as RealTarang
+using LinearAlgebra, FFTW, KernelAbstractions
+using KernelAbstractions: @kernel, @index, @Const
+module Tarang   # absorbs cheb_deriv.jl's `Tarang._gpu_chebyshev_deriv!` method
+    import Tarang as T0
+    const architecture = T0.architecture
+    const ScalarField = T0.ScalarField
+    const get_grid_data = T0.get_grid_data
+    const set_grid_data! = T0.set_grid_data!
+    function _gpu_chebyshev_deriv! end
+end
+const launch! = RealTarang.launch!
+const CuArray = Array
+const CuMatrix = Matrix
+module CUDA
+    zeros(T, dims...) = Base.zeros(T, dims...)
+    device() = 0
+    synchronize() = nothing
+end
+module CUFFT
+    using FFTW
+    # cuFFT, unlike FFTW, cannot plan an empty batch (CUDA.jl passes batch 0 to
+    # cufftXtMakePlanMany -> CUFFT_INVALID_SIZE); the stand-in refuses it too.
+    function plan_rfft(x, region)
+        isempty(x) && error("cuFFT cannot plan an empty batch (size $(size(x)))")
+        return FFTW.plan_rfft(x, region; flags=FFTW.ESTIMATE | FFTW.UNALIGNED)
+    end
+end
+ensure_device!(arch) = nothing
+get_gpu_dct_scratch(arch, shape, T, count; purpose=:default) = [zeros(T, shape) for _ in 1:count]
+const _ROOT = dirname(@__DIR__)
+include(joinpath(_ROOT, "ext", "cuda", "cheb_deriv.jl"))
+
+# Production override, renamed so it never extends the real `Tarang.dct_in_dim!`.
+function _find_override(ex)
+    ex isa Expr || return nothing
+    if ex.head === :function
+        sig = ex.args[1]
+        call = sig isa Expr && sig.head === :where ? sig.args[1] : sig
+        call isa Expr && call.head === :call && call.args[1] == :(Tarang.dct_in_dim!) && return ex
+    end
+    for a in ex.args
+        found = _find_override(a)
+        found === nothing || return found
+    end
+    return nothing
+end
+let def = _find_override(Meta.parseall(read(joinpath(_ROOT, "ext", "cuda", "transpose_kernels.jl"), String)))
+    def === nothing && error("GPU dct_in_dim! override not found in ext/cuda/transpose_kernels.jl")
+    def = deepcopy(def)
+    call = def.args[1].args[1]          # signature carries `where {T,N}`
+    call.args[1] = :gpu_dct_in_dim!
+    call.args[end] = :arch              # was `arch::Tarang.GPU`
+    Core.eval(@__MODULE__, def)
+end
+end # GPUDctInDimEmulation
+
+@testset "GPU dct_in_dim! override (KA CPU, FFTW) == canonical CPU dct_in_dim!" begin
+    emu = GPUDctInDimEmulation
+    for shape in ((9,), (8,), (7, 6), (6, 9), (5, 8, 7), (8, 5, 6)),
+        T in (Float64, Float32, ComplexF64), dim in eachindex(shape)
+        x = randn(T, shape...)
+        tol = real(T) === Float32 ? 1e-5 : 1e-12
+        gpu = emu.gpu_dct_in_dim!(copy(x), dim, :forward, nothing)
+        cpu = Tarang.dct_in_dim!(copy(x), dim, :forward, Tarang.CPU())
+        @test gpu ≈ cpu atol = tol rtol = 0
+        @test emu.gpu_dct_in_dim!(copy(gpu), dim, :backward, nothing) ≈ x atol = tol rtol = 0
+        @test emu.gpu_dct_in_dim!(copy(gpu), dim, :backward, nothing) ≈
+              Tarang.dct_in_dim!(copy(gpu), dim, :backward, Tarang.CPU()) atol = tol rtol = 0
+    end
+    # Analytic anchor independent of both implementations: u = T0 + T1 + T2 on
+    # Tarang's -cos grid has canonical coefficients [1, 1, 1, 0, ...] — the
+    # override used to return [1, -1, 1, 0, ...].
+    for N in (8, 9)
+        x = -cos.(π .* (0:N-1) ./ (N - 1))
+        u = reshape(1 .+ x .+ (2 .* x .^ 2 .- 1), 1, N, 1)     # along dim 2 of a 3D array
+        c = emu.gpu_dct_in_dim!(copy(u), 2, :forward, nothing)
+        @test vec(c) ≈ [1.0, 1.0, 1.0, zeros(N - 3)...] atol = 1e-12
+    end
+end
+
+# ── Scaled backward through the REAL staged device driver (host emulation) ───
+# `ext/cuda/mixed_transforms.jl` and `_gpu_backward_staged!` (ext/cuda/transforms.jl)
+# run verbatim on host arrays; only cuFFT, the DCT-I kernels, device scratch and
+# device ids are stubbed (the kernels are pinned above). This covers the step the
+# replays above cannot see: base coefficients left by a scale change resampled
+# into the plan's layout, the rfft-stage Nyquist fold of a downsample, and the
+# Chebyshev pad/truncate — the paths a GPU `set_scales!` takes.
+module ScaledBackwardEmulation
+using Tarang: GPU, ScalarField, RealFourier, ComplexFourier, ChebyshevT
+using Tarang: get_grid_data, set_grid_data!
+import Tarang
+using FFTW, LinearAlgebra
+const CuArray = Array
+struct CuDevice end
+module CUDA
+zeros(T, dims...) = Base.zeros(T, dims...)
+deviceid(_) = 0
+device() = nothing
+end
+_current_device_id() = 0
+ensure_device!(arch) = nothing
+struct GPUFFTPlanDim{P,I}
+    plan::P
+    iplan::I
+    is_real::Bool
+end
+function plan_gpu_fft_dim(arch, shape, T, dim; real_input=false)
+    input = zeros(T, shape)
+    plan = real_input ? plan_rfft(input, (dim,)) : plan_fft(input, (dim,))
+    return GPUFFTPlanDim(plan, inv(plan), real_input)
+end
+gpu_fft_dim!(out, input, plan) = mul!(out, plan.plan, input)
+gpu_ifft_dim!(out, input, plan; destroy_input=false) =
+    mul!(out, plan.iplan, destroy_input ? input : copy(input))
+get_gpu_dct_scratch(arch, shape, T, count; purpose=:default) = [zeros(T, shape) for _ in 1:count]
+# Tarang's DCT-I convention (chebyshev.jl): forward = REDFT00 · 1/(N-1) ·
+# ½-endpoints · odd-flip; backward is its inverse.
+function gpu_dct1_along_dim!(out, input, dim, direction)
+    n = size(input, dim)
+    n <= 1 && return copyto!(out, input)
+    function component(x)
+        x = copy(x)
+        if direction === :backward
+            selectdim(x, dim, 1) .*= 2
+            selectdim(x, dim, n) .*= 2
+            for k in 2:2:n
+                selectdim(x, dim, k) .*= -1
+            end
+        end
+        y = FFTW.r2r(x, FFTW.REDFT00, (dim,))
+        if direction === :forward
+            y ./= n - 1
+            selectdim(y, dim, 1) .*= 0.5
+            selectdim(y, dim, n) .*= 0.5
+            for k in 2:2:n
+                selectdim(y, dim, k) .*= -1
+            end
+        else
+            y ./= 2
+        end
+        return y
+    end
+    out .= eltype(input) <: Complex ?
+           complex.(component(real.(input)), component(imag.(input))) : component(input)
+    return out
+end
+const ROOT = dirname(@__DIR__)
+include(joinpath(ROOT, "ext/cuda/mixed_transforms.jl"))
+function _definition(ex, name)
+    ex isa Expr || return nothing
+    if ex.head === :function
+        sig = ex.args[1]
+        sig isa Expr && sig.head === :where && (sig = sig.args[1])
+        sig isa Expr && sig.head === :call && sig.args[1] === name && return ex
+    end
+    for arg in ex.args
+        found = _definition(arg, name)
+        found === nothing || return found
+    end
+    return nothing
+end
+Core.eval(@__MODULE__, _definition(Meta.parseall(read(joinpath(ROOT, "ext/cuda/transforms.jl"),
+                                                     String)), :_gpu_backward_staged!))
+end
+
+@testset "Scaled transforms through the staged device driver (host emulation)" begin
+    E = ScaledBackwardEmulation
+    arch = Tarang.GPU{E.CuDevice}(E.CuDevice())
+    kinds_basis(c, nm, kind, n) =
+        kind === :RF ? RealFourier(c[nm]; size=n, bounds=(0.0, 2π)) :
+        kind === :CF ? ComplexFourier(c[nm]; size=n, bounds=(0.0, 2π)) :
+                       ChebyshevT(c[nm]; size=n, bounds=(-1.0, 1.0))
+    function emu_field(kinds, sizes, T)
+        names = ("x", "y", "z")[1:length(kinds)]
+        coords = CartesianCoordinates(names...)
+        dist = Distributor(coords; mesh=(1,), dtype=T)
+        bases = ntuple(i -> kinds_basis(coords, names[i], kinds[i], sizes[i]), length(kinds))
+        return ScalarField(dist, "u", bases, T)
+    end
+    layouts = [((:RF, :CHEB), (16, 17), Float64), ((:CHEB, :RF), (17, 15), Float64),
+               ((:CF, :CHEB), (12, 9), Float64), ((:CF, :CHEB), (12, 9), ComplexF64),
+               ((:RF, :RF, :CHEB), (8, 8, 9), Float64), ((:RF, :CHEB, :CHEB), (8, 9, 7), Float64),
+               ((:CHEB, :CHEB), (9, 8), Float64), ((:CHEB,), (9,), Float64),
+               ((:RF, :RF), (16, 12), Float64), ((:RF, :CF), (16, 12), Float64),
+               ((:RF,), (16,), Float64)]
+
+    @testset "base coefficients onto the scaled grid: $kinds $sizes $T s=$s" for
+            (kinds, sizes, T) in layouts, s in (1.5, 0.75)
+        cpu = emu_field(kinds, sizes, T)
+        dev = emu_field(kinds, sizes, T)
+        ensure_layout!(cpu, :g)
+        get_grid_data(cpu) .= randn(T, size(get_grid_data(cpu))...)
+        forward_transform!(cpu)               # base spectrum, Nyquist content included
+        ensure_layout!(dev, :c)
+        copyto!(get_coeff_data(dev), get_coeff_data(cpu))
+        stored = copy(get_coeff_data(dev))
+        preset_scales!(cpu, s); backward_transform!(cpu)
+        preset_scales!(dev, s)
+        @test E._gpu_backward_staged!(dev, arch, get_coeff_data(dev), get_scaled_shape(dev))
+        @test size(get_grid_data(dev)) == get_scaled_shape(dev)
+        @test isapprox(get_grid_data(dev), get_grid_data(cpu); atol=1e-12)
+        @test get_coeff_data(dev) == stored   # the resample never writes the stored spectrum
+    end
+
+    @testset "forward from a scaled grid keeps basis-size Chebyshev coefficients" begin
+        # Upscaled grids truncate, downscaled ones zero-pad (as the CPU chain);
+        # the Fourier axes keep the grid's own spectrum, e.g. (13, 17) at 3/2.
+        for (kinds, sizes, T) in layouts[1:8], s in (1.5, 0.75)
+            cpu = emu_field(kinds, sizes, T)
+            preset_scales!(cpu, s)
+            ensure_layout!(cpu, :g)
+            grid = randn(T, size(get_grid_data(cpu))...)
+            get_grid_data(cpu) .= grid
+            forward_transform!(cpu)
+            plan = E.plan_gpu_mixed_transform(arch, cpu.bases, size(grid), T)
+            coeffs = zeros(eltype(get_coeff_data(cpu)), plan.coeff_shape)
+            E.gpu_mixed_forward_transform!(coeffs, grid, plan)
+            @test size(coeffs) == size(get_coeff_data(cpu))
+            @test isapprox(coeffs, get_coeff_data(cpu); atol=1e-12)
+        end
+    end
+end
+
+# An over-decomposed mesh (more ranks than points along an axis) hands some rank
+# an EMPTY block whose transform axis is still long. Its batch is zero, and cuFFT
+# cannot plan that: the rank errored while its peers waited in the next transpose.
+@testset "empty blocks build no cuFFT plan and launch nothing" begin
+    emu = GPUDctInDimEmulation
+    plans_before = length(emu._GPU_CHEB_DERIV_CACHE)
+    for shape in ((0, 6, 5), (7, 0, 5), (7, 6, 0)), T in (Float64, ComplexF64), dim in 1:3
+        shape[dim] > 1 || continue
+        x = zeros(T, shape)
+        out = zeros(T, shape)
+        @test emu.gpu_dct1_along_dim!(out, x, dim, :forward) === out
+        @test emu.gpu_dct1_along_dim!(out, x, dim, :backward) === out
+        @test emu.gpu_dct_in_dim!(x, dim, :backward, nothing) === x
+        deriv! = T <: Real ? emu._gpu_cheb_deriv_into! : emu._gpu_cheb_deriv_complex_into!
+        @test deriv!(out, x, dim, 1, 1.0) === out
+    end
+    @test length(emu._GPU_CHEB_DERIV_CACHE) == plans_before
+end

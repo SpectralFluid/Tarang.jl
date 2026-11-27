@@ -110,8 +110,9 @@ function async_transpose_y_to_x!(tf::TransposableField{F,T,N}) where {F,T,N}
 
     # CRITICAL: Check that yx_counts were computed (same guard as blocking version)
     # For 2D with 1D decomposition (Rx>1, Ry==1 or vice versa), yx counts may not be computed
-    # because Y↔X transposes are not needed in that configuration (ZLocal==XLocal)
-    if sum(tf.counts.yx_send_counts) == 0 && sum(tf.counts.yx_recv_counts) == 0
+    # because Y↔X transposes are not needed in that configuration (ZLocal==XLocal).
+    # By flag, never by value: all-zero counts are valid on an empty-block rank.
+    if !tf.counts.yx_computed[]
         if N == 2 && (topo.Rx == 1 || topo.Ry == 1)
             error("Async Y→X transpose not supported for 2D domain with 1D decomposition (Rx=$(topo.Rx), Ry=$(topo.Ry)). " *
                   "In this configuration, ZLocal and XLocal are equivalent - use transpose_z_to_y! and " *

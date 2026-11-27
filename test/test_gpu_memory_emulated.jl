@@ -16,8 +16,25 @@ zeros(T, dims...) = Base.zeros(T, dims...)
 context() = :host_emulation
 synchronize() = KernelAbstractions.synchronize(KernelAbstractions.CPU())
 end
-const CUFFT = FFTW
-CUDABackend() = KernelAbstractions.CPU()
+# Stand-ins that keep the two device restrictions FFTW and the KA CPU backend
+# lack, so an empty pencil block (over-decomposed mesh) is exercised faithfully:
+# cuFFT cannot plan an empty batch (CUFFT_INVALID_SIZE), and on CUDABackend()
+# KernelAbstractions sizes the workgroup from ndrange, so ndrange == 0 throws.
+module CUFFT
+using FFTW
+_plannable(x) = isempty(x) && error("cuFFT cannot plan an empty batch (size $(size(x)))")
+plan_fft(x, region) = (_plannable(x); FFTW.plan_fft(x, region))
+plan_ifft(x, region) = (_plannable(x); FFTW.plan_ifft(x, region))
+end
+struct ZeroCheckedBackend end
+struct ZeroCheckedKernel{K}
+    kernel::K
+end
+function (k::ZeroCheckedKernel)(args...; ndrange)
+    prod(ndrange) == 0 && throw(DivideError())
+    return k.kernel(args...; ndrange=ndrange)
+end
+CUDABackend() = ZeroCheckedBackend()
 _current_device_id() = 0
 ensure_device!(arch) = nothing
 struct GPUFFTPlanDim{P,I}
@@ -67,6 +84,10 @@ include(joinpath(ROOT, "ext/cuda/mixed_transforms.jl"))
 include(joinpath(ROOT, "ext/cuda/pencil.jl"))
 include(joinpath(ROOT, "ext/cuda/nccl_transpose.jl"))
 include(joinpath(ROOT, "ext/cuda/dct_distributed.jl"))
+for kernel in (:pack_z_to_y_kernel!, :unpack_z_to_y_kernel!, :pack_y_to_z_kernel!, :unpack_y_to_z_kernel!,
+               :pack_y_to_x_kernel!, :unpack_y_to_x_kernel!, :pack_x_to_y_kernel!, :unpack_x_to_y_kernel!)
+    @eval $kernel(::ZeroCheckedBackend) = ZeroCheckedKernel($kernel(KernelAbstractions.CPU()))
+end
 function nccl_alltoall!(send::Array, recv::Array, sc::Vector{Int}, rc::Vector{Int},
                          sd::Vector{Int}, rd::Vector{Int}, comm::MPI.Comm; my_rank::Int)
     MPI.Alltoallv!(MPI.VBuffer(send, sc, sd), MPI.VBuffer(recv, rc, rd), comm)
@@ -296,4 +317,49 @@ end
         @test source == complex.(local_grid)
         _GM.free_pencil_decomposition!(pencil)
     end
+end
+
+if _GM_NP > 1
+@testset "Distributed CUDA pipeline with EMPTY pencil blocks ($_GM_NP ranks)" begin
+    # More ranks than points along a split axis hands some ranks an EMPTY pencil
+    # block. They must skip their local transforms and kernel launches — cuFFT
+    # cannot plan an empty batch and a zero-ndrange CUDABackend() launch throws
+    # (both stand-ins above refuse, as the device does) — yet still join every
+    # exchange, or their peers block in it. Ny = 1 empties Z-pencil blocks (and
+    # X-pencil blocks on the (2,2) mesh); Nz = 1 empties X- and Y-pencil blocks.
+    mesh = _GM_NP == 4 ? (2,2) : (1,_GM_NP)
+    function block(n,p,r)
+        q,rem = divrem(n,p)
+        first = r*q + min(r,rem) + 1
+        first:(first+q+(r<rem)-1)
+    end
+    for (kinds, shape) in (((:chebyshev,:complex_fourier,:chebyshev), (7,1,9)),
+                           ((:complex_fourier,:chebyshev,:complex_fourier), (6,5,1)))
+        plan = _GM.distributed_plan(shape,mesh,kinds,Float64)
+        pencil = plan.pencil
+        xrank,yrank = pencil.grid_coords
+        full = rand(MersenneTwister(7),shape...)
+        local_grid = copy(full[block(shape[1],mesh[1],xrank),block(shape[2],mesh[2],yrank),:])
+        empty_here = any(s -> prod(s) == 0,
+                         (pencil.x_pencil_shape, pencil.y_pencil_shape, pencil.z_pencil_shape))
+        @test MPI.Allreduce(empty_here ? 1 : 0, MPI.SUM, MPI.COMM_WORLD) > 0
+        coefficients = zeros(ComplexF64,plan.coeff_pencil.z_pencil_shape)
+        _GM.distributed_forward_dct!(coefficients,local_grid,plan)
+        oracle = complex.(full)
+        for dim in 3:-1:1
+            if kinds[dim] === :chebyshev
+                tmp=similar(oracle); _GM.gpu_dct1_along_dim!(tmp,oracle,dim,:forward); oracle=tmp
+            else
+                oracle=fft(oracle,(dim,))
+            end
+        end
+        @test coefficients ≈ oracle[block(shape[1],mesh[1],xrank),block(shape[2],mesh[2],yrank),:] atol=1e-10
+        recovered = similar(local_grid)
+        _GM.distributed_backward_dct!(recovered,coefficients,plan)
+        @test recovered ≈ local_grid atol=1e-10
+        MPI.Barrier(MPI.COMM_WORLD)
+        @test true   # every rank reached the barrier: none was left in an exchange
+        _GM.free_pencil_decomposition!(pencil)
+    end
+end
 end

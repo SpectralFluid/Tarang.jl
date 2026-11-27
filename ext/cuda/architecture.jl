@@ -296,6 +296,22 @@ end
 # Fallback
 Tarang.unsafe_free!(::GPU, a::CuArray) = CUDA.unsafe_free!(a)
 
+"""
+    _seed_device_rng!(gpu::GPU{CuDevice}, seed::Integer)
+
+Seed the generator `rand!`/`randn!` use for a `CuArray`: CUDA.jl's native
+`CUDA.default_rng()` (src/random.jl), which is task-local, one per device
+context, and otherwise seeded from `RandomDevice`. The device is activated first
+because `default_rng()` belongs to the ACTIVE context. `Random.seed!` keeps the
+low 32 bits of `seed`. Not `CUDA.seed!`: that also seeds CURAND, which these
+fills never use, and its `Culonglong` seed rejects negative integers.
+"""
+function Tarang._seed_device_rng!(gpu::GPU{CuDevice}, seed::Integer)
+    ensure_device!(gpu)
+    Random.seed!(CUDA.default_rng(), seed)
+    return nothing
+end
+
 # ============================================================================
 # Override is_gpu_array for CuArray detection
 # ============================================================================

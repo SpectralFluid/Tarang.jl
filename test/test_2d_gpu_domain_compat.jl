@@ -49,16 +49,20 @@ end
         GPUArrays.allowscalar(false)
         Random.seed!(1)
 
-        @testset "Poisson invert ψ̂ = -q̂/k² (k=0 pinned, no scalar write)" begin
+        @testset "constraint solve ψ̂ = -q̂/k² (k=0 pinned, no scalar write)" begin
+            # Δψ - q = 0: L̂ = -k², input weight -1, so the refresh multiplies by
+            # -1/L̂ = 1/k² with the gauge (k=0) entry of that multiplier zeroed.
             N = 8
             q = ComplexF64.(randn(N, N)) .+ im .* randn(N, N)
             k2 = abs.(randn(N, N)); k2[1, 1] = 0.0        # k=0 (mean) mode
             ref = ifelse.(k2 .> 1e-12, .-q ./ k2, zero(ComplexF64))
+            neg_inv = ifelse.(k2 .> 0, complex.(1 ./ k2), zero(ComplexF64))
 
-            qd = _JLA2D(copy(q)); k2d = _JLA2D(copy(k2))
-            Tarang._poisson_invert!(qd, k2d)              # real function, on device
-            @test Array(qd) ≈ ref rtol=1e-12
-            @test Array(qd)[1, 1] == 0.0 + 0.0im          # gauge / k=0 mode exactly zero
+            dest = _JLA2D(zeros(ComplexF64, N, N))
+            Tarang._constraint_single!(dest, _JLA2D(neg_inv), -1.0, _JLA2D(copy(q)),
+                                       nothing)           # real function, on device
+            @test Array(dest) ≈ ref rtol=1e-12
+            @test Array(dest)[1, 1] == 0.0 + 0.0im        # gauge / k=0 mode exactly zero
         end
 
         @testset "2D k² grid (rfft first axis × full-fft second axis)" begin
@@ -74,7 +78,7 @@ end
         end
 
         @testset "Poisson-solve-into broadcast (both sign conventions)" begin
-            # verbatim from _spectral_poisson_solve_into! (state_utils.jl):
+            # the shape of the constraint refresh's per-mode solve (state_utils.jl):
             #   dest .= ifelse.(k2 .> 1e-12, sign .* src ./ k2, 0)
             N = 8
             src = ComplexF64.(randn(N, N ÷ 2 + 1)) .+ im .* randn(N, N ÷ 2 + 1)

@@ -73,6 +73,33 @@ end
     @test_throws DimensionMismatch Tarang.MatSolvers.solve(factor, ComplexF64[1])
 end
 
+# Stand-in with CUDA.jl's `CUSOLVER.getrf!` contract (lib/cusolver/dense.jl): it
+# returns `(A, ipiv, info)` and raises only for info < 0 — a zero pivot (info > 0)
+# is an ordinary return. Only the probe pivot type opts in, as above.
+function Tarang._cudense_getrf!(A::Matrix{ComplexF64}, pivots::DenseSolveBufferProbe{Int32,true})
+    F = lu!(A; check=false)
+    copyto!(pivots.data, F.ipiv)
+    return A, pivots, F.info
+end
+
+@testset "CuDenseLU factorization raises SingularException like DenseLUSolver" begin
+    pivots() = DenseSolveBufferProbe{Int32,true}(zeros(Int32, 3), Ref(0))
+    # Row 2 = 2·row 1, so the third pivot is exactly zero (info = 3). The factor
+    # used to be accepted, and every solve with it returned Inf/NaN.
+    singular = ComplexF64[1 2 3; 2 4 6; 1 0 1]
+    @test_throws SingularException Tarang.MatSolvers.DenseLUSolver(singular)
+    @test_throws SingularException(3) Tarang._cudense_factor!(copy(singular), pivots())
+    # A zero column (an unconstrained tau variable) fails at the first pivot.
+    @test_throws SingularException(1) Tarang._cudense_factor!(
+        ComplexF64[0 1 0; 0 2 1; 0 0 3], pivots())
+    regular = ComplexF64[4 1 0; 1 3 1; 0 1 2]
+    factors, ipiv = copy(regular), pivots()
+    @test Tarang._cudense_factor!(factors, ipiv) === factors
+    expected = ComplexF64[1-im, 2, 3im]
+    @test LinearAlgebra.LAPACK.getrs!('N', factors, Vector{LinearAlgebra.BlasInt}(ipiv.data),
+                                      regular * expected) ≈ expected
+end
+
 const _GPU_SOLVER_REUSE_CUDA = try
     @eval import CUDA
     CUDA.functional()

@@ -1,23 +1,11 @@
 using Documenter
+using Tarang
 
 # Set up documentation generation
 println("Building Tarang.jl documentation...")
+println("  Tarang.jl loaded from: $(pathof(Tarang))")
 
-# Try to load Tarang, but don't fail if it errors
-tarang_loaded = false
-try
-    @eval using Tarang
-    global tarang_loaded = true
-    println("  Tarang.jl loaded from: $(pathof(Tarang))")
-catch e
-    println("  Failed to load Tarang module: $e")
-    println("  Building docs without module - API docs will be incomplete")
-end
-
-# Set up documentation metadata only if Tarang loaded
-if tarang_loaded
-    DocMeta.setdocmeta!(Tarang, :DocTestSetup, :(using Tarang); recursive=true)
-end
+DocMeta.setdocmeta!(Tarang, :DocTestSetup, :(using Tarang); recursive=true)
 
 #####
 ##### Documentation configuration
@@ -122,14 +110,14 @@ pages = Any[
 println("Generating documentation with Documenter.jl...")
 
 makedocs(;
-    modules = tarang_loaded ? [Tarang] : Module[],
+    modules = [Tarang],
     authors = "Subhajit Kar",
     repo = "https://github.com/SpectralFluid/Tarang.jl/blob/{commit}{path}#{line}",
     sitename = "Tarang.jl",
     format = format,
     pages = pages,
     clean = true,
-    doctest = tarang_loaded,
+    doctest = true,
     linkcheck = false,
     # A `@docs` block naming a function that no longer exists, or a dead cross-reference, is a
     # DOC BUG — the docs have drifted from the code. `:docs_block` and `:cross_references` were
@@ -153,6 +141,18 @@ makedocs(;
 if get(ENV, "CI", "false") == "true"
     println("Deploying documentation...")
 
+    # TagBot creates release tags with GITHUB_TOKEN, which does not start a tag
+    # `push` run, so TagBot.yml sends a `tagbot-release` repository_dispatch and
+    # Documentation.yml checks that tag out. For this event GitHub sets GITHUB_REF
+    # to the default branch, and Documenter only deploys push-like events, so
+    # describe the run as the tag push it stands in for.
+    deploy_config = if get(ENV, "GITHUB_EVENT_NAME", "") == "repository_dispatch"
+        Documenter.GitHubActions(ENV["GITHUB_REPOSITORY"], "push",
+                                 "refs/tags/" * ENV["TARANG_DOCS_TAG"])
+    else
+        Documenter.GitHubActions()
+    end
+
     deploydocs(;
         repo = "github.com/SpectralFluid/Tarang.jl.git",
         devbranch = "main",
@@ -161,7 +161,7 @@ if get(ENV, "CI", "false") == "true"
         make = nothing,
         versions = ["stable" => "v^", "v#.#", "dev" => "dev"],
         forcepush = false,
-        deploy_config = Documenter.GitHubActions(),
+        deploy_config = deploy_config,
         push_preview = true
     )
 else

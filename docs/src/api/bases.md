@@ -531,13 +531,14 @@ xg15, zg15 = local_grids(dist, x_basis, z_basis; scales=1.5)
 maximum(abs.(get_grid_data(Tpad) .- sin.(2π/4 .* xg15) .* sin.(π .* zg15')))   # 3.9e-15
 ```
 
-!!! warning "On a mixed Fourier-Chebyshev field, `set_scales!` does not reverse"
-    Padding works, but scaling such a field back down — `set_scales!(Tpad, 1.0)` — throws
-    `TypeError: in setfield!, expected Matrix{Float64}, got a value of type Matrix{ComplexF64}`.
-    The forward transform of a padded grid stores a padded half-spectrum (here 25×16 rather
-    than the base 17×16), and the backward transform cannot map that back onto the base real
-    grid. Give the padded output its own field instead of rescaling one you still need.
-    Pure-Fourier fields rescale in both directions.
+Scaling back down — `set_scales!(Tpad, 1.0)` — returns the same function on the base nodes,
+and scales below 1 give coarser grids. Every axis is resampled by one rule: modes the target
+grid can hold are kept, the rest are dropped (the even-`N` Nyquist mode is dropped when
+refining and folded into the new Nyquist mode when coarsening, as the grid resample does).
+A field left in coefficient space keeps its stored coefficients through `set_scales!`; the
+next backward transform resamples them onto the new grid. (When a `RealFourier` half-spectrum
+length cannot identify the grid it came from — e.g. after a forward transform at another
+non-unit scale — `set_scales!` returns the field in grid space instead.)
 
 ### Domain shapes
 

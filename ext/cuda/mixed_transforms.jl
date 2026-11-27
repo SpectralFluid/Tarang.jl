@@ -291,22 +291,23 @@ function gpu_mixed_forward_transform!(coeff_data::CuArray{T, N}, grid_data::CuAr
             end
 
             if needs_resize
-                # Scaled Chebyshev axis: truncate to the basis size (matches the
-                # CPU chain). The final stage truncates straight into the
+                # Scaled Chebyshev axis: keep the basis size — truncate an
+                # upscaled grid's spectrum, zero-pad a downscaled one (matches the
+                # CPU chain). The final stage resizes straight into the
                 # coefficient buffer.
                 if is_last && eltype(coeff_data) == eltype(current_data)
-                    Tarang._copy_axis_prefix!(coeff_data, current_data, dim)
+                    Tarang._resize_axis_prefix!(coeff_data, current_data, dim)
                     current_data = coeff_data
                 else
                     resized_scratch = get_gpu_mixed_transform_scratch(
                         plan, complex_T, output_shape)
                     if eltype(current_data) <: Complex
                         resized = _next_mixed_complex_buffer(current_data, resized_scratch)
-                        Tarang._copy_axis_prefix!(resized, current_data, dim)
+                        Tarang._resize_axis_prefix!(resized, current_data, dim)
                         current_data = resized
                     else
-                        Tarang._copy_axis_prefix!(_mixed_buffer!(resized_scratch, Val(:real_output)),
-                                                  current_data, dim)
+                        Tarang._resize_axis_prefix!(_mixed_buffer!(resized_scratch, Val(:real_output)),
+                                                    current_data, dim)
                         current_data = _mixed_buffer!(resized_scratch, Val(:real_output))
                     end
                 end
@@ -322,7 +323,8 @@ function gpu_mixed_forward_transform!(coeff_data::CuArray{T, N}, grid_data::CuAr
 end
 
 """
-    gpu_mixed_backward_transform!(grid_data::CuArray, coeff_data::CuArray, plan::GPUMixedTransformPlan)
+    gpu_mixed_backward_transform!(grid_data::CuArray, coeff_data::CuArray, plan::GPUMixedTransformPlan;
+                                  input_disposable=false, nyquist_fold=(0, 0))
 
 Execute backward mixed Fourier-Chebyshev transform on GPU.
 Supports both 2D and 3D arrays.
@@ -330,20 +332,28 @@ Supports both 2D and 3D arrays.
 Transforms spectral coefficients to grid-space data:
 1. Apply inverse DCT along Chebyshev dimensions
 2. Apply inverse FFT along Fourier dimensions
+
+`input_disposable=true` lets the stages consume `coeff_data` (a caller's scratch,
+e.g. a spectrum resampled for a scaled grid). `nyquist_fold = (dim, bin)` adds the
+`-n/2` image to that bin of the rfft axis just before its inverse — the step a
+half-spectrum downsample to an even grid still owes, which is local only once the
+other Fourier axes are inverted (`Tarang._fold_half_spectrum_nyquist!`).
 """
 function gpu_mixed_backward_transform!(grid_data::CuArray{T, N}, coeff_data::CuArray{S, N},
-                                       plan::GPUMixedTransformPlan) where {T, S, N}
+                                       plan::GPUMixedTransformPlan;
+                                       input_disposable::Bool=false,
+                                       nyquist_fold::Tuple{Int,Int}=(0, 0)) where {T, S, N}
     complex_T = S <: Complex ? S : Complex{S}
     _require_mixed_shape("coefficient input", coeff_data, plan.coeff_shape)
     _require_mixed_shape("grid output", grid_data, plan.grid_shape)
     current_data = coeff_data
-    # PROVENANCE flag: true only while `current_data` is one of this plan's
-    # ping-pong scratch buffers, i.e. dead intermediate data the destructive
-    # cuFFT C2R may consume. Tracked explicitly at every reassignment below —
-    # an identity test like `current_data !== coeff_data` would wrongly mark a
-    # future live buffer (a caller's array reused by a new stage order) as
-    # disposable and let the C2R silently trash it.
-    current_disposable = false
+    # PROVENANCE flag: true only while `current_data` is dead intermediate data
+    # the destructive cuFFT C2R may consume — one of this plan's ping-pong scratch
+    # buffers, or an input the caller declared disposable. Tracked explicitly at
+    # every reassignment below — an identity test like `current_data !== coeff_data`
+    # would wrongly mark a future live buffer (a caller's array reused by a new
+    # stage order) as disposable and let the C2R silently trash it.
+    current_disposable = input_disposable
 
     for stage_index in reverse(eachindex(plan.transform_order))
         dim = plan.transform_order[stage_index]
@@ -357,13 +367,15 @@ function gpu_mixed_backward_transform!(grid_data::CuArray{T, N}, coeff_data::CuA
             scratch = get_gpu_mixed_transform_scratch(plan, complex_T, output_shape)
             dct_input = current_data
             if output_shape != input_shape
+                # Basis-size coefficients onto a scaled grid: zero-pad (finer) or
+                # truncate (coarser), as the CPU chain keeps min(coeff, grid) modes.
                 if eltype(current_data) <: Complex
                     padded = _next_mixed_complex_buffer(current_data, scratch)
-                    Tarang._zero_pad_axis_prefix!(padded, current_data, dim)
+                    Tarang._resize_axis_prefix!(padded, current_data, dim)
                     dct_input = padded
                 else
-                    Tarang._zero_pad_axis_prefix!(_mixed_buffer!(scratch, Val(:real_input)),
-                                                  current_data, dim)
+                    Tarang._resize_axis_prefix!(_mixed_buffer!(scratch, Val(:real_input)),
+                                                current_data, dim)
                     dct_input = _mixed_buffer!(scratch, Val(:real_input))
                 end
             end
@@ -395,10 +407,22 @@ function gpu_mixed_backward_transform!(grid_data::CuArray{T, N}, coeff_data::CuA
                 output_shape == plan.grid_shape || throw(DimensionMismatch(
                     "real inverse FFT produced intermediate shape $output_shape " *
                     "instead of final grid shape $(plan.grid_shape)"))
+                if nyquist_fold[1] == dim
+                    # Every other axis is in grid space now, so the downsample's
+                    # Nyquist fold is local. Never fold a live caller buffer.
+                    if !current_disposable
+                        staged = get_gpu_mixed_transform_scratch(plan, complex_T, input_shape)
+                        staged_data = _next_mixed_complex_buffer(current_data, staged)
+                        copyto!(staged_data, current_data)
+                        current_data = staged_data
+                        current_disposable = true
+                    end
+                    Tarang._fold_half_spectrum_nyquist!(current_data, dim, nyquist_fold[2])
+                end
                 # `current_disposable` says whether current_data is dead
                 # ping-pong scratch (mixed fields visit a Chebyshev stage
-                # first, making it so); only then may the destructive cuFFT
-                # C2R consume it without the defensive input copy.
+                # first, making it so) or a disposable input; only then may the
+                # destructive cuFFT C2R consume it without the defensive copy.
                 gpu_ifft_dim!(grid_data, current_data, fft_plan;
                               destroy_input=current_disposable)
                 current_data = grid_data

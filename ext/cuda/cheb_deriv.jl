@@ -379,6 +379,7 @@ function _gpu_cheb_deriv_into!(dest::CuArray{T}, data_g::CuArray{T}, axis::Int,
                                order::Int, scale::Float64) where {T<:AbstractFloat}
     n  = size(data_g, axis)
     batch = prod(size(data_g)) ÷ n
+    batch == 0 && return dest   # empty block: cuFFT cannot plan an empty batch
     plan = _get_gpu_cheb_deriv_plan(n, batch, T)
 
     if axis == 1
@@ -406,6 +407,7 @@ function _gpu_cheb_deriv_complex_into!(dest::CuArray{Complex{T}}, data_g::CuArra
                                        axis::Int, order::Int, scale::Float64) where {T<:AbstractFloat}
     n  = size(data_g, axis)
     batch = prod(size(data_g)) ÷ n
+    batch == 0 && return dest   # empty block: cuFFT cannot plan an empty batch
     arch  = Tarang.architecture(data_g)
     plan2 = _get_gpu_cheb_deriv_plan(n, 2 * batch, T)
     core! = packed -> _apply_gpu_cheb_deriv_nth!(packed, packed, scale, order, plan2)
@@ -551,6 +553,9 @@ function gpu_dct1_along_dim!(output::CuArray{T,N}, input::CuArray{T,N},
     end
 
     batch = prod(size(input)) ÷ n
+    # batch == 0: an empty block (e.g. an over-decomposed pencil). Nothing to
+    # transform, and cuFFT cannot plan an empty batch (CUFFT_INVALID_SIZE).
+    batch == 0 && return output
     arch  = Tarang.architecture(input)
     plan  = _get_gpu_cheb_deriv_plan(n, batch, T)
 
@@ -579,6 +584,7 @@ function gpu_dct1_along_dim!(output::CuArray{Complex{T},N}, input::CuArray{Compl
     end
 
     batch = prod(size(input)) ÷ n
+    batch == 0 && return output   # empty block: see the real method above
     arch  = Tarang.architecture(input)
     plan2 = _get_gpu_cheb_deriv_plan(n, 2 * batch, T)
     core! = packed -> _dct1_batch_mat!(packed, packed, direction, plan2, arch)

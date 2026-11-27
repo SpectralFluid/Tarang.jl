@@ -22,6 +22,12 @@ Follows fill_random API for familiar usage.
   of MPI decomposition. Each grid point gets a deterministic random value based on its
   global index. If false, uses rank-local seeding (faster but MPI-dependent).
 
+A complex `"normal"` fill has unit total variance (each component N(0, 1/2)), as
+`randn(ComplexF64)`. With `reproducible=false`, `seed` seeds the host RNG and, for a
+GPU field, the device RNG that `randn!`/`rand!` draw from there, so a seeded run
+repeats on the same architecture. In either mode the same seed gives DIFFERENT
+values on CPU and GPU: the two use different generators.
+
 # Example
 ```julia
 # Fill with reproducible random noise (same result with 1 or 4 MPI ranks)
@@ -48,6 +54,9 @@ function fill_random!(field::ScalarField, layout::String="g";
         # Standard mode: rank-local seeding (original behavior)
         if seed !== nothing
             Random.seed!(seed)
+            # `Random.seed!` reaches only the host RNG; a device array draws from
+            # the backend's own generator.
+            _seed_device_rng!(field.dist.architecture, seed)
         end
 
         if distribution == "normal" || distribution == "standard_normal"
@@ -109,12 +118,19 @@ end
         u1 = _field_random_uniform(seed, 2counter - 1, RT)
         u2 = _field_random_uniform(seed, 2counter, RT)
         if normal
-            radius = sqrt(-RT(2) * log(max(u1, eps(RT))))
-            re = radius * cos(RT(2π) * u2)
+            # Box–Muller. A complex normal has unit TOTAL variance, each component
+            # N(0, 1/2), like `randn(ComplexF64)` on the host path; the radius
+            # therefore uses -log(u1) for complex storage, not the real -2log(u1),
+            # which gave E|c|² = 2.
+            log_u1 = log(max(u1, eps(RT)))
             if ET <: Complex
+                radius = sqrt(-log_u1)
+                re = radius * cos(RT(2π) * u2)
                 imv = radius * sin(RT(2π) * u2)
                 @inbounds data[i] = ET(re, imv) * scale
             else
+                radius = sqrt(-RT(2) * log_u1)
+                re = radius * cos(RT(2π) * u2)
                 @inbounds data[i] = re * scale
             end
         else
@@ -152,6 +168,7 @@ function _fill_random_reproducible!(data::AbstractArray, field::ScalarField,
     if field.domain === nothing
         # No domain info - fall back to standard random fill
         Random.seed!(seed)
+        _seed_device_rng!(dist.architecture, seed)
         if distribution == "normal" || distribution == "standard_normal"
             randn!(data)
         elseif distribution == "uniform"

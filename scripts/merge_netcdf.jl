@@ -72,56 +72,16 @@ if !(PROJECT_ROOT in LOAD_PATH)
     push!(LOAD_PATH, PROJECT_ROOT)
 end
 
-using ArgParse
 using Tarang
 
 # Version info from package metadata; avoids depending on private module globals.
 const VERSION = string(pkgversion(Tarang))
 const SCRIPT_NAME = "merge_netcdf.jl"
 
-function parse_arguments()
-    # Keep the CLI surface here and the NetCDF merge mechanics in
-    # src/tools/netcdf_merge.jl so scripts stay thin wrappers around library
-    # functionality.
-    s = ArgParseSettings(description="Merge per-processor NetCDF files from Tarang.jl",
-                        version="$SCRIPT_NAME v$VERSION",
-                        add_version=true)
-
-    @add_arg_table! s begin
-        "handlers"
-            nargs = '*'
-            help = "Handler names to merge (e.g., snapshots, analysis)"
-            
-        "--set", "-s"
-            arg_type = Int
-            default = 0
-            help = "Set number to merge (default: all discovered sets)"
-            
-        "--output", "-o"
-            arg_type = String
-            default = ""
-            help = "Output filename (auto-generated if not specified)"
-            
-        "--mode", "-m"
-            arg_type = String
-            default = "reconstruct"
-            help = "Merge mode: concat, reconstruct, decomp"
-            
-        "--cleanup", "-c"
-            action = :store_true
-            help = "Delete source files after successful merge"
-            
-        "--auto", "-a"
-            action = :store_true
-            help = "Auto-discover all mergeable handlers"
-            
-        "--quiet", "-q"
-            action = :store_true
-            help = "Minimal output"
-    end
-
-    return parse_args(s)
-end
+# Keep the CLI surface in scripts/ and the NetCDF merge mechanics in
+# src/tools/netcdf_merge.jl so scripts stay thin wrappers around library
+# functionality. `parse_arguments` lives in merge_netcdf_cli.jl.
+include(joinpath(@__DIR__, "merge_netcdf_cli.jl"))
 
 function str_to_merge_mode(mode_str::String)
     mode_lower = lowercase(mode_str)
@@ -383,6 +343,28 @@ function merge_specific_handlers(args)
     return success_count > 0
 end
 
+function show_help()
+    println("""
+usage: julia $SCRIPT_NAME [OPTIONS] [HANDLER ...]
+
+Merge per-processor NetCDF files from Tarang.jl.
+
+positional arguments:
+  HANDLER              Handler names to merge (e.g., snapshots, analysis)
+
+options:
+  -s, --set N          Set number to merge (default: all discovered sets)
+  -o, --output FILE    Output filename (auto-generated if not specified)
+  -m, --mode MODE      Merge mode: concat, reconstruct, decomp (default: reconstruct)
+  -c, --cleanup        Delete source files after successful merge
+  -a, --auto           Auto-discover all mergeable handlers
+  -q, --quiet          Minimal output
+  -h, --help           Show this help message
+  -v, --version        Show version information
+""")
+    show_usage_examples()
+end
+
 function show_usage_examples()
     println("""
 USAGE EXAMPLES:
@@ -420,17 +402,22 @@ After Merge:
 """)
 end
 
-function main()
+function main(argv::AbstractVector{<:AbstractString}=ARGS)
     args = try
-        parse_arguments()
+        parse_arguments(argv)
     catch e
-        if isa(e, ArgParseError) && occursin("help", string(e))
-            show_usage_examples()
-            return 0
-        else
-            println("Error parsing arguments: $e")
-            return 1
-        end
+        e isa ArgumentError || rethrow()
+        println(stderr, "Error parsing arguments: ", e.msg)
+        println(stderr, "Run `julia $SCRIPT_NAME --help` for usage.")
+        return 1
+    end
+
+    if args["help"]
+        show_help()
+        return 0
+    elseif args["version"]
+        println("$SCRIPT_NAME v$VERSION")
+        return 0
     end
 
     verbose = !args["quiet"]

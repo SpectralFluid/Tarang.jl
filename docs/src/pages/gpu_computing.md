@@ -108,13 +108,15 @@ The current boundary of this validation is deliberate:
 Pure-Fourier GPU IVPs use field-native stepping: explicit Runge-Kutta and the
 matrix-free multistep field path run entirely on device arrays. When the
 left-hand side has an implicit diagonal Fourier operator, `RK222()`, `RK443()`,
-and `SBDF2()` select their diagonal implementations automatically. The operator
+`SBDF2()` and the other IMEX Runge-Kutta tableaux (`RK111()`, `RKSMR()`,
+`RKGFY()`) select their diagonal implementations automatically. The operator
 is applied per mode in spectral space
 on the device; the operator is read from the equation (Laplacian, hyper- or
 fractional Laplacian, constant damping, derivatives of the stepped field) or
 from an attached `SpectralLinearOperator`. Every other scheme refuses a
-left-hand-side operator on a single GPU with an error that names these three,
-because a pure-Fourier GPU solver assembles no global matrix to treat it with.
+left-hand-side operator on a single GPU with an error that names these six,
+because a pure-Fourier GPU solver assembles no global matrix to treat it with,
+and refuses an attached operator with an `ArgumentError`.
 The full per-architecture table is in
 [Time Steppers](timesteppers.md#Where-each-scheme-runs).
 
@@ -204,6 +206,17 @@ The distributed DCT-I path supports selected three-dimensional
 Fourier–Chebyshev layouts. It requires at least one Fourier and one Chebyshev
 axis. `RealFourier` is allowed only on the first axis and cannot be combined
 with another Fourier axis. Other layouts, including pure Chebyshev, are rejected.
+`forward_transform!` and `backward_transform!` select this path automatically
+for such fields. Its transposes run over NCCL: load NCCL.jl (`using NCCL`) on
+every rank before the first transform (calling `init_nccl!` is not required).
+Without it every rank raises the same error before any communication starts.
+The NCCL communicators belong to the cached transform plans; `close(dist)` destroys
+them explicitly — `ncclCommDestroy` is collective, so call it on every rank rather
+than leaving it to garbage collection, which runs at a different moment on each
+rank. A mesh may have more ranks than points along an axis: ranks whose block is
+empty skip their local transforms but still take part in every exchange.
+A hand-built multi-rank `TransposableField` refuses a real field with a
+`RealFourier` axis, because its fixed-size buffers cannot hold the half spectrum.
 
 ## Custom kernels
 

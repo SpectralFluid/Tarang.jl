@@ -235,8 +235,8 @@ bad = boundary_advection_diffusion_setup(
     diffusion=DiffusionSpec(type=:laplacian, coefficient=0.01)
 )
 # Set velocity externally
-bad.velocities["concentration"]get_grid_data(.components[1]) .= u_x
-bad.velocities["concentration"]get_grid_data(.components[2]) .= u_y
+get_grid_data(bad.velocities["concentration"].components[1]) .= u_x
+get_grid_data(bad.velocities["concentration"].components[2]) .= u_y
 ```
 
 ## With interior coupling (QG-like)
@@ -750,9 +750,8 @@ The source function should have signature:
 ```julia
 # Add a Gaussian forcing
 function my_source(bad, name)
-    x = get_grid(bad, :x)
-    y = get_grid(bad, :y)
-    return 0.1 * exp.(-((x .- π).^2 .+ (y .- π).^2) ./ 0.5)
+    x, y = local_grids(bad.dist, bad.bases...)
+    return 0.1 * exp.(-((x .- π).^2 .+ (y' .- π).^2) ./ 0.5)
 end
 bad_add_source!(bad, "surface", my_source)
 ```

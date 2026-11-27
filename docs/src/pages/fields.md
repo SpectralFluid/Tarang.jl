@@ -147,6 +147,10 @@ MPI.
 
 `fill_random!` fills the field in place. With `reproducible=true` (the default) the
 same `seed` produces the same global field regardless of how many ranks are used.
+With `reproducible=false` the seed also seeds the GPU's own generator, so a seeded
+GPU run repeats. In both modes the same seed gives different values on CPU and GPU,
+which use different generators. A complex `"normal"` fill has unit total variance
+(each component N(0, 1/2)), as `randn(ComplexF64)`.
 
 ```julia
 # Small-amplitude noise on top of an existing profile

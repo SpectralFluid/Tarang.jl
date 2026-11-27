@@ -13,8 +13,9 @@ mutable struct NCCLConfig
     comm_handle::Any  # NCCL communicator (when NCCL.jl is loaded)
     rank::Int
     size::Int
+    mpi_comm::Union{Nothing, MPI.Comm}  # communicator init_nccl! mirrored (teardown barrier)
 
-    NCCLConfig() = new(false, nothing, 0, 1)
+    NCCLConfig() = new(false, nothing, 0, 1, nothing)
 end
 
 const NCCL_CONFIG = NCCLConfig()
@@ -237,19 +238,82 @@ found, false otherwise.
 """
 _try_load_nccl() = _find_nccl_module() !== nothing
 
-"""
-    finalize_nccl_subcomms!(subcomms::NCCLSubComms)
+# ----------------------------------------------------------------------------
+# Explicit, collective NCCL teardown
+#
+# `ncclCommDestroy` is an intra-node collective, yet NCCL.jl only registers it
+# as a GC finalizer (`finalizer(destroy, comm)`). Merely dropping references let
+# every rank destroy whenever its own GC ran: one rank could block in
+# ncclCommDestroy while its peer waited in an MPI collective. Teardown is
+# therefore explicit, at a point all ranks reach together: finish this rank's
+# device work, barrier on the parent MPI communicator, then destroy in a fixed,
+# rank-invariant order — row, then column (finalize_nccl_subcomms!), the world
+# communicator last (finalize_nccl!). NCCL.jl's `destroy` (≥ 0.1.2) nulls the
+# handle, so the finalizer that runs later is a no-op.
+# ----------------------------------------------------------------------------
 
-Clean up NCCL sub-communicators.
-Sets all fields to their default uninitialized state.
+"""Wait for this rank's queued work on `comm`'s device (`NCCL.device(comm)`)."""
+function _synchronize_nccl_device(nccl::Module, comm)
+    dev = nccl.device(comm)
+    synchronize(GPU{typeof(dev)}(dev))
+    return nothing
+end
+
+_nccl_teardown_barrier(::Nothing) = nothing
+function _nccl_teardown_barrier(comm::MPI.Comm)
+    MPI.Initialized() && !MPI.Finalized() && MPI.Barrier(comm)
+    return nothing
+end
+
 """
-function finalize_nccl_subcomms!(subcomms::NCCLSubComms)
-    if subcomms.initialized
-        subcomms.row_comm = nothing
-        subcomms.col_comm = nothing
-        subcomms.initialized = false
-        @debug "NCCL sub-communicators finalized"
+    _destroy_nccl_comms!(comms; barrier_comm=nothing)
+
+Collectively destroy the NCCL communicators in `comms` (skipping `nothing`), in
+exactly that order on every rank: synchronize their devices, barrier on
+`barrier_comm`, then `NCCL.destroy` each one. A failure is rethrown only after
+every later destroy has been posted, so peers waiting on them are not stranded.
+"""
+function _destroy_nccl_comms!(comms; barrier_comm=nothing)
+    live = Any[comm for comm in comms if comm !== nothing]
+    if isempty(live)
+        _nccl_teardown_barrier(barrier_comm)
+        return nothing
     end
+    nccl = _require_nccl_module()
+    for comm in live
+        _synchronize_nccl_device(nccl, comm)
+    end
+    _nccl_teardown_barrier(barrier_comm)
+    first_error = nothing
+    for comm in live
+        try
+            nccl.destroy(comm)
+        catch err
+            first_error === nothing && (first_error = err)
+        end
+    end
+    first_error === nothing || throw(first_error)
+    return nothing
+end
+
+"""
+    finalize_nccl_subcomms!(subcomms::NCCLSubComms; barrier_comm=nothing)
+
+Destroy the NCCL sub-communicators explicitly and reset `subcomms` to its
+uninitialized state. Collective: every rank of the sub-communicators must call
+it at the same point. Their devices are synchronized, `barrier_comm` (the parent
+MPI communicator, when given) is barriered, and the row communicator is
+destroyed before the column one on every rank.
+"""
+function finalize_nccl_subcomms!(subcomms::NCCLSubComms; barrier_comm=nothing)
+    subcomms.initialized || return nothing
+    comms = (subcomms.row_comm, subcomms.col_comm)   # rank-invariant order: row, column
+    subcomms.row_comm = nothing
+    subcomms.col_comm = nothing
+    subcomms.initialized = false
+    _destroy_nccl_comms!(comms; barrier_comm)
+    @debug "NCCL sub-communicators destroyed"
+    return nothing
 end
 
 """
@@ -270,12 +334,16 @@ end
 Initialize NCCL for GPU collective operations.
 
 NCCL must be initialized after MPI and after GPU devices are selected.
-Each MPI rank should call this on their assigned GPU.
+Each MPI rank should call this on their assigned GPU. Release it collectively
+with [`finalize_nccl!`](@ref).
 
 # Example
 ```julia
 MPI.Init()
-arch = GPU(device_id=MPI.Comm_rank(MPI.COMM_WORLD))
+# Pick the GPU from the NODE-local rank: the global rank is not a device ordinal
+# on several nodes or with one visible GPU per rank.
+node = MPI.Comm_split_type(MPI.COMM_WORLD, MPI.COMM_TYPE_SHARED, MPI.Comm_rank(MPI.COMM_WORLD))
+arch = GPU(device_id=MPI.Comm_rank(node) % CUDA.ndevices())
 init_nccl!(MPI.COMM_WORLD)
 ```
 """
@@ -314,6 +382,7 @@ function init_nccl!(comm::MPI.Comm)
         NCCL_CONFIG.comm_handle = nccl_comm
         NCCL_CONFIG.rank = rank
         NCCL_CONFIG.size = size
+        NCCL_CONFIG.mpi_comm = comm
 
         @info "NCCL initialized" rank=rank size=size
         return true
@@ -406,13 +475,20 @@ end
 """
     finalize_nccl!()
 
-Finalize NCCL resources.
+Destroy the communicator created by [`init_nccl!`](@ref). Collective over the MPI
+communicator passed to `init_nccl!`: call it on every rank at the same point,
+after closing the Distributors and plans whose NCCL sub-communicators it
+outlives (see `finalize_nccl_subcomms!`). The device is synchronized and the MPI
+communicator barriered before `NCCL.destroy` runs.
 """
 function finalize_nccl!()
-    if NCCL_CONFIG.initialized
-        NCCL_CONFIG.comm_handle = nothing
-        NCCL_CONFIG.initialized = false
-        @info "NCCL finalized"
-    end
+    NCCL_CONFIG.initialized || return nothing
+    comm, mpi_comm = NCCL_CONFIG.comm_handle, NCCL_CONFIG.mpi_comm
+    NCCL_CONFIG.comm_handle = nothing
+    NCCL_CONFIG.mpi_comm = nothing
+    NCCL_CONFIG.initialized = false
+    _destroy_nccl_comms!((comm,); barrier_comm=mpi_comm)
+    @info "NCCL finalized"
+    return nothing
 end
 

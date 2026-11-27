@@ -196,6 +196,20 @@ solver = CuIterativeCG(A; preconditioner=...)
 - Unsure if SPD: Use `:ilu0` (works for all matrices)
 - Simple/well-conditioned: Use `:jacobi` (fastest setup)
 
+## Convergence and Failure
+
+- `tol` is a **relative** tolerance: a solve has converged when `‖b - A*x‖ ≤ tol·‖b‖`.
+  `CuIterativeGMRES` recomputes this true residual after every restart cycle, including
+  the last; `CuIterativeCG` tests its recursively updated residual. A zero right-hand
+  side returns `x = 0` without iterating, and a non-finite one throws `ArgumentError`.
+- `CuIterativeGMRES` is right-preconditioned, so the preconditioner cannot hide residual
+  components from the convergence test.
+- `:jacobi` uses 1 wherever the diagonal is zero, as it is on the boundary (tau) rows of
+  a tau discretization, so those rows pass through unscaled instead of being dropped.
+- Both solvers throw when `tol` is not reached within `maxiter` iterations, and CG also
+  throws when it breaks down on an operator that is not Hermitian positive definite. An
+  unconverged iterate is never returned.
+
 ## See Also
 
 - [GPU Solvers Overview](../pages/solvers.md): Solver types and selection

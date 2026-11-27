@@ -83,19 +83,30 @@ The polynomial (Chebyshev/Jacobi) derivative is a global operation along its axi
 or a dense differentiation matrix — so it is only correct on a rank that holds every point
 of that axis. Under MPI a decomposed non-Fourier axis is only differentiable in the solve
 layout (`subproblem_io.jl`), which the interpreted evaluator never enters. Serial fields
-(plain arrays) always pass.
+always pass.
+
+Distributed grid data comes in two forms. PencilArrays (CPU MPI) report their own local and
+global extents. Plain arrays under MPI (GPU+MPI, or `use_pencil_arrays=false`) hold the
+TransposableField ZLocal slab, whose LEADING axes are decomposed — so a Chebyshev axis on
+dimension 1 or 2 is split there even though the array type says nothing about it.
 
 The test is DECOMPOSITION (local extent vs this array's own global extent), NOT the basis
 size: a dealiased or rescaled grid legitimately has more points than `basis.meta.size`, and
 comparing against the basis size would reject those correct, fully-local configurations."""
 function _assert_local_polynomial_axis(field::ScalarField, axis::Int)
-    data = get_grid_data(field)
-    data isa PencilArrays.PencilArray || return nothing
     basis = field.bases[axis]
     basis === nothing && return nothing
-    pencil = PencilArrays.pencil(data)
-    n_local = length(pencil.axes_local[axis])
-    n_global = PencilArrays.size_global(pencil)[axis]
+    data = get_grid_data(field)
+    if data isa PencilArrays.PencilArray
+        pencil = PencilArrays.pencil(data)
+        n_local = length(pencil.axes_local[axis])
+        n_global = PencilArrays.size_global(pencil)[axis]
+    else
+        dist = field.dist
+        (dist === nothing || dist.size <= 1) && return nothing
+        n_local = size(data, axis)
+        n_global = get_scaled_shape(field)[axis]
+    end
     n_local == n_global && return nothing   # axis is fully local on this rank — fine
     error("Interpreted RHS: cannot differentiate along the non-Fourier axis $axis " *
           "($(nameof(typeof(basis)))) of a DISTRIBUTED field — this rank owns only $n_local " *
@@ -611,6 +622,8 @@ basis' collocation forward transform.
 """
 function evaluate_jacobi_collocation_derivative!(result::ScalarField, operand::ScalarField,
                                                  axis::Int, order::Int, layout::Symbol)
+    # The nodal matrix below is built from this rank's nodes only.
+    _assert_local_polynomial_axis(operand, axis)
     ensure_layout!(operand, :g)
     basis = operand.bases[axis]
     nodes = vec(Array(local_grid(basis, operand.dist, 1)))

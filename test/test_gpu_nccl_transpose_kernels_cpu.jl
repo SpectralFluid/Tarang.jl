@@ -131,6 +131,52 @@ end
             dim == 3 || @test vec(out) != packed
         end
 
+        @testset "an empty pencil block skips the launch, never the exchange" begin
+            # On CUDABackend() KernelAbstractions sizes the provisional workgroup
+            # from ndrange, so ndrange == 0 throws DivideError before its own
+            # empty-grid check; the CPU launches above treat 0 as a no-op, so
+            # they could never notice. An over-decomposed mesh gives some rank an
+            # empty block; it died there while its peers blocked in the NCCL
+            # exchange. Any launch attempt on CUDABackend() throws here (that
+            # DivideError, or no device), so returning `false` proves the skip.
+            names = vcat(first.(_NCCL_PACK_CASES), first.(_NCCL_UNPACK_CASES))
+            for name in names
+                @test ext._launch_transpose_kernel!(getproperty(ext, name), CUDA.CUDABackend(), 0,
+                    zeros(0), zeros(0, 6, 8), 0, 6, 8, [0, 0], [0, 0], 2, [0, 0]) === false
+            end
+
+            # A non-empty block launches the kernel it was given, unchanged.
+            shape = (4, 6, 8)
+            data = reshape(collect(1.0:prod(shape)), shape)
+            chunks = _split(shape[3]); displs = _displs_for(shape, 3, chunks)
+            buffer = zeros(Float64, prod(shape))
+            @test ext._launch_transpose_kernel!(ext.pack_z_to_y_kernel!, backend, prod(shape),
+                buffer, data, shape..., chunks, displs, length(chunks), cumsum(chunks)) === true
+            KernelAbstractions.synchronize(backend)
+            @test buffer == _nccl_reference_packed(data, 3, chunks)
+
+            # Every directional launch in the transpose drivers goes through the
+            # guard, and none constructs a kernel for CUDABackend() directly.
+            src = Meta.parseall(read(joinpath(@__DIR__, "..", "ext", "cuda", "nccl_transpose.jl"), String))
+            guarded = Symbol[]
+            direct = Ref(0)
+            function walk(ex)
+                ex isa Expr || return
+                if ex.head === :call && ex.args[1] === :_launch_transpose_kernel! &&
+                   length(ex.args) >= 3 && ex.args[3] == :(CUDABackend())
+                    push!(guarded, ex.args[2])
+                elseif ex.head === :call && ex.args[1] isa Symbol &&
+                       endswith(String(ex.args[1]), "_kernel!") && length(ex.args) == 2 &&
+                       ex.args[2] == :(CUDABackend())
+                    direct[] += 1
+                end
+                foreach(walk, ex.args)
+            end
+            walk(src)
+            @test sort(guarded) == sort(names)
+            @test direct[] == 0
+        end
+
         @testset "pack/unpack partners invert each other" begin
             shape = (4, 6, 8)
             for (pk, pdim, uk, udim) in ((:pack_z_to_y_kernel!, 3, :unpack_y_to_z_kernel!, 3),

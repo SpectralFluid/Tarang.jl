@@ -16,7 +16,9 @@ function evaluate_rhs(solver::InitialValueSolver, state::Vector{<:ScalarField}, 
     _update_registered_forcings!(solver, time, solver.dt, DeterministicForcingType)
     strategy = _rhs_evaluation_strategy(solver)
     if strategy !== :interpreted
-        _refresh_algebraic_state!(solver.problem, state)
+        # Not authoritative: this also runs on the implicit CPU paths, whose stage
+        # solve owns the constraints the refresh cannot solve exactly.
+        _refresh_algebraic_state!(solver.problem, state; authoritative=false)
     end
 
     rhs_fields = _evaluate_rhs_with_strategy(strategy, solver, state)
@@ -39,9 +41,20 @@ function _evaluate_rhs_interpreted(solver::InitialValueSolver,
         # Sync current state into problem variables for expression evaluation
         sync_state_to_problem!(problem, state)
 
-        # CRITICAL: Solve algebraic constraints before evaluating RHS
-        # This is needed for MPI mode where we use explicit-only time stepping
-        # and algebraic constraints (like Poisson equations) aren't handled by matrix solve
+        # `equation_data` is filled by `build_matrix_expressions!`, which runs as part
+        # of global-matrix assembly — the step a pure-Fourier GPU InitialValueProblem SKIPS. Treating an
+        # empty IR as "no equations contribute" would leave `rhs` as the zero fields
+        # allocated above and freeze the solution at its initial condition with nothing
+        # raised. That is the bug fixed in `build_lazy_rhs_plan!`; this is the same hole
+        # on the interpreted path, closed the same way. The build is matrix-free, and
+        # the enclosing catch rethrows, so a parse failure surfaces instead of becoming
+        # a zero RHS. It must precede the constraint refresh below, which reads the IR.
+        if isempty(problem.equation_data) && !isempty(problem.equations)
+            build_matrix_expressions!(problem)
+        end
+
+        # Refresh the algebraic variables F reads from the state being evaluated
+        # (exact solves only; see `_refresh_algebraic_state!`).
         _solve_algebraic_constraints!(problem, state)
 
         # Update time parameter if it exists
@@ -59,18 +72,6 @@ function _evaluate_rhs_interpreted(solver::InitialValueSolver,
             elseif hasfield(typeof(problem.time), :value)
                 problem.time.value = time
             end
-        end
-
-        # `equation_data` is filled by `build_matrix_expressions!`, which runs as part
-        # of global-matrix assembly — the step a pure-Fourier GPU InitialValueProblem SKIPS. Treating an
-        # empty IR as "no equations contribute" would leave `rhs` as the zero fields
-        # allocated above and freeze the solution at its initial condition with nothing
-        # raised. That is the bug fixed in `build_lazy_rhs_plan!`; this is the same hole
-        # on the interpreted path, closed the same way. The build is matrix-free, and
-        # the enclosing catch rethrows, so a parse failure surfaces instead of becoming
-        # a zero RHS.
-        if isempty(problem.equation_data) && !isempty(problem.equations)
-            build_matrix_expressions!(problem)
         end
 
         # Build mapping from state field index to equation F_expr
@@ -274,7 +275,7 @@ function evaluate_rhs_buffered(
     _update_registered_forcings!(solver, time, solver.dt, DeterministicForcingType)
     strategy = _rhs_evaluation_strategy(solver; buffered=true)
     if strategy !== :interpreted
-        _refresh_algebraic_state!(solver.problem, state)
+        _refresh_algebraic_state!(solver.problem, state; authoritative=false)
     end
 
     rhs_fields = _evaluate_rhs_with_strategy(strategy, solver, state)
@@ -282,12 +283,28 @@ function evaluate_rhs_buffered(
     return _evaluate_rhs_interpreted(solver, state, time)
 end
 
-function _refresh_algebraic_state!(problem::Problem, state::Vector{<:ScalarField})
+"""
+    _refresh_algebraic_state!(problem, state; authoritative=true) -> Bool
+
+Re-solve the algebraic variables of `state` from its evolved fields, exactly (see
+"Algebraic-constraint refresh" below). With `authoritative=true` — the default,
+for the steppers that have no implicit stage solve and call this after each step —
+an algebraic equation the refresh cannot solve exactly is an error. The RHS
+evaluation passes `authoritative=false`: it also runs on the CPU global-matrix and
+subproblem paths, whose stage solve owns such equations, so they are left
+untouched there. Either way nothing is written that is not an exact solution.
+
+The problem variables are left aliased to `state`, which the refresh writes in place.
+"""
+function _refresh_algebraic_state!(problem::Problem, state::Vector{<:ScalarField};
+                                   authoritative::Bool=true)
     _has_algebraic_constraints(problem) || return false
+    plan = _constraint_refresh_plan!(problem, state)
+    authoritative && _require_solved_constraints(plan)
+    isempty(plan.solves) && return false
 
     sync_state_to_problem!(problem, state)
-    _solve_algebraic_constraints!(problem, state)
-    _sync_problem_to_state!(problem, state)
+    _apply_constraint_plan!(plan, problem, state)
     return true
 end
 
@@ -301,33 +318,6 @@ function _has_algebraic_constraints(problem::Problem)
         end
     end
     return false
-end
-
-function _sync_problem_to_state!(problem::Problem, state::Vector{<:ScalarField})
-    idx = 1
-    for var in problem.variables
-        if isa(var, ScalarField)
-            if idx <= length(state)
-                copy_field_data!(state[idx], var)
-            end
-            idx += 1
-        elseif isa(var, VectorField)
-            for comp in var.components
-                if idx <= length(state)
-                    copy_field_data!(state[idx], comp)
-                end
-                idx += 1
-            end
-        elseif isa(var, TensorField)
-            for comp in vec(var.components)
-                if idx <= length(state)
-                    copy_field_data!(state[idx], comp)
-                end
-                idx += 1
-            end
-        end
-    end
-    return state
 end
 
 """
@@ -815,248 +805,693 @@ end
 # field with no error. An unknown forcing type is a MethodError, on purpose.
 _matched_forcing_view(::Nothing, target) = nothing
 
+# ============================================================================
+# Algebraic-constraint refresh
+# ============================================================================
+#
+# An algebraic equation (no ∂t) determines a diagnostic variable — a
+# streamfunction, a velocity, an inverted field — from the evolved state. The
+# refresh below re-solves those variables from the current state, before every
+# RHS evaluation and after every step of a stepper that has no implicit stage
+# solve.
+#
+# Who relies on it:
+#   * A pure-Fourier GPU problem, the matrix-free MPI path and the diagonal-IMEX /
+#     explicit field steppers have NO other constraint solver; the refresh is
+#     authoritative there (`authoritative=true`, the post-step call sites).
+#   * The CPU global-matrix and subproblem steppers impose every constraint in
+#     the stage solve, so the stages they produce are already consistent. There
+#     the RHS-evaluation refresh (`authoritative=false`) only repairs a state that
+#     did not come out of a solve — the initial condition, whose diagnostic
+#     variables are usually left at zero, or a state edited between steps —
+#     before F reads it. Without it the first stage of the first step evaluates F
+#     on that inconsistent state: a first-order error that the measured 2D
+#     Poisson case shows at ~1e-4 against an exact 6e-12.
+#
+# Because of that second role the refresh may never write an inexact value: it
+# either solves an equation EXACTLY or leaves it untouched, and "untouched" is a
+# loud error wherever the refresh is authoritative. The pattern matcher this
+# replaces did neither — it used the first source field it found, ignored
+# coefficients, recognised only a bare Laplacian, and swallowed failures at
+# @debug. On a device problem that dropped θ from `Δφ = ζ + θ` and never updated
+# `2Δφ = ζ` or `φ - Δφ/2 = ζ`; on the CPU it then overwrote the stage solve's
+# correct φ with that wrong one right before F was evaluated.
+#
+# Solved exactly, per Fourier mode and without scalar indexing:
+#
+#     L̂ ⊙ v̂  +  Σⱼ M̂ⱼ ⊙ x̂ⱼ  +  Σ cₜ·τₜ  +  (other terms)  =  F̂
+#
+#   * `v`, the target, is the one algebraic variable the equation determines. Its
+#     operator L̂ must be diagonal in Fourier space: any sum of constant multiples
+#     of the identity, Laplacian, fractional/hyper-Laplacian and derivatives of
+#     `v` — the operators `_accumulate_diagonal_L!` symbolizes for the
+#     diagonal-IMEX steppers. A plain constant multiple of `v` works on any basis.
+#   * `xⱼ` are evolved fields or algebraic variables an earlier equation solved.
+#     Diagonal operators on them become multipliers M̂ⱼ; anything else (products,
+#     `skew(grad(ψ))`, parameter fields) is evaluated with the RHS evaluator.
+#   * `τₜ` are 0-D tau variables. They touch only k = 0 and carry no storage, so
+#     v̂(k=0) comes from the gauge row instead, as in the coupled implicit solve:
+#     `integ(v) = c` pins the mean of `v` to c/|Ω|. With neither tau nor gauge, a
+#     mode where L̂ vanishes (k = 0 of a Laplacian) is set to zero — the
+#     zero-mean convention of the inverse Laplacian. L̂ vanishing anywhere else
+#     means the operator is singular, which is refused.
+#   * Equations are solved in dependency order (a velocity after the
+#     streamfunction it differentiates); a vector target (`u - skew(grad(ψ)) = 0`)
+#     is evaluated from its right-hand side.
+#
+# Anything else is reported by name. With `authoritative=false` those equations
+# are left to the stage solve: "not mine to refresh" is an explicit outcome of
+# the plan, not an exception swallowed along the way.
+
+"""One contribution `weight ⊙ x̂` to a constraint's right-hand side, where
+`x = state[index]`. `weight` is a real scalar or a complex multiplier array on
+the target's local coefficient grid."""
+struct _ConstraintInput
+    index::Int
+    weight::Any
+end
+
+"""Exact refresh of one algebraic equation for its target variable."""
+struct _ConstraintSolve
+    equation::Int
+    label::String
+    target::Int                           # state index (first component of a vector)
+    target_var::Operand                   # the problem variable being solved for
+    neg_inv::Any                          # scalar target: -1/L̂ — a scalar, or an array zero on pinned modes
+    pin::Any                              # `nothing`, or the gauge-pinned k = 0 coefficients
+    inputs::Vector{_ConstraintInput}
+    constant::Any                         # `nothing`, or the coefficients of the constant terms
+    generic::Vector{Tuple{Float64, Any}}  # (coefficient, term) evaluated at every refresh
+    vector_expr::Any                      # vector target: its value, or `nothing` for zero
+end
+
+"""An algebraic equation the refresh cannot solve exactly, and why."""
+struct _UnsolvedConstraint
+    equation::Int
+    label::String
+    reason::String
+end
+
+struct _ConstraintRefreshPlan
+    equation_ids::Vector{UInt}
+    rhs_ids::Vector{UInt}    # see `_constraint_rhs_id`
+    nstate::Int
+    solves::Vector{_ConstraintSolve}
+    unsolved::Vector{_UnsolvedConstraint}
+end
+
+"""A linear term `coefficient * term` of a constraint, with the problem variables
+`term` references."""
+struct _ConstraintTerm
+    coefficient::Float64
+    term::Any
+    variables::Vector{Operand}
+end
+
 """
     _solve_algebraic_constraints!(problem, state)
 
-Solve algebraic constraint equations before evaluating RHS.
-This is critical for MPI mode where explicit time-stepping is used
-and algebraic constraints (like Poisson equations) aren't handled by matrix solve.
-
-For QG-type problems, this handles:
-1. Poisson equations: Δ(ψ) + tau - q = 0 → ψ = -Δ⁻¹(q - tau)
-2. Algebraic substitutions: u - expr = 0 → u = expr
+Refresh every algebraic variable the constraint plan can solve exactly, leaving
+the rest to the caller's implicit solve (`authoritative=false` semantics). The
+caller must already have aliased the problem variables to `state`
+(`sync_state_to_problem!`).
 """
 function _solve_algebraic_constraints!(problem::Problem, state::Vector{<:ScalarField})
-    # Only needed if we have equation_data
-    isempty(problem.equation_data) && return
-
-    # Track which variables have been solved to ensure correct ordering
-    solved_vars = Set{String}()
-
-    # First pass: solve Poisson-type equations (need to be solved first for velocity)
-    # Second pass: solve algebraic substitutions (simple var = expr)
-    for pass in 1:2
-        for (eq_idx, eq_data) in enumerate(problem.equation_data)
-            # Skip equations with time derivatives
-            M_expr = get(eq_data, "M", nothing)
-            if M_expr !== nothing && !_is_zero_m_term(M_expr)
-                continue
-            end
-
-            # Get LHS and RHS of constraint
-            L_expr = get(eq_data, "L", nothing)
-            F_expr = get(eq_data, "F", nothing)
-
-            if L_expr === nothing
-                continue
-            end
-
-            if pass == 1
-                # First pass: Poisson-type equations like "Δ(ψ) + tau - q = 0"
-                _try_solve_poisson_constraint!(problem, L_expr, F_expr, state, solved_vars)
-            else
-                # Second pass: simple substitutions like "u - skew(grad(ψ)) = 0"
-                _try_solve_simple_constraint!(problem, L_expr, F_expr, state, solved_vars)
-            end
-        end
-    end
-end
-
-"""Recognize a constant multiple of one directly stored algebraic variable.
-Derivatives and other operators are deliberately excluded: they need a solve."""
-function _simple_constraint_variable(expr)
-    if expr isa VectorField || (expr isa ScalarField && !isempty(expr.bases))
-        return (expr, 1.0)
-    elseif expr isa NegateOperator
-        part = _simple_constraint_variable(expr.operand)
-        return part === nothing ? nothing : (part[1], -part[2])
-    elseif expr isa MultiplyOperator
-        coefficient = _mass_scalar(expr.left)
-        operand = expr.right
-        if coefficient === nothing
-            coefficient = _mass_scalar(expr.right)
-            operand = expr.left
-        end
-        coefficient === nothing && return nothing
-        part = _simple_constraint_variable(operand)
-        return part === nothing ? nothing : (part[1], coefficient * part[2])
-    elseif expr isa DivideOperator
-        coefficient = _mass_scalar(expr.right)
-        (coefficient === nothing || iszero(coefficient)) && return nothing
-        part = _simple_constraint_variable(expr.left)
-        return part === nothing ? nothing : (part[1], part[2] / coefficient)
-    end
+    _has_algebraic_constraints(problem) || return nothing
+    _apply_constraint_plan!(_constraint_refresh_plan!(problem, state), problem, state)
     return nothing
 end
 
-"""
-Try to solve a simple algebraic constraint of the form: var - expr = 0
-"""
-function _try_solve_simple_constraint!(problem, L_expr, F_expr, state::Vector{<:ScalarField}, solved_vars::Set{String})
-    @debug "Simple constraint check: L_expr type=$(typeof(L_expr))"
+"""Raise, naming each equation, when the refresh cannot solve every algebraic
+equation of `problem` exactly. Called at construction for solvers that have no
+implicit stage solve, so an unsupported constraint fails before the first step."""
+function _require_refreshable_constraints!(problem::Problem, state::Vector{<:ScalarField})
+    _has_algebraic_constraints(problem) || return nothing
+    _require_solved_constraints(_constraint_refresh_plan!(problem, state))
+    return nothing
+end
 
-    # For equations like "u - skew(grad(ψ)) = 0", the L_expr is AddOperator(VectorField, NegateOperator)
-    # We need to find the variable and evaluate the expression
+function _require_solved_constraints(plan::_ConstraintRefreshPlan)
+    isempty(plan.unsolved) && return nothing
+    details = join(("  * `$(u.label)`: $(u.reason)" for u in plan.unsolved), "\n")
+    throw(ArgumentError(
+        "No implicit stage solve imposes this problem's algebraic equations (pure-Fourier " *
+        "GPU, matrix-free MPI, or a diagonal-IMEX / explicit field stepper), so the " *
+        "spectral constraint refresh is their only solver, and it cannot solve these " *
+        "exactly:\n$details\n" *
+        "The refresh solves an equation for ONE algebraic variable whose operator is " *
+        "diagonal in Fourier space (sums of constant multiples of the identity, Laplacian, " *
+        "fractional/hyper-Laplacian and derivatives of that variable), plus any linear " *
+        "combination of other fields, constants, and 0-D tau variables backed by a gauge " *
+        "row such as `integ(v) = 0`. Rewrite the constraint in that form, or use a CPU " *
+        "solver whose global-matrix or subproblem stage solve imposes it. (Such equations " *
+        "used to be skipped silently, leaving the variable stale or wrong.)"))
+end
 
-    target_var = nothing
-    target_name = nothing
-    eval_expr = nothing
+"""The cached refresh plan for `problem`, rebuilt when its parsed equations change."""
+function _constraint_refresh_plan!(problem::Problem, state::Vector{<:ScalarField})
+    cache = compiled_problem(problem).caches.workspaces
+    plan = get(cache, :algebraic_constraint_refresh, nothing)
+    if plan isa _ConstraintRefreshPlan && _constraint_plan_matches(plan, problem, state)
+        return plan
+    end
+    plan = _build_constraint_refresh_plan(problem, state)
+    cache[:algebraic_constraint_refresh] = plan
+    return plan
+end
 
-    # Isolate an algebraic variable from the COMPLETE equation a*var + rest = F.
-    # Evolved fields can also occur as direct terms (u+w-v=0): never replace
-    # their stage values while trying to refresh the diagnostic variable v.
-    terms = _flatten_add_terms(L_expr)
-    evolved = Set{String}()
-    for equation in problem.equation_data
-        for i in _find_time_derivative_targets(equation.mass, state, problem.variables)
-            push!(evolved, state[i].name)
+function _constraint_plan_matches(plan::_ConstraintRefreshPlan, problem::Problem,
+                                  state::Vector{<:ScalarField})
+    plan.nstate == length(state) || return false
+    equations = problem.equation_data
+    length(equations) == length(plan.equation_ids) || return false
+    @inbounds for i in eachindex(equations)
+        objectid(equations[i]) == plan.equation_ids[i] || return false
+        _constraint_rhs_id(equations[i]) == plan.rhs_ids[i] || return false
+    end
+    return true
+end
+
+"""Identity of an algebraic equation's right-hand side. A time- or space-dependent
+boundary condition is re-applied by storing a NEW `F`/`F_expr` in the same
+`EquationIR` (`_write_bc_value_to_eq!`), so a gauge value or constant the plan
+folded in would otherwise go stale without the equation itself changing."""
+_constraint_rhs_id(eq::EquationIR) = _is_zero_m_term(eq.mass) ?
+    hash(objectid(eq.forcing), objectid(eq.forcing_expr)) : UInt(0)
+
+_constraint_label(eq, e::Int) = string(something(get(eq, "equation_string", nothing), "equation $e"))
+
+_is_tau_variable(x) = x isa ScalarField && isempty(x.bases)
+
+"""Flatten `expr` into `(coefficient, term)` pairs. Sums, differences, negation
+and products/quotients with a literal scalar are distributed; every other node
+is a term."""
+function _flatten_constraint_terms!(terms::Vector{Tuple{Float64, Any}}, expr, coefficient::Float64)
+    (expr === nothing || expr isa ZeroOperator) && return terms
+    if expr isa AddOperator
+        _flatten_constraint_terms!(terms, expr.left, coefficient)
+        _flatten_constraint_terms!(terms, expr.right, coefficient)
+    elseif expr isa SubtractOperator
+        _flatten_constraint_terms!(terms, expr.left, coefficient)
+        _flatten_constraint_terms!(terms, expr.right, -coefficient)
+    elseif expr isa NegateOperator
+        _flatten_constraint_terms!(terms, expr.operand, -coefficient)
+    elseif expr isa MultiplyOperator && _as_diagonal_scalar(expr.left) !== nothing
+        _flatten_constraint_terms!(terms, expr.right, coefficient * _as_diagonal_scalar(expr.left))
+    elseif expr isa MultiplyOperator && _as_diagonal_scalar(expr.right) !== nothing
+        _flatten_constraint_terms!(terms, expr.left, coefficient * _as_diagonal_scalar(expr.right))
+    elseif expr isa DivideOperator && _as_diagonal_scalar(expr.right) !== nothing
+        denominator = _as_diagonal_scalar(expr.right)
+        (isfinite(denominator) && !iszero(denominator)) || throw(ArgumentError(
+            "Algebraic constraint divides by the scalar $denominator."))
+        _flatten_constraint_terms!(terms, expr.left, coefficient / denominator)
+    else
+        push!(terms, (coefficient, expr))
+    end
+    return terms
+end
+
+"""Terms of `L - F = 0` for one parsed equation."""
+function _constraint_equation_terms(eq::EquationIR, variables::Vector{<:Operand})
+    flat = Tuple{Float64, Any}[]
+    _flatten_constraint_terms!(flat, eq.linear, 1.0)
+    rhs = eq.forcing_expr === nothing ? eq.forcing : eq.forcing_expr
+    _flatten_constraint_terms!(flat, rhs, -1.0)
+    return _ConstraintTerm[_ConstraintTerm(c, t, _detect_equation_variables(t, variables))
+                           for (c, t) in flat]
+end
+
+function _integrates_all_axes(op::Integrate, field::ScalarField)
+    coords = op.coord isa Tuple ? op.coord : (op.coord,)
+    names = Set(String(c.name) for c in coords)
+    return names == Set(String(b.meta.element_label) for b in field.bases)
+end
+
+"""`(variable, value)` when the equation is a gauge row `a*integ(v) + constants = 0`
+over every axis of `v`, i.e. it fixes `integ(v) = value`; the reason it cannot be
+used when it has that shape but a non-constant value; `nothing` otherwise."""
+function _constraint_gauge(terms::Vector{_ConstraintTerm})
+    target = nothing
+    scale = 0.0
+    constant = 0.0
+    nonconstant = nothing
+    for t in terms
+        if isempty(t.variables)
+            s = _as_diagonal_scalar(t.term)
+            s === nothing ? (nonconstant = t.term) : (constant += t.coefficient * s)
+        elseif target === nothing && t.term isa Integrate && length(t.variables) == 1
+            v = only(t.variables)
+            (v isa ScalarField && !isempty(v.bases) && t.term.operand isa ScalarField &&
+             _operand_matches_variable(t.term.operand, v) && _integrates_all_axes(t.term, v)) ||
+                return nothing
+            target = v
+            scale = t.coefficient
+        else
+            return nothing
         end
     end
-    for term in terms
-        candidate = _simple_constraint_variable(term)
-        candidate === nothing && continue
-        variable, _ = candidate
-        any(comp -> comp.name in evolved, scalar_components(variable)) && continue
-        any(var -> _operand_matches_variable(variable, var), problem.variables) || continue
+    (target === nothing || iszero(scale)) && return nothing
+    nonconstant === nothing ||
+        return "a gauge row must fix `integ($(target.name))` to a constant, and " *
+               "`$(expression_to_string(nonconstant))` is not one"
+    return (target, -constant / scale)
+end
 
-        coefficient = 0.0
-        rhs_terms = Any[]
-        (F_expr === nothing || is_zero_expression(F_expr)) || push!(rhs_terms, F_expr)
-        isolatable = true
-        for other in terms
-            part = _simple_constraint_variable(other)
-            if part !== nothing && _operand_matches_variable(part[1], variable)
-                coefficient += part[2]
-            elseif _references_problem_variable(other, [variable])
-                isolatable = false  # e.g. v + lap(v): requires an operator solve
-                break
+"""Reduce a plan-build statistic over the field's ranks (identity in serial)."""
+function _constraint_allreduce(value, op, dist::Distributor)
+    (dist.size > 1 && MPI.Initialized()) || return value
+    return MPI.Allreduce(value, op, dist.comm)
+end
+
+"""Coefficients of the constant field 1 on `field`'s layout. Every multiple of a
+constant is represented through these, so no transform normalisation is assumed."""
+function _unit_constant_coefficients(field::ScalarField)
+    unit = _constant_field_from_template(field, 1.0; layout=:g)
+    return _local_coeff(coeff_data!(unit))
+end
+
+"""Scratch field shaped and NAMED like `variable`, so the diagonal symbolization
+matches operands by name without touching (and transforming) the live field."""
+_constraint_template(variable::ScalarField) =
+    ScalarField(variable.dist, variable.name, variable.bases, variable.dtype)
+
+_add_constraint_weights(a::Real, b::Real) = a + b
+_add_constraint_weights(a, b) = a .+ b
+
+"""Build the exact per-mode solve of equation `e` for the scalar target `v`, or
+return the reason it cannot be built."""
+function _scalar_constraint_solve(e::Int, label::String, terms::Vector{_ConstraintTerm},
+                                  v::ScalarField, first_index::IdDict{Any, Int},
+                                  gauges::IdDict{Any, Tuple{Int, Float64}},
+                                  consumed::Set{Int})
+    target_terms = Tuple{Float64, Any}[]
+    inputs = Tuple{Float64, Any, ScalarField}[]
+    generic = Tuple{Float64, Any}[]
+    constant = 0.0
+    has_tau = false
+    for t in terms
+        vars = t.variables
+        if isempty(vars)
+            s = _as_diagonal_scalar(t.term)
+            s === nothing ? push!(generic, (t.coefficient, t.term)) :
+                            (constant += t.coefficient * s)
+        elseif any(x -> x === v, vars)
+            length(vars) == 1 ||
+                return "the term `$(expression_to_string(t.term))` mixes `$(v.name)` with other variables"
+            push!(target_terms, (t.coefficient, t.term))
+        elseif any(_is_tau_variable, vars)
+            (length(vars) == 1 && t.term isa ScalarField) ||
+                return "the 0-D variable in `$(expression_to_string(t.term))` enters " *
+                       "through an operator; only a bare tau term is supported"
+            has_tau |= !iszero(t.coefficient)
+        elseif length(vars) == 1 && only(vars) isa ScalarField
+            push!(inputs, (t.coefficient, t.term, only(vars)))
+        else
+            push!(generic, (t.coefficient, t.term))   # vector-valued or nonlinear in known fields
+        end
+    end
+
+    fourier = _constraint_all_fourier_bases(v)
+    template = fourier ? _constraint_template(v) : nothing
+    k2 = nothing
+    k0 = nothing
+    if fourier
+        coeff_data!(template)
+        k2 = _local_coeff(compute_wavenumber_squared_grid(template))
+        k0 = k2 .== 0
+    end
+
+    # The target's operator L̂: a scalar for a constant multiple of `v`, else a
+    # diagonal multiplier over the local |k|² grid.
+    m = if all(term isa ScalarField for (_, term) in target_terms)
+        s = sum(first, target_terms)
+        iszero(s) && return "the coefficients of `$(v.name)` cancel"
+        s
+    else
+        fourier || return "`$(v.name)` has a non-Fourier basis, so only a constant multiple " *
+                          "of it can be solved for"
+        multiplier = similar_zeros(k2, ComplexF64, size(k2)...)
+        for (c, term) in target_terms
+            _accumulate_diagonal_L!(multiplier, k2, term, c, template) ||
+                return "`$(expression_to_string(term))` is not diagonal in Fourier space"
+        end
+        multiplier
+    end
+
+    # Modes where L̂ vanishes. Only k = 0 may be one (then the mean is a gauge);
+    # anywhere else the operator is singular. Reduced over ranks so every rank
+    # reaches the same decision.
+    zero_modes = nothing
+    mean_free = false
+    if m isa AbstractArray
+        local_scale = isempty(m) ? 0.0 : Float64(maximum(abs, m))
+        scale = _constraint_allreduce(local_scale, max, v.dist)
+        zero_modes = abs.(m) .<= 1e-13 * scale
+        singular = _constraint_allreduce(count(zero_modes .& .!k0), +, v.dist)
+        singular == 0 ||
+            return "its operator on `$(v.name)` vanishes at $singular nonzero wavenumber(s), so it is singular"
+        mean_free = _constraint_allreduce(any(zero_modes .& k0), |, v.dist)
+    end
+
+    gauge = get(gauges, v, nothing)
+    pinned = false
+    pin_value = 0.0
+    if gauge !== nothing
+        fourier || return "a gauge row is only supported for a purely Fourier `$(v.name)`"
+        (has_tau || mean_free) ||
+            return "the constraint and the gauge row both fix the mean of `$(v.name)`; " *
+                   "add a tau variable to the constraint"
+        pinned = true
+        pin_value = gauge[2]
+        push!(consumed, gauge[1])
+    elseif has_tau
+        return "it has a tau variable but no gauge row such as `integ($(v.name)) = 0` " *
+               "fixes the mean of `$(v.name)`"
+    elseif mean_free
+        pinned = true   # zero-mean convention
+    end
+
+    neg_inv = if m isa AbstractArray
+        inverse = similar(m)
+        inverse .= ifelse.(zero_modes .| (pinned .& k0), zero(ComplexF64), .-inv.(m))
+        inverse
+    elseif pinned
+        inverse = similar_zeros(k2, ComplexF64, size(k2)...)
+        inverse .= ifelse.(k0, zero(ComplexF64), ComplexF64(-1 / m))
+        inverse
+    else
+        -1 / m
+    end
+
+    pin = nothing
+    if pinned && !iszero(pin_value)
+        volume = prod(b.meta.bounds[2] - b.meta.bounds[1] for b in v.bases)
+        unit = _unit_constant_coefficients(v)
+        pin = similar_zeros(k2, ComplexF64, size(k2)...)
+        pin .= ifelse.(k0, (pin_value / volume) .* unit, zero(ComplexF64))
+    end
+
+    constant_coefficients = iszero(constant) ? nothing :
+                            constant .* _unit_constant_coefficients(v)
+
+    # Inputs: a field with the target's layout enters with a scalar weight, or a
+    # multiplier when its operator is diagonal; anything else is evaluated.
+    weights = IdDict{Any, Any}()
+    order = ScalarField[]
+    for (c, term, x) in inputs
+        weight = nothing
+        if x.dist === v.dist && x.bases == v.bases
+            if term isa ScalarField
+                weight = c
+            elseif fourier
+                input_template = _constraint_template(x)
+                coeff_data!(input_template)
+                multiplier = similar_zeros(k2, ComplexF64, size(k2)...)
+                _accumulate_diagonal_L!(multiplier, k2, term, c, input_template) &&
+                    (weight = multiplier)
+            end
+        end
+        if weight === nothing
+            push!(generic, (c, term))
+        elseif haskey(weights, x)
+            weights[x] = _add_constraint_weights(weights[x], weight)
+        else
+            weights[x] = weight
+            push!(order, x)
+        end
+    end
+    constraint_inputs = _ConstraintInput[_ConstraintInput(first_index[x], weights[x]) for x in order]
+
+    return _ConstraintSolve(e, label, first_index[v], v, neg_inv, pin, constraint_inputs,
+                            constant_coefficients, generic, nothing)
+end
+
+"""`coefficient * term`, without a multiplication node for ±1."""
+_scaled_constraint_term(coefficient::Float64, term) =
+    coefficient == 1 ? term :
+    coefficient == -1 ? NegateOperator(term) :
+    MultiplyOperator(ConstantOperator(coefficient), term)
+
+"""Build the refresh of equation `e` for the vector target `v`: only a constant
+multiple of `v` itself, with the rest evaluated (exact for the spectral operators
+it contains, e.g. `skew(grad(ψ))`). Returns the reason when that form does not apply."""
+function _vector_constraint_solve(e::Int, label::String, terms::Vector{_ConstraintTerm},
+                                  v::VectorField, first_index::IdDict{Any, Int})
+    a = 0.0
+    rest = Tuple{Float64, Any}[]
+    for t in terms
+        vars = t.variables
+        if any(x -> x === v, vars)
+            (length(vars) == 1 && t.term isa VectorField) ||
+                return "only a constant multiple of the vector `$(v.name)` can be solved " *
+                       "for; `$(expression_to_string(t.term))` is not one"
+            a += t.coefficient
+        elseif isempty(vars)
+            s = _as_diagonal_scalar(t.term)
+            (s !== nothing && iszero(s)) ||
+                return "the term `$(expression_to_string(t.term))` is not a vector field"
+        elseif any(_is_tau_variable, vars)
+            return "the 0-D variable in `$(expression_to_string(t.term))` cannot enter a " *
+                   "vector equation"
+        else
+            push!(rest, (t.coefficient, t.term))
+        end
+    end
+    iszero(a) && return "the coefficients of `$(v.name)` cancel"
+    expr = isempty(rest) ? nothing :
+           combine_operators(Any[_scaled_constraint_term(-c / a, term) for (c, term) in rest])
+    return _ConstraintSolve(e, label, first_index[v], v, nothing, nothing, _ConstraintInput[],
+                            nothing, Tuple{Float64, Any}[], expr)
+end
+
+"""Classify every algebraic equation of `problem`: the exact solves, in dependency
+order, and the equations the refresh cannot solve."""
+function _build_constraint_refresh_plan(problem::Problem, state::Vector{<:ScalarField})
+    equations = problem.equation_data
+    variables = problem.variables
+    plan = _ConstraintRefreshPlan(UInt[objectid(eq) for eq in equations],
+                                  UInt[_constraint_rhs_id(eq) for eq in equations],
+                                  length(state), _ConstraintSolve[], _UnsolvedConstraint[])
+
+    # Flattened state index of each variable (first component of a vector) and
+    # which state entries are time-stepped.
+    first_index = IdDict{Any, Int}()
+    next = 1
+    for var in variables
+        first_index[var] = next
+        # Mirrors `collect_state_fields`, which gives other operands no state entry.
+        var isa Union{ScalarField, VectorField, TensorField} &&
+            (next += length(scalar_components(var)))
+    end
+    evolved = falses(length(state))
+    for eq in equations
+        _is_zero_m_term(eq.mass) && continue
+        for i in _find_time_derivative_targets(eq.mass, state, variables)
+            1 <= i <= length(state) && (evolved[i] = true)
+        end
+    end
+
+    algebraic = Int[e for (e, eq) in enumerate(equations) if _is_zero_m_term(eq.mass)]
+    isempty(algebraic) && return plan
+    terms = Dict{Int, Vector{_ConstraintTerm}}(
+        e => _constraint_equation_terms(equations[e], variables) for e in algebraic)
+
+    gauges = IdDict{Any, Tuple{Int, Float64}}()
+    gauge_rows = Int[]
+    unusable_gauges = Dict{Int, String}()
+    for e in algebraic
+        gauge = _constraint_gauge(terms[e])
+        gauge === nothing && continue
+        if gauge isa String
+            unusable_gauges[e] = gauge
+            continue
+        end
+        haskey(gauges, gauge[1]) && continue   # a second gauge on one variable stays unsolved
+        gauges[gauge[1]] = (e, gauge[2])
+        push!(gauge_rows, e)
+    end
+
+    solved = IdDict{Any, Nothing}()
+    unknown(x) = (x isa VectorField || x isa TensorField ||
+                  (x isa ScalarField && !isempty(x.bases))) &&
+                 !evolved[first_index[x]] && !haskey(solved, x)
+    unknowns_of(e) = unique(objectid,
+                            Operand[x for t in terms[e] for x in t.variables if unknown(x)])
+
+    # Peel off equations that determine exactly one not-yet-solved algebraic
+    # variable; each solve can unblock the equations that read its variable.
+    pending = Int[e for e in algebraic if !(e in gauge_rows) && !haskey(unusable_gauges, e)]
+    done = Set{Int}()
+    consumed = Set{Int}()
+    reasons = Dict{Int, String}()
+    progress = true
+    while progress
+        progress = false
+        for e in pending
+            e in done && continue
+            unknowns = unknowns_of(e)
+            length(unknowns) == 1 || continue
+            v = only(unknowns)
+            label = _constraint_label(equations[e], e)
+            result = if v isa ScalarField
+                _scalar_constraint_solve(e, label, terms[e], v, first_index, gauges, consumed)
+            elseif v isa VectorField
+                _vector_constraint_solve(e, label, terms[e], v, first_index)
             else
-                push!(rhs_terms, _negate_term(other))
+                "the tensor variable `$(_operand_name(v))` cannot be refreshed"
+            end
+            if result isa _ConstraintSolve
+                push!(plan.solves, result)
+                solved[v] = nothing
+                push!(done, e)
+                delete!(reasons, e)
+                progress = true
+            else
+                reasons[e] = result
             end
         end
-        (!isolatable || iszero(coefficient)) && continue
-        target_var = variable
-        target_name = variable.name
-        eval_expr = combine_operators(rhs_terms)
-        coefficient == 1 || (eval_expr = DivideOperator(eval_expr, ConstantOperator(coefficient)))
-        break
     end
 
-    if target_var === nothing || eval_expr === nothing
-        @debug "Simple constraint: no valid target found"
-        return
-    end
-
-    @debug "Simple constraint: target=$(target_name), eval_expr type=$(typeof(eval_expr))"
-
-    # Don't re-solve already solved variables
-    if target_name in solved_vars
-        return
-    end
-
-    # The doubly-periodic 2D InitialValueProblem uses u = skew(grad(psi)). Write those two
-    # Fourier derivatives straight into u's existing coefficient buffers. The
-    # generic evaluator below constructs several full-sized temporary fields,
-    # which is especially expensive when those fields live on a GPU.
-    if _try_refresh_fourier_streamfunction_velocity!(target_var, eval_expr)
-        push!(solved_vars, target_name)
-        return
-    end
-
-    try
-        # Evaluate the expression to get the value
-        template = target_var isa ScalarField ? target_var : nothing
-        result = evaluate_solver_expression(eval_expr, problem.variables; layout=:g, template)
-
-        if isa(result, ScalarField) && isa(target_var, ScalarField)
-            # Update the target variable
-            copy_field_data!(target_var, result)
-            push!(solved_vars, target_name)
-            @debug "Solved simple constraint for $target_name"
-        elseif isa(result, VectorField) && isa(target_var, VectorField)
-            # Update each component
-            for (i, comp) in enumerate(target_var.components)
-                copy_field_data!(comp, result.components[i])
-            end
-            push!(solved_vars, target_name)
-            @debug "Solved simple constraint for $target_name (vector)"
+    for e in pending
+        e in done && continue
+        # A row on 0-D variables and constants only determines tau variables,
+        # which carry no storage: there is nothing to refresh.
+        all(t -> all(_is_tau_variable, t.variables), terms[e]) && continue
+        unknowns = unknowns_of(e)
+        reason = get(reasons, e, nothing)
+        if reason === nothing
+            reason = isempty(unknowns) ?
+                "it determines no algebraic variable the refresh could update (its " *
+                "variables are time-stepped, 0-D, or fixed by another equation), so only " *
+                "an implicit solve can impose it" :
+                "it couples the algebraic variables " *
+                join(("`$(_operand_name(x))`" for x in unknowns), ", ") *
+                ", which no sequence of single-variable solves determines"
         end
-    catch e
-        @debug "Could not solve simple constraint for $target_name: $e"
+        push!(plan.unsolved, _UnsolvedConstraint(e, _constraint_label(equations[e], e), reason))
     end
+    for e in gauge_rows
+        e in consumed && continue
+        push!(plan.unsolved, _UnsolvedConstraint(e, _constraint_label(equations[e], e),
+            "it fixes the mean of a variable no refreshable constraint solves"))
+    end
+    for (e, reason) in sort!(collect(unusable_gauges); by=first)
+        push!(plan.unsolved, _UnsolvedConstraint(e, _constraint_label(equations[e], e), reason))
+    end
+    return plan
 end
 
-"""
-Try to solve a Poisson-type constraint: Δ(var) + ... = rhs
-Uses spectral inversion: var = -Δ⁻¹(rhs - ...)
-"""
-function _try_solve_poisson_constraint!(problem, L_expr, F_expr, state::Vector{<:ScalarField}, solved_vars::Set{String})
-    # Look for Laplacian operator on LHS
-    laplacian_var, other_lhs_terms = _extract_laplacian_term(L_expr)
-
-    @debug "Poisson constraint check: L_expr type=$(typeof(L_expr)), laplacian_var=$(laplacian_var !== nothing ? laplacian_var.name : "nothing")"
-
-    if laplacian_var === nothing
-        return
-    end
-
-    target_name = laplacian_var.name
-
-    # Don't re-solve already solved variables
-    if target_name in solved_vars
-        return
-    end
-
-    # Fast path for Δ(psi) ± q + tau = 0 on a pure-Fourier domain. The tau
-    # variable affects only k=0, which the gauge pins to zero. Solving directly
-    # into psi avoids both the copied RHS field and the rotating result field.
-    found = other_lhs_terms === nothing ? nothing :
-            _find_source_field_in_terms(other_lhs_terms)
-    if found !== nothing && _is_zero_constraint_rhs(F_expr)
-        source_field, was_negated = found
-        if _spectral_poisson_solve_into!(laplacian_var, source_field, was_negated)
-            push!(solved_vars, target_name)
-            return
+"""Run every exact solve of `plan` on `state` (problem variables already aliased to it)."""
+function _apply_constraint_plan!(plan::_ConstraintRefreshPlan, problem::Problem,
+                                 state::Vector{<:ScalarField})
+    for solve in plan.solves
+        if solve.target_var isa VectorField
+            _apply_vector_constraint!(solve, problem, state)
+        else
+            _apply_scalar_constraint!(solve, problem, state)
         end
     end
-
-    try
-        # Build RHS for Poisson equation
-        # For "Δ(ψ) + tau - q = 0", we need Δ(ψ) = q - tau
-        # L = Δ(ψ) + tau - q, F = 0
-        # So we need: rhs = -(other_lhs_terms) = -(tau - q) = q - tau
-
-        # First, find source variable in other_lhs_terms
-        # For QG: Δ(ψ) + tau_ψ - q = 0, the source is q
-
-        rhs_value = _evaluate_poisson_rhs(problem, other_lhs_terms, F_expr)
-
-        if rhs_value === nothing || !isa(rhs_value, ScalarField)
-            @debug "Poisson RHS is nothing or not ScalarField"
-            return
-        end
-
-        @debug "About to solve Poisson for $(laplacian_var.name)"
-
-        # Solve Poisson equation: Δ(var) = rhs → var = -rhs/k²
-        result = _spectral_poisson_solve(rhs_value, laplacian_var.dist)
-        @debug "Poisson solve returned: $(result !== nothing ? "success" : "nothing")"
-
-        if result !== nothing
-            copy_field_data!(laplacian_var, result)
-            push!(solved_vars, target_name)
-            @debug "Solved Poisson constraint for $target_name"
-        end
-    catch e
-        @debug "Could not solve Poisson constraint for $target_name: $e"
-    end
+    return state
 end
 
-@inline _is_zero_constraint_rhs(::Nothing) = true
-@inline _is_zero_constraint_rhs(expr::ZeroOperator) = true
-@inline _is_zero_constraint_rhs(expr::ConstantOperator) = iszero(expr.value)
-@inline _is_zero_constraint_rhs(expr::Number) = iszero(expr)
-@inline _is_zero_constraint_rhs(expr) = false
+"""Coefficient buffer the solve overwrites in full: the existing one when it has
+the right shape (no transform of the stale value), else allocated by a transform."""
+function _constraint_target_coefficients!(target::ScalarField, shape)
+    cd = get_coeff_data(target)
+    if cd === nothing || (shape !== nothing && size(_local_coeff(cd)) != shape)
+        cd = coeff_data!(target)
+    end
+    return _local_coeff(cd)
+end
+
+_constraint_shape(neg_inv::AbstractArray) = size(neg_inv)
+_constraint_shape(::Any) = nothing
+
+# Function barriers: the plan stores weights untyped, these see concrete arrays.
+function _constraint_accumulate!(dest::AbstractArray, weight, x::AbstractArray, first::Bool)
+    size(x) == size(dest) || throw(DimensionMismatch(
+        "constraint refresh: input coefficients $(size(x)) vs target $(size(dest))"))
+    first ? (dest .= weight .* x) : (dest .+= weight .* x)
+    return dest
+end
+
+_constraint_finish!(dest::AbstractArray, neg_inv, ::Nothing) = (dest .*= neg_inv; dest)
+_constraint_finish!(dest::AbstractArray, neg_inv, pin::AbstractArray) =
+    (dest .= neg_inv .* dest .+ pin; dest)
+
+# The common one-input case (Δψ + τ - ζ = 0) in a single fused pass.
+function _constraint_single!(dest::AbstractArray, neg_inv, weight, x::AbstractArray, pin)
+    size(x) == size(dest) || throw(DimensionMismatch(
+        "constraint refresh: input coefficients $(size(x)) vs target $(size(dest))"))
+    if pin === nothing
+        dest .= neg_inv .* (weight .* x)
+    else
+        dest .= neg_inv .* (weight .* x) .+ pin
+    end
+    return dest
+end
+
+function _apply_scalar_constraint!(solve::_ConstraintSolve, problem::Problem,
+                                   state::Vector{<:ScalarField})
+    target = state[solve.target]
+    dest = _constraint_target_coefficients!(target, _constraint_shape(solve.neg_inv))
+    if length(solve.inputs) == 1 && isempty(solve.generic) && solve.constant === nothing
+        input = only(solve.inputs)
+        x = _local_coeff(coeff_data!(state[input.index]))
+        _constraint_single!(dest, solve.neg_inv, input.weight, x, solve.pin)
+    else
+        first = true
+        for input in solve.inputs
+            x = _local_coeff(coeff_data!(state[input.index]))
+            _constraint_accumulate!(dest, input.weight, x, first)
+            first = false
+        end
+        for (c, term) in solve.generic
+            value = evaluate_solver_expression(term, problem.variables; layout=:c,
+                                               template=solve.target_var)
+            value isa ScalarField || throw(ArgumentError(
+                "constraint refresh of `$(solve.label)`: the term " *
+                "`$(expression_to_string(term))` evaluated to $(typeof(value)), not a " *
+                "scalar field"))
+            _constraint_accumulate!(dest, c, _local_coeff(coeff_data!(value)), first)
+            first = false
+        end
+        if solve.constant !== nothing
+            _constraint_accumulate!(dest, 1.0, solve.constant, first)
+            first = false
+        end
+        first && fill!(dest, zero(eltype(dest)))
+        _constraint_finish!(dest, solve.neg_inv, solve.pin)
+    end
+    target.current_layout = :c
+    return target
+end
+
+function _apply_vector_constraint!(solve::_ConstraintSolve, problem::Problem,
+                                   state::Vector{<:ScalarField})
+    target = solve.target_var::VectorField
+    expr = solve.vector_expr
+    ncomp = length(target.components)
+    if expr === nothing
+        for i in 1:ncomp
+            component = state[solve.target + i - 1]
+            fill!(_constraint_target_coefficients!(component, nothing), 0)
+            component.current_layout = :c
+        end
+        return target
+    end
+    _try_refresh_fourier_streamfunction_velocity!(target, expr) && return target
+    value = evaluate_solver_expression(expr, problem.variables; layout=:c)
+    (value isa VectorField && length(value.components) == ncomp) || throw(ArgumentError(
+        "constraint refresh of `$(solve.label)`: `$(expression_to_string(expr))` evaluated " *
+        "to $(typeof(value)), not a $ncomp-component vector field"))
+    for i in 1:ncomp
+        component = value.components[i]
+        coeff_data!(component)
+        copy_field_data!(state[solve.target + i - 1], component; preserve_layout=true)
+    end
+    return target
+end
 
 @inline function _constraint_all_fourier_bases(field::ScalarField)
     !isempty(field.bases) && all(is_fourier_axis, field.bases)
@@ -1064,31 +1499,6 @@ end
 
 @inline _coefficient_array(data::PencilArrays.PencilArray) = parent(data)
 @inline _coefficient_array(data::AbstractArray) = data
-
-"""
-Solve a pure-Fourier Poisson constraint directly into `target`.
-
-`was_negated` describes the source sign in the constraint LHS. For
-`Δ(target) - source = 0`, the resulting coefficients are `-source/k²`;
-for `Δ(target) + source = 0`, they are `+source/k²`.
-"""
-function _spectral_poisson_solve_into!(target::ScalarField, source::ScalarField,
-                                       was_negated::Bool)
-    (_constraint_all_fourier_bases(target) && target.bases == source.bases) || return false
-    ensure_layout!(source, :c)
-    target_coeff = coeff_data!(target)
-    source_coeff = get_coeff_data(source)
-    (target_coeff === nothing || source_coeff === nothing) && return false
-
-    k2 = _build_k_squared(source)
-    k2 === nothing && return false
-    dest = _coefficient_array(target_coeff)
-    src = _coefficient_array(source_coeff)
-    sign = was_negated ? -1.0 : 1.0
-    dest .= ifelse.(k2 .> 1e-12, sign .* src ./ k2, zero(eltype(dest)))
-    target.current_layout = :c
-    return true
-end
 
 """Refresh `u = skew(grad(psi))` in existing 2D pure-Fourier buffers."""
 function _try_refresh_fourier_streamfunction_velocity!(target, expr)
@@ -1126,276 +1536,11 @@ function _try_refresh_fourier_streamfunction_velocity!(target, expr)
 end
 
 """
-Evaluate the RHS for a Poisson equation by negating other LHS terms.
-For "Δ(ψ) + tau - q = 0", the RHS is "q - tau" = -(tau - q) = -other_lhs_terms
-
-Special handling: 0D tau variables (gauge constants) only affect k=0 mode,
-which is set to 0 by the gauge condition anyway, so we can ignore them.
-"""
-function _evaluate_poisson_rhs(problem, other_lhs_terms, F_expr)
-    if other_lhs_terms === nothing && F_expr === nothing
-        return nothing
-    end
-
-    # For Poisson equations like "Δ(ψ) + tau - q = 0", the other terms are "tau - q"
-    # The RHS we need is -(tau - q) = q - tau
-    # Since tau is a 0D constant affecting only k=0, and we set ψ[k=0]=0 anyway,
-    # we can focus on finding the main source field (q) in the terms
-
-    rhs_value = nothing
-
-    if other_lhs_terms !== nothing
-        # Try to extract the main source field from the other terms
-        # Look for ScalarField or NegateOperator(ScalarField)
-        found = _find_source_field_in_terms(other_lhs_terms)
-
-        if found !== nothing
-            source_field, was_negated = found
-            @debug "Found source field: $(source_field.name) (negated=$was_negated)"
-            rhs_value = copy(source_field)
-            ensure_layout!(rhs_value, :c)
-            # RHS = -(other LHS terms). A source written with '+' in the constraint
-            # LHS (Δ(ψ) + q = 0  ⇒  Δψ = -q) contributes -source to the RHS; one
-            # written negated (Δ(ψ) - q = 0  ⇒  Δψ = +q) contributes +source. The old
-            # shortcut always copied +source, giving the WRONG SIGN for the +source
-            # convention (only the -source form was correct).
-            if !was_negated
-                coeff_data = get_coeff_data(rhs_value)
-                if isa(coeff_data, PencilArrays.PencilArray)
-                    parent(coeff_data) .*= -1
-                else
-                    coeff_data .*= -1
-                end
-            end
-            @debug "Created RHS for Poisson solve from $(source_field.name)"
-        else
-            # Fallback: try to evaluate directly
-            try
-                other_value = evaluate_solver_expression(other_lhs_terms, problem.variables; layout=:c)
-                if isa(other_value, ScalarField)
-                    rhs_value = copy(other_value)
-                    coeff_data = coeff_data!(rhs_value)
-                    if isa(coeff_data, PencilArrays.PencilArray)
-                        parent(coeff_data) .*= -1
-                    else
-                        coeff_data .*= -1
-                    end
-                end
-            catch e
-                @debug "Could not evaluate other LHS terms: $e"
-            end
-        end
-    end
-
-    # Add F_expr contribution
-    if F_expr !== nothing
-        try
-            f_value = evaluate_solver_expression(F_expr, problem.variables; layout=:c)
-            if isa(f_value, ScalarField)
-                ensure_layout!(f_value, :c)
-                if rhs_value === nothing
-                    rhs_value = copy(f_value)
-                else
-                    rhs_coeff = coeff_data!(rhs_value)
-                    f_coeff = get_coeff_data(f_value)
-                    if isa(rhs_coeff, PencilArrays.PencilArray)
-                        parent(rhs_coeff) .+= parent(f_coeff)
-                    else
-                        rhs_coeff .+= f_coeff
-                    end
-                end
-            end
-        catch e
-            @debug "Could not evaluate F_expr: $e"
-        end
-    end
-
-    return rhs_value
-end
-
-"""
-Find the main spatial source field in an expression, ignoring 0D fields (tau variables).
-Returns `(field, was_negated)` — `was_negated` records whether the field appeared
-behind a NegateOperator in the constraint LHS, so the caller can give it the correct
-RHS sign (RHS = -(LHS terms)). Returns `nothing` if no spatial source field is found.
-For "tau - q" → (q, true); for "+q" → (q, false); for "-q" → (q, true).
-"""
-function _find_source_field_in_terms(expr)
-    # Flatten to get all terms
-    terms = _flatten_add_terms(expr)
-
-    for term in terms
-        # Direct ScalarField with spatial dimensions
-        if isa(term, ScalarField) && !isempty(term.bases)
-            return (term, false)
-        end
-
-        # NegateOperator around ScalarField
-        if isa(term, NegateOperator)
-            inner = term.operand
-            if isa(inner, ScalarField) && !isempty(inner.bases)
-                return (inner, true)
-            end
-        end
-    end
-
-    # Try to handle single term that's not an AddOperator
-    if isa(expr, ScalarField) && !isempty(expr.bases)
-        return (expr, false)
-    end
-
-    if isa(expr, NegateOperator)
-        inner = expr.operand
-        if isa(inner, ScalarField) && !isempty(inner.bases)
-            return (inner, true)
-        end
-    end
-
-    return nothing
-end
-
-"""
-Extract Laplacian term from an expression.
-Returns (variable being Laplacian'd, other terms) or (nothing, nothing).
-Recursively searches nested AddOperator expressions.
-"""
-function _extract_laplacian_term(expr)
-    if expr === nothing
-        return nothing, nothing
-    end
-
-    # Direct Laplacian
-    if isa(expr, Laplacian)
-        if isa(expr.operand, ScalarField)
-            @debug "Found direct Laplacian of $(expr.operand.name)"
-            return expr.operand, nothing
-        end
-        return nothing, nothing
-    end
-
-    # Collect all terms from nested AddOperator structure
-    terms = _flatten_add_terms(expr)
-    @debug "Extracted $(length(terms)) terms from L_expr, types: $([typeof(t) for t in terms])"
-
-    if isempty(terms)
-        return nothing, nothing
-    end
-
-    # Find Laplacian term
-    for (i, term) in enumerate(terms)
-        if isa(term, Laplacian) && isa(term.operand, ScalarField)
-            # Found Laplacian - collect other terms
-            other_terms = [t for (j, t) in enumerate(terms) if j != i]
-            if isempty(other_terms)
-                return term.operand, nothing
-            elseif length(other_terms) == 1
-                return term.operand, other_terms[1]
-            else
-                # Reconstruct as AddOperator chain
-                result = other_terms[1]
-                for j in 2:length(other_terms)
-                    result = AddOperator(result, other_terms[j])
-                end
-                return term.operand, result
-            end
-        end
-    end
-
-    return nothing, nothing
-end
-
-"""
-Flatten nested AddOperator into a list of terms.
-"""
-function _flatten_add_terms(expr)
-    terms = Any[]
-    _collect_add_terms!(terms, expr)
-    return terms
-end
-
-function _collect_add_terms!(terms::Vector{Any}, expr)
-    if expr === nothing
-        return
-    end
-
-    if isa(expr, AddOperator)
-        _collect_add_terms!(terms, expr.left)
-        _collect_add_terms!(terms, expr.right)
-    else
-        push!(terms, expr)
-    end
-end
-
-# Rotating pool of Poisson-result buffers (keyed by bases/dtype). The result is
-# consumed (copied into the solved variable) right after this returns, so a small
-# rotation avoids a fresh `copy(rhs)` allocation each solve without aliasing.
-const _POISSON_RESULT_POOL_SIZE = 4
-const _POISSON_RESULT_POOL = Dict{Tuple, Vector{ScalarField}}()
-const _POISSON_RESULT_IDX = Ref(0)
-
-function _checkout_poisson_result!(rhs::ScalarField)
-    key = (hash(rhs.bases), rhs.dtype)
-    bufs = get!(() -> Vector{ScalarField}(undef, _POISSON_RESULT_POOL_SIZE),
-                _POISSON_RESULT_POOL, key)
-    i = (_POISSON_RESULT_IDX[] % _POISSON_RESULT_POOL_SIZE) + 1
-    _POISSON_RESULT_IDX[] += 1
-    if !isassigned(bufs, i)
-        bufs[i] = ScalarField(rhs.dist, "poisson_solution", rhs.bases, rhs.dtype)
-    end
-    return bufs[i]
-end
-
-"""
-Spectral Poisson solve: given rhs, compute var = -rhs/k²
-Works with MPI/PencilArrays.
-"""
-function _spectral_poisson_solve(rhs::ScalarField, dist::Distributor)
-    ensure_layout!(rhs, :c)
-
-    # Result from a small rotating buffer pool (consumed immediately by the caller).
-    result = _checkout_poisson_result!(rhs)
-    copy_field_data!(result, rhs)
-    result.name = "poisson_solution"
-
-    coeff_data = coeff_data!(result)
-
-    if isempty(rhs.bases)
-        return result
-    end
-
-    # Build k² for spectral Poisson inversion
-    k_squared = _build_k_squared(rhs)
-
-    if k_squared === nothing
-        @warn "Could not build k² for Poisson solve"
-        return nothing
-    end
-
-    # Apply Poisson inversion: result = -rhs/k² (avoiding k=0). The function
-    # barrier below uses one fused broadcast, which is a regular CPU loop for
-    # Arrays and a device kernel for GPU arrays (no forbidden scalar indexing).
-    if isa(coeff_data, PencilArrays.PencilArray)
-        _poisson_invert!(parent(coeff_data), k_squared)
-    else
-        _poisson_invert!(coeff_data, k_squared)
-    end
-
-    return result
-end
-
-"""Function barrier for the spectral Poisson inversion: `data .= -data / k²`
-(with the k=0 gauge mode zeroed). The fused broadcast is CPU/GPU portable."""
-function _poisson_invert!(data::AbstractArray, k2::AbstractArray)
-    data .= ifelse.(k2 .> 1e-12, .-data ./ k2, zero(eltype(data)))
-    return data
-end
-
-"""
-Build k² array for spectral Poisson inversion.
+Build the k² array of a field's local coefficient grid.
 
 The k² grid is a constant of the domain/decomposition, so it is cached (per rank,
-keyed by basis sizes + local coefficient shape + element type) and reused across
-solves. The caller (`_spectral_poisson_solve`) only reads it, so sharing is safe.
+keyed by basis sizes + local coefficient shape + element type) and reused. Callers
+(the lazy fractional Laplacian) only read it, so sharing is safe.
 """
 const _POISSON_K2_CACHE = Dict{Tuple, Any}()
 

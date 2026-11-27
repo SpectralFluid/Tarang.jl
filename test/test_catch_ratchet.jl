@@ -218,7 +218,7 @@ end
     @info "src/ catch clauses: $total total, $n_silent with no rethrow/throw/error in the handler"
 
     # Current count. Lower it when you remove one; never raise it.
-    SILENT_RATCHET = 84
+    SILENT_RATCHET = 68
 
     if n_silent > SILENT_RATCHET
         sites = sort(silent; by = x -> (x[1], x[2]))

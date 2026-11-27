@@ -23,8 +23,10 @@ Deterministic forcing is instead evaluated at every RHS evaluation time.
 """
 function step!(state::TimestepperState, solver::InitialValueSolver)
     # Parameters can also register an operator without going through the setter.
-    _get_spectral_linear_operator(solver) === nothing ||
+    if _get_spectral_linear_operator(solver) !== nothing
         _check_attached_operator_distribution!(solver)
+        _check_attached_operator_consumed!(solver, state.timestepper)
+    end
     _check_stochastic_timestepper_compatibility!(state, solver)
     _check_state_level_forcing_unapplied!(state)
     _check_gpu_implicit_compatibility!(state, solver)
@@ -108,9 +110,10 @@ Refuse — loudly — to silently drop an implicit linear operator on a single-G
 that has no per-mode implicit path.
 
 A pure-Fourier GPU InitialValueProblem skips global-matrix and subproblem assembly, so
-`L_matrix === nothing` does not mean "no implicit term". RK222, RK443, and SBDF2
-select internal diagonal solves; internal diagonal types also solve per mode on-device.
-Other schemes must be rejected here instead of silently dropping the implicit L.
+`L_matrix === nothing` does not mean "no implicit term". The IMEX RK family and SBDF2
+(`_SERIAL_DIAGONAL_IMEX_TIMESTEPPERS`) select internal diagonal solves; internal
+diagonal types also solve per mode on-device. Other schemes must be rejected here
+instead of silently dropping the implicit L.
 
 Scoped to GPU: the coupled (Fourier×Chebyshev) GPU path DOES build subproblems and
 is exempt; the CPU global-matrix path is unaffected.
@@ -139,9 +142,10 @@ function _check_gpu_implicit_compatibility!(state::TimestepperState, solver::Ini
         "$scheme cannot treat an implicit (left-hand-side) linear operator on a single " *
         "GPU: a pure-Fourier GPU solver builds no global matrix or subproblem, so the " *
         "term has no per-mode implicit solve and would be silently dropped — the equation " *
-        "would integrate without it. Use RK222, RK443, or SBDF2 to solve the diagonal Fourier " *
-        "operator per mode on-device, or move the linear term to the explicit right-hand " *
-        "side (e.g. write `dt(u) = nu*lap(u) + ...` instead of `dt(u) - nu*lap(u) = ...`)."
+        "would integrate without it. Use RK111, RK222, RK443, RKSMR, RKGFY, or SBDF2 to " *
+        "solve the diagonal Fourier operator per mode on-device, or move the linear term " *
+        "to the explicit right-hand side (e.g. write `dt(u) = nu*lap(u) + ...` instead " *
+        "of `dt(u) - nu*lap(u) = ...`)."
     )
 end
 

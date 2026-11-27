@@ -64,6 +64,12 @@ function distributed_forward_transform!(tf::TransposableField{F,T,N};
         return tf
     end
 
+    # The constructor validated the field it was built for, but a cached
+    # workspace is repointed to other fields (`transpose_workspace!`). Refuse an
+    # rfft-halved layout on every rank before the first transpose, rather than
+    # failing the coefficient copy-out below on only some of them.
+    _require_transposable_layout(tf.field)
+
     fft_plans = plans === nothing ? tf.fft_plans : plans
     arch = tf.buffers.architecture
     grid_data = get_grid_data(tf.field)
@@ -213,6 +219,9 @@ function distributed_backward_transform!(tf::TransposableField{F,T,N};
         tf.total_fft_time += time() - fft_start
         return tf
     end
+
+    # See distributed_forward_transform!.
+    _require_transposable_layout(tf.field)
 
     fft_plans = plans === nothing ? tf.fft_plans : plans
     arch = tf.buffers.architecture
@@ -451,12 +460,21 @@ end
 
 Perform DCT along specified dimension for Chebyshev transforms (CPU version).
 
-Uses DCT-I (FFTW.REDFT00) to match the Gauss-Lobatto grid used by
-ChebyshevTransform in chebyshev.jl:
-- Forward: DCT-I with 1/(N-1) normalization and endpoint halving
-- Backward: DCT-I (self-inverse up to normalization) with endpoint doubling
+Uses DCT-I (FFTW.REDFT00) on the Gauss-Lobatto grid and produces the SAME
+canonical coefficients as `ChebyshevTransform` (`_chebyshev_forward` /
+`_chebyshev_backward` in chebyshev.jl):
+- Forward: DCT-I with 1/(N-1) normalization, endpoint halving, then the
+  odd-degree sign flip
+- Backward: odd-degree sign flip, endpoint doubling, then DCT-I (self-inverse
+  up to normalization)
 
-This ensures serial and distributed transform results agree exactly.
+The flip is not optional. Tarang's grid is `-cos(πj/(N-1))`, the reverse of
+REDFT00's, so the raw DCT-I output is the expansion of `f(-x)`; see
+`_flip_odd_indices_along_axis!`. Without it a forward→backward round trip still
+succeeds (both directions share the error), but every consumer of the stored
+coefficients — tau/BC rows, interpolation, coefficient output, solver matrices
+— sees the field mirrored. This keeps the distributed coefficients identical to
+the serial ones.
 """
 function dct_in_dim!(data, dim::Int, direction::Symbol, arch::CPU; grid_size::Union{Nothing,Int}=nothing)
     n = size(data, dim)
@@ -491,10 +509,14 @@ function dct_in_dim!(data, dim::Int, direction::Symbol, arch::CPU; grid_size::Un
             last_idx = ntuple(i -> i == dim ? (n_dim:n_dim) : Colon(), ndims(result))
             result[last_idx...] .*= 0.5
         end
+        # Canonical-convention bridge, exactly as in _chebyshev_forward.
+        _flip_odd_indices_along_axis!(result, dim)
         data .= result
     else
-        # DCT-I backward: undo endpoint halving, then apply DCT-I and divide by 2
+        # DCT-I backward: undo the convention bridge and the endpoint halving,
+        # then apply DCT-I and divide by 2 (mirror of _chebyshev_backward).
         scaled_data = copy(data)
+        _flip_odd_indices_along_axis!(scaled_data, dim)
         # Double DC (first coefficient)
         first_idx = ntuple(i -> i == dim ? (1:1) : Colon(), ndims(scaled_data))
         scaled_data[first_idx...] .*= 2.0

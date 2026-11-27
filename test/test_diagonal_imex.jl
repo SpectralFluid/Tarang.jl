@@ -321,4 +321,96 @@ import Tarang: SpectralLinearOperator
             @test uf < 1e-2        # actually damped toward exp(−ν k² T) ≈ 0
         end
     end
+
+    @testset "Attached operator: applied at the scheme's order, or refused" begin
+        # dt(u) = 0 plus an attached ν·Laplacian (ν = 0.5): u0 = cos 2x decays as
+        # exp(-2t)·cos 2x. Only RK222, RK443 and SBDF2 used to read the operator;
+        # every other scheme returned u0 bit-unchanged with no error or warning.
+        xs = collect(range(0, 2π, length=17))[1:16]
+        function attached_setup(ts, dt)
+            coords = CartesianCoordinates("x")
+            dist = Distributor(coords; mesh=(1,), dtype=Float64)
+            xb = RealFourier(coords["x"]; size=16, bounds=(0.0, 2π))
+            u = ScalarField(dist, "u", (xb,), Float64)
+            ensure_layout!(u, :g)
+            Tarang.get_grid_data(u) .= cos.(2 .* xs)
+            problem = InitialValueProblem([u]); add_equation!(problem, "dt(u) = 0")
+            solver = InitialValueSolver(problem, ts; dt=dt)
+            return solver, u, SpectralLinearOperator(dist, (xb,), :laplacian; ν=0.5)
+        end
+        function attached_error(ts, dt; T=0.4)
+            solver, u, L = attached_setup(ts, dt)
+            Tarang.set_spectral_linear_operator!(solver, L)
+            for _ in 1:round(Int, T / dt)
+                step!(solver)
+            end
+            ensure_layout!(u, :g)
+            return maximum(abs, Tarang.get_grid_data(u) .- exp(-2T) .* cos.(2 .* xs))
+        end
+
+        # Every IMEX RK tableau shares the per-mode stage solve; SBDF2 has its own.
+        # RKSMR and RKGFY are second order in their implicit part. (Measured rates
+        # 0.99, 2.00, 2.99, 2.00, 2.00, 2.02; an ignored operator errs by 0.55.)
+        for (ts, order) in ((RK111(), 1), (RK222(), 2), (RK443(), 3),
+                            (RKSMR(), 2), (Tarang.RKGFY(), 2), (SBDF2(), 2))
+            coarse, fine = attached_error(ts, 0.02), attached_error(ts, 0.01)
+            @test fine < 5e-3
+            @test log2(coarse / fine) > order - 0.25
+        end
+
+        # The rest solve only the equations' own operator. Refused when attached,
+        # naming the scheme and the ones that work; and, for an operator registered
+        # as a problem parameter instead, at the first step, before anything moves.
+        for ts in (CNAB1(), CNAB2(), SBDF1(), SBDF3(), SBDF4(), ETD_RK222(), ETD_CNAB2(),
+                   ETD_SBDF2(), Tarang.MCNAB2(), Tarang.CNLF2())
+            solver, u, L = attached_setup(ts, 0.01)
+            err = try
+                Tarang.set_spectral_linear_operator!(solver, L)
+                nothing
+            catch e
+                e
+            end
+            @test err isa ArgumentError
+            message = err === nothing ? "" : sprint(showerror, err)
+            @test occursin(string(nameof(typeof(ts))), message)
+            @test occursin("RK111, RK222, RK443, RKGFY, RKSMR, SBDF2", message)
+            @test Tarang._get_spectral_linear_operator(solver) === nothing
+
+            solver.problem.parameters["spectral_linear_operator"] = L
+            @test_throws ArgumentError step!(solver)
+            ensure_layout!(u, :g)
+            @test Tarang.get_grid_data(u) == cos.(2 .* xs)
+            @test solver.iteration == 0
+        end
+    end
+
+    @testset "Attached operator on a problem with per-mode subproblems is refused" begin
+        # A Chebyshev axis gives RK222 per-mode subproblems, whose stage solve reads
+        # the equations' own operator only: the attached one was silently dropped.
+        coords = CartesianCoordinates("x", "z")
+        dist = Distributor(coords; dtype=Float64)
+        xb = RealFourier(coords["x"]; size=8, bounds=(0.0, 2π))
+        zb = ChebyshevT(coords["z"]; size=8, bounds=(0.0, 1.0))
+        b = ScalarField(Domain(dist, (xb, zb)), "b")
+        set!(b, (x, z) -> cos(2x) * sin(π * z))
+        tau1 = ScalarField(dist, "tau1", (xb,), Float64)
+        tau2 = ScalarField(dist, "tau2", (xb,), Float64)
+        lift_basis = derivative_basis(zb, 1)
+        problem = InitialValueProblem([b, tau1, tau2])
+        add_parameters!(problem; lift1=lift(tau1, lift_basis, -1), lift2=lift(tau2, lift_basis, -2))
+        add_equation!(problem, "dt(b) - 0.01*lap(b) + lift1 + lift2 = 0")
+        add_bc!(problem, "b(z=0) = 0")
+        add_bc!(problem, "b(z=1) = 0")
+        solver = InitialValueSolver(problem, RK222(); dt=0.002)
+        @test Tarang._timestepper_subproblems(solver) !== nothing
+        L = SpectralLinearOperator(dist, (xb, zb), :laplacian; ν=5.0)
+        err = try
+            Tarang.set_spectral_linear_operator!(solver, L)
+            nothing
+        catch e
+            e
+        end
+        @test err isa ArgumentError
+        @test occursin("non-Fourier axis", err === nothing ? "" : sprint(showerror, err))
+    end
 end
