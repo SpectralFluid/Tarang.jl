@@ -23,7 +23,7 @@ const NP = MPI.Comm_size(COMM)
     buffers = nothing
     for rep in 1:4
         # Exercise independent operand magnitudes in the packed MPI transform.
-        su, sv = ((1.0, 1.0), (1e-100, 1e100), (1e100, 1e-100), (0.0, 1.0))[rep]
+        su, sv = ((1.0, 1.0), (1e-100, 1e100), (1e100, 1e-100), (0.0, 1e100))[rep]
         parent(ug) .= su .* (rep .* sin.(3 .* x) .+ cos.(y) .+ 0 .* z)
         parent(vg) .= sv .* (cos.(2 .* x) .+ sin.(z) .+ 0 .* y)
         before_u, before_v = copy(parent(ug)), copy(parent(vg))
@@ -50,7 +50,7 @@ const NP = MPI.Comm_size(COMM)
             if hasproperty(ws, :transpose_count)
                 # Both real operands share the two padding transposes. Two more
                 # transposes return the truncated product to its original layout.
-                @test ws.transpose_count == 4
+                @test ws.transpose_count == (iszero(su) ? 0 : 4)
                 @test ws.transpose_elements <= 12 * prod(ns)
                 @test !any(ws.in_use)
             end

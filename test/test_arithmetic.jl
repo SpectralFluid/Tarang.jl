@@ -240,7 +240,10 @@ end
         k = n == 16 ? 7 : n ÷ 2
         x = vec(local_grid(only(dom.bases), dom.dist, 1.0))
         grid_data!(f) .= cos.(k .* x)
-        @test maximum(abs, grid_data!(f * f) .- 0.5) < 1e-12
+        # A complex Nyquist bin is the single mode -n/2. Its square has
+        # frequency -n, outside the retained band. A cosine has DC power 1/2.
+        expected = dtype <: Complex && 2k == n ? 0.0 : 0.5
+        @test maximum(abs, grid_data!(f * f) .- expected) < 1e-12
     end
 end
 
@@ -468,11 +471,12 @@ end
     # no spurious aliased energy anywhere except DC (the k=28 contamination is gone)
     @test maximum(pc[2:end]) < 1e-8
 
-    # With exactly 3N/2 padded points, the ±N harmonics of this product wrap
-    # onto the retained Nyquist bin. Exercise both padded FFT implementations.
+    # The real Nyquist cosine has a constant term in its square. The signed
+    # complex mode reaches -N and projects to zero. Neither leaves Nyquist power.
     for dtype in (Float64, ComplexF64)
         nyquist = ScalarField(dist, "nyquist", (xb,), dtype)
         grid_data!(nyquist) .= [iseven(j) ? 1 : -1 for j in 0:(N - 1)]
-        @test grid_data!(nyquist * nyquist) ≈ fill(dtype(0.5), N) atol=1e-12
+        expected = dtype <: Real ? dtype(0.5) : zero(dtype)
+        @test grid_data!(nyquist * nyquist) ≈ fill(expected, N) atol=1e-12
     end
 end

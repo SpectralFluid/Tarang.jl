@@ -149,6 +149,10 @@ onto the original 128 modes. The working FFT length includes room to keep
 Nyquist products from aliasing into the retained modes. Distributed Cartesian
 products use the same projection along locally owned pencils.
 
+On an even grid, a real field represents its Nyquist bin as a cosine. A complex
+field assigns the bin to frequency `-N/2`. Squaring a unit Nyquist mode therefore
+leaves a constant `1/2` in a real field and projects to zero in a complex field.
+
 ### 2/1 Rule
 
 For a padded grid of 256 points at `size=128`:

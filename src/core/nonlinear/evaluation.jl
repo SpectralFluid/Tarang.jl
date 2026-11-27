@@ -590,6 +590,12 @@ function evaluate_padded_multiply_distributed(field1::ScalarField, field2::Scala
         # packed FFT. Powers of two rescale exactly, including subnormal inputs.
         peaks = [maximum(abs, parent(g); init=zero(T)) for g in (gd1, gd2)]
         MPI.Allreduce!(peaks, MPI.MAX, dist.comm)
+        if any(iszero, peaks) && all(isfinite, peaks)
+            result = _checkout_nl_result!(evaluator, field1)
+            fill!(parent(grid_data!(result)), zero(T))
+            ensure_layout!(result, result_layout)
+            return result
+        end
         exponents = (last(frexp(peaks[1])), last(frexp(peaks[2])))
         product_exponent = sum(exponents)
         up1 = sweep(tolog(gd1, gd2, exponents), decomp0, N, Mp, padded_axes)
