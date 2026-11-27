@@ -24,8 +24,10 @@ end
 
 # Recomputed in serial after the RK222 tableau correction in 7968d251c,
 # with the final boundary projection from 1de3ba3e9. Keep MPI tolerances tight.
-const SUMSQ_REF = 33.39084541007002
-const BMAX_REF  = 1.438012874504084
+# Refreshed for the even-N Nyquist handling of 6d21cebd6 (Nx = 8 here; an odd Nx
+# reproduces the previous code bit for bit); np = 1, 2 and 4 agree to 1e-14.
+const SUMSQ_REF = 33.39084541400477
+const BMAX_REF  = 1.4380120887837065
 
 _loc(f) = get_grid_data(f) isa PencilArrays.PencilArray ? parent(get_grid_data(f)) : get_grid_data(f)
 function _global_boundary_max(field, logical_dim, endpoints, comm)
