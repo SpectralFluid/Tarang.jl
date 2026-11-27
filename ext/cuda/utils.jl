@@ -687,7 +687,7 @@ multiple slice-based copies, reducing kernel launch overhead.
 """
 function Tarang._pad_spectral!(padded::CuArray{Complex{T}}, spec_data::CuArray{Complex{T}},
                                 original_shape::Tuple, padded_shape::Tuple,
-                                fourier_dims::Vector{Int}) where T
+                                fourier_dims::Vector{Int}, cosine_dims=fourier_dims) where T
     # Broadcasts, KA kernels and cuFFT remain ordered on this task's CUDA stream.
     # No host synchronization is needed between dependent operations. Pin the
     # device before the first broadcast as well as inside launch!.
@@ -732,14 +732,7 @@ function Tarang._pad_spectral!(padded::CuArray{Complex{T}}, spec_data::CuArray{C
         end
     end
 
-    # Split the even-N Nyquist symmetrically across ±N/2 so the padded spectrum
-    # stays Hermitian for real fields — EXACTLY as the CPU `_pad_spectral!` does
-    # after its copy step. The index maps above (kernel `_gpu_padded_idx` and the
-    # 1D slices) copy the full Nyquist bin to +N/2 and leave −N/2 zero; without
-    # this split the padded grid picks up a spurious imaginary part that
-    # contaminates every dealiased product. The helper is pure selectdim views +
-    # broadcast (GPU-compatible; no-op for odd N, which has no Nyquist bin).
-    Tarang._split_nyquist_symmetric!(padded, original_shape, padded_shape, fourier_dims)
+    Tarang._place_padded_nyquist!(padded, original_shape, padded_shape, fourier_dims, cosine_dims)
     return padded
 end
 
@@ -748,18 +741,13 @@ Override _truncate_spectral! for CuArray: uses fused GPU kernel.
 """
 function Tarang._truncate_spectral!(result::CuArray{Complex{T}}, padded_spec::CuArray{Complex{T}},
                                      original_shape::Tuple, padded_shape::Tuple,
-                                     fourier_dims::Vector{Int}) where T
+                                     fourier_dims::Vector{Int}, cosine_dims=fourier_dims) where T
     # Pin the current CUDA device to the array's device (see _pad_spectral! note).
     arch = Tarang.architecture(result)
     ensure_device!(arch)
     ndim = length(original_shape)
 
-    # Fold the dropped −N/2 image into the +N/2 plane (in place, BEFORE the copy)
-    # along each even-N Fourier axis — EXACTLY as the CPU `_truncate_spectral!`
-    # does — so the copy below picks up the FULL Nyquist coefficient instead of
-    # only the +N/2 half. Pure selectdim views + broadcast (GPU-compatible;
-    # no-op for odd N).
-    Tarang._fold_nyquist_into_positive!(padded_spec, original_shape, padded_shape, fourier_dims)
+    Tarang._collect_truncated_nyquist!(padded_spec, original_shape, padded_shape, fourier_dims, cosine_dims)
 
     if ndim == 2
         N1, N2 = original_shape

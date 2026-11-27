@@ -48,7 +48,7 @@ end
 """Vectorized scaling: result = α * a"""
 @inline function vectorized_scale!(result::AbstractArray, a::AbstractArray, α::Real)
     if is_gpu_array(result) || is_gpu_array(a)
-        result .= α .* a
+        result .= _widest_real_type(result)(α) .* a   # no Float64 into Metal kernels
     elseif length(result) > 100
         @turbo for i in eachindex(result, a)
             result[i] = α * a[i]
@@ -61,7 +61,7 @@ end
 """Vectorized AXPY: result = α*x + y"""
 @inline function vectorized_axpy!(result::AbstractArray, α::Real, x::AbstractArray, y::AbstractArray)
     if is_gpu_array(result) || is_gpu_array(x) || is_gpu_array(y)
-        result .= α .* x .+ y
+        result .= _widest_real_type(result)(α) .* x .+ y
     elseif length(result) > 100
         @turbo for i in eachindex(result, x, y)
             result[i] = α * x[i] + y[i]
@@ -74,7 +74,8 @@ end
 """Vectorized linear combination: result = α*a + β*b"""
 @inline function vectorized_linear_combination!(result::AbstractArray, α::Real, a::AbstractArray, β::Real, b::AbstractArray)
     if is_gpu_array(result) || is_gpu_array(a) || is_gpu_array(b)
-        result .= α .* a .+ β .* b
+        W = _widest_real_type(result)
+        result .= W(α) .* a .+ W(β) .* b
     elseif length(result) > 100
         @turbo for i in eachindex(result, a, b)
             result[i] = α * a[i] + β * b[i]
@@ -94,7 +95,7 @@ function fast_axpy!(α::Real, x::ScalarField, y::ScalarField)
     y_data = get_grid_data(y)
     n = length(x_data)
     if is_gpu_array(x_data) || is_gpu_array(y_data)
-        y_data .+= α .* x_data
+        y_data .+= _widest_real_type(y_data)(α) .* x_data
     elseif n > 2000  # Use BLAS for very large arrays
         BLAS.axpy!(α, x_data, y_data)
     elseif n > 100  # Use LoopVectorization for medium arrays

@@ -21,7 +21,8 @@ that survived is the rotating result pools, whose contract is documented in
 `src/core/module_contracts.jl`; `checkout_or_alloc` consequently always
 allocates, which is the intended behaviour, not a fallback.
 """
-function step!(solver::InitialValueSolver, dt::Float64=solver.dt)
+function step!(solver::InitialValueSolver, dt::Real=solver.dt)
+    dt = _checked_timestep(dt, solver.sim_time)
     start_time = time()
 
     _refresh_step_boundary_conditions!(solver, dt)
@@ -31,6 +32,7 @@ function step!(solver::InitialValueSolver, dt::Float64=solver.dt)
     previous_length = previous_state === nothing ? 0 : length(previous_state.dt_history)
     oldest_dt = previous_length == 0 ? previous_dt : first(previous_state.dt_history)
     ts_state = _ensure_timestepper_state!(solver, dt)
+    accepted_state = last(ts_state.history)
 
     try
         step!(ts_state, solver)
@@ -43,6 +45,10 @@ function step!(solver::InitialValueSolver, dt::Float64=solver.dt)
         else
             _restore_timestep_history!(previous_state, previous_state_dt, previous_length, oldest_dt)
         end
+        # An interpreted RHS can bind the public field handles to its predictor.
+        # On the first step those handles also belong to the original solver.state.
+        solver.state = accepted_state
+        _alias_state_to_problem!(solver.problem, accepted_state)
         rethrow(step_error)
     end
 
@@ -174,10 +180,7 @@ function run!(solver::InitialValueSolver;
     while proceed(solver)
         # Adaptive timestep from a CFL controller, if supplied — lets CFL-driven
         # runs use run! too (no manual while-loop just to call compute_timestep).
-        if cfl !== nothing
-            solver.dt = compute_timestep(cfl)
-        end
-        step!(solver)
+        step!(solver, cfl === nothing ? solver.dt : compute_timestep(cfl))
 
         # Auto-process registered output handlers. Each handler gates its own
         # cadence (sim_dt/iter/wall_dt) via should_write, so this is a no-op on
@@ -295,9 +298,12 @@ function _bvp_lhs_solver(sp::Subproblem)
     try
         return MatSolvers.solver_instance(st, sp.L_min)
     catch err
-        _gpu_subproblem_execution(sp) && error(
-            "GPU BVP factorization with $(st) failed; CPU SPQR/dense fallback is disabled. " *
-            "Original error: $(sprint(showerror, err))")
+        if _gpu_subproblem_execution(sp)
+            pinned = _gpu_singular_factorization(sp, st, sp.L_min, (;), "boundary-value system")
+            pinned !== nothing && return pinned
+            error("GPU BVP factorization with $(st) failed; CPU SPQR/dense fallback is disabled. " *
+                  "Original error: $(sprint(showerror, err))")
+        end
         try
             return MatSolvers.solver_instance(MatSolvers.SPQRSolver, sp.L_min)
         catch qr_err

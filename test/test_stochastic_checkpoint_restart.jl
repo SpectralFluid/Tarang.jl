@@ -2,17 +2,17 @@ using Test
 using Tarang
 using Random
 
-function _stochastic_restart_solver(; architecture=CPU(), separable=false, seed=42,
+function _stochastic_restart_solver(; architecture=CPU(), dtype=Float64, separable=false, seed=42,
                                       rate=0.1, forced=true, equation="∂t(q) = 0",
                                       timestepper=RK222())
     coords = CartesianCoordinates("x", "y")
-    dist = Distributor(coords; dtype=Float64, device=architecture)
+    dist = Distributor(coords; dtype, device=architecture)
     xb = RealFourier(coords["x"]; size=8, bounds=(0.0, 2π))
     yb = separable ? ChebyshevT(coords["y"]; size=8, bounds=(-1.0, 1.0)) :
                      RealFourier(coords["y"]; size=8, bounds=(0.0, 2π))
     q = ScalarField(Domain(dist, (xb, yb)), "q")
     fill!(grid_data!(q), 0)
-    kwargs = (; architecture, energy_injection_rate=rate, k_forcing=2.0,
+    kwargs = (; architecture, dtype, energy_injection_rate=rate, k_forcing=2.0,
                 dk_forcing=1.0, dt=0.01, rng=MersenneTwister(seed))
     forcing = separable ? SeparableStochasticForcing(; fourier_size=(8,),
         chebyshev_basis=yb, chebyshev_profile=ones(8), kwargs...) :
@@ -78,6 +78,30 @@ end
 
 @testset "Stochastic checkpoint restart" begin
     _test_stochastic_restart(CPU())
+    @testset "Version 1 Float32 normalization" begin
+        original, f = _stochastic_restart_solver(; dtype=Float32)
+        legacy = similar(f.spectrum)
+        Tarang._fill_spectrum_2d!(legacy, f.wavenumbers..., 2.0, 1.0, :ring)
+        legacy[1] = 0
+        power = foldl((acc, x) -> acc + abs2(x), legacy; init=0f0)
+        legacy .*= sqrt(f.energy_injection_rate / (power / (2 * Float32(length(legacy))^2)))
+        @test legacy != f.spectrum
+        copyto!(f.spectrum, legacy)
+        cached = copy(generate_forcing!(f, 0.0))
+        path = save_state(original, joinpath(mktempdir(), "forcing32"))
+        resumed, restored = _stochastic_restart_solver(; dtype=Float32, seed=999)
+        corrected = copy(restored.spectrum)
+        @test_throws ErrorException load_state!(resumed, path)  # current files require an exact match
+        Tarang.ncputatt(path, "global", Dict("stochastic_forcing_version" => 1))
+        load_state!(resumed, path)
+        @test generate_forcing!(restored, 0.0) == cached
+        @test restored.rng == f.rng && restored.spectrum == corrected
+        @test generate_forcing!(restored, 0.01) != generate_forcing!(f, 0.01)
+        @test restored.rng == f.rng
+        # A changed spectral shape is not a normalization difference.
+        restored.spectrum[2] *= 1.5f0
+        @test_throws ErrorException load_state!(resumed, path)
+    end
     @testset "configuration mismatches fail before restoring fields" begin
         original, _ = _stochastic_restart_solver()
         step!(original, 0.01)

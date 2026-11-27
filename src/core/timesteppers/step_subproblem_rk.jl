@@ -326,9 +326,21 @@ function _solve_cached_system!(dest::_SubproblemVector, lhs_solver, rhs::_Subpro
     return dest
 end
 
-_solve_implicit_stage!(dest, factor, rhs) = _solve_cached_system!(dest, factor, rhs)
-_solve_implicit_stage!(dest, factor::MatSolvers.SPQRSolver, rhs) =
-    MatSolvers.solve!(dest, factor, rhs; require_consistent=true)
+_solve_implicit_stage!(dest, factor, rhs, sp) = _solve_cached_system!(dest, factor, rhs)
+
+# A stage matrix that is singular only at this step size (dt·λ = 1 for some mode)
+# has no solution for a generic right-hand side, so an inconsistent one rejects
+# the step. One that is singular at every step size is a gauge or degenerate tau
+# mode the formulation leaves undetermined (the RealFourier Nyquist pressure mode,
+# a too-coarse first-order tau system); its least-squares solution is the
+# intended one, so an inconsistency there is reported once instead. A per-mode
+# residual cannot draw this line itself: a negligible residual in a nearly empty
+# mode (~1e-21 absolute) is ~1e-6 of that mode's own scale.
+function _solve_implicit_stage!(dest, factor::MatSolvers.SPQRSolver, rhs, sp)
+    _structurally_rank_deficient(sp) &&
+        return MatSolvers.solve!(dest, factor, rhs; warn_inconsistent=true)
+    return MatSolvers.solve!(dest, factor, rhs; require_consistent=true)
+end
 
 function _subproblem_operator(sp::Subproblem, which::Symbol, data::AbstractVector)
     matrix = which === :M ? sp.M_min : sp.L_min
@@ -433,7 +445,7 @@ function _solve_rk_local_mode!(sp, rhs, mx0, F, LX, alg_f, solution, factor,
     a_ii = A_imp[stage, stage]
     if abs(a_ii) > 1e-14
         apply_bc_override!(rhs, alg_f, sp, dt * a_ii)
-        _solve_implicit_stage!(solution, factor, rhs)
+        _solve_implicit_stage!(solution, factor, rhs, sp)
     elseif factor === nothing
         _assign_to_buffer!(solution, rhs)
     else
@@ -1166,7 +1178,7 @@ function _get_or_build_lhs!(sp::Subproblem, stage_idx::Int, dt::Float64, a_ii::F
     # defines `refactor!` — CPU `SparseLUSolver`, GPU `CuSparseLU`
     # (Float64 via cusolverRF). Detected via `hasmethod` so the check is
     # independent of whether CUDA.jl is loaded.
-    if cached !== nothing && is_dirty &&
+    if cached !== nothing && is_dirty && !_gpu_lhs_pinned(sp, a_ii) &&
        hasmethod(MatSolvers.refactor!, Tuple{typeof(cached), typeof(LHS)})
         try
             MatSolvers.refactor!(cached, LHS)
@@ -1201,12 +1213,20 @@ function _get_or_build_lhs!(sp::Subproblem, stage_idx::Int, dt::Float64, a_ii::F
         return lhs_solver
     catch err
         if _gpu_subproblem_execution(sp)
+            pinned = _gpu_singular_factorization(sp, solver_type, LHS, solver_kwargs,
+                                                 "IMEX stage $stage_idx system")
+            if pinned !== nothing
+                sp.LHS_solvers[a_ii] = pinned
+                _mark_gpu_lhs_pinned!(sp, a_ii)
+                return pinned
+            end
             error("GPU subproblem factorization failed for group=$(sp.group), " *
                   "stage=$stage_idx; CPU sparse/dense fallback is disabled. " *
                   "Original error: $(sprint(showerror, err))")
         end
         # Rank-deficient stage system. Legitimate for a pressure gauge mode of an
-        # incompressible problem (the kx=0 mode of Rayleigh–Bénard reaches here),
+        # incompressible problem (the RealFourier Nyquist mode of Rayleigh–Bénard,
+        # where ∂x vanishes and the pressure constant is undetermined, reaches here),
         # where the least-squares solve is the intended treatment. NOT safe for two
         # tau variables lifted to the same mode under a moving boundary condition
         # (exponentially unstable, 2026-09-05 audit) — that formulation is refused
@@ -1259,6 +1279,9 @@ function _get_or_compute_mass_lu!(sp::Subproblem)
         return mass_solver
     catch err
         if _gpu_subproblem_execution(sp)
+            # No pinning here: a tau/BC mass matrix has empty algebraic rows, so
+            # its right-hand side is inconsistent by construction and the pinned
+            # solution would differ from the CPU's least-squares one.
             error("GPU mass-matrix factorization failed for group=$(sp.group); " *
                   "CPU sparse fallback is disabled. Original error: " *
                   "$(sprint(showerror, err))")

@@ -346,6 +346,40 @@ has_metal() = _metal_functional(Val(:metal))
 _metal_functional(::Any) = false
 
 _default_field_dtype(::AbstractArchitecture) = Float64
+
+"""
+    _device_supports_float64(arch) -> Bool
+
+Whether kernels and allocations on `arch` may use double precision. Apple GPUs
+(Metal) cannot, so no Float64 value may reach their kernels or arrays.
+"""
+_device_supports_float64(::AbstractArchitecture) = true
+
+"""
+    _widest_real_type(a::AbstractArray) -> Type
+
+Widest real type that `a`'s device computes in: at least Float64, or `a`'s own
+real type on a device without Float64. Code that accumulates or applies host
+constants in double precision on the CPU, CUDA or ROCm uses this so the same code
+also runs on Metal, without changing results elsewhere.
+"""
+_widest_real_type(a::AbstractArray) =
+    _device_supports_float64(architecture(a)) ? promote_type(real(eltype(a)), Float64) :
+                                                real(eltype(a))
+
+"""
+    _storable_field_dtype(arch, T) -> Type
+
+Element type a field on `arch` stores for an arithmetic result promoted to `T`.
+A device without Float64 narrows it to single precision, so a Float64 scalar
+literal cannot produce a field the device refuses to allocate.
+"""
+_storable_field_dtype(arch::AbstractArchitecture, ::Type{T}) where {T} =
+    _device_supports_float64(arch) ? T : _single_precision(T)
+_single_precision(::Type{<:Complex}) = ComplexF32
+_single_precision(::Type{<:AbstractFloat}) = Float32
+_single_precision(::Type{T}) where {T} = T
+
 _coordinate_array(arch::AbstractArchitecture, ::Type, values) = to_architecture(arch, values)
 _coordinate_array(arch::GPU, T::Type, values) = on_architecture(arch, convert(AbstractArray{real(T)}, values))
 _validate_gpu_field_dtype(::AbstractArchitecture, ::Type) = nothing

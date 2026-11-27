@@ -602,6 +602,8 @@ or `apply_forcing!` in your time loop.
   `DeterministicForcing`). It must be constructed for the target field's architecture —
   `architecture = field.dist.architecture`; the constructors default to `CPU()` — and a
   mismatch (e.g. a CPU forcing on a GPU field) raises `ArgumentError`.
+  Stochastic forcing must also match the target's global physical grid size.
+  Register before previewing the first draw to use the synchronized random stream.
 
 ## Example
 
@@ -691,11 +693,14 @@ function add_stochastic_forcing!(problem::InitialValueProblem, variable::Symbol,
         end
     end
     target_field = state_fields[var_idx]
-    # Before the RNG synchronization below, so a refused forcing is left untouched.
-    _check_forcing_architecture(forcing, target_field)
-
     if forcing isa StochasticForcingType
+        # All ranks must agree on validation before any rank enters the seed broadcast.
+        _collectively(target_field.dist, "stochastic forcing registration") do
+            _check_stochastic_forcing_target(forcing, target_field)
+        end
         _synchronize_forcing_rng!(forcing, target_field.dist.comm)
+    else
+        _check_forcing_architecture(forcing, target_field)
     end
 
     # Store in stochastic_forcings dict keyed by variable index

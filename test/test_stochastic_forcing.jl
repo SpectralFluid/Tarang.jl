@@ -17,6 +17,7 @@ using Test
 using Random
 using LinearAlgebra
 using Tarang
+isdefined(@__MODULE__, :check_forcing_grid_registration) || include("stochastic_forcing_layout_cases.jl")
 
 println("=" ^ 60)
 println("Stochastic Forcing Tests")
@@ -42,6 +43,7 @@ function cpu_work_diagnostic_allocations(forcing, sol)
 end
 
 @testset "StochasticForcing" begin
+    check_forcing_grid_registration(CPU())
 
     @testset "CPU Construction" begin
         # Test 1D construction
@@ -141,6 +143,22 @@ end
 
     @testset "Physical spectrum normalization and validation" begin
         ε = 0.125
+
+        # A smooth broadband spectrum exposes loss in a linear Float32 sum
+        # without allocating the 2^24 equal-weight modes needed for saturation.
+        dims = (64, 64, 64)
+        L = (2π, 2π, 2π)
+        k = Tarang.build_wavenumbers(dims, L, Float32)
+        for metric in (:direct, :vorticity_kinetic)
+            spectrum = compute_forcing_spectrum(k, 18, 8, ε, L, :ring, Float32; injection_metric=metric)
+            power = sum(CartesianIndices(spectrum)) do I
+                k2 = sum(d -> abs2(Float64(k[d][I[d]])), 1:3)
+                amplitude2 = abs2(Float64(spectrum[I]))
+                metric === :direct || iszero(k2) ? amplitude2 : amplitude2 / k2
+            end
+            @test eltype(spectrum) === Float32
+            @test power / (2 * prod(dims)^2) ≈ ε rtol=2eps(Float32)
+        end
 
         # Tarang stores unnormalized full FFT coefficients, so Parseval's
         # normalization is M⁻² and must not depend on grid resolution.
@@ -1033,6 +1051,7 @@ end
     end
 
     if gpu_available
+        check_forcing_grid_registration(GPU(backend=:cuda))
         println("\nGPU tests (CUDA available):")
 
         @testset "GPU Construction" begin

@@ -1,4 +1,13 @@
-Tarang._device_aware_mpi(::ROCGPU) = MPI.has_rocm()
+# MPI.jl only probes Open MPI 5+. Cray MPICH (Frontier, LUMI) enables GPU
+# transport with MPICH_GPU_SUPPORT_ENABLED=1; TARANG_ROCM_AWARE_MPI overrides both,
+# like TARANG_CUDA_AWARE_MPI does for CUDA.
+function Tarang._device_aware_mpi(::ROCGPU)
+    override = uppercase(strip(get(ENV, "TARANG_ROCM_AWARE_MPI", "")))
+    override in ("1", "TRUE", "YES") && return true
+    override in ("0", "FALSE", "NO") && return false
+    MPI.has_rocm() && return true
+    return get(ENV, "MPICH_GPU_SUPPORT_ENABLED", "") == "1"
+end
 Tarang._verify_device_aware_mpi(arch::ROCGPU) = Tarang._device_aware_mpi(arch)
 
 const _LOCAL_FFT_PLANS = Dict{Tuple,Any}()

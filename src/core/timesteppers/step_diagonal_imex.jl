@@ -894,65 +894,60 @@ end
     return d
 end
 
-"""
-    step_distributed_diagonal_etd_rk222!(state, solver)
-
-ETDRK2 (Cox-Matthews 2002) with the linear operator treated diagonally per
-Fourier mode, for MPI pure-Fourier problems. Each time-stepped field is
-propagated as `Xₙ₊₁ = c + dt·φ₂⊙(N(c) − N(Xₙ))`, `c = exp(z)⊙Xₙ + dt·φ₁⊙N(Xₙ)`,
-with `z = -dt·L̂` element-wise. Algebraic variables are refreshed between stages.
-"""
-function step_distributed_diagonal_etd_rk222!(state::TimestepperState, solver::InitialValueSolver)
-    current_state = state.history[end]
+"""Apply ETD-RK2 or variable-step exponential AB2 to the local Fourier modes."""
+function _step_distributed_diagonal_etd!(state::TimestepperState, solver::InitialValueSolver,
+                                         multistep::Bool)
+    current = last(state.history)
     dt = state.dt
     t = solver.sim_time
     Lhats = _get_distributed_diagonal_Lhats!(state, solver)
     phis = _get_distributed_diagonal_phi!(state, dt, Lhats)
 
-    # N(Xₙ) must survive the corrector's second evaluate_rhs (which reuses buffers).
-    # Reuse a persistent 1-slot cache + coeff-copy instead of copy_state every step;
-    # only φ-fields (those read by the predictor/corrector) are written.
-    n_fields = length(current_state)
-    _Nn_src = evaluate_rhs(solver, current_state, t)
-    _group_rhs_coefficients!(_Nn_src)
-    N_n = _ddetd_nn_cache!(state, current_state, n_fields)
-    @inbounds for i in 1:n_fields
-        haskey(phis, i) || continue
-        fr = _Nn_src[i]
-        _ddirk_copy!(_local_coeff(get_coeff_data(N_n[i])), _local_coeff(coeff_data!(fr)))
-        N_n[i].current_layout = :c
-    end
-    _release_rhs_buffer!(_Nn_src, solver)   # N(Xₙ) is now in the cache; free the shared buffer
-                                            # before the corrector's evaluate_rhs reuses it.
-
-    # Predictor: c = exp(z)⊙Xₙ + dt·φ₁⊙N(Xₙ). `pred` reuses the history-dropped
-    # field-set (ETD is one-step — reads only history[end]=current_state — so the
-    # recycled set is provably not live) instead of a fresh copy_state.
-    pred = _ddirk_acquire_xnew!(state, current_state, n_fields)
-    for (i, field) in enumerate(pred)
-        haskey(phis, i) || continue
-        ensure_layout!(field, :c); ensure_layout!(current_state[i], :c); ensure_layout!(N_n[i], :c)
-        expz, ph1, _ = phis[i]
-        _ddetd_predictor!(_local_coeff(get_coeff_data(field)),
-                          _local_coeff(get_coeff_data(current_state[i])),
-                          expz, ph1, _local_coeff(get_coeff_data(N_n[i])), dt)
+    N = _timestep_field_state!(state, :dd_etd_current_N, current)
+    rhs = evaluate_rhs(solver, current, t)
+    try
+        _group_rhs_coefficients!(rhs)
+        for i in keys(phis)
+            _ddirk_copy!(_local_coeff(coeff_data!(N[i])), _local_coeff(coeff_data!(rhs[i])))
+        end
+    finally
+        _release_rhs_buffer!(rhs, solver)
     end
 
-    # Corrector: Xₙ₊₁ = c + dt·φ₂⊙(N(c) − N(Xₙ)), written in place into `pred`.
-    # evaluate_rhs refreshes pred's algebraic state internally (no separate refresh).
-    N_c = evaluate_rhs(solver, pred, t + dt)
-    _group_rhs_coefficients!(N_c)
-    for (i, field) in enumerate(pred)
-        haskey(phis, i) || continue
-        ensure_layout!(field, :c); ensure_layout!(N_c[i], :c); ensure_layout!(N_n[i], :c)
-        _, _, ph2 = phis[i]
-        _ddetd_corrector!(_local_coeff(get_coeff_data(field)), ph2,
-                          _local_coeff(get_coeff_data(N_c[i])),
-                          _local_coeff(get_coeff_data(N_n[i])), dt)
+    candidate = _ddirk_acquire_xnew!(state, current, length(current))
+    for (i, (E, phi1, _)) in phis
+        _ddetd_predictor!(_local_coeff(coeff_data!(candidate[i])),
+                          _local_coeff(coeff_data!(current[i])), E, phi1,
+                          _local_coeff(coeff_data!(N[i])), dt)
     end
-    _release_rhs_buffer!(N_c, solver)   # corrector RHS consumed; free the shared buffer
-    _refresh_algebraic_state!(solver.problem, pred)
-    _ddirk_push_recycle!(state, pred)
+
+    previous = get(state.timestepper_data, :dd_etd_previous_N, nothing)
+    use_history = multistep && previous !== nothing
+    if use_history
+        newer, older = N, previous
+        weight = dt * (dt / get_previous_timestep(state))
+    else
+        state.current_substep = 2
+        newer, older = evaluate_rhs(solver, candidate, t + dt), N
+        weight = dt
+    end
+    try
+        use_history || _group_rhs_coefficients!(newer)
+        for (i, (_, _, phi2)) in phis
+            _ddetd_corrector!(_local_coeff(coeff_data!(candidate[i])), phi2,
+                              _local_coeff(coeff_data!(newer[i])),
+                              _local_coeff(coeff_data!(older[i])), weight)
+        end
+    finally
+        use_history || _release_rhs_buffer!(newer, solver)
+    end
+    _refresh_algebraic_state!(solver.problem, candidate)
+    _ddirk_push_recycle!(state, candidate)
+    if multistep
+        state.timestepper_data[:dd_etd_current_N] = _timestep_field_state!(state, :dd_etd_previous_N, N)
+        state.timestepper_data[:dd_etd_previous_N] = N
+    end
+    return nothing
 end
 
 # ============================================================================
@@ -1158,23 +1153,6 @@ function _ddirk_push_recycle!(state::TimestepperState, X_new)
     return state.history
 end
 
-"""Persistent single field-set holding N(Xₙ) across the ETD corrector's second
-`evaluate_rhs` (which reuses buffers), reused every step in place of
-`copy_state(evaluate_rhs(...))`. Mirrors `_ddirk_fs_cache!` with one set; the
-caller writes only φ-fields, non-φ slots are never read. (Re)built on missing set
-or field-count change."""
-function _ddetd_nn_cache!(state::TimestepperState, template, n_fields::Int)
-    cache = get!(() -> Vector{ScalarField}[],
-                 state.timestepper_data, :_ddetd_Nn)::Vector{Vector{ScalarField}}
-    if isempty(cache) || length(cache[1]) != n_fields
-        for f in template
-            isempty(f.bases) || ensure_layout!(f, :c)
-        end
-        empty!(cache)
-        push!(cache, copy_state(template))
-    end
-    return cache[1]
-end
 
 """Push a copy of `F_n` onto the rolling-2 SBDF2 `Fhist`, reusing the field-set
 dropped from `Fhist` on the previous step (stashed under `:_ddi_sbdf2_frec`) in

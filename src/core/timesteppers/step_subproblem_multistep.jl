@@ -333,7 +333,7 @@ function _solve_multistep_local_mode!(sp, rhs, solution, factor, alg_f,
     if !iszero(b[1])
         apply_bc_override!(rhs, alg_f, sp, b[1])
     end
-    _solve_implicit_stage!(solution, factor, rhs)
+    _solve_implicit_stage!(solution, factor, rhs, sp)
     return nothing
 end
 
@@ -372,7 +372,7 @@ function _get_or_build_multistep_lhs!(sp::Subproblem, a0::Float64, b0::Float64)
     # any future solver that opts in), call it to reuse the symbolic
     # factorization. Detected via `hasmethod` so the GPU path doesn't
     # need a hard dependency on CUDA.jl being loaded.
-    if cached !== nothing && cached_k !== nothing &&
+    if cached !== nothing && cached_k !== nothing && !_gpu_lhs_pinned(sp, cache_key) &&
        hasmethod(MatSolvers.refactor!, Tuple{typeof(cached), typeof(LHS)})
         try
             MatSolvers.refactor!(cached, LHS)
@@ -394,6 +394,14 @@ function _get_or_build_multistep_lhs!(sp::Subproblem, a0::Float64, b0::Float64)
         return lhs_solver
     catch err
         if _gpu_subproblem_execution(sp)
+            pinned = _gpu_singular_factorization(sp, solver_type, LHS, solver_kwargs,
+                                                 "multistep system")
+            if pinned !== nothing
+                sp.matrices[cache_key] = pinned
+                sp.matrices[cache_key_k] = current_key
+                _mark_gpu_lhs_pinned!(sp, cache_key)
+                return pinned
+            end
             error("GPU multistep factorization failed for group=$(sp.group); " *
                   "CPU sparse/dense fallback is disabled. Original error: " *
                   "$(sprint(showerror, err))")
@@ -477,15 +485,18 @@ end
     return a, ((8 + 1/w)/16, (7 - 1/w)/16, 1/16), c
 end
 
-"""CNLF2 coefficients (Wang 2008 eqn 2.11) for current/previous timestep: a
-three-level leapfrog mass stencil, a wide Crank–Nicolson L stencil, and F at the
-current level only. Reduces to the classical CNLF at w1 = 1. The same numbers
-`step_cnlf2!` builds inline for the global-matrix path."""
+"""Integrate from tₙ₋₁ to tₙ₊₁ using trapezoidal L and the linear interpolant of F.
+
+The interval midpoint is displaced from tₙ by (dt - dt_prev)/2. Evaluating the
+interpolant there integrates it exactly. The homogeneous recurrence Xₙ₊₁ = Xₙ₋₁
+keeps both leapfrog modes bounded as step sizes change.
+"""
 @inline function _cnlf2_coefs(dt::Float64, dt_prev::Float64)
-    w1 = dt / dt_prev
-    a = (1.0 / ((1.0 + w1) * dt), (w1 - 1.0) / dt, -w1^2 / ((1.0 + w1) * dt))
-    b = (1.0 / (2.0 * w1), (1.0 - 1.0 / w1) / 2.0, 0.5)
-    c = (0.0, 1.0, 0.0)
+    inv_span = 1.0 / (dt_prev + dt)
+    shift = (dt - dt_prev) / dt_prev / 2
+    a = (inv_span, 0.0, -inv_span)
+    b = (0.5, 0.0, 0.5)
+    c = (0.0, 1.0 + shift, -shift)
     return a, b, c
 end
 

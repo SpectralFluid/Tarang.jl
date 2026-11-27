@@ -4,6 +4,7 @@ using Test, Tarang, AMDGPU, LinearAlgebra
 using Tarang: MPI, FFTW
 using .FFTW: fft, rfft
 using Random
+include("stochastic_forcing_layout_cases.jl")
 
 const roc = Base.get_extension(Tarang, :TarangAMDGPUExt)
 const comm = MPI.COMM_WORLD
@@ -161,6 +162,7 @@ if has_amdgpu()
     end
     if MPI.Comm_size(comm) == 1
         @testset "AMD GPU numerical checks" begin
+            check_forcing_grid_registration(arch)
             check_gpu_workspace_cases(arch, roc, () -> AMDGPU.alloc_stats.alloc_bytes)
             sample = AMDGPU.zeros(Float32, 8, 12)
             fwd, invplan, spectrum = roc._plan_real_workspace(arch, sample, (1,2), (5,12))
@@ -243,6 +245,7 @@ if has_amdgpu()
     else
         @testset "ROCm-aware MPI on device arrays" begin
             check_half_pencils(arch)
+            check_distributed_forcing_slabs(arch, comm)
             MPI.Comm_size(comm) == 4 && check_half_pencils(arch; mesh=(2,2))
         end
     end

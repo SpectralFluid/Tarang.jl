@@ -1,6 +1,12 @@
+include("cartesian_basis_cases.jl")
+
 # The full-complex FFTW reference covers folds on intersections of Nyquist
 # planes, including reflections on the other axes of a real half spectrum.
 function check_gpu_workspace_cases(arch, ext, alloc_bytes; reusable_real_fft=true)
+    @testset "Cartesian basis products and operators" begin
+        check_cartesian_products(arch, Float32, Tarang.MPI.COMM_SELF)
+        check_cartesian_operators(arch, Float32)
+    end
     @testset "GPU grid resize parity and buffer reuse" begin
         rng = MersenneTwister(84)
         for T in (Float32, ComplexF32), (small, large) in (

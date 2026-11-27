@@ -496,8 +496,10 @@ end
 function _apply_rfft_weights!(density::AbstractArray, N::Int, offset_k::Int)
     max_interior_k = iseven(N) ? (N ÷ 2 - 1) : (N ÷ 2)
     n1 = size(density, 1)
-    # Local row i holds global rfft mode k = i - 1 + offset_k.
-    weights = [1 <= i - 1 + offset_k <= max_interior_k ? 2.0 : 1.0 for i in 1:n1]
+    # Local row i holds global rfft mode k = i - 1 + offset_k. The weights take
+    # the density's precision, so a Float32-only device never receives Float64.
+    W = real(eltype(density))
+    weights = W[1 <= i - 1 + offset_k <= max_interior_k ? 2 : 1 for i in 1:n1]
     shape = ntuple(d -> d == 1 ? n1 : 1, ndims(density))
     density .*= _logical_multiplier(density, reshape(weights, shape))
     return density
@@ -520,8 +522,10 @@ function calculate_spectral_kinetic_energy(velocity::VectorField; apply_conjugat
 
     # Get first component to determine array size (GPU-compatible allocation)
     first_component = velocity.components[1]
-    ke_spectral = similar(coeff_data!(first_component), Float64)
-    fill!(ke_spectral, zero(Float64))
+    first_coeffs = coeff_data!(first_component)
+    W = _widest_real_type(first_coeffs)   # Float64, except on a Float32-only device
+    ke_spectral = similar(first_coeffs, W)
+    fill!(ke_spectral, zero(W))
 
     # Sum |û_i|² over all velocity components
     for component in velocity.components
@@ -535,7 +539,7 @@ function calculate_spectral_kinetic_energy(velocity::VectorField; apply_conjugat
     # Callers computing a plain squared magnitude Σ|v̂_i|² (e.g. enstrophy spectrum
     # of the vorticity vector) pass apply_half=false to skip the ½.
     if apply_half
-        ke_spectral .*= 0.5
+        ke_spectral .*= W(0.5)
     end
 
     return ke_spectral
@@ -905,7 +909,7 @@ function calculate_spectral_power(field::ScalarField; apply_conjugate_symmetry::
     coeff_data = coeff_data!(field)
 
     # Compute |f̂|²
-    power_spectral = similar(coeff_data, Float64)
+    power_spectral = similar(coeff_data, _widest_real_type(coeff_data))
     power_spectral .= abs2.(coeff_data)
 
     apply_conjugate_symmetry && _weight_real_spectrum!(power_spectral, field)

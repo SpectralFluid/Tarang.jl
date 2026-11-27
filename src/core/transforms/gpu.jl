@@ -262,10 +262,10 @@ function _gpu_forward_transform_backend! end
 function _gpu_backward_transform_backend! end
 
 _gpu_forward_transform_backend!(::AbstractArchitecture, ::ScalarField) =
-    error("GPU forward transform backend is unavailable. Load CUDA.jl or AMDGPU.jl before " *
+    error("GPU forward transform backend is unavailable. Load CUDA.jl, AMDGPU.jl or Metal.jl before " *
           "constructing GPU fields; CPU fallback is disabled.")
 _gpu_backward_transform_backend!(::AbstractArchitecture, ::Any) =
-    error("GPU backward transform backend is unavailable. Load CUDA.jl or AMDGPU.jl before " *
+    error("GPU backward transform backend is unavailable. Load CUDA.jl, AMDGPU.jl or Metal.jl before " *
           "constructing GPU fields; CPU fallback is disabled.")
 
 """

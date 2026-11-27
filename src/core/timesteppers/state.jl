@@ -555,7 +555,12 @@ function _generate_one_forcing!(forcing::DeterministicForcing,
         "'$(target_field.name)' has $(length(target_field.bases)) bases.",
     ))
 
-    raw_grids = local_grids(target_field.dist, target_field.bases...)
+    # User forcing functions are ordinary Julia code with Float64 constants and a
+    # Float64 `sim_time`. Evaluate them on device grids where the device runs
+    # Float64; on a device without it (Metal) evaluate on the host —
+    # `generate_forcing!` converts the values and uploads them.
+    raw_grids = local_grids(target_field.dist, target_field.bases...;
+                            move_to_arch=_device_supports_float64(target_field.dist.architecture))
     local_shape = ntuple(axis -> length(raw_grids[axis]), n_dims)
     local_shape == forcing.field_size || throw(ArgumentError(
         "DeterministicForcing field_size $(forcing.field_size) does not match " *

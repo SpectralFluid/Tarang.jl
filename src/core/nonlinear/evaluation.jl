@@ -97,18 +97,10 @@ end
 
 """Efficiently multiply two fields using transform method and proper dealiasing.
 
-    Uses proper 3/2-rule padded dealiasing (Orszag 1971) when possible:
-    - CPU serial: full padded dealiasing on all Fourier dimensions
-    - GPU serial: full padded dealiasing using GPU FFTs (CUFFT)
-    - MPI distributed: full padded dealiasing on ALL Fourier dimensions
-      (including the decomposed one) via PencilArrays transpose-pad — matches
-      the serial result to roundoff for 2D + 3D pure-Fourier and mixed
-      Fourier×(Chebyshev/Jacobi) fields (`evaluate_padded_multiply_distributed`).
-
-    Falls back to local 2/3-rule truncation-after-multiply when padded dealiasing
-    does not apply: no Fourier bases, or (distributed only) >3D, a decomposed
-    non-Fourier axis, or a Fourier axis with N ≤ 4 (matching serial's small-grid
-    skip).
+    Fourier and ChebyshevT axes with padding enabled evaluate the product on
+    an oversampled grid and project back to the retained modes. Serial CPU
+    and GPU use FFTs. MPI resizes each axis while its pencil is local.
+    Other polynomial axes keep their original collocation nodes.
 
     # Buffer ownership
 
@@ -140,9 +132,15 @@ function evaluate_transform_multiply(field1::ScalarField, field2::ScalarField, e
             "'$(field2.name)' has bases=$(field2.bases). " *
             "Both fields must be defined on the same domain."))
     end
+    if _has_nonunit_arithmetic_scale(field1) || _has_nonunit_arithmetic_scale(field2)
+        # Scaled fields use the caller's working grid, as in field arithmetic.
+        result = field1 * field2
+        ensure_layout!(result, result_layout)
+        return result
+    end
 
     # Try proper 3/2-rule padded dealiasing. Gate on the per-axis basis `dealias`
-    # settings (factor > 1 on any Fourier axis) rather than the evaluator's global
+    # settings (factor > 1 on a Fourier or ChebyshevT axis) rather than the evaluator's global
     # default, so bases set to dealias ≤ 1 are computed without dealiasing.
     if _any_axis_dealias(field1.bases, evaluator.dealiasing_factor)
         T = field1.dtype <: Complex ? real(field1.dtype) : field1.dtype
@@ -192,8 +190,7 @@ function evaluate_transform_multiply(field1::ScalarField, field2::ScalarField, e
         end
     end
 
-    # Fallback: direct multiplication + truncation-after-multiply dealiasing
-    # (only reached for fields with no Fourier bases, or dealiasing_factor <= 1)
+    # Direct product for bases without an active padded workspace.
     ensure_layout!(field1, :g)
     ensure_layout!(field2, :g)
     result = ScalarField(field1.dist, "_nl_product", field1.bases, field1.dtype)
@@ -208,9 +205,6 @@ function evaluate_transform_multiply(field1::ScalarField, field2::ScalarField, e
         gpu_multiply_fields!(result["g"], field1["g"], field2["g"])
     end
 
-    # Only apply truncation-after-multiply dealiasing if a Fourier axis requests it
-    # (dealias > 1). For pure Chebyshev/Legendre fields, or bases with dealias ≤ 1,
-    # the forward/backward roundtrip in apply_basic_dealiasing! is skipped.
     if _any_axis_dealias(field1.bases, evaluator.dealiasing_factor)
         apply_basic_dealiasing!(result, evaluator.dealiasing_factor)
     end
@@ -234,9 +228,39 @@ function gpu_multiply_fields!(result_data::AbstractArray, data1::AbstractArray, 
     return result_data
 end
 
-# Resize one Fourier axis while a rank owns the entire axis. The source and
-# destination pencils have identical transverse ranges in this layout.
-function _resize_transpose_axis!(dst, src, axis)
+# Number of physical nodes to use in a padded product. Lobatto endpoints
+# correspond to the endpoints of half an even periodic grid.
+function _padded_product_nodes(basis, n, factor)
+    strength = _axis_dealias_factor(basis, factor)
+    if basis isa FourierBasis
+        return _padded_fourier_size(n, strength)
+    elseif basis isa ChebyshevT && n > 1 && strength > 1
+        return _padded_fourier_size(2 * (n - 1), strength) ÷ 2 + 1
+    end
+    return n
+end
+
+# The sweep owns the input buffer and may overwrite it. The local DCT uses
+# normalized Chebyshev coefficients, so this resize needs no FFT length factor.
+function _resize_chebyshev_product_axis!(out, input, axis, field)
+    isempty(input) && return out
+    arch = field.dist.architecture
+    if arch isa CPU && field.dist.use_pencil_arrays
+        transforms = _field_transform_bundle(field).transforms
+        transform = only(t for t in transforms if t isa ChebyshevTransform && t.axis == axis)
+        _apply_forward!(input, input, transform)
+        return _apply_backward!(out, input, transform, size(out, axis))
+    end
+    dct_in_dim!(input, axis, :forward, arch)
+    keep = 1:min(size(input, axis), size(out, axis))
+    size(out, axis) > length(keep) && fill!(out, zero(eltype(out)))
+    selectdim(out, axis, keep) .= selectdim(input, axis, keep)
+    return dct_in_dim!(out, axis, :backward, arch)
+end
+
+# Resize one axis while a rank owns the entire axis. Both pencils have the
+# same transverse ranges in this layout.
+function _resize_transpose_axis!(dst, src, axis, field)
     topo = src.topology
     layout = if axis == 1 && topo.Rx > 1
         length(src.global_shape) == 2 && topo.Ry == 1 ? YLocal : XLocal
@@ -249,13 +273,16 @@ function _resize_transpose_axis!(dst, src, axis)
     layout == XLocal && transpose_y_to_x!(src)
     dst.buffers.active_layout[] = layout
     input, output = current_data(src), current_data(dst)
-    if !isempty(input)
+    if field.bases[axis] isa ChebyshevT
+        _resize_chebyshev_product_axis!(output, input, axis, field)
+    elseif !isempty(input)
         arch = src.buffers.architecture
         fft_in_dim!(input, axis, :forward, arch)
+        cosine_dims = field.dtype <: Real ? (axis,) : ()
         if dst.global_shape[axis] > src.global_shape[axis]
-            _pad_spectral!(output, input, size(input), size(output), [axis])
+            _pad_spectral!(output, input, size(input), size(output), [axis], cosine_dims)
         else
-            _truncate_spectral!(output, input, size(output), size(input), [axis])
+            _truncate_spectral!(output, input, size(output), size(input), [axis], cosine_dims)
         end
         fft_in_dim!(output, axis, :backward, arch)
     end
@@ -264,28 +291,26 @@ function _resize_transpose_axis!(dst, src, axis)
     return dst
 end
 
-"""Padded Fourier product on the explicit transpose backend, using rank-local buffers."""
+"""Padded product on the explicit transpose backend, using rank-local buffers."""
 function _transpose_padded_product(a, b, evaluator, result_layout)
     dist = a.dist
     dist.closed && throw(ArgumentError("cannot multiply fields on a closed Distributor"))
     shape = map(basis -> basis.meta.size, a.bases)
-    axes_to_pad = findall(eachindex(shape)) do d
-        a.bases[d] isa FourierBasis && _axis_dealias_factor(a.bases[d], evaluator.dealiasing_factor) > 1
-    end
+    padded_shape = ntuple(d -> _padded_product_nodes(a.bases[d], shape[d], evaluator.dealiasing_factor), length(shape))
+    axes_to_pad = findall(d -> padded_shape[d] != shape[d], eachindex(shape))
     padded_workspace(sz) = get!(dist.transpose_workspace_cache, (:nonlinear, sz, a.dtype)) do
         _build_transpose_workspace(a, sz, nothing)
     end
     stages = [padded_workspace(shape)]
     for axis in axes_to_pad
-        factor = _axis_dealias_factor(a.bases[axis], evaluator.dealiasing_factor)
-        shape = Base.setindex(shape, _padded_fourier_size(shape[axis], factor), axis)
+        shape = Base.setindex(shape, padded_shape[axis], axis)
         push!(stages, padded_workspace(shape))
     end
     function interpolate!(field)
         first(stages).buffers.active_layout[] = ZLocal
         first(stages).buffers.z_local_data .= grid_data!(field)
         for (i, axis) in enumerate(axes_to_pad)
-            _resize_transpose_axis!(stages[i+1], stages[i], axis)
+            _resize_transpose_axis!(stages[i+1], stages[i], axis, field)
         end
         return last(stages).buffers.z_local_data
     end
@@ -306,11 +331,12 @@ function _transpose_padded_product(a, b, evaluator, result_layout)
         padded .*= saved
     end
     for i in reverse(eachindex(axes_to_pad))
-        _resize_transpose_axis!(stages[i], stages[i+1], axes_to_pad[i])
+        _resize_transpose_axis!(stages[i], stages[i+1], axes_to_pad[i], a)
     end
     result = _checkout_nl_result!(evaluator, a)
     data = first(stages).buffers.z_local_data
-    scale = prod(shape) / prod(first(stages).global_shape)
+    T = real(result.dtype)
+    scale = prod((T(shape[d]) / T(first(stages).global_shape[d]) for d in axes_to_pad if a.bases[d] isa FourierBasis); init=one(T))
     if result.dtype <: Real
         get_grid_data(result) .= scale .* real.(data)
     else
@@ -462,16 +488,8 @@ function _padded_dist_inv_plan!(ws::PaddedDistDealiasWorkspace, arr, a::Int)
     return p
 end
 
-# ── Full 3/2-rule padded dealiasing under MPI (N-D all-Fourier) ──────────────
-# Re-implements the serial padded product (evaluate_padded_multiply) for a
-# DISTRIBUTED field: pad each Fourier axis WHEN that axis is local, transposing to
-# bring each decomposed axis local in turn (PencilFFTs decomposes D-1 axes, keeping
-# one local; single-swap transposes cycle the local axis through all D). Reuses the
-# SAME per-axis pad/truncate helpers as serial (incl. even-N Nyquist split/fold) +
-# scale ∏(M_d/N_d) once, so it matches serial to ROUNDOFF (verified Real+Complex
-# Fourier, 2D np=2/4 + 3D np=2/4). Returns `nothing` for cases not covered (>3D,
-# mixed bases, not pencil-decomposed) → caller falls back to truncation-after-
-# multiply. Round-7 audit 2026-06-23.
+# Resize one local pencil axis at a time. Fourier FFT normalization is applied
+# once after truncation. The Chebyshev DCTs carry their own normalization.
 function evaluate_padded_multiply_distributed(field1::ScalarField, field2::ScalarField,
                                               evaluator::NonlinearEvaluator; result_layout::Symbol=:g)
     bases = field1.bases
@@ -485,14 +503,9 @@ function evaluate_padded_multiply_distributed(field1::ScalarField, field2::Scala
     T = field1.dtype <: Complex ? real(field1.dtype) : field1.dtype
     CT = Complex{T}
     N = ntuple(d -> bases[d].meta.size, D)
-    # Only Fourier axes are 3/2-padded (matching serial evaluate_padded_multiply,
-    # which pads only fourier_dims); non-Fourier (Chebyshev/Jacobi) axes keep their
-    # nodal grid and are left untouched. Mp[d] == N[d] for non-Fourier axes.
-    Mp = ntuple(D) do d
-        isfourier(bases[d]) || return N[d]
-        return _padded_fourier_size(N[d], _axis_dealias_factor(bases[d], factor))
-    end
-    any(d -> Mp[d] > N[d], fourier_axes) || return nothing
+    Mp = ntuple(d -> _padded_product_nodes(bases[d], N[d], factor), D)
+    padded_axes = Tuple(d for d in 1:D if Mp[d] != N[d])
+    isempty(padded_axes) && return nothing
     ensure_layout!(field1, :g); ensure_layout!(field2, :g)
     gd1 = get_grid_data(field1); gd2 = get_grid_data(field2)
     (gd1 isa PencilArrays.PencilArray && gd2 isa PencilArrays.PencilArray) || return nothing
@@ -513,8 +526,14 @@ function evaluate_padded_multiply_distributed(field1::ScalarField, field2::Scala
     ws.transpose_elements = 0
     mkpen(sz, dd) = _padded_dist_pencil!(ws, sz, dd)
 
-    tolog(gd) = begin
-        gc = _padded_dist_buf!(ws, PencilArrays.pencil(gd)); parent(gc) .= CT.(parent(gd))
+    function tolog(gd, imag_grid=nothing, exponents=(0, 0))
+        gc = _padded_dist_buf!(ws, PencilArrays.pencil(gd))
+        if imag_grid === nothing
+            parent(gc) .= parent(gd)
+        else
+            e1, e2 = exponents
+            parent(gc) .= complex.(ldexp.(parent(gd), -e1), ldexp.(parent(imag_grid), -e2))
+        end
         logical_pen = mkpen(N, decomp0)
         _pen_compatible(PencilArrays.pencil(gc), logical_pen) && return gc
         a = _padded_dist_buf!(ws, logical_pen)
@@ -535,47 +554,58 @@ function evaluate_padded_multiply_distributed(field1::ScalarField, field2::Scala
         _padded_dist_transpose!(ws, nxt, cur)
         (nxt, ndec)
     end
-    # Local-axis pad/truncate: forward FFT in place on the SPENT input buffer `pin`
-    # (never read again), pad/truncate into the
-    # fresh `pout` (a distinct slot/size), then inverse FFT in place. Plan-backed
-    # (no per-call fft()/ifft() allocation); identical FFTW/CUFFT routines + 1/N
-    # normalization as the original out-of-place fft/ifft, so the values match to
-    # roundoff. `_pad_spectral!` zero-fills pout; `_truncate_spectral!` writes full
-    # coverage — both overwrite pout completely before the inverse FFT reads it.
-    pad_local!(pout, pin, a) = begin
-        pp = parent(pin); _padded_dist_fwd_plan!(ws, pp, a) * pp
-        orig = collect(size(pp)); padl = copy(orig); padl[a] = Mp[a]
-        _pad_spectral!(parent(pout), pp, Tuple(orig), Tuple(padl), [a])
-        po = parent(pout); _padded_dist_inv_plan!(ws, po, a) * po
+    function resize_local!(pout, pin, axis)
+        input, output = parent(pin), parent(pout)
+        if bases[axis] isa ChebyshevT
+            return _resize_chebyshev_product_axis!(output, input, axis, field1)
+        end
+        _padded_dist_fwd_plan!(ws, input, axis) * input
+        cosine_dims = field1.dtype <: Real ? (axis,) : ()
+        if size(output, axis) > size(input, axis)
+            _pad_spectral!(output, input, size(input), size(output), [axis], cosine_dims)
+        else
+            _truncate_spectral!(output, input, size(output), size(input), [axis], cosine_dims)
+        end
+        _padded_dist_inv_plan!(ws, output, axis) * output
     end
-    trunc_local!(pout, pin, a) = begin
-        pp = parent(pin); _padded_dist_fwd_plan!(ws, pp, a) * pp
-        orig = collect(size(pp)); trl = copy(orig); trl[a] = N[a]
-        _truncate_spectral!(parent(pout), pp, Tuple(trl), Tuple(orig), [a])
-        po = parent(pout); _padded_dist_inv_plan!(ws, po, a) * po
-    end
-    sweep(start, sdec, ssz, tgt, op, axes_order) = begin
+    sweep(start, sdec, ssz, tgt, axes_order) = begin
         cur = start; dec = collect(sdec); csz = collect(ssz)
-        for a in axes_order   # pad/truncate only Fourier axes; non-Fourier stay nodal/local
+        for a in axes_order
             cur, dec = makelocal(cur, csz, dec, a, 0)
             csz[a] = tgt[a]
             nxt = _padded_dist_buf!(ws, mkpen(csz, dec))
-            op(nxt, cur, a)
+            resize_local!(nxt, cur, a)
             _release_padded_dist_buf!(ws, cur)
             cur = nxt
         end
         cur
     end
 
-    up1 = sweep(tolog(gd1), decomp0, N, Mp, pad_local!, fourier_axes)
-    up2 = sweep(tolog(gd2), decomp0, N, Mp, pad_local!, fourier_axes)
+    # Interpolation with cosine Nyquist bins maps real grids to real grids.
+    # Linearity lets one complex pencil carry both real operands through every
+    # FFT, DCT and transpose. Their product then occupies the same buffer.
+    product_exponent = 0
+    if field1.dtype <: Real && field2.dtype <: Real && _pen_compatible(pen, PencilArrays.pencil(gd2))
+        # Normalize each operand independently so a weak field survives the
+        # packed FFT. Powers of two rescale exactly, including subnormal inputs.
+        peaks = [maximum(abs, parent(g); init=zero(T)) for g in (gd1, gd2)]
+        MPI.Allreduce!(peaks, MPI.MAX, dist.comm)
+        exponents = (last(frexp(peaks[1])), last(frexp(peaks[2])))
+        product_exponent = sum(exponents)
+        up1 = sweep(tolog(gd1, gd2, exponents), decomp0, N, Mp, padded_axes)
+        packed = parent(up1)
+        @. packed = real(packed) * imag(packed)
+    else
+        up1 = sweep(tolog(gd1), decomp0, N, Mp, padded_axes)
+        up2 = sweep(tolog(gd2), decomp0, N, Mp, padded_axes)
+        parent(up1) .*= parent(up2)
+        _release_padded_dist_buf!(ws, up2)
+    end
     pdec = Tuple(PencilArrays.decomposition(PencilArrays.pencil(up1)))
-    parent(up1) .*= parent(up2)
-    _release_padded_dist_buf!(ws, up2)
     # Separable truncations commute. Undo the padding order so the first axis is
     # already local, and shrink each axis BEFORE communicating the next pencil.
-    res = sweep(up1, pdec, Mp, N, trunc_local!, reverse(fourier_axes))
-    parent(res) .*= (T(prod(Mp)) / T(prod(N)))
+    res = sweep(up1, pdec, Mp, N, reverse(padded_axes))
+    parent(res) .*= prod(T(Mp[d]) / T(N[d]) for d in fourier_axes)
 
     result = _checkout_nl_result!(evaluator, field1)
     rg = grid_data!(result)
@@ -600,7 +630,7 @@ function evaluate_padded_multiply_distributed(field1::ScalarField, field2::Scala
     if field1.dtype <: Complex
         parent(rg) .= parent(rc)
     else
-        parent(rg) .= real.(parent(rc))
+        parent(rg) .= ldexp.(real.(parent(rc)), product_exponent)
     end
     _release_padded_dist_buf!(ws, rc)
     ensure_layout!(result, result_layout)

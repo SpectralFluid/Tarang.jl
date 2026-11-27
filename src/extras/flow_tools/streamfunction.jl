@@ -78,10 +78,14 @@ function streamfunction_spectral_invert(vorticity::ScalarField, apply_gauge::Boo
     # by the Poisson equation and is set to zero whether or not `apply_gauge` is
     # requested; zero is the ∫ψ dA = 0 gauge.
     vorticity_spec = get_coeff_data(vorticity)
-    k2 = _logical_multiplier(vorticity_spec, k_squared)
-    gauge = zero(eltype(vorticity_spec)) / one(eltype(k_squared))   # both branches one type
+    # k² is built in Float64 on the host; upload it in the widest precision the
+    # device supports (Float64, or Float32 on Metal), with a matching threshold.
+    R = _widest_real_type(vorticity_spec)
+    k2 = _logical_multiplier(vorticity_spec, convert(AbstractArray{R}, k_squared))
+    gauge = zero(eltype(vorticity_spec)) / one(R)   # both branches one type
+    threshold = R(1e-12)
     psi_spec = get_coeff_data(streamfunction_field)
-    psi_spec .= ifelse.(k2 .> 1e-12, .-vorticity_spec ./ k2, gauge)
+    psi_spec .= ifelse.(k2 .> threshold, .-vorticity_spec ./ k2, gauge)
 
     # NOTE: MPI reduction is NOT needed here.
     # Each rank computes its local spectral coefficients from local vorticity.

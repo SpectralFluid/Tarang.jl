@@ -20,8 +20,10 @@ jobs:
   test:
     name: Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.arch }}
     runs-on: ${{ matrix.os }}
-    # Julia 1.12 on macOS completed the suite just before the old 60-minute limit.
-    timeout-minutes: ${{ matrix.os == 'macOS-latest' && matrix.version == '1.12' && 90 || 60 }}
+    # The suite grew past the old limits: on 2026-11-27 Ubuntu and Windows 1.11 hit
+    # 60 minutes on main, and every macOS job hit its 60/90-minute limit while
+    # still running tests. These are ceilings; jobs end when the suite does.
+    timeout-minutes: ${{ matrix.os == 'macOS-latest' && 150 || 90 }}
     strategy:
       fail-fast: false
       matrix:

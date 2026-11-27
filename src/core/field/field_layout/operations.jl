@@ -65,22 +65,37 @@ function _fill_random!(field::ScalarField, layout::String, seed, distribution::S
             # the backend's own generator.
             _seed_device_rng!(field.dist.architecture, component_seed)
         end
-
-        if distribution == "normal" || distribution == "standard_normal"
-            randn!(data)
-        elseif distribution == "uniform"
-            rand!(data)
-            data .-= 0.5  # Center around zero
-            data .*= 2.0  # Scale to [-1, 1]
-        else
-            throw(ArgumentError("Unknown distribution: $distribution. Use 'normal' or 'uniform'."))
-        end
-
-        data .*= scale
+        _fill_random_local!(data, distribution, scale)
     end
 
     return field
 end
+
+# Rank-local draw from the array's own generator (the backend RNG for device
+# arrays). Constants use the widest precision the device supports, so CPU and
+# CUDA results are unchanged and a Float32-only device (Metal) never receives a
+# Float64 kernel argument.
+function _fill_random_local!(data::AbstractArray, distribution::String, scale::Real)
+    W = _widest_real_type(data)
+    if distribution == "normal" || distribution == "standard_normal"
+        _randn_device!(data)
+    elseif distribution == "uniform"
+        rand!(data)
+        data .= (data .- W(0.5)) .* W(2)   # centre on zero, scale to [-1, 1]
+    else
+        throw(ArgumentError("Unknown distribution: $distribution. Use 'normal' or 'uniform'."))
+    end
+    data .*= W(scale)
+    return data
+end
+
+"""
+    _randn_device!(data)
+
+`randn!` for field storage. A backend whose library lacks complex normals
+(rocRAND) adds a method that draws the real and imaginary parts separately.
+"""
+_randn_device!(data::AbstractArray) = randn!(data)
 
 @inline function _field_random_splitmix64(x::UInt64)
     z = x + UInt64(0x9e3779b97f4a7c15)
@@ -174,14 +189,7 @@ function _fill_random_reproducible!(data::AbstractArray, field::ScalarField,
         component_seed = seed + stream[1] * 1000003
         Random.seed!(component_seed)
         _seed_device_rng!(dist.architecture, component_seed)
-        if distribution == "normal" || distribution == "standard_normal"
-            randn!(data)
-        elseif distribution == "uniform"
-            rand!(data)
-            data .-= 0.5
-            data .*= 2.0
-        end
-        data .*= scale
+        _fill_random_local!(data, distribution, scale)
         return
     end
 

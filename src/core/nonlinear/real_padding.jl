@@ -12,6 +12,7 @@ mutable struct RealPaddedDealiasingWorkspace{R,C,PF,PB,SF,SB} <: AbstractNonline
     padded2::R
     padded_spectrum::C
     spectrum::C
+    extended_grid::Union{Nothing,R}
     plan_forward::PF
     plan_backward::PB
     plan_spec_forward::SF
@@ -54,20 +55,17 @@ end
 function _get_real_padded_workspace!(ev, bases, ::Type{T}) where T
     key = (hash(bases), T, hash(:real_padded), _padded_architecture_key(ev.dist.architecture))
     haskey(ev.pencil_transforms, key) && return ev.pencil_transforms[key]
-    dims = findall(b -> b isa Union{RealFourier,ComplexFourier}, collect(bases))
+    shape, padded, dims, cosine_dims = _product_fft_layout(bases, ev.dealiasing_factor)
     isempty(dims) && return nothing
-    shape = map(b -> b.meta.size, bases)
     length(shape) > 3 && return nothing
-    padded = ntuple(length(shape)) do d
-        d in dims ? _padded_fourier_size(shape[d], _axis_dealias_factor(bases[d], ev.dealiasing_factor)) : shape[d]
-    end
     rdim = first(dims)
     half(s) = ntuple(d -> d == rdim ? s[d] ÷ 2 + 1 : s[d], length(s))
     arch = ev.dist.architecture
     a, b = zeros(arch, T, padded...), zeros(arch, T, padded...)
     original = zeros(arch, T, shape...)
     pf, pb, sf, sb, ps, s = _real_padded_fft_plans(arch, a, original, half(padded), half(shape), dims)
-    ws = RealPaddedDealiasingWorkspace(shape, padded, dims, a, b, ps, s, pf, pb, sf, sb, arch, nothing)
+    extended = isempty(cosine_dims) ? nothing : original
+    ws = RealPaddedDealiasingWorkspace(shape, padded, dims, a, b, ps, s, extended, pf, pb, sf, sb, arch, nothing)
     ev.pencil_transforms[key] = ws
     return ws
 end
@@ -185,6 +183,10 @@ function _real_operand_spectrum!(ws, field)
     else
         ensure_layout!(field, :g)
         src = on_architecture(ws.arch, get_local_data(get_grid_data(field)))
+        if ws.extended_grid !== nothing
+            _extend_lobatto_grid!(ws.arch, ws.extended_grid, src)
+            src = ws.extended_grid
+        end
         mul!(ws.spectrum, ws.plan_spec_forward, src)
     end
     return ws.spectrum
@@ -217,8 +219,10 @@ function evaluate_padded_multiply(a::ScalarField, b::ScalarField, ev::NonlinearE
         return result
     end
     dst = get_local_data(grid_data!(result))
-    _padded_inverse!(dst, ws.plan_spec_backward, ws.spectrum)
-    dst .*= scale
+    grid = something(ws.extended_grid, dst)
+    _padded_inverse!(grid, ws.plan_spec_backward, ws.spectrum)
+    values = _lobatto_grid_view(grid, dst)
+    @. dst = values * scale
     result.current_layout = :g
     ensure_layout!(result, result_layout)
     return result

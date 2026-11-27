@@ -418,6 +418,9 @@ function _synchronize_forcing_rng!(forcing::StochasticForcingType, comm::MPI.Com
         MPI.Bcast!(seed_buf, comm; root=0)
     end
     forcing.rng = Random.MersenneTwister(seed_buf[])
+    # A preview made before registration belongs to the previous RNG stream.
+    # Keeping it would let just the ranks with a preview skip the first draw.
+    forcing.last_update_time == -Inf || reset_forcing!(forcing)
     return forcing
 end
 
@@ -649,26 +652,28 @@ function compute_forcing_spectrum(
     # Enforce zero mean (no forcing at k=0)
     spectrum[ntuple(_ -> 1, N)...] = zero(T)
 
-    # Tarang stores unnormalized full FFT coefficients. Parseval therefore
-    # contributes M⁻², where M is the number of physical grid points.
-    weighted_power = zero(T)
-    for I in CartesianIndices(spectrum)
-        k2 = injection_metric === :direct ? zero(T) :
-             sum(d -> wavenumbers[d][I[d]]^2, 1:N)
-        weight = _injection_metric_weight(k2, injection_metric)
-        weighted_power += abs2(spectrum[I]) * weight
-    end
-    M = T(prod(field_size))
-    ε0 = weighted_power / (2 * M^2)
-
+    ε0 = _forcing_spectrum_rate(spectrum, wavenumbers, injection_metric)
     if ε0 > 0
-        # Scale spectrum to achieve target ε
-        spectrum .*= sqrt(T(ε) / ε0)
+        spectrum .*= sqrt(oftype(ε0, ε) / ε0)
     elseif ε > 0
         throw(ArgumentError("forcing spectrum has no representable nonzero modes for positive energy injection rate $ε"))
     end
-
     return spectrum
+end
+
+# Parseval for Tarang's full, unnormalized FFT coefficients.
+function _forcing_spectrum_rate(spectrum::Array{T,N}, wavenumbers, injection_metric) where {T,N}
+    # Setup runs on the host for every backend. Float32 stops counting unit
+    # contributions at 2^24, which materially overdrives broad 3D spectra.
+    W = promote_type(Float64, T)
+    weighted_power = zero(W)
+    for I in CartesianIndices(spectrum)
+        k2 = injection_metric === :direct ? zero(W) :
+             sum(d -> abs2(W(wavenumbers[d][I[d]])), 1:N)
+        weight = _injection_metric_weight(k2, injection_metric)
+        weighted_power += abs2(W(spectrum[I])) * weight
+    end
+    return weighted_power / (2 * W(length(spectrum))^2)
 end
 
 function _fill_spectrum_1d!(spectrum, kx, k_f, dk_f, spectrum_type)

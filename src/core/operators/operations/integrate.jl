@@ -106,7 +106,10 @@ function integrate_along_coord(field::ScalarField, coord::Coordinate)
 
     # Scales change the collocation grid, but not basis.meta.size. Construct
     # quadrature for the actual global grid (after any MPI gather).
-    weights = get_integration_weights(basis, size(data, basis_index))
+    # Weights are built in Float64; use the widest precision the data's device
+    # supports (Float64, or Float32 on Metal) before they meet the data.
+    weights = convert(Vector{_widest_real_type(data)},
+                      get_integration_weights(basis, size(data, basis_index)))
     result_data = integrate_weighted_sum(data, weights, basis_index)
 
     # Create result field with reduced dimensionality
@@ -123,7 +126,8 @@ function integrate_along_coord(field::ScalarField, coord::Coordinate)
         result = ScalarField(result_dist, "int_$(field.name)", new_bases, field.dtype)
         result.scales = field.scales === nothing ? nothing :
             Tuple(field.scales[i] for i in 1:nb if i != basis_index)
-        set_grid_data!(result, result_data)
+        # A Float32 field reduces in wider precision; store at the field's dtype.
+        set_grid_data!(result, convert(AbstractArray{field.dtype}, result_data))
         result.current_layout = :g
         return result
     end

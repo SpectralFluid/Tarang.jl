@@ -1,7 +1,16 @@
 using Test
 using Tarang
 
+include("cartesian_basis_cases.jl")
+
 @testset "Spectral review regressions" begin
+    @testset "Cartesian basis products and operators" begin
+        check_cartesian_products(CPU(), Float64, Tarang.MPI.COMM_SELF)
+        check_cartesian_operators(CPU(), Float64)
+        for height in (0, -1, Inf)
+            @test_throws ArgumentError ChannelDomain3D(4, 5, 6; Lz=height)
+        end
+    end
     @testset "Real Nyquist derivative on the second Fourier axis" begin
         domain = PeriodicDomain(8, 8)
         q = ScalarField(domain, "q")

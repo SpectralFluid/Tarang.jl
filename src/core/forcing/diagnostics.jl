@@ -47,7 +47,7 @@ use `work_stratonovich(forcing, sol) / forcing.dt` instead.
 
 Instantaneous power (energy per unit time).
 """
-function instantaneous_power(forcing::StochasticForcing{T, N, A, CA}, sol::AbstractArray{Complex{T}, N}) where {T, N, A, CA}
+function instantaneous_power(forcing::StochasticForcing{T, N}, sol::Union{ScalarField,AbstractArray{Complex{T}, N}}) where {T, N}
     return _diagnostic_inner_product(forcing, sol)
 end
 
@@ -159,6 +159,9 @@ get_cached_forcing(forcing::SeparableStochasticForcing) = forcing.cached_forcing
 # Serial / single-rank / non-PencilArray inputs are returned unchanged, so
 # existing serial and degenerate (single-rank) configurations are untouched.
 _forcing_reduce_partial(::AbstractArray, partial) = partial
+
+_forcing_reduce_partial(field::ScalarField, partial) =
+    field.dist.size > 1 ? MPI.Allreduce(partial, MPI.SUM, field.dist.comm) : partial
 
 function _forcing_reduce_partial(sol::PencilArrays.PencilArray, partial)
     MPI.Initialized() || return partial

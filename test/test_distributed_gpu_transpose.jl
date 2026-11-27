@@ -13,6 +13,7 @@ These tests verify:
 using Test
 using Tarang
 using MPI
+include("stochastic_forcing_layout_cases.jl")
 
 # Initialize MPI if not already initialized
 if !MPI.Initialized()
@@ -395,6 +396,7 @@ if _HAS_CUDA
         @test cuda_aware
 
         if cuda_aware
+            nprocs > 1 && check_distributed_forcing_slabs(gpu_arch, comm)
             @testset "GPU Construction" begin
                 coords = CartesianCoordinates("x", "y")
                 dist = Distributor(coords; comm=comm, mesh=(nprocs,), dtype=Float32,

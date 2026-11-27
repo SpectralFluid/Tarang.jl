@@ -484,6 +484,7 @@ function _build_initial_value_solver(problem::InitialValueProblem, timestepper;
                                      batched_modes::Union{Nothing, Bool}=nothing,
                                      batched_modes_max_bytes::Int=1 << 30,
                                      threaded_modes::Union{Nothing, Bool}=nothing)
+    h = _checked_timestep(dt, 0.0)
     reset_compiled_problem!(problem)
     setup_domain!(problem)
 
@@ -506,7 +507,7 @@ function _build_initial_value_solver(problem::InitialValueProblem, timestepper;
                                                assembled_global_matrices=false)
 
     solver = InitialValueSolver(base, problem, timestepper, 0.0, 0, Inf, Inf, typemax(Int),
-                                state, Float64(dt), nothing, nothing, time(),
+                                state, h, nothing, nothing, time(),
                                 perf_stats, rhs_fallback_policy, nothing,
                                 provisional_plan)
     attach_evaluator!(solver)

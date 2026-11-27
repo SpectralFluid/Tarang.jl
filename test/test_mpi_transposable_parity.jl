@@ -123,7 +123,9 @@ end
             y = reshape((2π/Ny) .* (oy .- 1), 1, :, 1)
             z = reshape((2π/Nz) .* (0:Nz-1), 1, 1, :)
             grid_data!(marked) .= cis.(3 .* x .+ 2 .* y) .+ cis.(z)
-            expected = 2 .* cis.(3 .* x .+ 2 .* y .+ z) .+ cis.(2 .* z)
+            # Four complex z modes span -2 through +1. The +2 square is
+            # outside that band and only the cross term survives projection.
+            expected = 2 .* cis.(3 .* x .+ 2 .* y .+ z)
             delta = maximum(abs, grid_data!(marked * marked) .- expected; init=0.0)
             @test MPI.Allreduce(delta, MPI.MAX, COMM) < 1e-11
         end
@@ -131,6 +133,32 @@ end
     end
 
     if NP >= 2
+        @testset "Padded Chebyshev and signed Fourier modes on transposed pencils" begin
+            nz, nx, ny = 13, 12, 7
+            mesh = NP == 4 ? (2, 2) : (NP, 1)
+            coords = CartesianCoordinates("z", "x", "y")
+            dist = Distributor(coords; comm=COMM, mesh, dtype=ComplexF64, use_pencil_arrays=false)
+            try
+                bases = (ChebyshevT(coords["z"]; size=nz, dealias=1.5),
+                         ComplexFourier(coords["x"]; size=nx), ComplexFourier(coords["y"]; size=ny))
+                base = ScalarField(dist, "a", bases)
+                a = ScalarField(base, Tarang.TransposableFieldStorage(CPU(), get_grid_data(base), get_coeff_data(base)))
+                b, out = copy(a), copy(a)
+                iz, ix = block_ranges(mesh, nz, nx)
+                polynomial = cospi.(10 .* (iz .- 1) ./ (nz - 1))
+                x = reshape(2π .* (ix .- 1) ./ nx, 1, :, 1)
+                y = reshape(2π .* (0:ny-1) ./ ny, 1, 1, :)
+                grid_data!(a) .= im .* polynomial .* cis.(-6 .* x .+ y)
+                grid_data!(b) .= polynomial .* cis.(x)
+                expected = (im/2) .* cis.(-5 .* x .+ y)
+                Tarang._dealiased_lazy_product!(out, a, b)
+                err = maximum(abs, grid_data!(out) .- expected; init=0.0)
+                @test MPI.Allreduce(err, MPI.MAX, COMM) < 2e-12
+            finally
+                close(dist)
+            end
+        end
+
         @testset "Padded Fourier products and spectra, mesh=$mesh" for mesh in
             (NP == 4 ? ((4, 1), (1, 4), (2, 2)) : ((NP, 1), (1, NP)))
             nx, ny = 12, 10

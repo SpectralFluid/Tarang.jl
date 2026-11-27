@@ -141,7 +141,12 @@ Tarang.CNLF2()    # Crank-Nicolson Leapfrog (CN implicit + centered leapfrog exp
 `(9/16, 6/16, 1/16)` at constant timestep, with variable-step corrections based on
 the current/previous timestep ratio. It has no theta parameter.
 
-`CNLF2` is 2nd order and 2-step. Its explicit leapfrog part is unstable for a
+`CNLF2` is second order on fixed steps and variable steps with bounded adjacent
+step ratios. It integrates over
+the previous and current intervals together. For step ratio `r = dt/dt_prev`,
+the explicit weights on the current and previous RHS are `(1+r)/2` and
+`(1-r)/2`. The implicit term averages the two outer endpoints.
+Its fixed-step explicit leapfrog part is unstable for a
 negative real eigenvalue: for `dt(u) = -a*u`, `a > 0`, the parasitic amplification
 factor is `-a*dt - sqrt(1 + (a*dt)^2)`, whose magnitude exceeds one at every
 positive timestep. Put dissipative terms on the implicit LHS when using CNLF2.
@@ -154,13 +159,14 @@ exponential, which is well suited to very stiff linear operators.
 ```julia
 ETD_RK222()  # 2nd-order exponential Runge-Kutta
 ETD_CNAB2()  # 2nd-order exponential Crank-Nicolson Adams-Bashforth
-ETD_SBDF2()  # 2nd-order exponential semi-implicit BDF
+ETD_SBDF2()  # Same 2nd-order exponential Adams–Bashforth update as ETD_CNAB2
 ```
 
 **Properties**:
 - Order: 2
 - Linear term: exact exponential propagation (via φ-functions)
-- Nonlinear term: explicit (RK / Adams-Bashforth / BDF extrapolation)
+- The nonlinear term uses a two-stage Runge–Kutta update or, after startup,
+  variable-step exponential Adams–Bashforth. These formulas also apply on CPU MPI Fourier grids.
 - Best for problems where the linear part dominates the stiffness.
 
 ## Specialized IMEX-RK

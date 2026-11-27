@@ -196,10 +196,10 @@ Per-axis dealiasing factor, read literally from the basis's `dealias` setting.
 The Fourier bases default to 3/2 (the standard 2/3-rule), so a basis left unset
 still dealiases. Setting `dealias=1` (or any value ≤ 1) disables dealiasing on
 that axis (all modes kept, aliasing accepted); larger values mean stronger
-dealiasing. Non-Fourier bases return the fallback unchanged.
+dealiasing. ChebyshevT uses its own factor and defaults to 1.
 """
 function _axis_dealias_factor(basis, fallback::Float64)
-    isa(basis, Union{RealFourier, ComplexFourier}) || return fallback
+    isa(basis, Union{FourierBasis, ChebyshevT}) || return fallback
     d = basis.meta.dealias
     return d isa Number ? Float64(d) : Float64(first(d))
 end
@@ -233,9 +233,7 @@ end
 """
     _any_axis_dealias(bases, fallback) -> Bool
 
-True if any Fourier axis requests dealiasing (factor > 1). Used to gate the
-nonlinear-product dealiasing: when every Fourier axis has `dealias ≤ 1`, the
-product is computed without any dealiasing.
+True when a Fourier or ChebyshevT axis requests padding for nonlinear products.
 """
 # `field.bases` is abstractly typed (`Tuple{Vararg{Basis}}`), so a plain
 # `for b in bases` loop boxes every element — measurable per-step allocation on
@@ -249,14 +247,14 @@ _any_axis_dealias(bases::Tuple, fallback::Float64) = _any_axis_dealias_tuple(fal
 _any_axis_dealias_tuple(::Float64, ::Tuple{}) = false
 @inline function _any_axis_dealias_tuple(fallback::Float64, bases::Tuple)
     b = bases[1]
-    (isa(b, Union{RealFourier, ComplexFourier}) && _axis_dealias_factor(b, fallback) > 1) && return true
+    (isa(b, Union{FourierBasis, ChebyshevT}) && _axis_dealias_factor(b, fallback) > 1) && return true
     return _any_axis_dealias_tuple(fallback, Base.tail(bases))
 end
 
 # Generic fallback for non-tuple `bases` (e.g. a Vector); not on the hot path.
 function _any_axis_dealias(bases, fallback::Float64)
     for basis in bases
-        isa(basis, Union{RealFourier, ComplexFourier}) || continue
+        isa(basis, Union{FourierBasis, ChebyshevT}) || continue
         _axis_dealias_factor(basis, fallback) > 1 && return true
     end
     return false

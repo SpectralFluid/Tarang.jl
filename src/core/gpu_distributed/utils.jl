@@ -22,7 +22,7 @@ function check_cuda_aware_mpi()
     if haskey(ENV, "TARANG_CUDA_AWARE_MPI")
         val = uppercase(strip(ENV["TARANG_CUDA_AWARE_MPI"]))
         if val in ("1", "TRUE", "YES")
-            @info "CUDA-aware MPI enabled via TARANG_CUDA_AWARE_MPI environment variable"
+            @info "CUDA-aware MPI enabled via TARANG_CUDA_AWARE_MPI environment variable" maxlog=1
             return true
         elseif val in ("0", "FALSE", "NO")
             return false

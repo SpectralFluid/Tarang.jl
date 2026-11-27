@@ -803,7 +803,7 @@ end
 function CuIterativeCG(matrix::AbstractMatrix;
                        tol::Real=1e-10,
                        maxiter::Int=1000,
-                       preconditioner::Symbol=:jacobi,
+                       preconditioner=:jacobi,   # Symbol, vector of diagonal inverses, function or nothing
                        kwargs...)
     if !CUDA_AVAILABLE[]
         error("CUDA not available. Use CPU solver instead.")
@@ -1035,7 +1035,7 @@ function CuIterativeGMRES(matrix::AbstractMatrix;
                           tol::Real=1e-10,
                           maxiter::Int=1000,
                           restart::Int=30,
-                          preconditioner::Symbol=:jacobi,
+                          preconditioner=:jacobi,   # Symbol, vector of diagonal inverses, function or nothing
                           kwargs...)
     if !CUDA_AVAILABLE[]
         error("CUDA not available. Use CPU solver instead.")

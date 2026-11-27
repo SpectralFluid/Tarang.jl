@@ -36,7 +36,9 @@ function kinetic_energy(velocity::VectorField, density::Float64=1.0)
     end
 
     ke_field = ScalarField(velocity.dist, "kinetic_energy", velocity.bases, velocity.dtype)
-    grid_data!(ke_field) .= 0.5 * density .* vel_squared
+    # Scalars take the device's widest precision (Float64; Float32 on Metal).
+    W = _widest_real_type(vel_squared)
+    grid_data!(ke_field) .= W(0.5 * density) .* vel_squared
 
     return ke_field
 end
@@ -64,7 +66,8 @@ function enstrophy(velocity::VectorField)
     enstrophy_field = ScalarField(velocity.dist, "enstrophy", velocity.bases, velocity.dtype)
     ensure_layout!(vorticity_field, :g)
 
-    grid_data!(enstrophy_field) .= 0.5 .* abs2.(get_grid_data(vorticity_field))
+    vorticity_data = get_grid_data(vorticity_field)
+    grid_data!(enstrophy_field) .= _widest_real_type(vorticity_data)(0.5) .* abs2.(vorticity_data)
 
     return enstrophy_field
 end
@@ -97,7 +100,7 @@ function energy_dissipation_rate(velocity::VectorField, viscosity::Float64)
     end
 
     dissipation_field = ScalarField(velocity.dist, "dissipation", velocity.bases, velocity.dtype)
-    grid_data!(dissipation_field) .= viscosity .* strain_rate_squared
+    grid_data!(dissipation_field) .= _widest_real_type(strain_rate_squared)(viscosity) .* strain_rate_squared
 
     return dissipation_field
 end
@@ -124,7 +127,8 @@ function vorticity_transport(velocity::VectorField, vorticity::ScalarField, visc
     lap_vorticity = lap(vorticity)
     diffusion = ScalarField(velocity.dist, "vorticity_diffusion", velocity.bases, velocity.dtype)
     ensure_layout!(lap_vorticity, :g)
-    grid_data!(diffusion) .= viscosity .* get_grid_data(lap_vorticity)
+    lap_data = get_grid_data(lap_vorticity)
+    grid_data!(diffusion) .= _widest_real_type(lap_data)(viscosity) .* lap_data
 
     return (advection=advection, diffusion=diffusion)
 end

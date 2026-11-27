@@ -87,11 +87,13 @@ function Base.:*(a::ScalarField, b::Number)
     # Operand path and return an UNEVALUATED future (the scaling was silently never
     # applied). Promote the dtype so a real field times a complex scalar yields a
     # complex field.
-    T = promote_type(a.dtype, typeof(b))
+    T = _storable_field_dtype(a.dist.architecture, promote_type(a.dtype, typeof(b)))
     result = _allocate_field_arithmetic_result(a, T)
     ensure_layout!(a, :g)
 
-    _local_data(grid_data!(result)) .= b .* _local_data(get_grid_data(a))
+    # The scalar enters the kernel at the result's precision (exact on CPU/CUDA,
+    # where T is the promoted type; Float32 on Metal).
+    _local_data(grid_data!(result)) .= convert(T, b) .* _local_data(get_grid_data(a))
 
     return result
 end

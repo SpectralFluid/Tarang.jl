@@ -1,7 +1,9 @@
-# The same public-API checks run on CPU, the JLArray reference backend and CUDA.
+# The Float64 cases run on CPU, JLArray, CUDA and ROCm. Metal runs the shared
+# variable-step and retry checks with Float32 fields.
 using LinearAlgebra: SingularException
 
 function check_fourier_timestepper_cases(arch)
+    check_variable_timestep_cases(arch, Float64)
     coords = CartesianCoordinates("x", "y")
     dist = Distributor(coords; dtype=Float64, device=arch)
     bases = map(c -> RealFourier(coords[c]; size=8, bounds=(0.0, 2π)), ("x", "y"))
@@ -128,5 +130,86 @@ function check_fourier_timestepper_cases(arch)
                 @test maximum(abs, Array(grid_data!(u)) .- expected) < 2e-13
             end
         end
+    end
+end
+
+function check_variable_timestep_cases(arch, ::Type{T}) where {T<:AbstractFloat}
+    dom = PeriodicDomain(8; device=arch, dtype=T)
+    try
+        @testset "Invalid timesteps leave the accepted state and clock intact" begin
+            u = ScalarField(dom, "u")
+            set!(u, zero(T))
+            p = InitialValueProblem([u])
+            add_equation!(p, "dt(u) = 1")
+            for dt in (0.0, -0.01, NaN, Inf, -Inf)
+                @test_throws ArgumentError InitialValueSolver(p, RK222(); dt)
+            end
+            s = InitialValueSolver(p, RK222(); dt=0.125)
+            step!(s, 0.125f0)
+            accepted = copy(Array(grid_data!(u)))
+            history = copy(s.timestepper_state.dt_history)
+            for (t, dt) in ((0.125, 0.0), (0.125, -0.01), (0.125, Inf), (0.125, NaN),
+                            (1e12, eps(1e12)/4), (floatmax(Float64), floatmax(Float64)))
+                s.sim_time = t
+                @test_throws ArgumentError step!(s, dt)
+                @test (s.sim_time, s.iteration, s.dt) == (t, 1, 0.125)
+                @test s.timestepper_state.dt_history == history
+                @test Array(grid_data!(u)) == accepted
+            end
+        end
+
+        @testset "ETD stage failures and retries" begin
+            for ts in (ETD_RK222(), ETD_CNAB2(), ETD_SBDF2())
+                u = ScalarField(dom, "u")
+                set!(u, zero(T))
+                p = InitialValueProblem([u])
+                add_equation!(p, "dt(u) = 0")
+                fail_at = Ref(0.125)
+                f = DeterministicForcing((x,t,p) -> begin
+                    t == fail_at[] && error("forcing unavailable")
+                    zero.(x) .+ T(1+t)
+                end, (8,); architecture=arch, dtype=T)
+                add_stochastic_forcing!(p, :u, f)
+                s = InitialValueSolver(p, ts; dt=0.125)
+
+                @test_throws "forcing unavailable" step!(s)
+                @test (s.iteration, s.sim_time, s.timestepper_state) == (0, 0.0, nothing)
+                @test all(iszero, Array(grid_data!(u)))
+                fail_at[] = Inf
+                step!(s)
+                before = copy(Array(grid_data!(u)))
+                fail_at[] = ts isa ETD_RK222 ? 0.375 : 0.125
+                @test_throws "forcing unavailable" step!(s, 0.25)
+                @test (s.iteration, s.sim_time, s.dt) == (1, 0.125, 0.125)
+                @test Array(grid_data!(u)) == before
+
+                fail_at[] = Inf
+                for h in (0.0625, 0.125)
+                    step!(s, h)
+                    t = s.sim_time
+                    @test maximum(abs, Array(grid_data!(u)) .- (t + t^2/2)) < 32eps(T)
+                end
+            end
+        end
+
+        @testset "CNLF2 with alternating steps" begin
+            errors = map((16, 32, 64)) do n
+                u = ScalarField(dom, "u")
+                set!(u, zero(T))
+                p = InitialValueProblem([u])
+                add_equation!(p, "dt(u) = 0")
+                f = DeterministicForcing((x,t,p) -> zero.(x) .+ T(t+t^2), (8,);
+                                         architecture=arch, dtype=T)
+                add_stochastic_forcing!(p, :u, f)
+                s = InitialValueSolver(p, Tarang.CNLF2(); dt=1.0/n)
+                for i in 1:n
+                    step!(s, (isodd(i) ? 0.8 : 1.2)/n)
+                end
+                maximum(abs, Array(grid_data!(u)) .- 5/6)
+            end
+            @test all(log2.(errors[1:2] ./ errors[2:3]) .> 1.8)
+        end
+    finally
+        close(dom.dist)
     end
 end

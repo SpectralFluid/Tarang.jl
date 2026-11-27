@@ -118,6 +118,9 @@ using Tarang
             architecture=CPU(),
             rng=MersenneTwister(42),
         )
+        wrong_grid = SeparableStochasticForcing(; fourier_size=(nx+1,),
+            chebyshev_basis=zbasis2, chebyshev_profile=z -> z * (1 - z))
+        @test_throws ArgumentError add_stochastic_forcing!(problem, :b, wrong_grid)
         add_stochastic_forcing!(problem, :b, forcing)
         solver = InitialValueSolver(problem, RK222(); dt)
         @test solver.rhs_plan !== nothing

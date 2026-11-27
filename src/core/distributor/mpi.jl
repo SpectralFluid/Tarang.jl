@@ -172,10 +172,12 @@ function _scatter_array_from_root(dist::Distributor,
         error("rank 0 must provide the global scatter array")
     cpu_global_array = global_array
     if dist.rank == 0 && is_gpu_array(global_array)
-        if !_device_aware_mpi(architecture(global_array))
-            # Stage through CPU for MPI operations
-            cpu_global_array = Array(global_array)
-        end
+        # Always stage through the host, even with device-aware MPI: the receive
+        # buffers below are host arrays, so copying device slices into them would
+        # scalar-index the device array (rank 0 throws while every other rank waits
+        # in MPI.Probe), and a device slice sent directly would leave without a
+        # stream synchronization. A scatter is setup-time, so one copy is cheap.
+        cpu_global_array = on_architecture(CPU(), global_array)
     end
 
     ndims_global = length(global_shape)

@@ -28,7 +28,7 @@ backward_transform!(u)
 @assert architecture(get_grid_data(u)) == arch
 ```
 
-On Apple silicon, install Metal.jl in the same environment as Tarang. Keep that environment separate from CUDA.jl 5 and AMDGPU.jl 2.4–2.8 because their compiler dependencies conflict with Metal.jl 1.11. Metal fields default to `Float32`. Use `ComplexF32` with complex Fourier fields. Each Metal distributor uses one MPI rank.
+On Apple silicon, install Metal.jl in the same environment as Tarang. Keep that environment separate from CUDA.jl 5 and AMDGPU.jl 2.4–2.8 because their compiler dependencies conflict with Metal.jl 1.11. Metal fields default to `Float32`. Use `ComplexF32` with complex Fourier fields. Each Metal distributor uses one MPI rank. Apple GPUs have no `Float64`: Tarang converts its own constants, scalar arithmetic (`2.0 * u` stays `Float32`) and forcing functions, which run on the host, but your own broadcasts into device arrays must use `Float32` values, for example `get_grid_data(u) .+= 1f0` rather than `.+= 1.0`.
 
 ```julia
 using Tarang, Metal
@@ -155,7 +155,9 @@ The full per-architecture table is in
 
 Fourier–Chebyshev IVPs use per-mode coupled subproblems, batched across Fourier
 modes by default on CUDA and ROCm (`batched_modes=false` opts out). Metal solves one Fourier mode at a time. With GPU fields,
-`matsolver=:auto`, `:gpu`, and `:hybrid` select a backend-specific solver. Individual mode solves use `:cuda_sparse` on NVIDIA and `:rocm_dense` on AMD. On Metal, `:metal_dense` factors the equivalent real single-precision system with pivoted LU in Metal Performance Shaders. It retains the factors in native row-major layout and reuses the solve buffers for subsequent right-hand sides of the same shape. The AMD solver uses rocSOLVER for dense LU and rocSPARSE for sparse matrix products. A singular stage matrix raises a factorization error.
+`matsolver=:auto`, `:gpu`, and `:hybrid` select a backend-specific solver. Individual mode solves use `:cuda_sparse` on NVIDIA and `:rocm_dense` on AMD. On Metal, `:metal_dense` factors the equivalent real single-precision system with pivoted LU in Metal Performance Shaders. It retains the factors in native row-major layout and reuses the solve buffers for subsequent right-hand sides of the same shape. The AMD solver uses rocSOLVER for dense LU and rocSPARSE for sparse matrix products.
+
+Some stage matrices are rank deficient by construction. An incompressible problem with an even-sized `RealFourier` axis has one: at the Nyquist mode ∂x vanishes, so no equation fixes the constant part of the pressure. The CPU solves such a mode with sparse QR and keeps the undetermined unknowns at zero. On a GPU the free unknowns are found once on the host and pinned, and the mode is factored on the device, giving the same solution for a consistent right-hand side. The device does not check consistency. A matrix that is singular for any other reason still raises a factorization error.
 
 Most of this is covered without hardware: `test/test_gpu_timesteppers_jlarray.jl`
 drives all twenty schemes on the single-GPU dispatch path using `JLArray` device
@@ -194,8 +196,9 @@ dist = Distributor(coords; comm=comm, dtype=ComplexF64, device=arch)
 
 The example above uses CUDA-aware MPI. AMD uses ROCm-aware MPI for all distributed transposes. When a scheduler exposes one GPU per rank, each rank can use device ID zero. When all GPUs on a node are visible, use the node-local rank as the device ID.
 
+ROCm-aware MPI is detected with `MPI.has_rocm()` (Open MPI 5 and later) or `MPICH_GPU_SUPPORT_ENABLED=1` (Cray MPICH on Frontier and LUMI). Set `TARANG_ROCM_AWARE_MPI=1` to assert it for another MPI library, or `0` to refuse it.
+
 ```julia
-@assert MPI.has_rocm()
 node = MPI.Comm_split_type(comm, MPI.COMM_TYPE_SHARED, MPI.Comm_rank(comm))
 arch = GPU(backend=:amdgpu, device_id=MPI.Comm_rank(node))
 MPI.free(node)

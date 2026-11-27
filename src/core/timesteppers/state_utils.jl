@@ -154,18 +154,7 @@ function _evaluate_rhs_interpreted(solver::InitialValueSolver,
             for (var_idx, forcing) in problem.stochastic_forcings
                 if var_idx <= length(rhs)
                     rhs_field = rhs[var_idx]
-                    coeff_data = get_coeff_data(rhs_field)
-                    if coeff_data !== nothing
-                        F_view = _matched_forcing_view(forcing, coeff_data)
-                        ensure_layout!(rhs_field, :c)
-                        if F_view !== nothing
-                            coeff_data .+= F_view
-                            @debug "Added stochastic forcing to state field $var_idx"
-                        else
-                            throw(ArgumentError(
-                                "Forcing size doesn't match RHS size $(size(coeff_data)) for state field $var_idx"))
-                        end
-                    end
+                    _add_cached_forcing!(rhs_field, forcing)
                 end
             end
         end
@@ -1523,7 +1512,7 @@ function _try_refresh_fourier_streamfunction_velocity!(target, expr)
     # skew(grad(psi)) = (-dpsi/dy, dpsi/dx)
     derivative_coords = (gradient.coordsys[gradient.coordsys.names[2]],
                          gradient.coordsys[gradient.coordsys.names[1]])
-    signs = (-1.0, 1.0)
+    negate = (true, false)
     @inbounds for i in 1:2
         component = target.components[i]
         component_coeff = coeff_data!(component)
@@ -1532,7 +1521,12 @@ function _try_refresh_fourier_streamfunction_velocity!(target, expr)
         axis = _resolve_diff_axis(derivative_coords[i], component.bases)
         axis == 0 && return false
         _apply_lazy_diff_coeff!(component, 1, axis)
-        signs[i] == 1.0 || (_coefficient_array(component_coeff) .*= signs[i])
+        if negate[i]
+            # Negate in the coefficients' own precision: a Float64 literal would
+            # put double arithmetic into the kernel, which Metal cannot compile.
+            coeffs = _coefficient_array(component_coeff)
+            coeffs .= .-coeffs
+        end
         component.current_layout = :c
     end
     return true

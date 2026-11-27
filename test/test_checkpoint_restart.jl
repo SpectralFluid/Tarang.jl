@@ -203,7 +203,11 @@ end
 
 @testset "Failed replacement preserves the last complete checkpoint" begin
     mktempdir() do dir
-        path = joinpath(dir, "recovery_α")
+        # The non-ASCII stem exercises character-safe suffix handling. On Windows the
+        # NetCDF C library opens files through the ANSI code page, so the staged
+        # file would not carry the UTF-8 name the rename expects; use ASCII there.
+        stem = Sys.iswindows() ? "recovery_a" : "recovery_α"
+        path = joinpath(dir, stem)
         source = _decay_solver(RK222())
         step!(source)
         written = save_state(source, path)
@@ -213,7 +217,7 @@ end
         problem = InitialValueProblem([u])
         add_equation!(problem, "dt(u) = 0")
         @test_throws Exception save_state(InitialValueSolver(problem, RK111(); dt=0.1), path)
-        @test readdir(dir) == ["recovery_α.nc"]
+        @test readdir(dir) == [stem * ".nc"]
         @test read(written) == saved
         restored = _decay_solver(RK222())
         load_state!(restored, written)

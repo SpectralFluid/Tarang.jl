@@ -36,13 +36,16 @@ if review_case("jacobian_failure")
 end
 
 if review_case("forcing_mismatch")
-    @testset "Registered forcing shape mismatch aborts RHS evaluation" begin
+    @testset "A forcing shape mismatch is refused at registration and by the RHS" begin
         u = ScalarField(PeriodicDomain(8, 8), "u")
         problem = InitialValueProblem([u])
         add_equation!(problem, "dt(u) = 0")
         forcing = StochasticForcing(field_size=(4, 4), forcing_rate=0.1,
             k_forcing=1.0, dk_forcing=1.0, dt=0.01, rng=MersenneTwister(42))
-        add_stochastic_forcing!(problem, :u, forcing)
+        @test_throws "global physical grid" add_stochastic_forcing!(problem, :u, forcing)
+        @test isempty(problem.stochastic_forcings)
+        # The RHS still rejects incompatible buffers if registration was bypassed.
+        problem.stochastic_forcings[1] = forcing
         solver = InitialValueSolver(problem, RK222(); dt=0.01)
         Tarang._update_registered_forcings!(solver, 0.0, solver.dt)
 

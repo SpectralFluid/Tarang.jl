@@ -154,6 +154,51 @@ using Test
         @test_throws ArgumentError MS.solve!(dest, solver, b; require_consistent=true)
         MS.solve!(dest, solver, b)
         @test A * dest ≈ ComplexF64[2, 0]
+        # The timestep policy: report the inconsistency once, keep the least-squares
+        # solution. (The warning is maxlog=1 per session, so it is not asserted here.)
+        fill!(dest, NaN)
+        MS.solve!(dest, solver, b; warn_inconsistent=true)
+        @test A * dest ≈ ComplexF64[2, 0]
+    end
+
+    @testset "SPQR consistency check scales with the matrix, not only the RHS" begin
+        MS = Tarang.MatSolvers
+        # A small RHS formed from large matrix terms carries rounding of order
+        # eps·‖A‖‖x‖ outside the column space. That is consistent, not an error
+        # (the Nyquist pressure mode of a Rayleigh–Bénard step looked like this).
+        A = sparse(ComplexF64[1e8 -1e8 0; 0 1 0; 0 0 0])
+        solver = MS.SPQRSolver(A)
+        dest = zeros(ComplexF64, 3)
+        b = ComplexF64[0, 1, 1e-10]
+        MS.solve!(dest, solver, b; require_consistent=true)
+        @test dest ≈ ComplexF64[1, 1, 0]
+        b[3] = 1e-2
+        @test_throws ArgumentError MS.solve!(dest, solver, b; require_consistent=true)
+    end
+
+    @testset "pin_free_columns reproduces the sparse-QR basic solution" begin
+        using Random
+        MS = Tarang.MatSolvers
+        @test MS.pin_free_columns(sparse(ComplexF64(1)I, 4, 4)) === nothing
+        rng = MersenneTwister(4)
+        n = 10
+        base() = sprandn(rng, ComplexF64, n, n, 0.5) + 6I
+        zero_column = base(); zero_column[:, 4] .= 0
+        dependent = base(); dependent[:, 6] .= dependent[:, 2] .+ 2 .* dependent[:, 8]
+        two_free = base(); two_free[:, 3] .= 0; two_free[:, 7] .= 0
+        for (name, A, d) in (("empty column", zero_column, 1), ("dependent column", dependent, 1),
+                             ("two-dimensional null space", two_free, 2))
+            dropzeros!(A)
+            pinned = MS.pin_free_columns(A)
+            @test pinned !== nothing
+            @test length(pinned.free_columns) == d
+            Ap = Matrix(pinned.matrix)
+            @test rank(Ap) == n
+            b = A * randn(rng, ComplexF64, n)        # consistent right-hand side
+            x = Ap \ b
+            @test norm(A * x - b) <= 1e-10 * norm(b)
+            @test x ≈ MS.solve(MS.SPQRSolver(A), b) atol=1e-10 * norm(x)
+        end
     end
 
     @testset "mass inverse in-place allocations" begin

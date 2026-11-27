@@ -823,7 +823,7 @@ function _leftover_stage_solve!(sp, sp_idx, i::Int, dt::Float64, A_exp, A_imp,
         end
     else
         lhs_solver = _get_or_build_lhs!(sp, i, dt, a_ii)
-        _solve_implicit_stage!(x_sol, lhs_solver, rhs)
+        _solve_implicit_stage!(x_sol, lhs_solver, rhs, sp)
     end
 
     scatter_inputs(sp, x_sol, state_fields)

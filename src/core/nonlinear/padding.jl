@@ -15,6 +15,44 @@
     return 2cld(m, 2)
 end
 
+# A Lobatto grid with n samples is the first half (including both endpoints)
+# of an even periodic grid with 2(n-1) samples. Fourier padding on this grid
+# is cosine-series interpolation. Folding the two endpoint modes on return
+# gives the truncated Chebyshev series, including its highest retained degree.
+function _product_fft_layout(bases, factor)
+    nodes = map(b -> b.meta.size, bases)
+    cosine_dims = findall(eachindex(bases)) do d
+        bases[d] isa ChebyshevT && nodes[d] > 1 && _axis_dealias_factor(bases[d], factor) > 1
+    end
+    dims = findall(d -> bases[d] isa FourierBasis || d in cosine_dims, eachindex(bases))
+    shape = ntuple(d -> d in cosine_dims ? 2 * (nodes[d] - 1) : nodes[d], length(nodes))
+    padded = ntuple(length(nodes)) do d
+        d in dims ? _padded_fourier_size(shape[d], _axis_dealias_factor(bases[d], factor)) : shape[d]
+    end
+    return shape, padded, dims, cosine_dims
+end
+
+@kernel function _extend_lobatto_grid_kernel!(out, @Const(grid))
+    I = @index(Global, NTuple)
+    J = ntuple(d -> I[d] <= size(grid, d) ? I[d] : 2 * size(grid, d) - I[d], Val(length(I)))
+    @inbounds out[I...] = grid[J...]
+end
+
+function _extend_lobatto_grid!(arch, out, grid)
+    for d in 1:ndims(out)
+        n, m = size(grid, d), size(out, d)
+        m == n || m == 2 * (n - 1) || throw(DimensionMismatch(
+            "Cannot extend $(size(grid)) to the Lobatto FFT grid $(size(out))"))
+    end
+    launch!(arch, _extend_lobatto_grid_kernel!, out, grid; ndrange=size(out))
+    return out
+end
+
+@inline function _lobatto_grid_view(data, grid)
+    size(data) == size(grid) && return data
+    return view(data, axes(grid)...)
+end
+
 """
     PaddedDealiasingWorkspace{T, A}
 
@@ -32,6 +70,7 @@ mutable struct PaddedDealiasingWorkspace{T<:AbstractFloat, A<:AbstractArray{Comp
     original_shape::Tuple{Vararg{Int}}
     padded_shape::Tuple{Vararg{Int}}
     fourier_dims::Vector{Int}
+    cosine_dims::Vector{Int}
 
     # Pre-allocated padded arrays (on same architecture as input data)
     padded1::A
@@ -60,7 +99,8 @@ end
 
 Get or create a cached padded dealiasing workspace.
 
-For serial fields, uses the full basis shape and all Fourier dimensions.
+For serial fields, the FFT grid includes every Fourier axis and the even
+extensions of ChebyshevT axes that request padding.
 For MPI-distributed fields, pass `local_shape` (the per-rank array shape) and
 `local_fourier_dims` (only the non-decomposed Fourier dimensions to pad).
 """
@@ -81,37 +121,19 @@ function _get_padded_workspace!(evaluator::NonlinearEvaluator, bases::Tuple, dty
 
     factor = evaluator.dealiasing_factor
 
-    # Use local_shape if provided (MPI), otherwise compute from bases
-    if local_shape !== nothing
-        original_shape = collect(local_shape)
-        fourier_dims = local_fourier_dims !== nothing ? local_fourier_dims : Int[]
+    if local_shape === nothing
+        orig_t, pad_t, fourier_dims, cosine_dims = _product_fft_layout(bases, factor)
     else
-        fourier_dims = Int[]
-        original_shape = Int[]
-        for (i, basis) in enumerate(bases)
-            N = basis.meta.size
-            push!(original_shape, N)
-            if isa(basis, Union{RealFourier, ComplexFourier})
-                push!(fourier_dims, i)
-            end
+        orig_t = local_shape
+        fourier_dims = something(local_fourier_dims, Int[])
+        cosine_dims = Int[]
+        pad_t = ntuple(length(orig_t)) do d
+            d in fourier_dims || return orig_t[d]
+            strength = d <= length(bases) ? _axis_dealias_factor(bases[d], factor) : factor
+            _padded_fourier_size(orig_t[d], strength)
         end
     end
-
-    if isempty(fourier_dims)
-        return nothing
-    end
-
-    # Compute padded shape: pad only Fourier dimensions. Each axis uses its own
-    # basis `dealias` strength when set (>1), falling back to the global factor,
-    # so per-basis dealias=... controls the padding (3/2-rule) resolution.
-    padded_shape = copy(original_shape)
-    for d in fourier_dims
-        axis_factor = d <= length(bases) ? _axis_dealias_factor(bases[d], factor) : factor
-        padded_shape[d] = _padded_fourier_size(original_shape[d], axis_factor)
-    end
-
-    orig_t = Tuple(original_shape)
-    pad_t = Tuple(padded_shape)
+    isempty(fourier_dims) && return nothing
 
     # Allocate padded arrays on the correct architecture
     padded1 = zeros(_arch, Complex{T}, pad_t...)
@@ -139,7 +161,7 @@ function _get_padded_workspace!(evaluator::NonlinearEvaluator, bases::Tuple, dty
     end
 
     ws = PaddedDealiasingWorkspace{T, typeof(padded1)}(
-        orig_t, pad_t, fourier_dims,
+        orig_t, pad_t, fourier_dims, cosine_dims,
         padded1, padded2, spectrum,
         plan_forward, plan_backward,
         plan_spec_forward, plan_spec_backward, _arch, nothing
@@ -171,42 +193,37 @@ function _freq_ranges(N::Int, M::Int, is_fourier::Bool)
     return (pos_orig, pos_pad, neg_orig, neg_pad)
 end
 
-# ── Even-N Nyquist handling for the full-complex-FFT pad/truncate ────────────
-# With a full complex FFT, an even-N axis has a SINGLE Nyquist bin (k=N/2) that
-# physically represents both +N/2 and -N/2. Zero-padding must split it symmetrically
-# across ±N/2 (so the padded grid stays real/Hermitian for real fields), and
-# truncation must SUM the ±N/2 images back into the single N-grid Nyquist bin.
-# Without this the Nyquist mode of every dealiased product on an even-N Fourier axis
-# comes out at HALF amplitude. Odd N has no Nyquist bin and is untouched. Both helpers
-# use selectdim (generic over ndims, GPU-compatible) and process even axes in sequence;
-# for multiple even axes the in-place sweep correctly accumulates the corner terms.
-
-function _split_nyquist_symmetric!(padded, original_shape, padded_shape, fourier_dims)
+# The block copies place the coarse Nyquist bin at +N/2. A real
+# trigonometric interpolant splits it between both signs. A complex Fourier
+# field assigns it entirely to -N/2. Chebyshev even extensions always split.
+function _place_padded_nyquist!(padded, original_shape, padded_shape, fourier_dims, cosine_dims)
     for d in fourier_dims
-        N = original_shape[d]
-        (iseven(N) && padded_shape[d] > N) || continue
-        nyq = N ÷ 2 + 1                       # padded index of +N/2 (== original Nyquist)
-        mir = padded_shape[d] - N ÷ 2 + 1     # padded index of -N/2 (left zero by the copy)
-        plane = selectdim(padded, d, nyq)
-        plane .*= eltype(padded)(0.5)
-        # Duplicate (do NOT conjugate) the halved +N/2 plane into the −N/2 mirror. The
-        # even-N Nyquist mode is a real cosine for a real field; splitting it as X/2 at
-        # ±N/2 keeps the padded spectrum Hermitian AND lets _fold_nyquist_into_positive!
-        # recover X exactly (X/2 + X/2 = X). A plain `conj` here only matched the 1D
-        # real case and silently dropped the imaginary part of the Nyquist plane in ≥2D
-        # (the cross terms X[N/2, m] are complex), giving Re(X) on the round-trip.
-        selectdim(padded, d, mir) .= plane
+        n = original_shape[d]
+        (iseven(n) && padded_shape[d] > n) || continue
+        positive = selectdim(padded, d, n ÷ 2 + 1)
+        negative = selectdim(padded, d, padded_shape[d] - n ÷ 2 + 1)
+        if d in cosine_dims
+            positive .*= real(eltype(padded))(0.5)
+            negative .= positive
+        else
+            negative .= positive
+            fill!(positive, zero(eltype(padded)))
+        end
     end
     return padded
 end
 
-function _fold_nyquist_into_positive!(padded, original_shape, padded_shape, fourier_dims)
+function _collect_truncated_nyquist!(padded, original_shape, padded_shape, fourier_dims, cosine_dims)
     for d in fourier_dims
-        N = original_shape[d]
-        (iseven(N) && padded_shape[d] > N) || continue
-        nyq = N ÷ 2 + 1
-        mir = padded_shape[d] - N ÷ 2 + 1
-        selectdim(padded, d, nyq) .+= selectdim(padded, d, mir)
+        n = original_shape[d]
+        (iseven(n) && padded_shape[d] > n) || continue
+        positive = selectdim(padded, d, n ÷ 2 + 1)
+        negative = selectdim(padded, d, padded_shape[d] - n ÷ 2 + 1)
+        if d in cosine_dims
+            positive .+= negative
+        else
+            positive .= negative
+        end
     end
     return padded
 end
@@ -218,7 +235,7 @@ Zero-pad spectral coefficients. Uses slice-based operations for GPU compatibilit
 """
 function _pad_spectral!(padded::AbstractArray{Complex{T}}, spec_data::AbstractArray{Complex{T}},
                         original_shape::Tuple, padded_shape::Tuple,
-                        fourier_dims::Vector{Int}) where T
+                        fourier_dims::Vector{Int}, cosine_dims=fourier_dims) where T
     fill!(padded, zero(Complex{T}))
     ndim = length(original_shape)
 
@@ -237,9 +254,7 @@ function _pad_spectral!(padded::AbstractArray{Complex{T}}, spec_data::AbstractAr
     elseif ndim == 3
         _pad_spectral_sliced_3d!(padded, spec_data, original_shape, padded_shape, fourier_dims)
     end
-    # Split the even-N Nyquist symmetrically across ±N/2 so the padded grid stays
-    # real/Hermitian (no-op when the input has no Nyquist content).
-    _split_nyquist_symmetric!(padded, original_shape, padded_shape, fourier_dims)
+    _place_padded_nyquist!(padded, original_shape, padded_shape, fourier_dims, cosine_dims)
 end
 
 function _pad_spectral_sliced_2d!(padded, spec_data, original_shape, padded_shape, fourier_dims)
@@ -285,13 +300,10 @@ Uses slice-based operations for GPU compatibility.
 """
 function _truncate_spectral!(result::AbstractArray{Complex{T}}, padded_spec::AbstractArray{Complex{T}},
                              original_shape::Tuple, padded_shape::Tuple,
-                             fourier_dims::Vector{Int}) where T
+                             fourier_dims::Vector{Int}, cosine_dims=fourier_dims) where T
     ndim = length(original_shape)
 
-    # Fold the dropped -N/2 image into the +N/2 plane (in place) along each even-N
-    # Fourier axis, so the standard copy below picks up the FULL Nyquist coefficient
-    # rather than half. Sequential per-axis folding accumulates the corner terms.
-    _fold_nyquist_into_positive!(padded_spec, original_shape, padded_shape, fourier_dims)
+    _collect_truncated_nyquist!(padded_spec, original_shape, padded_shape, fourier_dims, cosine_dims)
 
     if ndim == 1
         r = _freq_ranges(original_shape[1], padded_shape[1], 1 in fourier_dims)
@@ -353,7 +365,12 @@ function _complex_operand_spectrum!(ws, field)
         copyto!(ws.spectrum, get_local_data(get_coeff_data(field)))
     else
         ensure_layout!(field, :g)
-        _copy_convert_into!(ws.spectrum, on_architecture(ws.arch, get_local_data(get_grid_data(field))))
+        src = on_architecture(ws.arch, get_local_data(get_grid_data(field)))
+        if isempty(ws.cosine_dims)
+            _copy_convert_into!(ws.spectrum, src)
+        else
+            _extend_lobatto_grid!(ws.arch, ws.spectrum, src)
+        end
         ws.plan_spec_forward * ws.spectrum
     end
     return ws.spectrum
@@ -372,13 +389,14 @@ function evaluate_padded_multiply(field1::ScalarField, field2::ScalarField,
                                   result_layout::Symbol=:g, operand_key=nothing) where T
     # Step 1: FFT to spectral along Fourier dimensions, in place via pre-built
     # plans (no per-call allocation). Plans dispatch to CUFFT for GPU arrays.
+    cosine_dims = field1.dtype <: Real ? ws.fourier_dims : ws.cosine_dims
     _complex_operand_spectrum!(ws, field1)
-    _pad_spectral!(ws.padded1, ws.spectrum, ws.original_shape, ws.padded_shape, ws.fourier_dims)
+    _pad_spectral!(ws.padded1, ws.spectrum, ws.original_shape, ws.padded_shape, ws.fourier_dims, cosine_dims)
     ws.plan_backward * ws.padded1
     if operand_key === nothing || ws.cached_operand !== operand_key
         ws.cached_operand = nothing
         _complex_operand_spectrum!(ws, field2)
-        _pad_spectral!(ws.padded2, ws.spectrum, ws.original_shape, ws.padded_shape, ws.fourier_dims)
+        _pad_spectral!(ws.padded2, ws.spectrum, ws.original_shape, ws.padded_shape, ws.fourier_dims, cosine_dims)
         ws.plan_backward * ws.padded2
         ws.cached_operand = operand_key
     end
@@ -391,7 +409,7 @@ function evaluate_padded_multiply(field1::ScalarField, field2::ScalarField,
 
     # Step 6: Truncate to original coefficients
     # Truncation overwrites every original-size element; no clear is needed.
-    _truncate_spectral!(ws.spectrum, ws.padded1, ws.original_shape, ws.padded_shape, ws.fourier_dims)
+    _truncate_spectral!(ws.spectrum, ws.padded1, ws.original_shape, ws.padded_shape, ws.fourier_dims, cosine_dims)
 
     # Step 7: IFFT to grid and normalize
     # Normalization: padded IFFT divides by M, but we want result on N-grid.
@@ -417,10 +435,11 @@ function evaluate_padded_multiply(field1::ScalarField, field2::ScalarField,
     # fused broadcast — no intermediate `scaled_result` allocation. The workspace
     # and the output field share an architecture, so no device transfer is needed.
     dst = get_local_data(result_data)
+    values = _lobatto_grid_view(ws.spectrum, dst)
     if field1.dtype <: Real
-        @. dst = real(ws.spectrum) * scale
+        @. dst = real(values) * scale
     else
-        @. dst = ws.spectrum * scale
+        @. dst = values * scale
     end
     ensure_layout!(result, result_layout)
     return result

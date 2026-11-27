@@ -132,4 +132,35 @@ end
     end
 end
 
+@testset "Fourier ETD uses the selected update on variable steps" begin
+    for ts in (ETD_RK222(), ETD_CNAB2(), ETD_SBDF2())
+        u, _, _ = _mdoc_fields()
+        try
+            set!(u, 1.0)
+            p = InitialValueProblem([u])
+            add_equation!(p, "dt(u) + 0.4*u = -u*u")
+            solver = InitialValueSolver(p, ts; dt=0.125)
+            expected, prev_f, prev_h = 1.0, 0.0, 0.0
+            for h in (0.125, 0.0625, 0.09375, 0.05)
+                z = -0.4h
+                phi1, phi2 = expm1(z)/z, (expm1(z)-z)/z^2
+                f = -expected^2
+                predictor = exp(z)*expected + h*phi1*f
+                correction = if ts isa ETD_RK222 || iszero(prev_h)
+                    -predictor^2 - f
+                else
+                    (h/prev_h) * (f-prev_f)
+                end
+                expected = predictor + h*phi2*correction
+                step!(solver, h)
+                local_err = maximum(abs, parent(grid_data!(u)) .- expected)
+                @test MPI.Allreduce(local_err, max, MPI.COMM_WORLD) < 2e-13
+                prev_f, prev_h = f, h
+            end
+        finally
+            close(u.dist)
+        end
+    end
+end
+
 MPI.Barrier(MPI.COMM_WORLD)

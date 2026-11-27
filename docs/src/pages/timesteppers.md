@@ -163,11 +163,9 @@ rank-local Fourier multipliers. This avoids retaining unused global matrices.
 Mixed-basis problems, states containing zero-dimensional fields, and other
 schemes retain their existing construction paths.
 
-Two degradations are announced with a warning rather than refused, because the
-result is still correct: serial `ETD_*` above 4096 coefficients falls back to
-CNAB2 (the operator stays implicit — see the serial size limit under ETD below), and
-the three ETD types share one distributed per-mode ETD-RK2 implementation under
-MPI.
+Above 4096 coefficients, serial CPU ETD selects an implicit fallback before
+building the dense matrix functions. The choice depends on the scheme and on
+whether white-noise forcing is registered.
 
 `RK222()`, `RK443()`, and `SBDF2()` select internal diagonal solves on GPU Fourier
 problems. CPU matrix and subproblem paths retain the same numerical scheme.
@@ -359,27 +357,10 @@ ETD methods use phi functions defined as:
 \phi_2(z) = \frac{e^z - 1 - z}{z^2}
 ```
 
-Scalar arguments use a Taylor expansion near zero (`|z| < 1e-8`), where the `e^z − 1 − z`
-numerator cancels catastrophically against the `z^2` denominator.
-
-For the matrix case, `phi_functions_matrix(L, dt)` computes all three at once from the assembled
-`L_matrix`, choosing its method by the operator norm `‖dt·L‖`:
-
-| `‖dt·L‖` | method |
-|---|---|
-| `< 1e-8` | Taylor series |
-| `< 50` | dense matrix exponential plus stable φ solves, with an eigendecomposition fallback when `z` is singular (the `k=0` mode of a pure diffusion operator makes it so) |
-| `≥ 50` | Krylov approximation, column by column, via `ExponentialUtilities.phiv` |
-
-Matrix ETD is rejected above size 4096 because it requires dense O(n²) storage — see the serial
-size limit below.
-
-The Krylov branch announces itself with `Warning: Matrix is large or stiff (norm=...), using
-Krylov approximation`. It is not an error — a stiff `L` is the whole point of ETD, so any useful
-ETD run will trip it (the 1-D heat example below has `‖dt·L‖ ≈ 269` and still reproduces the
-analytic solution to 8 digits).
-
-The result is cached and only recomputed when `dt` changes.
+Scalar arguments use a Taylor expansion for `|z| < 0.01` to avoid cancellation
+near zero. For a global matrix, `phi_functions_matrix(L, dt)` computes all three
+functions together by scaling and squaring. The cache is reused for the same
+operator and timestep.
 
 ### When to Use ETD
 
@@ -410,16 +391,13 @@ ordering, and the stepper will silently propagate the wrong operator.
 
 ### Size limit (serial)
 
-In serial the exponential is taken of the **dense global** matrix, so the cost is O(n³) in the
-total number of coefficients. Above `n = 4096` degrees of freedom the phi-function builder
-refuses, and the stepper emits
-
-> `Warning: ETD-RK222 failed: ArgumentError("ETD matrix exponential requires dense O(n²) storage
-> but n=8193 is too large ..."), falling back to CNAB2 (keeps the linear operator implicit)`
-
-and carries on with CNAB2, which keeps the linear operator implicit (it does not drop to an
-explicit scheme). If you asked for ETD and see that warning, you are not getting ETD —
-reduce the resolution or switch to SBDF2.
+Global matrix functions use O(n²) storage. Above 4096 coefficients the serial
+CPU solver warns and selects an implicit method before allocating the dense
+matrices. With deterministic forcing, `ETD_RK222` and `ETD_CNAB2` use CNAB2,
+and `ETD_SBDF2` uses SBDF2 after startup. With registered white noise,
+`ETD_RK222` uses one-step IMEX RK222 so each draw contributes to exactly one
+timestep. An error in a forcing callback or RHS evaluation propagates to the
+caller and rejects the attempted step.
 
 ETD also refuses tau / DAE formulations outright: a boundary-condition row has no time
 derivative, so the mass matrix is singular and `-M⁻¹L` does not exist
@@ -473,10 +451,10 @@ matrix exponential cannot run on distributed field vectors, so the distributed p
 Fourier mode with its own scalar exponential and never forms a global matrix (verified: a 128×128
 Fourier heat problem, 8320 coefficients, steps at np=2 with no fallback).
 
-The trade-off is that **all three** exported ETD types (`ETD_RK222`, `ETD_CNAB2`, `ETD_SBDF2`)
-dispatch to the same distributed per-mode ETD-RK2 implementation on that path — the distinction
-between the exponential-RK and the exponential-multistep variants is lost. If that distinction
-matters to you, use the serial global-matrix path.
+`ETD_RK222` evaluates a predictor and corrector on each step. `ETD_CNAB2` and
+`ETD_SBDF2` take one ETD-RK2 startup step, then retain the most recent accepted
+nonlinear term on each rank. Subsequent steps use exponential Adams–Bashforth
+with the current-to-previous timestep ratio and one new RHS evaluation.
 
 ### Example: 1D Heat Equation with ETD
 

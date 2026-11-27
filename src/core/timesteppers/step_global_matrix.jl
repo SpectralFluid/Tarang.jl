@@ -157,131 +157,31 @@ function step_mcnab2!(state::TimestepperState, solver::InitialValueSolver)
     end
 end
 
-"""
-    Crank-Nicolson Leapfrog 2nd order step with variable-timestep coefficients.
-
-    Uses the CNLF2 formulation (Wang 2008, Eqn 2.11) which correctly
-    handles variable timesteps via the ratio w1 = dt_current / dt_previous.
-
-    This is a 3-level method: X^{n-1}, X^n → X^{n+1}.
-
-    Coefficients (w1 = dt_n / dt_{n-1}):
-      a = [1/(1+w1)/dt, (w1-1)/dt, -w1^2/(1+w1)/dt]   # M stencil (3 levels)
-      b = [1/(2*w1), (1-1/w1)/2, 1/2]                    # Wide CN stencil
-      c = [0, 1, 0]                                       # Leapfrog: only F^n
-
-    Solve: (a[1]*M + b[1]*L) X^{n+1} = RHS
-    RHS = c[2]*F^n - a[2]*M*X^n - a[3]*M*X^{n-1} - b[2]*L*X^n - b[3]*L*X^{n-1}
-
-    For constant dt (w1=1): reduces to standard CNLF with θ=0.5.
-    """
+"""Crank–Nicolson/leapfrog over the interval from the previous to the next time."""
 function step_cnlf2!(state::TimestepperState, solver::InitialValueSolver)
-
-    current_state = state.history[end]
-    dt_current = state.dt
-
+    dt = state.dt
     sps = _timestepper_subproblems(solver)
     if sps !== nothing
-        if _sp_multistep_history_depth(state) < 1
-            step_cnab1!(state, solver)
-            return
-        end
-        a, b, c = _cnlf2_coefs(dt_current, get_previous_timestep(state))
-        step_subproblem_multistep!(state, solver, sps, a, b, c)
-        return
+        _sp_multistep_history_depth(state) < 1 && return step_cnab1!(state, solver)
+        a, b, c = _cnlf2_coefs(dt, get_previous_timestep(state))
+        return step_subproblem_multistep!(state, solver, sps, a, b, c)
     end
 
-    # GPU / MPI without subproblems: same reasoning as step_mcnab2! above. The
-    # field path carries CNLF2's own leapfrog stencil (`_cnlf2_coefs`).
     _try_step_explicit_multistep_field!(state, solver, :cnlf2) && return
-
-    # Initialize history tracking
-    if !haskey(state.timestepper_data, :iteration)
-        state.timestepper_data[:iteration] = 0
-    end
-
-    iteration = state.timestepper_data[:iteration]
-
-    # CNLF requires X^{n-1}, so need at least 2 history states and 1 prior step
-    if iteration < 1 || length(state.history) < 2
-        @debug "CNLF2 requires 2 history states, falling back to CNAB1"
+    _init_global_multistep_history!(state, :iteration)
+    if isempty(state.timestepper_data[:F_history])
         step_cnab1!(state, solver)
         state.timestepper_data[:iteration] += 1
         return
     end
 
-    L_matrix, M_matrix, used_fallback =
+    L, M, used_fallback =
         _prepare_global_matrix_timestep!(state, solver, "CNLF2", "RK222", step_rk222!)
     used_fallback && return
-
-    try
-        # Compute variable-timestep ratio using the main dt_history (updated by solvers.jl)
-        dt_previous = get_previous_timestep(state)
-        w1 = dt_current / dt_previous
-
-        # CNLF2 coefficients (Wang 2008 eqn 2.11)
-        # a: coefficients for M stencil [X^{n+1}, X^n, X^{n-1}]
-        a1 = 1.0 / ((1.0 + w1) * dt_current)
-        a2 = (w1 - 1.0) / dt_current
-        a3 = -w1^2 / ((1.0 + w1) * dt_current)
-
-        # b: coefficients for L (wide Crank-Nicolson) [X^{n+1}, X^n, X^{n-1}]
-        b1 = 1.0 / (2.0 * w1)
-        b2 = (1.0 - 1.0 / w1) / 2.0
-        b3 = 1.0 / 2.0
-
-        # c: leapfrog only uses F^n
-        # c = [0, 1, 0]
-
-        X_current = _timestep_fields_vector!(state, :cnlf2_X_current_vec, current_state)
-        X_previous = _timestep_fields_vector!(state, :cnlf2_X_previous_vec, state.history[end-1])
-
-        MX_current = _timestep_matvec!(state, :cnlf2_MX_current_vec, M_matrix, X_current)
-        MX_previous = _timestep_matvec!(state, :cnlf2_MX_previous_vec, M_matrix, X_previous)
-        LX_current = _timestep_matvec!(state, :cnlf2_LX_current_vec, L_matrix, X_current)
-        LX_previous = _timestep_matvec!(state, :cnlf2_LX_previous_vec, L_matrix, X_previous)
-
-        F_current_vec = _timestep_global_rhs_vector!(state, :cnlf2_F_current_vec,
-                                                       solver, current_state, solver.sim_time)
-
-        # Build RHS in-place (zero allocations):
-        # RHS = c[2]*F^n - a[2]*M*X^n - a[3]*M*X^{n-1} - b[2]*L*X^n - b[3]*L*X^{n-1}
-        rhs = _timestep_vector_buffer!(state, :cnlf2_rhs_vec, length(F_current_vec))
-        copyto!(rhs, F_current_vec)
-        @. rhs -= a2 * MX_current
-        @. rhs -= a3 * MX_previous
-        @. rhs -= b2 * LX_current
-        @. rhs -= b3 * LX_previous
-        zero_rows = _global_zero_mass_rows!(state, M_matrix)
-        _apply_global_algebraic_rhs!(rhs, state, solver.problem, zero_rows, b1)
-
-        # Cache single LU factorization; recompute only when (a1,b1) changes.
-        cache_key = (a1, b1)
-        if get(state.timestepper_data, :cnlf2_lhs_key, nothing) !== cache_key
-            state.timestepper_data[:cnlf2_lhs_factor] = _factorize_timestep_matrix(a1 * M_matrix + b1 * L_matrix)
-            state.timestepper_data[:cnlf2_lhs_key] = cache_key
-        end
-        X_new = _timestep_vector_buffer!(state, :cnlf2_X_new_vec, length(rhs))
-        _timestep_ldiv!(X_new, state.timestepper_data[:cnlf2_lhs_factor], rhs)
-
-        # Update state
-        _push_vector_state!(state.history, X_new, current_state, 4)
-
-        state.timestepper_data[:iteration] += 1
-
-        @debug "CNLF2 step completed: dt=$dt_current, w1=$w1, iteration=$(state.timestepper_data[:iteration])"
-
-    catch e
-        # GPU state: rethrow (see the MCNAB2 catch above). Silently running
-        # CNAB2 in place of CNLF2 changes the scheme's stability character.
-        # CNLF2 is a global-matrix method with no GPU path — on GPU use
-        # CNAB2/SBDF2 (subproblem-backed) or DiagonalIMEX_SBDF2 explicitly.
-        any(_field_uses_gpu, solver.state) && rethrow()
-        @warn "CNLF2 failed: $e, falling back to CNAB2"
-        step_cnab2!(state, solver)
-        return
-    end
-
+    a, b, c = _cnlf2_coefs(dt, get_previous_timestep(state))
+    _global_multistep_core!(state, solver, last(state.history), L, M, a, b, c;
+                            mx_depth=1, f_depth=1, state_cap=4, iter_key=:iteration, name="CNLF2")
+    return nothing
 end
 
 """

@@ -22,6 +22,7 @@ IMPORTANT for stochastic forcing (following GeophysicalFlows.jl pattern):
 Deterministic forcing is instead evaluated at every RHS evaluation time.
 """
 function step!(state::TimestepperState, solver::InitialValueSolver)
+    _checked_timestep(state.dt, solver.sim_time)
     # Parameters can also register an operator without going through the setter.
     if _get_spectral_linear_operator(solver) !== nothing
         _check_attached_operator_distribution!(solver)

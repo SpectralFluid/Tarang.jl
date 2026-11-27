@@ -47,6 +47,58 @@ function apply_forcing!(
     return rhs
 end
 
+function _check_stochastic_forcing_target(forcing::StochasticForcingType, field::ScalarField)
+    _check_forcing_architecture(forcing, field)
+    physical_shape = field.domain === nothing ? () : global_shape(field.domain)
+    forcing.field_size == physical_shape || throw(ArgumentError(
+        "Forcing grid $(forcing.field_size) does not match the global physical grid " *
+        "$physical_shape of field '$(field.name)'"))
+    return nothing
+end
+
+# PencilArrays carry their own global offsets and storage permutation. The raw
+# buffers of distributed GPU fields have logical axis order but carry no offsets.
+_forcing_needs_field_ranges(field::ScalarField) = field.dist.size > 1 && !field.dist.use_pencil_arrays
+
+function _local_forcing_ranges(field::ScalarField, coeffs)
+    ranges = coefficient_local_ranges(field.domain, field.dtype)
+    size(coeffs) == map(length, ranges) || throw(DimensionMismatch(
+        "Coefficient buffer $(size(coeffs)) for '$(field.name)' does not cover $ranges"))
+    return ranges
+end
+
+function _field_forcing_view(forcing::StochasticForcingType, field::ScalarField, coeffs)
+    if _forcing_needs_field_ranges(field)
+        return view(forcing.cached_forcing, _local_forcing_ranges(field, coeffs)...)
+    end
+    return _matched_forcing_view(forcing, coeffs)
+end
+
+# Deterministic forcing has already been transformed on the target distributor.
+_field_forcing_view(forcing::Forcing, field::ScalarField, coeffs) =
+    _matched_forcing_view(forcing, coeffs)
+
+function _add_cached_forcing!(field::ScalarField, forcing::Forcing)
+    coeffs = coeff_data!(field)
+    values = _field_forcing_view(forcing, field, coeffs)
+    values === nothing && throw(ArgumentError(
+        "Forcing size does not match the RHS size $(size(coeffs)) of field '$(field.name)'"))
+    coeffs .+= values
+    return field
+end
+
+"""
+    apply_forcing!(rhs::ScalarField, forcing::StochasticForcingType, t, substep=1)
+
+Add a realization to a field in coefficient space. Passing the field supplies
+the global coefficient ranges for a rank-local GPU buffer under MPI.
+"""
+function apply_forcing!(rhs::ScalarField, forcing::StochasticForcingType, t::Real, substep::Int=1)
+    _check_stochastic_forcing_target(forcing, rhs)
+    generate_forcing!(forcing, t, substep)
+    return _add_cached_forcing!(rhs, forcing)
+end
+
 """
     store_prevsol!(forcing::StochasticForcing, sol::AbstractArray)
 
@@ -81,6 +133,11 @@ function store_prevsol!(forcing::StochasticForcing{T, N, A, CA}, sol::AbstractAr
     end
     # Use copyto! for GPU compatibility
     copyto!(forcing.prevsol, sol)
+end
+
+function store_prevsol!(forcing::StochasticForcing, field::ScalarField)
+    _check_stochastic_forcing_target(forcing, field)
+    return store_prevsol!(forcing, coeff_data!(field))
 end
 
 function _diagnostic_layout(target::AbstractArray{<:Any, N}) where N
@@ -182,7 +239,7 @@ function _diagnostic_inner_product_cpu(forcing::StochasticForcing{T, N},
         weight = _diagnostic_mode_weight(forcing, global_shape, G, M2)
         value += weight * real(sol[I] * conj(forcing.cached_forcing[G]))
     end
-    return T(_forcing_reduce_partial(sol, value))
+    return value
 end
 
 function _diagnostic_inner_product_cpu(forcing::StochasticForcing{T, N},
@@ -199,7 +256,7 @@ function _diagnostic_inner_product_cpu(forcing::StochasticForcing{T, N},
         midpoint = (other[I] + sol[I]) / T(2)
         value += weight * real(midpoint * conj(forcing.cached_forcing[G]))
     end
-    return T(_forcing_reduce_partial(sol, value))
+    return value
 end
 
 function _diagnostic_inner_product_gpu(forcing::StochasticForcing{T, N},
@@ -209,11 +266,8 @@ function _diagnostic_inner_product_gpu(forcing::StochasticForcing{T, N},
                                        other::Nothing) where {T, N}
     weights = _cached_gpu_diagnostic_weights!(forcing, global_shape, local_ranges)
     cf = view(forcing.cached_forcing, local_ranges...)
-    partial = mapreduce((w, s, f) -> w * real(s * conj(f)), +,
-                        weights, sol, cf; init=zero(T))
-    # Sum this rank's slab into the global value, like the CPU path. Without the
-    # reduce a distributed-GPU diagnostic would report only this rank's fraction.
-    return T(_forcing_reduce_partial(sol, partial))
+    return mapreduce((w, s, f) -> w * real(s * conj(f)), +,
+                     weights, sol, cf; init=zero(T))
 end
 
 function _diagnostic_inner_product_gpu(forcing::StochasticForcing{T, N},
@@ -223,21 +277,34 @@ function _diagnostic_inner_product_gpu(forcing::StochasticForcing{T, N},
                                        other::AbstractArray{Complex{T}, N}) where {T, N}
     weights = _cached_gpu_diagnostic_weights!(forcing, global_shape, local_ranges)
     cf = view(forcing.cached_forcing, local_ranges...)
-    partial = mapreduce((w, a, b, f) -> w * real((a + b) / T(2) * conj(f)), +,
-                        weights, other, sol, cf; init=zero(T))
-    # See the other GPU method: reduce this rank's slab into the global value.
-    return T(_forcing_reduce_partial(sol, partial))
+    return mapreduce((w, a, b, f) -> w * real((a + b) / T(2) * conj(f)), +,
+                     weights, other, sol, cf; init=zero(T))
 end
 
 function _diagnostic_inner_product(forcing::StochasticForcing{T, N},
-                                   sol::AbstractArray{Complex{T}, N},
+                                   target::Union{ScalarField,AbstractArray{Complex{T}, N}},
                                    other::Union{Nothing, AbstractArray{Complex{T}, N}}=nothing) where {T, N}
-    global_shape, local_ranges = _diagnostic_layout(sol)
-    _validate_diagnostic_layout(forcing, global_shape, local_ranges)
-    if is_gpu(forcing.architecture) || is_gpu_array(sol)
-        return _diagnostic_inner_product_gpu(forcing, sol, global_shape, local_ranges, other)
+    if target isa ScalarField
+        _check_stochastic_forcing_target(forcing, target)
+        sol = coeff_data!(target)
+    else
+        sol = target
     end
-    return _diagnostic_inner_product_cpu(forcing, sol, global_shape, local_ranges, other)
+    if other !== nothing && size(other) != size(sol)
+        throw(ArgumentError("Previous solution size $(size(other)) does not match current solution size $(size(sol))"))
+    end
+    shape, ranges = if target isa ScalarField && _forcing_needs_field_ranges(target)
+        global_shape(target.domain, :c, target.dtype), _local_forcing_ranges(target, sol)
+    else
+        _diagnostic_layout(sol)
+    end
+    _validate_diagnostic_layout(forcing, shape, ranges)
+    partial = if is_gpu(forcing.architecture) || is_gpu_array(sol)
+        _diagnostic_inner_product_gpu(forcing, sol, shape, ranges, other)
+    else
+        _diagnostic_inner_product_cpu(forcing, sol, shape, ranges, other)
+    end
+    return T(_forcing_reduce_partial(target, partial))
 end
 
 """
@@ -263,16 +330,14 @@ This correctly accounts for the correlation between forcing and response.
 
 Work done during this timestep (scalar, units of energy).
 """
-function work_stratonovich(forcing::StochasticForcing{T, N, A, CA}, sol::AbstractArray{Complex{T}, N}) where {T, N, A, CA}
+function work_stratonovich(forcing::StochasticForcing{T, N}, sol::Union{ScalarField,AbstractArray{Complex{T}, N}}) where {T, N}
     if forcing.prevsol === nothing
         return zero(T)
     end
 
     # Stratonovich work: W = Re⟨ψ_mid · ΔF̂*⟩ where ΔF̂ = F̂_stored · dt
     # Since F̂_stored = √Q̂ · ξ / √dt, we have ΔF̂ = √Q̂ · ξ · √dt
-    ps = forcing.prevsol
-    size(ps) == size(sol) || throw(ArgumentError("Previous solution size $(size(ps)) does not match current solution size $(size(sol))"))
-    work = _diagnostic_inner_product(forcing, sol, ps)
+    work = _diagnostic_inner_product(forcing, sol, forcing.prevsol)
 
     # The cached_forcing stores F̂ = √Q̂ · ξ / √dt
     # The forcing increment is ΔF̂ = F̂ · dt = √Q̂ · ξ · √dt
@@ -296,7 +361,7 @@ The drift correction ε · dt accounts for the Itô-Stratonovich conversion.
 In Itô calculus, ψⁿ is independent of Fⁿ⁺¹, so ⟨ψⁿ · ΔF̂⟩ = 0.
 The drift ensures ⟨W_Itô⟩ = ⟨W_Stratonovich⟩ = ε · dt.
 """
-function work_ito(forcing::StochasticForcing{T, N, A, CA}, sol_prev::AbstractArray{Complex{T}, N}) where {T, N, A, CA}
+function work_ito(forcing::StochasticForcing{T, N}, sol_prev::Union{ScalarField,AbstractArray{Complex{T}, N}}) where {T, N}
     work = _diagnostic_inner_product(forcing, sol_prev)
 
     # The Itô integral has zero mean, so we add drift correction

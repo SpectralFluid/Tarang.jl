@@ -5,6 +5,9 @@ using Tarang: MPI, FFTW, RKGFY, MCNAB2, CNLF2
 
 include("gpu_boundary_cases.jl")
 include("gpu_workspace_cases.jl")
+include("stochastic_forcing_layout_cases.jl")
+include("gpu_float32_cases.jl")
+include("timestepper_fourier_cases.jl")
 
 @testset "Apple Metal" begin
     ext = Base.get_extension(Tarang, :TarangMetalExt)
@@ -18,7 +21,10 @@ include("gpu_workspace_cases.jl")
         @test_skip has_metal()
     else
         arch = GPU(backend=:metal)
+        check_variable_timestep_cases(arch, Float32)
+        check_forcing_grid_registration(arch)
         check_gpu_workspace_cases(arch, ext, () -> Metal.alloc_stats.alloc_bytes)
+        check_float32_device_paths(arch)
         @testset "Complex LU on the device" begin
             A = ComplexF32[0 2+im; 3-im 1]
             b = ComplexF32[4+im, 1-im]

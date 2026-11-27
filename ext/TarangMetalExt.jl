@@ -28,6 +28,8 @@ end
 
 Tarang.device(::MetalGPU) = Metal.MetalBackend()
 Tarang._default_field_dtype(::MetalGPU) = Float32
+# Apple GPUs have no Float64: host constants and arithmetic results stay single precision.
+Tarang._device_supports_float64(::MetalGPU) = false
 function Tarang._validate_gpu_field_dtype(::MetalGPU, T::Type)
     T in (Float32, ComplexF32) || throw(ArgumentError(
         "Metal spectral fields require Float32 or ComplexF32, got $T"))
