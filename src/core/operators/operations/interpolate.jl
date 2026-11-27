@@ -11,7 +11,7 @@ Evaluate interpolation operator at a specific position along a coordinate.
 Following operators Interpolate implementation.
 
 For Fourier bases: uses spectral interpolation (sum of modes)
-For Jacobi bases: uses barycentric interpolation or Clenshaw algorithm
+For Jacobi bases: contracts coefficients with the polynomial values at the requested point.
 """
 function evaluate_interpolate(interp_op::Interpolate, layout::Symbol=:g)
     operand = interp_op.operand
@@ -49,7 +49,7 @@ function evaluate_interpolate(interp_op::Interpolate, layout::Symbol=:g)
     if scaled
         ensure_layout!(operand, :g)
     end
-    grid_shape = scaled ? size(get_grid_data(operand)) : get_scaled_shape(operand)
+    grid_shape = get_scaled_shape(operand)
 
     # Work in coefficient space for spectral interpolation.
     ensure_layout!(operand, :c)
@@ -79,108 +79,88 @@ function interpolate_fourier(field::ScalarField, basis::FourierBasis, axis::Int,
     # Normalize position to [0, L)
     x = mod(position - x0, L)
 
-    coeffs = get_coeff_data(field)
-    if field.dist.size > 1 && is_gpu_array(coeffs)
-        throw(ArgumentError("Fourier interpolation on a distributed GPU field requires a global spectrum"))
-    end
     bundle = _field_transform_bundle(field)
     uses_rfft = _axis_uses_rfft(bundle, axis)
+    weights = uses_rfft ? _fourier_interp_weights(basis, N, L, x) :
+                          _fourier_full_weights(N, L, x; real_field=field.dtype <: Real)
+    data = _contract_slice(field, axis, weights)
+    length(field.bases) == 1 && return field.dtype <: Real ? real(data) : data
 
-    # MPI: reducing the interpolation axis multiplies the coefficients by global-length
-    # spectral weights and sums over that axis. If the axis is MPI-DECOMPOSED, each rank
-    # holds only a local coefficient slice (length < global) → the broadcast against the
-    # global-length weights is a DimensionMismatch, and the per-rank sum would be partial.
-    # Block it clearly. Interpolation along a NON-decomposed axis reduces correctly.
-    # NOTE: this guard MUST precede the 1-D early return below, else a genuinely 1-D
-    # MPI-decomposed Fourier field would bypass it and feed local coeffs to global weights.
-    if field.dist.size > 1 && coeffs isa PencilArrays.PencilArray
-        if axis in PencilArrays.decomposition(PencilArrays.pencil(coeffs))
-            throw(ErrorException(
-                "interpolate along axis $axis is not supported under MPI decomposition of " *
-                "that axis (it mixes per-rank-local coefficients with global-length spectral " *
-                "weights). Interpolate along a non-decomposed axis, run serially, or gather " *
-                "the field onto one rank first."))
+    remaining = Tuple(d for d in eachindex(field.bases) if d != axis)
+    bases = map(d -> field.bases[d], remaining)
+    if uses_rfft
+        # The doubled positive modes stand for conjugate pairs across the
+        # remaining Fourier axes. Polynomial degree is unchanged by conjugation.
+        spectrum = similar(data)
+        reflect = map(b -> b isa FourierBasis, bases)
+        launch!(architecture(data), _real_slice_spectrum!, spectrum, data, reflect; ndrange=size(data))
+        data = spectrum
+    end
+    layout === :c && return data
+
+    # Preserve the parent's storage convention. After collapsing its half
+    # spectrum, surviving Fourier axes still contain both frequency signs.
+    half_axis = findfirst(d -> _axis_uses_rfft(bundle, d), remaining)
+    if all(b -> b isa FourierBasis, bases)
+        if half_axis === nothing
+            grid = ifft(data)
+            return field.dtype <: Real ? real.(grid) : grid
         end
-        # The remaining axes need their entire spectra for reconstruction.
-        coeffs = _allgather_global_grid(coeffs, field.dist.comm)
+        full_axes = Tuple(d for d in eachindex(bases) if d != half_axis)
+        tmp = isempty(full_axes) ? data : ifft(data, full_axes)
+        return irfft(tmp, grid_shape[remaining[half_axis]], half_axis)
     end
-
-    # Follow the transform plan: complex-valued RealFourier fields use full FFTs,
-    # and at N=1 or N=2 the half/full spectra cannot be distinguished by length.
-    interp_weights = if uses_rfft
-        _fourier_interp_weights(basis, N, L, x)
-    else
-        _fourier_full_weights(N, L, x; real_field=field.dtype <: Real)
-    end
-    weights = on_architecture(architecture(coeffs), convert(Vector{eltype(coeffs)}, interp_weights))
-    if ndims(coeffs) == 1
-        value = sum(coeffs .* weights)
-        return field.dtype <: Real ? real(value) : value
-    end
-
-    # Weighted sum along axis: result[...] = Σ_i weights[i] * coeffs[..., i, ...]
-    # The weight vector length matches the coefficient extent along this axis
-    # (a half-spectrum N÷2+1 for the rfft'd RealFourier axis, N otherwise).
-    shape = ones(Int, ndims(coeffs))
-    shape[axis] = length(interp_weights)
-    w_shaped = reshape(weights, shape...)
-    result_data = dropdims(sum(coeffs .* w_shaped, dims=axis), dims=axis)
-
-    # Reduced-dimension result
-    nb = length(field.bases)
-    new_bases = ntuple(i -> field.bases[i < axis ? i : i + 1], nb - 1)
-    if nb == 1
-        return real(result_data isa AbstractArray ? sum(result_data) : result_data)
-    end
-
-    # `result_data` holds the spectral coefficients of the interpolated field on the
-    # REMAINING axes, in the operand's multi-D layout (the operand's first RealFourier
-    # axis is an rfft half-spectrum, other Fourier axes are full FFTs) and is generally
-    # COMPLEX (a real field's reduced spectrum is Hermitian, not real).
-    #
-    # Reconstruct grid values by inverse-transforming each remaining Fourier axis
-    # directly. Do NOT route this through a freshly-built reduced `ScalarField`: that
-    # field would inherit the parent's N-D `Distributor` (whose transform plans are
-    # N-D, throwing a BoundsError when applied to the reduced data), and storing the
-    # full-FFT slice into a 1-D field's rfft-sized coeff buffer is a size mismatch.
-    # Taking `real.(result_data)` (the previous behaviour) also zeroed the imaginary
-    # part of every surviving mode — corrupting the result.
-    if !all(b -> isa(b, RealFourier) || isa(b, ComplexFourier), new_bases)
-        throw(ArgumentError("interpolate: multi-dimensional interpolation is currently " *
-            "implemented only when the remaining axes are all Fourier; got " *
-            "$(typeof.(new_bases)). Interpolate along the non-Fourier axis separately."))
-    end
-    if layout != :g
-        # Collapsing the rfft with doubled interior weights counts the positive
-        # modes twice. Restore their conjugate partners across the remaining axes.
-        if uses_rfft
-            spectrum = similar(result_data)
-            launch!(architecture(spectrum), _real_slice_spectrum!, spectrum, result_data;
-                    ndrange=size(spectrum))
-            return spectrum
-        end
-        return result_data
-    end
-    # A remaining rfft half-spectrum axis exists only when the interpolated axis was
-    # NOT the operand's first RealFourier axis. ifft the full-spectrum axes, then irfft
-    # the half axis (which yields a real array); otherwise a plain inverse FFT.
-    remaining_axes = Tuple(d for d in 1:nb if d != axis)
-    half_axis = findfirst(d -> _axis_uses_rfft(bundle, d), remaining_axes)
-    if half_axis === nothing
-        # RealFourier also supports complex grid data; its basis type alone
-        # does not imply that the reduced grid is real.
-        full = ifft(result_data)
-        return field.dtype <: Complex ? full : real.(full)
-    end
-    full_axes = Tuple(d for d in 1:ndims(result_data) if d != half_axis)
-    tmp = isempty(full_axes) ? result_data : ifft(result_data, full_axes)
-    return irfft(tmp, grid_shape[remaining_axes[half_axis]], half_axis)
+    dtype = any(b -> b isa FourierBasis, bases) && half_axis === nothing ? complex(field.dtype) : field.dtype
+    reduced = _field_from_slice(field, remaining, data, dtype)
+    grid = grid_data!(reduced)
+    return field.dtype <: Real && eltype(grid) <: Complex ? real.(grid) : grid
 end
 
-@kernel function _real_slice_spectrum!(out, @Const(data))
+@kernel function _real_slice_spectrum!(out, @Const(data), reflect)
     I = @index(Global, NTuple)
-    J = ntuple(d -> I[d] == 1 ? 1 : size(data, d) + 2 - I[d], Val(length(I)))
+    J = ntuple(d -> reflect[d] && I[d] != 1 ? size(data, d) + 2 - I[d] : I[d], Val(length(I)))
     @inbounds out[I...] = (data[I...] + conj(data[J...])) / 2
+end
+
+# Contract the owned coefficients before communicating. Only the reduced
+# slice is replicated, in logical axis order, on every participating rank.
+function _contract_slice(field, axis, weights)
+    coeffs = get_coeff_data(field)
+    shape, ranges, order = _coefficient_geometry(field, coeffs)
+    local_data = get_local_data(coeffs)
+    physical_axis = findfirst(==(axis), order)
+    w = on_architecture(architecture(local_data), convert(Vector{eltype(coeffs)}, weights[ranges[axis]]))
+    if ndims(coeffs) == 1
+        value = sum(local_data .* w)
+        return field.dist.size == 1 ? value : MPI.Allreduce(value, +, field.dist.comm)
+    end
+
+    wshape = ntuple(d -> d == physical_axis ? length(w) : 1, ndims(coeffs))
+    piece = dropdims(sum(local_data .* reshape(w, wshape); dims=physical_axis); dims=physical_axis)
+    field.dist.size == 1 && return piece
+    remaining = Tuple(d for d in eachindex(shape) if d != axis)
+    physical = filter(!=(axis), order)
+    logical_order = map(d -> findfirst(==(d), physical), remaining)
+    # Stage only the slice for MPI implementations without GPU-aware collectives.
+    result = zeros(eltype(piece), map(d -> shape[d], remaining))
+    host_piece = on_architecture(CPU(), piece)
+    view(result, map(d -> ranges[d], remaining)...) .= PermutedDimsArray(host_piece, logical_order)
+    MPI.Allreduce!(result, +, field.dist.comm)
+    return on_architecture(field.dist.architecture, result)
+end
+
+function _field_from_slice(field, remaining, data, dtype)
+    dist = field.dist.size == 1 ? field.dist : _serial_replica_distributor(field.dist, dtype)
+    bases = map(d -> field.bases[d], remaining)
+    result = ScalarField(dist, "interp_$(field.name)", bases, dtype)
+    scales = field.scales === nothing ? ntuple(_ -> 1.0, length(bases)) : map(d -> field.scales[d], remaining)
+    preset_scales!(result, scales)
+    # When the last Fourier axis is removed, the polynomial series is real.
+    coeff_type = eltype(get_coeff_data(result))
+    coeffs = coeff_type <: Real && eltype(data) <: Complex ? real.(data) : data
+    set_coeff_data!(result, coeffs)
+    result.current_layout = :c
+    return result
 end
 
 """
@@ -233,84 +213,27 @@ end
 """
     interpolate_jacobi(field, basis, axis, position, layout)
 
-Interpolate Jacobi-type field (Chebyshev, Legendre) using Clenshaw algorithm.
+Evaluate the polynomial expansion along one axis, preserving the other axes.
 """
 function interpolate_jacobi(field::ScalarField, basis::JacobiBasis, axis::Int, position::Real, layout::Symbol)
-    N = basis.meta.size
     a, b = basis.meta.bounds
-
-    # Map position to native [-1, 1] interval
-    x_native = 2.0 * (position - a) / (b - a) - 1.0
-
-    # Clamp to valid range
-    x_native = clamp(x_native, -1.0, 1.0)
-
-    coeffs = get_coeff_data(field)
-    is_gpu_array(coeffs) && error(
-        "Jacobi interpolation is not yet device-native; CPU fallback is disabled.")
-
-    # Select the appropriate Clenshaw function
-    clenshaw_fn = if isa(basis, ChebyshevT)
-        clenshaw_chebyshev_t
-    elseif isa(basis, ChebyshevU)
-        clenshaw_chebyshev_u
-    elseif isa(basis, Legendre)
-        # Stored coefficients are in the ORTHONORMAL Legendre basis: the forward/backward
-        # transform matrices carry the per-mode factor √((2n+1)/2) (planning.jl).
-        # clenshaw_legendre evaluates the STANDARD-Pₙ series, so fold that factor into the
-        # coefficients first — otherwise interpolation is wrong by √((2n+1)/2) per mode.
-        (c, x) -> clenshaw_legendre([c[k] * sqrt((2 * (k - 1) + 1) / 2) for k in eachindex(c)], x)
+    modes = 0:(basis.meta.size - 1)
+    x = clamp(2 * (position - a) / (b - a) - 1, -1, 1)
+    weights = if basis isa ChebyshevT
+        cos.(modes .* acos(x))
+    elseif basis isa Legendre
+        # Use the same orthonormal polynomials as the inverse transform.
+        polynomials = vec(build_legendre_polynomials(length(modes), [Float64(x)]))
+        polynomials .*= sqrt.((2 .* modes .+ 1) ./ 2)
     else
-        (c, x) -> clenshaw_jacobi(c, x, basis.a, basis.b)
+        vec(evaluate_basis(basis, [clamp(position, a, b)], modes))
     end
-
-    # For 1D fields, evaluate directly
-    if ndims(coeffs) == 1
-        return clenshaw_fn(coeffs, x_native)
-    end
-
-    # For multi-D fields, apply Clenshaw along each slice of the specified axis
-    nd = ndims(coeffs)
-    result_shape = ntuple(d -> d == axis ? 1 : size(coeffs, d), nd)
-    result_size = ntuple(d -> size(coeffs, d), nd)
-
-    # Build result by iterating over all non-axis indices
-    other_dims = ntuple(i -> i < axis ? i : i + 1, nd - 1)
-    other_sizes = ntuple(i -> size(coeffs, other_dims[i]), nd - 1)
-
-    if nd == 1
-        # All dimensions are this axis — 1D case handled above
-        return clenshaw_fn(vec(coeffs), x_native)
-    end
-
-    result_data = zeros(eltype(coeffs), other_sizes...)
-
-    axis_range = 1:size(coeffs, axis)
-    for idx in CartesianIndices(other_sizes)
-        full_idx = ntuple(d -> d == axis ? axis_range : idx[d < axis ? d : d - 1], nd)
-        slice = vec(coeffs[full_idx...])
-        result_data[idx] = clenshaw_fn(slice, x_native)
-    end
-
-    # Create reduced-dimension field
-    nb = length(field.bases)
-    new_bases = ntuple(i -> field.bases[i < axis ? i : i + 1], nb - 1)
-    if nb == 1
-        return result_data isa AbstractArray ? result_data[] : result_data
-    end
-
-    result_field = ScalarField(field.dist, "interp_$(field.name)", new_bases, field.dtype)
-    result_field.scales = field.scales === nothing ? nothing :
-        ntuple(i -> field.scales[i < axis ? i : i + 1], nb - 1)
-    ensure_layout!(result_field, :c)
-    set_coeff_data!(result_field, result_data)
-    result_field.current_layout = :c
-
-    if layout == :g
-        backward_transform!(result_field)
-    end
-
-    return result_field
+    data = _contract_slice(field, axis, weights)
+    length(field.bases) == 1 && return data
+    remaining = Tuple(d for d in eachindex(field.bases) if d != axis)
+    result = _field_from_slice(field, remaining, data, field.dtype)
+    ensure_layout!(result, layout)
+    return result
 end
 
 # ============================================================================

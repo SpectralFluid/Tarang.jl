@@ -639,13 +639,7 @@ function _accumulate_diagonal_term!(Lhat, k2, coeff::Number, op, field::ScalarFi
         operand_multiplier = _diagonal_operand_multiplier(Lhat, k2, op.operand, field)
         operand_multiplier === nothing && return false
         α = eltype(k2)(op.α)
-        if α < 0
-            # Match the inverse fractional Laplacian's zero-mean convention.
-            threshold = eltype(k2)(1e-14)
-            @. Lhat += coeff * ifelse(k2 > threshold, k2 ^ α, 0) * operand_multiplier
-        else
-            @. Lhat += coeff * k2 ^ α * operand_multiplier
-        end
+        @. Lhat += coeff * _fractional_multiplier(k2, α) * operand_multiplier
         return true
     elseif isa(op, Laplacian)
         operand_multiplier = _diagonal_operand_multiplier(Lhat, k2, op.operand, field)

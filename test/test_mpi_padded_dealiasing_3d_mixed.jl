@@ -29,6 +29,8 @@ const MAX_REF   = 1.5333421886891991
 
 @testset "Distributed 3D Cheb-Fourier-Fourier dealiasing == serial (np=$nprocs)" begin
     check_cartesian_products(CPU(), Float64, comm)
+    check_mixed_cartesian_fields(CPU(), Float64, comm)
+    check_longwave_inverse(CPU(), Float64, comm)
     coords = CartesianCoordinates("z", "y", "x")          # Chebyshev FIRST
     dist = Distributor(coords)
     zb = ChebyshevT(coords["z"]; size=Nz, bounds=(0.0, 1.0))

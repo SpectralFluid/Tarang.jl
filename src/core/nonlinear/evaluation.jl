@@ -38,7 +38,8 @@ function evaluate_nonlinear_term(op::AdvectionOperator, layout::Symbol=:g)
 
     # Evaluate u·∇φ = u_x ∂φ/∂x + u_y ∂φ/∂y (+ u_z ∂φ/∂z in 3D)
     # Use in-place accumulation to avoid lazy Add trees and per-iteration allocation
-    result = ScalarField(dist, "$(op.name)_$(scalar.name)", scalar.bases, scalar.dtype)
+    result = ScalarField(dist, "$(op.name)_$(scalar.name)", scalar.bases, promote_type(velocity.dtype, scalar.dtype))
+    preset_scales!(result, scalar.scales)
     result_data = grid_data!(result)
     fill!(result_data, zero(scalar.dtype))
 
@@ -70,6 +71,7 @@ function evaluate_nonlinear_term(op::NonlinearAdvectionOperator, layout::Symbol=
 
     # Result is a vector field
     result = VectorField(dist, dist.coordsys, "$(op.name)_$(velocity.name)", velocity.bases, velocity.dtype)
+    preset_scales!(result, first(velocity.components).scales)
 
     # For each component: (u·∇)u_i = u_j ∂u_i/∂x_j (summed over j)
     # Use in-place accumulation to avoid lazy Add trees and allocation per iteration
@@ -94,6 +96,11 @@ function evaluate_nonlinear_term(op::NonlinearAdvectionOperator, layout::Symbol=
 
     return result
 end
+
+# The direct evaluator historically computes same-kind products at the first
+# operand's precision. Ordinary field arithmetic explicitly requests promotion.
+_nonlinear_product_dtype(a, b) = (a.dtype <: Real) == (b.dtype <: Real) ?
+    a.dtype : promote_type(a.dtype, b.dtype)
 
 """Efficiently multiply two fields using transform method and proper dealiasing.
 
@@ -125,14 +132,8 @@ function evaluate_transform_multiply(field1::ScalarField, field2::ScalarField, e
 
     _TRACK_NL_TIMING && (start_time = time())
 
-    if field1.bases != field2.bases
-        throw(ArgumentError(
-            "Cannot multiply fields with different bases: " *
-            "'$(field1.name)' has bases=$(field1.bases) but " *
-            "'$(field2.name)' has bases=$(field2.bases). " *
-            "Both fields must be defined on the same domain."))
-    end
-    if _has_nonunit_arithmetic_scale(field1) || _has_nonunit_arithmetic_scale(field2)
+    _check_field_arithmetic_compatibility(field1, field2, "multiply")
+    if _has_nonunit_arithmetic_scale(field1)
         # Scaled fields use the caller's working grid, as in field arithmetic.
         result = field1 * field2
         ensure_layout!(result, result_layout)
@@ -142,8 +143,12 @@ function evaluate_transform_multiply(field1::ScalarField, field2::ScalarField, e
     # Try proper 3/2-rule padded dealiasing. Gate on the per-axis basis `dealias`
     # settings (factor > 1 on a Fourier or ChebyshevT axis) rather than the evaluator's global
     # default, so bases set to dealias ≤ 1 are computed without dealiasing.
+    result_dtype = _nonlinear_product_dtype(field1, field2)
     if _any_axis_dealias(field1.bases, evaluator.dealiasing_factor)
-        T = field1.dtype <: Complex ? real(field1.dtype) : field1.dtype
+        # Match precision without changing either operand's Fourier interpolant.
+        T = real(result_dtype)
+        field1 = _product_operand_at_precision(field1, T)
+        field2 = _product_operand_at_precision(field2, T)
         # Detect the MPI pencil path WITHOUT forcing a layout first, so the
         # distributed routine can truncate inputs in coefficient space (avoids a
         # c→g→c round trip when operands arrive in coeff space — the usual case).
@@ -193,7 +198,7 @@ function evaluate_transform_multiply(field1::ScalarField, field2::ScalarField, e
     # Direct product for bases without an active padded workspace.
     ensure_layout!(field1, :g)
     ensure_layout!(field2, :g)
-    result = ScalarField(field1.dist, "_nl_product", field1.bases, field1.dtype)
+    result = ScalarField(field1.dist, "_nl_product", field1.bases, result_dtype)
 
     result_data = grid_data!(result)
     field1_data = get_grid_data(field1)
@@ -298,8 +303,9 @@ function _transpose_padded_product(a, b, evaluator, result_layout)
     shape = map(basis -> basis.meta.size, a.bases)
     padded_shape = ntuple(d -> _padded_product_nodes(a.bases[d], shape[d], evaluator.dealiasing_factor), length(shape))
     axes_to_pad = findall(d -> padded_shape[d] != shape[d], eachindex(shape))
-    padded_workspace(sz) = get!(dist.transpose_workspace_cache, (:nonlinear, sz, a.dtype)) do
-        _build_transpose_workspace(a, sz, nothing)
+    template = _product_template(a, b)
+    padded_workspace(sz) = get!(dist.transpose_workspace_cache, (:nonlinear, sz, template.dtype)) do
+        _build_transpose_workspace(template, sz, nothing)
     end
     stages = [padded_workspace(shape)]
     for axis in axes_to_pad
@@ -331,9 +337,9 @@ function _transpose_padded_product(a, b, evaluator, result_layout)
         padded .*= saved
     end
     for i in reverse(eachindex(axes_to_pad))
-        _resize_transpose_axis!(stages[i], stages[i+1], axes_to_pad[i], a)
+        _resize_transpose_axis!(stages[i], stages[i+1], axes_to_pad[i], template)
     end
-    result = _checkout_nl_result!(evaluator, a)
+    result = _checkout_nl_result!(evaluator, template)
     data = first(stages).buffers.z_local_data
     T = real(result.dtype)
     scale = prod((T(shape[d]) / T(first(stages).global_shape[d]) for d in axes_to_pad if a.bases[d] isa FourierBasis); init=one(T))
@@ -500,7 +506,8 @@ function evaluate_padded_multiply_distributed(field1::ScalarField, field2::Scala
     isempty(fourier_axes) && return nothing
     dist = field1.dist
     factor = evaluator.dealiasing_factor
-    T = field1.dtype <: Complex ? real(field1.dtype) : field1.dtype
+    template = _product_template(field1, field2)
+    T = real(template.dtype)
     CT = Complex{T}
     N = ntuple(d -> bases[d].meta.size, D)
     Mp = ntuple(d -> _padded_product_nodes(bases[d], N[d], factor), D)
@@ -554,13 +561,13 @@ function evaluate_padded_multiply_distributed(field1::ScalarField, field2::Scala
         _padded_dist_transpose!(ws, nxt, cur)
         (nxt, ndec)
     end
-    function resize_local!(pout, pin, axis)
+    function resize_local!(pout, pin, axis, field)
         input, output = parent(pin), parent(pout)
         if bases[axis] isa ChebyshevT
-            return _resize_chebyshev_product_axis!(output, input, axis, field1)
+            return _resize_chebyshev_product_axis!(output, input, axis, field)
         end
         _padded_dist_fwd_plan!(ws, input, axis) * input
-        cosine_dims = field1.dtype <: Real ? (axis,) : ()
+        cosine_dims = field.dtype <: Real ? (axis,) : ()
         if size(output, axis) > size(input, axis)
             _pad_spectral!(output, input, size(input), size(output), [axis], cosine_dims)
         else
@@ -568,13 +575,13 @@ function evaluate_padded_multiply_distributed(field1::ScalarField, field2::Scala
         end
         _padded_dist_inv_plan!(ws, output, axis) * output
     end
-    sweep(start, sdec, ssz, tgt, axes_order) = begin
+    sweep(start, sdec, ssz, tgt, axes_order, field) = begin
         cur = start; dec = collect(sdec); csz = collect(ssz)
         for a in axes_order
             cur, dec = makelocal(cur, csz, dec, a, 0)
             csz[a] = tgt[a]
             nxt = _padded_dist_buf!(ws, mkpen(csz, dec))
-            resize_local!(nxt, cur, a)
+            resize_local!(nxt, cur, a, field)
             _release_padded_dist_buf!(ws, cur)
             cur = nxt
         end
@@ -591,29 +598,29 @@ function evaluate_padded_multiply_distributed(field1::ScalarField, field2::Scala
         peaks = [maximum(abs, parent(g); init=zero(T)) for g in (gd1, gd2)]
         MPI.Allreduce!(peaks, MPI.MAX, dist.comm)
         if any(iszero, peaks) && all(isfinite, peaks)
-            result = _checkout_nl_result!(evaluator, field1)
+            result = _checkout_nl_result!(evaluator, template)
             fill!(parent(grid_data!(result)), zero(T))
             ensure_layout!(result, result_layout)
             return result
         end
         exponents = (last(frexp(peaks[1])), last(frexp(peaks[2])))
         product_exponent = sum(exponents)
-        up1 = sweep(tolog(gd1, gd2, exponents), decomp0, N, Mp, padded_axes)
+        up1 = sweep(tolog(gd1, gd2, exponents), decomp0, N, Mp, padded_axes, field1)
         packed = parent(up1)
         @. packed = real(packed) * imag(packed)
     else
-        up1 = sweep(tolog(gd1), decomp0, N, Mp, padded_axes)
-        up2 = sweep(tolog(gd2), decomp0, N, Mp, padded_axes)
+        up1 = sweep(tolog(gd1), decomp0, N, Mp, padded_axes, field1)
+        up2 = sweep(tolog(gd2), decomp0, N, Mp, padded_axes, field2)
         parent(up1) .*= parent(up2)
         _release_padded_dist_buf!(ws, up2)
     end
     pdec = Tuple(PencilArrays.decomposition(PencilArrays.pencil(up1)))
     # Separable truncations commute. Undo the padding order so the first axis is
     # already local, and shrink each axis BEFORE communicating the next pencil.
-    res = sweep(up1, pdec, Mp, N, reverse(padded_axes))
+    res = sweep(up1, pdec, Mp, N, reverse(padded_axes), template)
     parent(res) .*= prod(T(Mp[d]) / T(N[d]) for d in fourier_axes)
 
-    result = _checkout_nl_result!(evaluator, field1)
+    result = _checkout_nl_result!(evaluator, template)
     rg = grid_data!(result)
     # Align `res` (NoPermutation) to the result grid pencil's EXACT ordered
     # decomposition so the final transpose is perm-only. Matching just the local
@@ -633,7 +640,7 @@ function evaluate_padded_multiply_distributed(field1::ScalarField, field2::Scala
     else
         _padded_dist_transpose!(ws, _padded_dist_buf!(ws, PencilArrays.pencil(rg)), res)
     end
-    if field1.dtype <: Complex
+    if result.dtype <: Complex
         parent(rg) .= parent(rc)
     else
         parent(rg) .= ldexp.(real.(parent(rc)), product_exponent)

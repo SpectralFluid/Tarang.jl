@@ -53,6 +53,7 @@ function evaluate_curl_2d(operand::VectorField, coordsys::CoordinateSystem, layo
 
     # Result = dvy_dx - dvx_dy
     result = ScalarField(operand.dist, "curl_$(operand.name)", operand.bases, operand.dtype)
+    preset_scales!(result, vx.scales)
     ensure_layout!(result, layout)
 
     if layout == :g
@@ -87,6 +88,7 @@ function evaluate_curl_3d(operand::VectorField, coordsys::CoordinateSystem, layo
 
     result = VectorField(operand.dist, coordsys, "curl_$(operand.name)", operand.bases, operand.dtype)
 
+    preset_scales!(result, vx.scales)
     for comp in result.components
         ensure_layout!(comp, layout)
     end

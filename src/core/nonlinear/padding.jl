@@ -359,6 +359,11 @@ _padded_coefficient_compatible(f, shape) =
     (f.scales === nothing || all(isone, f.scales)) &&
     size(get_local_data(get_coeff_data(f))) == shape
 
+# Operands enter the padded path at the same real precision. A complex operand
+# supplies the full-spectrum result layout for mixed products in either order.
+_product_template(a, b) = a.dtype <: Real && b.dtype <: Complex ? b : a
+_product_cosine_dims(ws, field) = field.dtype <: Real ? ws.fourier_dims : ws.cosine_dims
+
 function _complex_operand_spectrum!(ws, field)
     if field.dtype <: Complex && field.current_layout === :c &&
        _padded_coefficient_compatible(field, ws.original_shape)
@@ -389,14 +394,14 @@ function evaluate_padded_multiply(field1::ScalarField, field2::ScalarField,
                                   result_layout::Symbol=:g, operand_key=nothing) where T
     # Step 1: FFT to spectral along Fourier dimensions, in place via pre-built
     # plans (no per-call allocation). Plans dispatch to CUFFT for GPU arrays.
-    cosine_dims = field1.dtype <: Real ? ws.fourier_dims : ws.cosine_dims
+    template = _product_template(field1, field2)
     _complex_operand_spectrum!(ws, field1)
-    _pad_spectral!(ws.padded1, ws.spectrum, ws.original_shape, ws.padded_shape, ws.fourier_dims, cosine_dims)
+    _pad_spectral!(ws.padded1, ws.spectrum, ws.original_shape, ws.padded_shape, ws.fourier_dims, _product_cosine_dims(ws, field1))
     ws.plan_backward * ws.padded1
     if operand_key === nothing || ws.cached_operand !== operand_key
         ws.cached_operand = nothing
         _complex_operand_spectrum!(ws, field2)
-        _pad_spectral!(ws.padded2, ws.spectrum, ws.original_shape, ws.padded_shape, ws.fourier_dims, cosine_dims)
+        _pad_spectral!(ws.padded2, ws.spectrum, ws.original_shape, ws.padded_shape, ws.fourier_dims, _product_cosine_dims(ws, field2))
         ws.plan_backward * ws.padded2
         ws.cached_operand = operand_key
     end
@@ -409,7 +414,7 @@ function evaluate_padded_multiply(field1::ScalarField, field2::ScalarField,
 
     # Step 6: Truncate to original coefficients
     # Truncation overwrites every original-size element; no clear is needed.
-    _truncate_spectral!(ws.spectrum, ws.padded1, ws.original_shape, ws.padded_shape, ws.fourier_dims, cosine_dims)
+    _truncate_spectral!(ws.spectrum, ws.padded1, ws.original_shape, ws.padded_shape, ws.fourier_dims, _product_cosine_dims(ws, template))
 
     # Step 7: IFFT to grid and normalize
     # Normalization: padded IFFT divides by M, but we want result on N-grid.
@@ -420,7 +425,7 @@ function evaluate_padded_multiply(field1::ScalarField, field2::ScalarField,
     end
     # Write result to a pooled output field (rotating buffers — distinct for
     # consecutively-held products like cross product; no per-call allocation).
-    result = destination === nothing ? _checkout_nl_result!(evaluator, field1) : destination
+    result = destination === nothing ? _checkout_nl_result!(evaluator, template) : destination
     if result_layout === :c && result.dtype <: Complex &&
        _padded_coefficient_compatible(result, ws.original_shape)
         dst = get_local_data(get_coeff_data(result))
@@ -436,7 +441,7 @@ function evaluate_padded_multiply(field1::ScalarField, field2::ScalarField,
     # and the output field share an architecture, so no device transfer is needed.
     dst = get_local_data(result_data)
     values = _lobatto_grid_view(ws.spectrum, dst)
-    if field1.dtype <: Real
+    if result.dtype <: Real
         @. dst = real(values) * scale
     else
         @. dst = values * scale
@@ -701,8 +706,8 @@ function evaluate_truncated_multiply_distributed(field1::ScalarField, field2::Sc
     # per-call `copy(field)` allocations.
     f1 = get!(() -> ScalarField(field1.dist, "_nl_trunc_f1", field1.bases, field1.dtype),
               evaluator.temp_fields, _nonlinear_temp_field_key("_nl_trunc_f1", field1))
-    f2 = get!(() -> ScalarField(field1.dist, "_nl_trunc_f2", field1.bases, field1.dtype),
-              evaluator.temp_fields, _nonlinear_temp_field_key("_nl_trunc_f2", field1))
+    f2 = get!(() -> ScalarField(field2.dist, "_nl_trunc_f2", field2.bases, field2.dtype),
+              evaluator.temp_fields, _nonlinear_temp_field_key("_nl_trunc_f2", field2))
     # Band-limit both inputs in coeff space, then bring them back to grid with a
     # SINGLE batched transpose instead of one per input (2 backwards → 1).
     _truncate_coeff_only!(f1, field1, factor)
@@ -711,7 +716,7 @@ function evaluate_truncated_multiply_distributed(field1::ScalarField, field2::Sc
 
     # Multiply on the grid. `result` comes from a rotating buffer pool — distinct
     # buffers for consecutively-held products (e.g. cross product), no per-call alloc.
-    result = _checkout_nl_result!(evaluator, field1)
+    result = _checkout_nl_result!(evaluator, _product_template(field1, field2))
     result_data = grid_data!(result)
     d1 = get_grid_data(f1)
     d2 = get_grid_data(f2)

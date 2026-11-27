@@ -56,29 +56,20 @@ function evaluate_scalar_fractional_laplacian(operand::ScalarField, alpha::Float
 
     # Create result field
     alpha_str = alpha >= 0 ? "$(alpha)" : "m$(abs(alpha))"
-    result = ScalarField(operand.dist, "fraclap$(alpha_str)_$(operand.name)", operand.bases, operand.dtype)
+    result = _allocate_field_arithmetic_result(operand, operand.dtype, "fraclap$(alpha_str)_$(operand.name)")
 
     # Work on a copy to avoid mutating the caller's field layout
     work = copy(operand)
+    _has_nonunit_arithmetic_scale(work) && ensure_layout!(work, :g)
     ensure_layout!(work, :c)
     ensure_layout!(result, :c)
 
     # Get wavenumber grids for each Fourier basis
     k_squared_total = compute_wavenumber_squared_grid(work)
 
-    # Compute |k|^(2*alpha) factor
     alpha_native = eltype(k_squared_total)(alpha)
-    if alpha >= 0
-        k_factor = k_squared_total .^ alpha_native
-    else
-        # For inverse operations, set k=0 mode to zero
-        k_factor = similar(k_squared_total)
-        threshold = eltype(k_squared_total)(1e-14)
-        k_factor .= ifelse.(k_squared_total .> threshold, k_squared_total .^ alpha_native, zero(eltype(k_squared_total)))
-    end
-
-    # Apply the fractional Laplacian in spectral space
-    get_coeff_data(result) .= get_coeff_data(work) .* k_factor
+    get_local_data(get_coeff_data(result)) .= get_local_data(get_coeff_data(work)) .*
+        _fractional_multiplier.(get_local_data(k_squared_total), alpha_native)
 
     # Transform to requested layout if needed
     if layout == :g
@@ -94,14 +85,7 @@ function evaluate_vector_fractional_laplacian(operand::VectorField, alpha::Float
                         operand.bases, operand.dtype)
 
     for (i, comp) in enumerate(operand.components)
-        frac_lap_comp = evaluate_scalar_fractional_laplacian(comp, alpha, layout)
-
-        ensure_layout!(result.components[i], layout)
-        if layout == :g
-            copyto!(get_grid_data(result.components[i]), get_grid_data(frac_lap_comp))
-        else
-            copyto!(get_coeff_data(result.components[i]), get_coeff_data(frac_lap_comp))
-        end
+        result.components[i] = evaluate_scalar_fractional_laplacian(comp, alpha, layout)
     end
 
     return result
@@ -117,72 +101,28 @@ Returns an array with the same shape as get_coeff_data(field) containing
 the squared wavenumber magnitude at each spectral coefficient location.
 """
 function compute_wavenumber_squared_grid(field::ScalarField)
-    bases = field.bases
     cd = get_coeff_data(field)
     T = real(eltype(cd))
-    isempty(bases) && return similar_zeros(cd, T, size(cd)...)
+    k_squared = fill!(similar(cd, T), zero(T))
+    isempty(field.bases) && return k_squared
+    shape, ranges, order = _coefficient_geometry(field, cd)
     bundle = _field_transform_bundle(field)
-
-    # MPI-distributed (PencilArray): build |k|² on each rank's LOCAL coefficients
-    # using its GLOBAL wavenumber indices (axes_local), in rfft/fft layout. The
-    # serial path below uses the global wavenumber arrays directly.
-    if isa(cd, PencilArrays.PencilArray)
-        k_squared = similar_zeros(cd, T, size(cd)...)
-        kp = parent(k_squared)
-        pencil = PencilArrays.pencil(cd)
-        local_axes = pencil.axes_local
-        # Tuple(NoPermutation()) is `nothing`, NOT identity — guard before findfirst.
-        _perm_raw = Tuple(PencilArrays.permutation(cd))
-        perm_tuple = _perm_raw === nothing ? ntuple(identity, ndims(kp)) : _perm_raw
-        for (axis, basis) in enumerate(bases)
-            k_axis = if isa(basis, RealFourier)
-                _axis_uses_rfft(bundle, axis) ? wavenumbers_rfft(basis) : wavenumbers_fft(basis)
-            elseif isa(basis, ComplexFourier)
-                wavenumbers(basis)
-            else
-                continue
-            end
-            local_range = axis <= length(local_axes) ? local_axes[axis] : (1:length(k_axis))
-            k_local = T.(k_axis[local_range])
-            physical_axis = findfirst(==(axis), perm_tuple)
-            physical_axis === nothing && (physical_axis = axis)
-            shp = ntuple(i -> i == physical_axis ? length(k_local) : 1, ndims(kp))
-            kp .+= reshape(k_local .^ 2, shp...)
-        end
-        return k_squared
+    for (axis, basis) in enumerate(field.bases)
+        basis isa FourierBasis || continue
+        half = _axis_uses_rfft(bundle, axis)
+        n = shape[axis]
+        k0 = 2π / (basis.meta.bounds[2] - basis.meta.bounds[1])
+        # A full FFT wraps its upper bins to negative frequencies. A half
+        # spectrum is nonnegative for both even and odd physical grid sizes.
+        k = [k0 * (half || i <= cld(n, 2) ? i - 1 : i - 1 - n) for i in ranges[axis]]
+        add_wavenumber_squared_contribution!(get_local_data(k_squared), k,
+                                            findfirst(==(axis), order), length(shape))
     end
-
-    data_shape = size(cd)
-
-    # Initialize with zeros on the same device as get_coeff_data(field)
-    k_squared = similar_zeros(cd, T, data_shape...)
-
-    # Add contribution from each basis
-    for (axis, basis) in enumerate(bases)
-        if isa(basis, RealFourier)
-            if _axis_uses_rfft(bundle, axis)
-                # RFFT layout: [k=0, k=1, ..., k=N/2]
-                k_axis_cpu = wavenumbers_rfft(basis)
-            else
-                # Full FFT layout: [k=0, k=1, ..., k=N/2-1, k=-N/2, ..., k=-1]
-                # This occurs on non-first axes in multi-dim transforms where
-                # rfft on the first axis produces complex data, so subsequent
-                # RealFourier axes use fft (standard FFT ordering).
-                k_axis_cpu = wavenumbers_fft(basis)
-            end
-
-            add_wavenumber_squared_contribution!(k_squared, k_axis_cpu, axis, length(bases))
-
-        elseif isa(basis, ComplexFourier)
-            # Get wavenumbers for ComplexFourier basis
-            k_axis_cpu = wavenumbers(basis)
-            add_wavenumber_squared_contribution!(k_squared, k_axis_cpu, axis, length(bases))
-        end
-        # For Chebyshev/Legendre bases, no wavenumber contribution
-    end
-
     return k_squared
 end
+
+# Only the constant Fourier mode is singular for an inverse power.
+@inline _fractional_multiplier(k2, alpha) = iszero(k2) && alpha < 0 ? zero(k2) : k2^alpha
 
 """
 Add k^2 contribution from one axis to the total wavenumber grid.
@@ -262,14 +202,7 @@ function subproblem_matrix(op::FractionalLaplacian, subproblem)
 
     k_squared_flat = vec(k_squared)
 
-    # Compute |k|^(2*alpha) diagonal entries
-    if alpha >= 0
-        diag_entries = k_squared_flat .^ alpha
-    else
-        threshold = 1e-14
-        diag_entries = ifelse.(k_squared_flat .> threshold, k_squared_flat .^ alpha, 0.0)
-    end
-
+    diag_entries = _fractional_multiplier.(k_squared_flat, alpha)
     return spdiagm(0 => diag_entries)
 end
 

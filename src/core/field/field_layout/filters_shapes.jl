@@ -293,3 +293,15 @@ function get_grid_layout_info(dist::Distributor, domain::Domain; scales=nothing)
         scales = scales
     )
 end
+
+"""Global coefficient shape, owned logical indices, and parent-buffer axis order."""
+function _coefficient_geometry(field::ScalarField, data)
+    if data isa PencilArrays.PencilArray
+        perm = Tuple(PencilArrays.permutation(data))
+        order = perm === nothing ? ntuple(identity, ndims(data)) : perm
+        return Tuple(PencilArrays.size_global(data)), PencilArrays.pencil(data).axes_local, order
+    end
+    shape = field.dist.size == 1 ? size(data) : get_coefficient_shape_for_context(field.domain, field.dist, field.dtype)
+    ranges = ntuple(d -> local_indices(field.dist, d, shape[d]), length(shape))
+    return shape, ranges, ntuple(identity, length(shape))
+end

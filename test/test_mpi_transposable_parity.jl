@@ -87,6 +87,36 @@ end
 
         distributed_backward_transform!(tf)
         @test maximum(abs, Tarang.get_grid_data(field) .- original; init=0.0) < 1e-10
+        close(tf)
+        if NP > 1
+            marked = ScalarField(field, Tarang.TransposableFieldStorage(CPU(),
+                                 get_grid_data(field), get_coeff_data(field)))
+            x = 2π .* (ox .- 1) ./ Nx
+            y = 2π .* (oy .- 1) ./ Ny
+            grid_data!(marked) .= cis.(2 .* x .+ transpose(y))
+            pos = 0.25
+            # Both ranks receive every sample, including the phase of the
+            # portion initially owned by another rank.
+            slice = interpolate(marked, coords["y"], pos)
+            expected = cis.(2 .* (2π/Nx) .* (0:Nx-1) .+ pos)
+            @test evaluate(slice, :g) ≈ expected atol=2e-12
+            @test evaluate(slice, :c) ≈ Tarang.FFTW.fft(expected) atol=2e-12
+            x_slice = interpolate(marked, coords["x"], pos)
+            @test evaluate(x_slice, :g) ≈ cis.(2pos .+ (2π/Ny) .* (0:Ny-1)) atol=2e-12
+            fractional = evaluate(fraclap(marked, 0.5), :c)
+            @test maximum(abs, grid_data!(fractional) .- sqrt(5).*cis.(2 .* x .+ transpose(y))) < 1e-11
+
+            r = ScalarField(dist, "real_nyquist", bases, Float32)
+            real_operand = ScalarField(r, Tarang.TransposableFieldStorage(CPU(), get_grid_data(r), get_coeff_data(r)))
+            grid_data!(real_operand) .= cos.((Nx ÷ 2) .* x)
+            expected_product = cis.((2 - Nx ÷ 2) .* x .+ transpose(y)) ./ 2
+            for (a,b) in ((real_operand, marked), (marked, real_operand))
+                product = a*b
+                @test product.dtype === ComplexF64
+                @test maximum(abs, grid_data!(product) .- expected_product) < 1e-11
+            end
+        end
+        close(dist)
     end
 
     @testset "3D mesh=$mesh" for mesh in (NP == 4 ? ((2, 2), (4, 1), (1, 4), (NP,)) : ((NP, 1), (NP,)))

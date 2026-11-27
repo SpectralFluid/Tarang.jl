@@ -5,6 +5,9 @@ include("cartesian_basis_cases.jl")
 function check_gpu_workspace_cases(arch, ext, alloc_bytes; reusable_real_fft=true)
     @testset "Cartesian basis products and operators" begin
         check_cartesian_products(arch, Float32, Tarang.MPI.COMM_SELF)
+        check_mixed_cartesian_fields(arch, Float32, Tarang.MPI.COMM_SELF)
+        check_longwave_inverse(arch, Float32, Tarang.MPI.COMM_SELF)
+        check_scaled_cartesian_fields(arch, Float32)
         check_cartesian_operators(arch, Float32)
     end
     @testset "GPU grid resize parity and buffer reuse" begin
