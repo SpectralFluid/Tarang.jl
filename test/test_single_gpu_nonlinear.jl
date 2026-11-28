@@ -131,4 +131,15 @@ end
     product = evaluate_transform_multiply(a, b, Tarang._get_evaluator(a.dist))
     @test eltype(grid_data!(product)) === Float32
     @test grid_data!(product) ≈ fill(6f0, 8, 8)
+
+    c = ScalarField(a.dist, "narrow_complex", a.bases, ComplexF32)
+    xs = [2π*i/8 for i in 0:7, j in 1:8]
+    grid_data!(b) .= cos.(4xs)
+    grid_data!(c) .= cis.(xs)
+    coeff_data!(c)
+    for (real_or_complex, other) in ((b,c), (c,b))
+        result = real_or_complex * other
+        @test result.dtype === ComplexF64
+        @test maximum(abs, grid_data!(result) .- cis.(-3xs)./2) < 10eps(Float32)
+    end
 end

@@ -65,6 +65,7 @@ function evaluate_cartesian_divergence(op::CartesianDivergence, layout::Symbol=:
 
     # Create scalar field for result
     result = ScalarField(operand.dist, "div_$(operand.name)", operand.components[1].bases, operand.dtype)
+    preset_scales!(result, first(operand.components).scales)
     ensure_layout!(result, layout)
 
     # Initialize to zero
@@ -149,6 +150,7 @@ Subtract two scalar fields.
 """
 function field_subtract(a::ScalarField, b::ScalarField, layout::Symbol)
     result = ScalarField(a.dist, "sub", a.bases, a.dtype)
+    preset_scales!(result, a.scales)
     ensure_layout!(result, layout)
     ensure_layout!(a, layout)
     ensure_layout!(b, layout)
@@ -174,6 +176,7 @@ function evaluate_cartesian_laplacian(op::CartesianLaplacian, layout::Symbol=:g)
     if isa(operand, ScalarField)
         # Create result field
         result = ScalarField(operand.dist, "lap_$(operand.name)", operand.bases, operand.dtype)
+        preset_scales!(result, operand.scales)
         ensure_layout!(result, layout)
 
         # Initialize to zero
@@ -237,6 +240,7 @@ function evaluate_cartesian_trace(op::CartesianTrace, layout::Symbol=:g)
     # Get first component to create result
     first_comp = operand.components[1, 1]
     result = ScalarField(first_comp.dist, "trace_$(operand.name)", first_comp.bases, first_comp.dtype)
+    preset_scales!(result, first_comp.scales)
     ensure_layout!(result, layout)
 
     # Initialize to zero
@@ -274,6 +278,7 @@ function evaluate_cartesian_skew(op::CartesianSkew, layout::Symbol=:g)
     result = VectorField(operand.dist, coordsys, "skew_$(operand.name)",
                         operand.components[1].bases, operand.dtype)
 
+    preset_scales!(result, first(operand.components).scales)
     for comp in result.components
         ensure_layout!(comp, layout)
     end

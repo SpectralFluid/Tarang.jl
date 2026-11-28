@@ -6,6 +6,9 @@ include("cartesian_basis_cases.jl")
 @testset "Spectral review regressions" begin
     @testset "Cartesian basis products and operators" begin
         check_cartesian_products(CPU(), Float64, Tarang.MPI.COMM_SELF)
+        check_mixed_cartesian_fields(CPU(), Float64, Tarang.MPI.COMM_SELF)
+        check_longwave_inverse(CPU(), Float64, Tarang.MPI.COMM_SELF)
+        check_scaled_cartesian_fields(CPU(), Float64)
         check_cartesian_operators(CPU(), Float64)
         for height in (0, -1, Inf)
             @test_throws ArgumentError ChannelDomain3D(4, 5, 6; Lz=height)

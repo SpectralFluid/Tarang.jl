@@ -25,24 +25,22 @@ function _check_field_arithmetic_compatibility(a::ScalarField, b::ScalarField,
 end
 
 """Allocate an arithmetic result with the source field's current grid shape."""
-function _allocate_field_arithmetic_result(field::ScalarField, dtype::DataType)
-    result = ScalarField(field.dist, _FIELD_ARITH_TMP_NAME, field.bases, dtype)
+function _allocate_field_arithmetic_result(field::ScalarField, dtype::DataType, name::String=_FIELD_ARITH_TMP_NAME)
+    result = ScalarField(field.dist, name, field.bases, dtype)
+    if is_transposable_storage(field) && !is_transposable_storage(result)
+        result = ScalarField(result, TransposableFieldStorage(field.dist.architecture,
+                             get_grid_data(result), get_coeff_data(result)))
+    end
     preset_scales!(result, field.scales)
     return result
 end
 
-"""Return `field` at `dtype`, copying only when arithmetic promotion requires it."""
-function _promote_field_arithmetic_operand(field::ScalarField, dtype::DataType)
+"""Change working precision while preserving the operand's Fourier interpolant."""
+function _product_operand_at_precision(field::ScalarField, ::Type{T}) where T
+    dtype = field.dtype <: Real ? T : Complex{T}
     field.dtype === dtype && return field
-
     promoted = _allocate_field_arithmetic_result(field, dtype)
-    # A real-to-complex promotion can replace an rfft half-spectrum with a
-    # full FFT. Use the field's plan, which agrees across ranks even when
-    # individual slabs happen to have matching local shapes.
-    changes_fourier_layout = field.current_layout === :c &&
-        field.dtype <: Real && dtype <: Complex &&
-        any(op -> op.op === :rfft, _field_transform_bundle(field).forward_ops)
-    if field.current_layout === :c && !changes_fourier_layout
+    if field.current_layout === :c
         _local_data(coeff_data!(promoted)) .= _local_data(get_coeff_data(field))
     else
         _local_data(grid_data!(promoted)) .= _local_data(grid_data!(field))
@@ -105,10 +103,9 @@ function Base.:*(a::ScalarField, b::ScalarField)
     # already represent samples on the user's chosen working grid.
     if has_spectral_bases(a) && !_has_nonunit_arithmetic_scale(a) &&
        _any_axis_dealias(a.bases, _get_evaluator(a.dist).dealiasing_factor)
-        dtype = promote_type(a.dtype, b.dtype)
-        promoted_a = _promote_field_arithmetic_operand(a, dtype)
-        promoted_b = _promote_field_arithmetic_operand(b, dtype)
-        return evaluate_transform_multiply(promoted_a, promoted_b, _get_evaluator(a.dist))
+        T = real(promote_type(a.dtype, b.dtype))
+        return evaluate_transform_multiply(_product_operand_at_precision(a, T),
+                                          _product_operand_at_precision(b, T), _get_evaluator(a.dist))
     end
 
     result = _allocate_field_arithmetic_result(a, promote_type(a.dtype, b.dtype))

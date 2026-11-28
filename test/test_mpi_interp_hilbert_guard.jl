@@ -1,12 +1,4 @@
-# Guard: interpolate / HilbertTransform fail LOUDLY (not silently-wrong) when a
-# Fourier axis they need is MPI-decomposed (np >= 2).
-#
-# Both reduce/multiply spectral coefficients along a Fourier axis using GLOBAL-length
-# weights or global wavenumbers. Under MPI a decomposed axis only exposes a per-rank
-# local slice, so the operation would mix local coefficients with global weights
-# (interpolate) / use local indices as wavenumbers (Hilbert) → wrong result. These
-# paths now raise a clear error instead. Interpolation along a NON-decomposed (local)
-# Fourier axis still works and matches serial. Surfaced by the broad MPI CPU audit.
+# Fourier slices are replicated across ranks. Hilbert still requires a local axis.
 using Tarang
 using MPI
 using PencilArrays
@@ -21,7 +13,7 @@ if nprocs < 2
     MPI.Finalize(); exit(0)
 end
 
-@testset "interpolate/Hilbert error on a decomposed Fourier axis (np=$nprocs)" begin
+@testset "Fourier slices and Hilbert on a decomposed axis (np=$nprocs)" begin
     coords = CartesianCoordinates("x", "y")
     dist = Distributor(coords)
     xb = RealFourier(coords["x"]; size=16, bounds=(0.0, 2π))
@@ -42,11 +34,12 @@ end
              collect(PencilArrays.decomposition(PencilArrays.pencil(cd))) : Int[]
     @test !isempty(decomp)
 
-    # Interpolating ALONG the decomposed Fourier axis (x, the rfft half-spectrum axis
-    # for RealFourier²) must raise our clear error — not a cryptic DimensionMismatch or
-    # a silent partial value. (Distributed interpolation is not yet supported in general;
-    # the point here is that it FAILS LOUDLY rather than returning garbage.)
-    @test_throws Exception Tarang.evaluate_interpolate(interpolate(u, coords["x"], 1.2), :g)
+    x0 = 1.2
+    y = (2π / 16) .* (0:15)
+    expected_y = cos.(x0 .+ y) .+ sin(x0) .* cos.(8y)
+    x_slice = interpolate(u, coords["x"], x0)
+    @test evaluate(x_slice, :g) ≈ expected_y atol=2e-13
+    @test evaluate(x_slice, :c) ≈ Tarang.FFTW.fft(expected_y) atol=2e-12
 
     # At half a y grid spacing the real Nyquist cosine vanishes. Every rank
     # receives the same x slice, including its phase in the half spectrum.

@@ -1535,114 +1535,17 @@ end
 """
 Build the k² array of a field's local coefficient grid.
 
-The k² grid is a constant of the domain/decomposition, so it is cached (per rank,
-keyed by basis sizes + local coefficient shape + element type) and reused. Callers
-(the lazy fractional Laplacian) only read it, so sharing is safe.
+Cache the read-only grid on the field's transform plan. The coefficient
+geometry distinguishes scaled grids and any change of local pencil layout.
 """
-const _POISSON_K2_CACHE = Dict{Tuple, Any}()
-
 function _build_k_squared(field::ScalarField)
-    coeff_data = coeff_data!(field)
-
-    if coeff_data === nothing
-        return nothing
+    coeffs = coeff_data!(field)
+    coeffs === nothing && return nothing
+    field.domain === nothing && return compute_wavenumber_squared_grid(field)
+    bundle = _field_transform_bundle(field)
+    cache = get!(() -> Dict{Tuple, Any}(), bundle.pencil_work_cache, :wavenumber_squared)
+    key = (map(b -> b.meta.bounds, field.bases), _coefficient_geometry(field, coeffs))
+    return get!(cache, key) do
+        get_local_data(compute_wavenumber_squared_grid(field))
     end
-
-    # Get local shape
-    local_shape = if isa(coeff_data, PencilArrays.PencilArray)
-        size(parent(coeff_data))
-    else
-        size(coeff_data)
-    end
-
-    T = real(eltype(coeff_data))
-    # Include the storage backend in the cache key.  A CPU k² array cannot be
-    # broadcast with CuArray coefficients, and rebuilding/copying k² at every RK
-    # stage would add an unnecessary host-to-device transfer.
-    backend = (typeof(coeff_data), architecture(coeff_data))
-    basis_key = Tuple(b === nothing ? nothing :
-                      (typeof(b), b.meta.size, b.meta.bounds) for b in field.bases)
-    key = (basis_key, local_shape, T, backend)
-    cached = get(_POISSON_K2_CACHE, key, nothing)
-    cached !== nothing && return cached
-
-    if is_gpu_array(coeff_data)
-        k_squared = compute_wavenumber_squared_grid(field)
-        _POISSON_K2_CACHE[key] = k_squared
-        return k_squared
-    end
-
-    k_squared = zeros(T, local_shape)
-
-    # Get wavenumber contributions from each basis
-    for (dim, basis) in enumerate(field.bases)
-        k_array = _get_wavenumber_array_for_poisson(field, dim, local_shape)
-        if k_array !== nothing
-            for idx in CartesianIndices(k_squared)
-                k_squared[idx] += k_array[idx]^2
-            end
-        end
-    end
-
-    _POISSON_K2_CACHE[key] = k_squared
-    return k_squared
-end
-
-"""
-Get wavenumber array for a specific dimension, handling MPI offsets.
-"""
-function _get_wavenumber_array_for_poisson(field::ScalarField, dim::Int, local_shape)
-    if dim > length(field.bases)
-        return nothing
-    end
-
-    basis = field.bases[dim]
-    coeff_data = get_coeff_data(field)
-    is_mpi = isa(coeff_data, PencilArrays.PencilArray)
-    global_shape = is_mpi ? PencilArrays.size_global(coeff_data) : size(coeff_data)
-    dim <= length(global_shape) || return zeros(local_shape)
-
-    if isa(basis, RealFourier)
-        k_global = _axis_uses_rfft(_field_transform_bundle(field), dim) ?
-                   wavenumbers_rfft(basis) : wavenumbers_fft(basis)
-    elseif isa(basis, ComplexFourier)
-        k_global = wavenumbers(basis)
-    else
-        return zeros(local_shape)
-    end
-
-    # Initialize wavenumber array
-    k_array = zeros(local_shape)
-
-    if is_mpi
-        pencil = PencilArrays.pencil(coeff_data)
-        local_axes = pencil.axes_local
-        perm = PencilArrays.permutation(coeff_data)
-        # Tuple(NoPermutation()) is `nothing`, NOT identity — guard before findfirst.
-        perm_raw = Tuple(perm)
-        perm_tuple = perm_raw === nothing ? ntuple(identity, ndims(coeff_data)) : perm_raw
-        physical_axis = findfirst(==(dim), perm_tuple)
-        if physical_axis === nothing
-            physical_axis = dim
-        end
-
-        if dim > length(local_axes)
-            return zeros(local_shape)
-        end
-
-        global_start = first(local_axes[dim])
-
-        for idx in CartesianIndices(k_array)
-            local_idx = Tuple(idx)[physical_axis]
-            global_idx = global_start + local_idx - 1
-            k_array[idx] = k_global[global_idx]
-        end
-    else
-        for idx in CartesianIndices(k_array)
-            global_idx = Tuple(idx)[dim]
-            k_array[idx] = k_global[global_idx]
-        end
-    end
-
-    return k_array
 end

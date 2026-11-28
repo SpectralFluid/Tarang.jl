@@ -135,12 +135,12 @@ end
 
 # Serial (COMM_SELF) distributors for rank-replicated reduction results,
 # cached so repeated integrate/average calls don't re-plan transforms.
-const _SERIAL_REPLICA_DISTS = Dict{Tuple{UInt, DataType}, Distributor}()
+const _SERIAL_REPLICA_DISTS = Dict{Tuple{UInt, DataType, AbstractArchitecture}, Distributor}()
 
 function _serial_replica_distributor(dist::Distributor, dtype::DataType)
-    key = (objectid(dist.coordsys), dtype)
+    key = (objectid(dist.coordsys), dtype, dist.architecture)
     return get!(_SERIAL_REPLICA_DISTS, key) do
-        Distributor(dist.coordsys; comm=MPI.COMM_SELF, dtype=dtype)
+        Distributor(dist.coordsys; comm=MPI.COMM_SELF, dtype, device=dist.architecture)
     end
 end
 

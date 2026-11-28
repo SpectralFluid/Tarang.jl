@@ -178,6 +178,49 @@ end
     end
 end
 
+# A complex equation can contain an entirely real factor. Its even Nyquist
+# mode must be interpolated as a cosine, including inside compound factors.
+# Leaf factors can use the source field directly. Compound factors reuse a
+# real workspace so their derivatives and nested products also use real modes.
+struct LazyRealFactor{E<:LazyFuture,W} <: LazyFuture
+    operand::E
+    workspace::W
+end
+
+_lazy_source(e::LazyStateField, state) = state[e.idx]
+_lazy_source(e::LazyParamField, state) = e.field
+
+_lazy_factor_is_real(e::Union{LazyConst,LazyRealFactor}, state) = true
+function _lazy_factor_is_real(e::Union{LazyStateField,LazyParamField}, state)
+    f = _lazy_source(e, state)
+    return f isa ScalarField && f.dtype <: Real
+end
+_lazy_factor_is_real(e::Union{LazyAdd,LazySub,LazyMul,LazyDiv}, state) =
+    _lazy_factor_is_real(e.left, state) && _lazy_factor_is_real(e.right, state)
+_lazy_factor_is_real(e::Union{LazyNegate,LazyScale,LazyPow,LazyUnaryFunc,LazyDiff,LazyMultiDiff,LazyFractionalLaplacian}, state) =
+    _lazy_factor_is_real(e.operand, state)
+
+function _lazy_product_factor(expr, state, target)
+    _lazy_factor_is_real(expr, state) || return expr
+    if expr isa Union{LazyStateField,LazyParamField}
+        src = _lazy_source(expr, state)
+        if src.dist === target.dist && src.bases == target.bases && src.scales == target.scales
+            return LazyRealFactor(expr, nothing)
+        end
+    end
+    field = _allocate_field_arithmetic_result(target, real(target.dtype))
+    workspace = LazyWorkspace{typeof(field)}()
+    workspace.template = field
+    return LazyRealFactor(expr, workspace)
+end
+
+function _lazy_product(left, right, state, target)
+    if target === nothing || target.dtype <: Real
+        return LazyMul(left, right)
+    end
+    return LazyMul(_lazy_product_factor(left, state, target), _lazy_product_factor(right, state, target))
+end
+
 # ── Translation from existing expression trees ──────────────────────────────
 
 """
@@ -251,7 +294,7 @@ function translate_to_lazy(expr, state; target=nothing)
         elseif isa(r, LazyConst)
             return LazyScale(l, r.value)
         end
-        return LazyMul(l, r)
+        return _lazy_product(l, r, state, target)
     end
     if isa(expr, DivideOperator)
         l = translate_to_lazy(expr.left, state; target=target)
@@ -554,9 +597,9 @@ function _translate_divergence_product_to_lazy(inner, state, target)
             isa(comp, ScalarField) && !_lazy_bases_match(comp, target) && return nothing
             ci = translate_to_lazy(comp, state; target=target)
             ci === nothing && return nothing
-            term = LazyMul(a, LazyDiff(ci, coord, 1, axis))                 # a ∂ᵢuᵢ
+            term = _lazy_product(a, LazyDiff(ci, coord, 1, axis), state, target)                 # a ∂ᵢuᵢ
             if !coeff_is_const                                             # uᵢ ∂ᵢa (0 if a const)
-                term = LazyAdd(term, LazyMul(ci, LazyDiff(a, coord, 1, axis)))
+                term = LazyAdd(term, _lazy_product(ci, LazyDiff(a, coord, 1, axis), state, target))
             end
             acc = acc === nothing ? term : LazyAdd(acc, term)
         end
@@ -581,10 +624,10 @@ function _translate_divergence_product_to_lazy(inner, state, target)
             basis === nothing && continue
             _lazy_diff_axis_supported(target, basis) || return nothing
             coord = _coord_of_axis(target, axis)
-            term = LazyMul(a, LazyDiff(u, coord, 2, axis))                 # a ∂ₖ²u
+            term = _lazy_product(a, LazyDiff(u, coord, 2, axis), state, target)                 # a ∂ₖ²u
             if !coeff_is_const                                            # ∂ₖa ∂ₖu (0 if a const)
-                term = LazyAdd(term, LazyMul(LazyDiff(a, coord, 1, axis),
-                                             LazyDiff(u, coord, 1, axis)))
+                term = LazyAdd(term, _lazy_product(LazyDiff(a, coord, 1, axis),
+                                             LazyDiff(u, coord, 1, axis), state, target))
             end
             acc = acc === nothing ? term : LazyAdd(acc, term)
         end
@@ -691,7 +734,7 @@ function _translate_future_to_lazy(expr::Future, state; target=nothing)
         for a in deps[2:end]
             rhs = translate_to_lazy(a, state; target=target)
             rhs === nothing && return nothing
-            result = LazyMul(result, rhs)
+            result = _lazy_product(result, rhs, state, target)
         end
 
         if scalar_coeff != 1.0
@@ -792,12 +835,18 @@ end
     return out
 end
 
+_materialize_factor!(expr, state, ws) = evaluate_lazy!(_borrow_scratch!(ws), expr, state, ws)
+function _materialize_factor!(expr::LazyRealFactor, state, ws)
+    native = expr.workspace
+    native === nothing && return _lazy_source(expr.operand, state)
+    _reset_diff_cache!(native)
+    return evaluate_lazy!(native.template, expr.operand, state, native)
+end
+
 @inline function evaluate_lazy!(out::ScalarField, expr::LazyMul, state, ws::LazyWorkspace)
     _with_scratch_scope(ws) do
-        a = _borrow_scratch!(ws)
-        b = _borrow_scratch!(ws)
-        evaluate_lazy!(a, expr.left, state, ws)
-        evaluate_lazy!(b, expr.right, state, ws)
+        a = _materialize_factor!(expr.left, state, ws)
+        b = _materialize_factor!(expr.right, state, ws)
         # LazyMul represents a field product. Use the ordinary product projection
         # when a Fourier or ChebyshevT axis requests dealiasing.
         if _any_axis_dealias(out.bases, 1.5)
@@ -1004,12 +1053,7 @@ function evaluate_lazy!(out::ScalarField, expr::LazyFractionalLaplacian,
     coeff = get_local_data(coeff_data!(out))
     k2 = get_local_data(_build_k_squared(out))
     alpha = eltype(k2)(expr.alpha)
-    if alpha >= 0
-        @. coeff *= k2 ^ alpha
-    else
-        threshold = eltype(k2)(1e-14)
-        @. coeff *= ifelse(k2 > threshold, k2 ^ alpha, 0)
-    end
+    @. coeff *= _fractional_multiplier(k2, alpha)
     out.current_layout = :c
     ensure_layout!(out, :g)
     return out
